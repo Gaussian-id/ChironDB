@@ -1,0 +1,117 @@
+name: security
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@87eb139fed4b08a67bd1fa429a21d1f5d523e03e # 1.92.0
+        with:
+          toolchain: 1.92.0
+      - name: Install policy tools
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-deny --version 0.20.2 --locked
+      - name: RustSec advisory gate
+        run: cargo audit --deny warnings
+      - name: Dependency source, license, and ban gate
+        run: cargo deny check
+      - name: CI dependency pinning policy
+        run: python3 .github/tools/check_ci_pinning.py
+      - name: Secret regression scan
+        run: bash .github/tools/secret_scan.sh
+      - name: Deterministic crash-consistency suite
+        run: cargo test -p chirondb-core --features fault-injection --test crash_consistency --locked
+
+  fuzz-corpus:
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-08-20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly
+        with:
+          toolchain: nightly-2026-08-20
+      - name: Install protoc and cargo-fuzz
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Compile independent fuzz workspace
+        run: cargo check --manifest-path fuzz/Cargo.toml --locked
+      - name: Corpus regression and short smoke
+        run: |
+          for target in protocol_decoders query_decoders storage_decoders index_decoders; do
+            cargo fuzz run "$target" fuzz/corpus/"$target" -- -runs=256 -rss_limit_mb=2048
+          done
+
+  real-disk-full:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@87eb139fed4b08a67bd1fa429a21d1f5d523e03e # 1.92.0
+        with:
+          toolchain: 1.92.0
+      - name: Install protoc and filesystem tools
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler e2fsprogs
+      - name: Resolve tested tree hashes
+        id: trees
+        run: |
+          echo "core=$(git rev-parse HEAD:chirondb-core)" >> "$GITHUB_OUTPUT"
+          echo "server=$(git rev-parse HEAD:chirondb-server)" >> "$GITHUB_OUTPUT"
+      - name: Real ENOSPC loopback fault
+        env:
+          CHIRONDB_CORE_TREE_HASH: ${{ steps.trees.outputs.core }}
+          CHIRONDB_SERVER_TREE_HASH: ${{ steps.trees.outputs.server }}
+          CHIRONDB_ENOSPC_EVIDENCE: ${{ runner.temp }}/real-enospc.json
+        run: |
+          set -euo pipefail
+          image="${RUNNER_TEMP}/chirondb-enospc.img"
+          mountpoint="${RUNNER_TEMP}/chirondb-enospc"
+          test ! -e "$image"
+          truncate -s 64M "$image"
+          mkfs.ext4 -F -m 0 "$image"
+          mkdir -p "$mountpoint"
+          sudo mount -o loop "$image" "$mountpoint"
+          trap 'sudo umount "$mountpoint"' EXIT
+          sudo chown "$(id -u):$(id -g)" "$mountpoint"
+          touch "$mountpoint/.chirondb-enospc-test-device"
+          CHIRONDB_ENOSPC_ROOT="$mountpoint" cargo test -p chirondb-core \
+            --features fault-injection --test real_enospc --locked -- --ignored --exact \
+            real_enospc_rejects_unacknowledged_write_and_reopens_acknowledged_state
+          CHIRONDB_ENOSPC_ROOT="$mountpoint" cargo test -p chirondb-core \
+            --features fault-injection --test real_enospc --locked -- --ignored --exact \
+            real_enospc_preserves_build_checkpoint_and_resumes_after_space_returns
+      - name: Upload ENOSPC evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: real-enospc-${{ github.sha }}
+          path: ${{ runner.temp }}/real-enospc.json
+          if-no-files-found: error
+
+  required:
+    name: security-required
+    if: always()
+    needs: [dependency-policy, fuzz-corpus, real-disk-full]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require security gates
+        env:
+          DEPENDENCY_RESULT: ${{ needs.dependency-policy.result }}
+          FUZZ_RESULT: ${{ needs.fuzz-corpus.result }}
+          DISK_RESULT: ${{ needs.real-disk-full.result }}
+        run: >-
+          test "$DEPENDENCY_RESULT" = success &&
+          test "$FUZZ_RESULT" = success &&
+          test "$DISK_RESULT" = success

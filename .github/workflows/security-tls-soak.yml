@@ -1,0 +1,80 @@
+name: security-tls-soak
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [labeled, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  external-client-tls-soak:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'security-full-gate')
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@87eb139fed4b08a67bd1fa429a21d1f5d523e03e # 1.92.0
+        with:
+          toolchain: 1.92.0
+      - name: Install external clients
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client protobuf-compiler
+          go install github.com/fullstorydev/grpcurl/cmd/grpcurl@v1.9.3
+          google-chrome --version
+          psql --version
+          "$(go env GOPATH)/bin/grpcurl" --version
+      - name: Build server and ChironWire client
+        run: cargo build --release --locked --bin chirondb --bin chironwirectl
+      - name: Resolve tested revision and trees
+        id: trees
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "core=$(git rev-parse HEAD:chirondb-core)" >> "$GITHUB_OUTPUT"
+          echo "server=$(git rev-parse HEAD:chirondb-server)" >> "$GITHUB_OUTPUT"
+      - name: Run 60-minute external TLS rotation soak
+        env:
+          TESTED_SHA: ${{ steps.trees.outputs.sha }}
+          CORE_TREE_HASH: ${{ steps.trees.outputs.core }}
+          SERVER_TREE_HASH: ${{ steps.trees.outputs.server }}
+        run: |
+          evidence="${RUNNER_TEMP}/tls-soak"
+          mkdir -p "$evidence"
+          python3 -B .github/tools/security_tls_soak.py \
+            --server target/release/chirondb \
+            --wirectl target/release/chironwirectl \
+            --proto-root proto \
+            --grpcurl "$(go env GOPATH)/bin/grpcurl" \
+            --duration-seconds 3600 \
+            --tested-sha "$TESTED_SHA" \
+            --core-tree-hash "$CORE_TREE_HASH" \
+            --server-tree-hash "$SERVER_TREE_HASH" \
+            --output "$evidence/evidence.json"
+      - name: Validate TLS evidence
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report = json.loads((Path(os.environ["RUNNER_TEMP"]) / "tls-soak/evidence.json").read_text())
+          assert report["verdict"] == "passed", report
+          assert report["actual_duration_seconds"] >= 3600, report
+          assert report["initial_serial"] != report["replacement_serial"], report
+          for client, counts in report["load_counts"].items():
+              assert counts["success"] > 0, (client, counts)
+              assert counts["failure"] == 0, (client, counts)
+          assert report["browser_grpc_web"] == "passed", report
+          PY
+      - name: Upload TLS soak evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: security-tls-soak-${{ github.sha }}
+          path: ${{ runner.temp }}/tls-soak/
+          if-no-files-found: warn
+          retention-days: 30

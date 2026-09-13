@@ -1,0 +1,3 @@
+mcp==2.2.0
+grpcio-tools==1.83.1
+requests==2.32.5

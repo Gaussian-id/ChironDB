@@ -1,0 +1,86 @@
+[package]
+name = "chirondb-fuzz"
+version = "0.0.0"
+publish = false
+license = "AGPL-3.0-only"
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+chirondb-core = { version = "=0.1.0-beta.1", path = "../chirondb-core", features = ["fuzzing"] }
+chirondb = { version = "=0.1.0-beta.1", path = "../chirondb-server" }
+crc32fast = "1.5.0"
+libfuzzer-sys = "0.4"
+prost = "0.14.3"
+serde_json = "1.0.149"
+tempfile = "3.27.0"
+
+[[bin]]
+name = "wal_frame_record"
+path = "fuzz_targets/wal_frame_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "catalog_wal"
+path = "fuzz_targets/catalog_wal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "archive_manifest"
+path = "fuzz_targets/archive_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "restore_journal"
+path = "fuzz_targets/restore_journal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol_decoders"
+path = "fuzz_targets/protocol_decoders.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "query_decoders"
+path = "fuzz_targets/query_decoders.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "storage_decoders"
+path = "fuzz_targets/storage_decoders.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "index_decoders"
+path = "fuzz_targets/index_decoders.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "graph_gdx_loaders"
+path = "fuzz_targets/graph_gdx_loaders.rs"
+test = false
+doc = false
+bench = false
+
+# Keep fuzz-only dependencies and lock resolution out of the production
+# workspace's default build, tests, release artifacts, and Cargo.lock.
+[workspace]
+members = ["."]

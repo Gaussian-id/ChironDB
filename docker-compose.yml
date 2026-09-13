@@ -1,0 +1,24 @@
+name: chirondb
+
+services:
+  chirondb:
+    image: ghcr.io/gaussian-id/chirondb:0.1.0-beta.1
+    pull_policy: always
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:7401:7401"
+      - "127.0.0.1:7402:7402"
+      - "127.0.0.1:7403:7403"
+    environment:
+      CHIRONDB_ALLOW_INSECURE_NON_LOOPBACK: "true"
+    volumes:
+      - chirondb-data:/var/lib/chirondb
+    healthcheck:
+      test: ["CMD", "chironctl", "health"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+
+volumes:
+  chirondb-data:

@@ -1,0 +1,28 @@
+name: WAL power-cut evidence
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dm-flakey:
+    runs-on: [self-hosted, linux, wal-powercut]
+    environment: wal-powercut
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@87eb139fed4b08a67bd1fa429a21d1f5d523e03e # 1.92.0
+      - name: Run privileged dm-flakey harness
+        env:
+          CHIRONDB_POWERCUT_ACK: I_UNDERSTAND_THIS_USES_DEVICE_MAPPER
+          CHIRONDB_POWERCUT_EVIDENCE: ${{ github.workspace }}/wal-powercut-evidence.json
+        run: sudo --preserve-env=CHIRONDB_POWERCUT_ACK,CHIRONDB_POWERCUT_EVIDENCE ./.github/tools/wal_powercut_harness.sh
+      - name: Upload durability evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wal-powercut-evidence-${{ github.sha }}
+          path: wal-powercut-evidence.json
+          if-no-files-found: error

@@ -1,0 +1,497 @@
+name: release
+
+# Tag-triggered release pipeline: builds the release binary set across the
+# same cross-platform matrix as cross-platform-ci.yml, archives them,
+# generates a checksums file, cosign-signs it keyless (Sigstore, via GitHub's
+# OIDC token -- no private key material to manage or leak), and publishes a
+# GitHub Release with all artifacts attached.
+#
+# Windows is best-effort, matching cross-platform-ci.yml's policy -- it does
+# not block the release.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write # to create the GitHub Release and upload assets
+  packages: write # to publish the production image to GHCR
+  id-token: write # for cosign keyless (Sigstore OIDC) signing
+  attestations: write
+
+env:
+  BINS: chirondb chironql chironmcp chironctl chironbench chirondrill chironrecall chirongrpcctl chironwirectl gaussdb gaussctl gaussbench gaussdrill gaussrecall gaussgrpcctl gausswirectl
+  IMAGE_NAME: ghcr.io/gaussian-id/chirondb
+
+jobs:
+  wal-release-gate:
+    name: WAL official SIFT-128 release gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@87eb139fed4b08a67bd1fa429a21d1f5d523e03e # 1.92.0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+
+      - name: Install benchmark dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler python3-venv
+          python3 -m venv .venv
+          .venv/bin/pip install h5py==3.14.0
+
+      - name: Cache pinned official SIFT corpus
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .cache/ann-benchmarks
+          key: sift-128-euclidean-dd6f0a6ed6b7ebb8934680f861a33ed01ff33991eaee4fd60914d854a0ca5984
+
+      - name: Fetch and verify official SIFT-128
+        run: |
+          set -euo pipefail
+          mkdir -p .cache/ann-benchmarks
+          h5=.cache/ann-benchmarks/sift-128-euclidean.hdf5
+          if [[ ! -f "$h5" ]]; then
+            curl --fail --location --retry 3 \
+              --output "$h5" \
+              https://ann-benchmarks.com/sift-128-euclidean.hdf5
+          fi
+          echo "dd6f0a6ed6b7ebb8934680f861a33ed01ff33991eaee4fd60914d854a0ca5984  $h5" | sha256sum --check --strict
+
+      - name: Convert and verify GBENCHv1 corpus
+        run: |
+          set -euo pipefail
+          h5=.cache/ann-benchmarks/sift-128-euclidean.hdf5
+          gbench=.cache/ann-benchmarks/sift-128-euclidean.gbench
+          if [[ ! -f "$gbench" ]]; then
+            .venv/bin/python .github/tools/ann-benchmarks/h5_to_gbench.py "$h5" "$gbench"
+          fi
+          echo "d9eb5c85b274efd3cd221a49d82ed8a577737fae9bec9074bc17a341c442ca04  $gbench" | sha256sum --check --strict
+
+      - name: Build benchmark and recovery tools
+        run: cargo build --release --locked -p chirondb --bin gaussbench --bin chirondrill
+
+      - name: Run official SIFT recall gate
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o "$RUNNER_TEMP/sift-plaintext-time.txt" \
+            target/release/gaussbench ann-benchmarks \
+            --dataset .cache/ann-benchmarks/sift-128-euclidean.gbench \
+            --data-dir "$RUNNER_TEMP/chirondb-sift-db" \
+            --ef-grid 32 \
+            --k 10 \
+            --recall-target 0.95 \
+            --output "$RUNNER_TEMP/sift-report.json" \
+            --git-sha "$GITHUB_SHA"
+          du -sb "$RUNNER_TEMP/chirondb-sift-db" | cut -f1 > "$RUNNER_TEMP/sift-plaintext-bytes.txt"
+          python3 -c 'import json, os; report=json.load(open(os.environ["RUNNER_TEMP"] + "/sift-report.json")); recall=report["pareto"][0]["recall_at_10"]; assert recall is not None and recall >= 0.95, f"recall@10 {recall} is below 0.95"'
+
+      - name: Run official SIFT recovery and RSS gate
+        run: |
+          set -euo pipefail
+          target/release/chirondrill \
+            --data-dir "$RUNNER_TEMP/chirondb-sift-db" \
+            --collection ann_benchmarks \
+            --existing-recovery-profile \
+            --expected-points 1000000 \
+            --max-recovery-seconds 120 \
+            --max-rss-delta-mib 256 \
+            | tee "$RUNNER_TEMP/sift-recovery-report.json"
+
+      - name: Run official encrypted SIFT and recovery gates
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, json, os, secrets
+          path = os.environ["RUNNER_TEMP"] + "/sift-keyring.json"
+          with open(path, "w", encoding="utf-8") as handle:
+              json.dump({
+                  "version": 1,
+                  "active_key_id": "release-gate",
+                  "keys": [{
+                      "id": "release-gate",
+                      "key_base64": base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
+                  }],
+              }, handle)
+          os.chmod(path, 0o600)
+          PY
+          /usr/bin/time -v -o "$RUNNER_TEMP/sift-encrypted-time.txt" \
+            target/release/gaussbench \
+            --encryption-keyring-file "$RUNNER_TEMP/sift-keyring.json" \
+            ann-benchmarks \
+            --dataset .cache/ann-benchmarks/sift-128-euclidean.gbench \
+            --data-dir "$RUNNER_TEMP/chirondb-sift-encrypted-db" \
+            --ef-grid 32 \
+            --k 10 \
+            --recall-target 0.95 \
+            --output "$RUNNER_TEMP/sift-encrypted-report.json" \
+            --git-sha "$GITHUB_SHA"
+          du -sb "$RUNNER_TEMP/chirondb-sift-encrypted-db" | cut -f1 > "$RUNNER_TEMP/sift-encrypted-bytes.txt"
+          target/release/chirondrill \
+            --encryption-keyring-file "$RUNNER_TEMP/sift-keyring.json" \
+            --data-dir "$RUNNER_TEMP/chirondb-sift-encrypted-db" \
+            --collection ann_benchmarks \
+            --existing-recovery-profile \
+            --expected-points 1000000 \
+            --max-recovery-seconds 120 \
+            --max-rss-delta-mib 256 \
+            | tee "$RUNNER_TEMP/sift-encrypted-recovery-report.json"
+
+      - name: Verify and report encryption overhead
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re
+          root = os.environ["RUNNER_TEMP"]
+          def load(name):
+              with open(os.path.join(root, name), encoding="utf-8") as handle:
+                  return json.load(handle)
+          def peak_rss(name):
+              text = open(os.path.join(root, name), encoding="utf-8").read()
+              match = re.search(r"Maximum resident set size \(kbytes\):\s*(\d+)", text)
+              if not match:
+                  raise AssertionError(f"missing peak RSS in {name}")
+              return int(match.group(1)) * 1024
+          plain = load("sift-report.json")
+          encrypted = load("sift-encrypted-report.json")
+          plain_peak = peak_rss("sift-plaintext-time.txt")
+          encrypted_peak = peak_rss("sift-encrypted-time.txt")
+          plain_bytes = int(open(os.path.join(root, "sift-plaintext-bytes.txt")).read())
+          encrypted_bytes = int(open(os.path.join(root, "sift-encrypted-bytes.txt")).read())
+          plain_point = plain["pareto"][0]
+          encrypted_point = encrypted["pareto"][0]
+          encrypted_recall = encrypted_point["recall_at_10"]
+          assert plain["encryption_enabled"] is False
+          assert encrypted["encryption_enabled"] is True
+          assert encrypted_recall is not None and encrypted_recall >= 0.95
+          assert encrypted_peak <= plain_peak * 1.20, (
+              f"encrypted peak RSS {encrypted_peak} exceeds 120% of plaintext {plain_peak}"
+          )
+          report = {
+              "schema_version": 1,
+              "dataset_sha256": "d9eb5c85b274efd3cd221a49d82ed8a577737fae9bec9074bc17a341c442ca04",
+              "git_sha": os.environ["GITHUB_SHA"],
+              "points": plain["n_train"],
+              "queries": plain["n_test"],
+              "plaintext": {
+                  "write_points_per_second": plain["n_train"] / plain["load"]["insert_s"],
+                  "search_p99_ms": plain_point["p99_ms"],
+                  "persisted_bytes": plain_bytes,
+                  "peak_rss_bytes": plain_peak,
+              },
+              "encrypted": {
+                  "write_points_per_second": encrypted["n_train"] / encrypted["load"]["insert_s"],
+                  "search_p99_ms": encrypted_point["p99_ms"],
+                  "persisted_bytes": encrypted_bytes,
+                  "peak_rss_bytes": encrypted_peak,
+              },
+              "overhead": {
+                  "write_throughput_ratio": (encrypted["n_train"] / encrypted["load"]["insert_s"]) / (plain["n_train"] / plain["load"]["insert_s"]),
+                  "search_p99_ratio": encrypted_point["p99_ms"] / plain_point["p99_ms"],
+                  "persisted_bytes_ratio": encrypted_bytes / plain_bytes,
+                  "peak_rss_ratio": encrypted_peak / plain_peak,
+              },
+          }
+          with open(os.path.join(root, "sift-encryption-overhead.json"), "w", encoding="utf-8") as handle:
+              json.dump(report, handle, indent=2, sort_keys=True)
+          PY
+
+      - name: Upload WAL release evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wal-sift-release-gate
+          path: |
+            ${{ runner.temp }}/sift-report.json
+            ${{ runner.temp }}/sift-recovery-report.json
+            ${{ runner.temp }}/sift-encrypted-report.json
+            ${{ runner.temp }}/sift-encrypted-recovery-report.json
+            ${{ runner.temp }}/sift-encryption-overhead.json
+            ${{ runner.temp }}/sift-plaintext-time.txt
+            ${{ runner.temp }}/sift-encrypted-time.txt
+          if-no-files-found: error
+
+  build:
+    name: build (${{ matrix.label }})
+    needs: wal-release-gate
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.best_effort == true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: false
+            best_effort: false
+            label: linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: true
+            best_effort: false
+            label: linux-aarch64
+          - target: x86_64-apple-darwin
+            os: macos-13
+            use_cross: false
+            best_effort: false
+            label: darwin-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-14
+            use_cross: false
+            best_effort: false
+            label: darwin-aarch64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            use_cross: false
+            best_effort: true
+            label: windows-x86_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Release version consistency
+        run: python3 .github/tools/check_release_version.py
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@87eb139fed4b08a67bd1fa429a21d1f5d523e03e # 1.92.0
+        with:
+          toolchain: 1.92.0
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+
+      - name: Install protobuf compiler (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install protobuf compiler (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install protobuf compiler (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install -y protoc
+          echo "C:\ProgramData\chocolatey\lib\protoc\tools\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Install cross (non-native Linux aarch64)
+        if: matrix.use_cross
+        run: cargo install cross --version 0.2.5 --locked
+
+      - name: cargo build --release --bins
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --locked --bins --target ${{ matrix.target }}
+          else
+            cargo build --release --locked --bins --target ${{ matrix.target }}
+          fi
+        shell: bash
+
+      - name: Binary version consistency
+        if: ${{ !matrix.use_cross }}
+        shell: bash
+        run: bash .github/tools/check_binary_versions.sh "target/${{ matrix.target }}/release"
+
+      - name: Generate CycloneDX workspace SBOM
+        shell: bash
+        run: |
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+          cargo cyclonedx --format json --all-features
+
+      - name: Archive binaries
+        id: archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="chirondb-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "$out"
+          ext=""
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            ext=".exe"
+          fi
+          for bin in $BINS; do
+            cp "target/${{ matrix.target }}/release/${bin}${ext}" "$out/"
+          done
+          mkdir -p "$out/proto/chirondb/v1"
+          cp proto/chirondb/v1/chirondb.proto "$out/proto/chirondb/v1/"
+          cp proto/chirondb/v1/compat.proto "$out/proto/chirondb/v1/"
+          mkdir -p "$out/sbom"
+          find . -name '*.cdx.json' -not -path './target/*' -not -path './fuzz/target/*' -exec cp {} "$out/sbom/" \;
+          cp LICENSE LICENSE-APACHE-2.0 NOTICE TRADEMARKS.md "$out/"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            7z a "${out}.zip" "$out" > /dev/null
+            echo "path=${out}.zip" >> "$GITHUB_OUTPUT"
+          else
+            tar -czf "${out}.tar.gz" "$out"
+            echo "path=${out}.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: chirondb-${{ matrix.target }}
+          path: ${{ steps.archive.outputs.path }}
+          if-no-files-found: error
+
+      - name: Attest release archive provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ steps.archive.outputs.path }}
+
+  publish-container:
+    name: publish + sign container
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=beta,enable=${{ contains(github.ref_name, '-beta.') && !contains(github.ref_name, '-rc.') }}
+            type=sha,prefix=sha-
+
+      - name: Build and push multi-platform image
+        id: image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            CHIRONDB_VERSION=${{ steps.meta.outputs.version }}
+            VCS_REF=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Make the GHCR package public
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method PATCH \
+            -H "Accept: application/vnd.github+json" \
+            "/orgs/${{ github.repository_owner }}/packages/container/chirondb" \
+            -f visibility=public
+
+      - name: Verify both platforms and the published runtime
+        env:
+          IMAGE_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect "${IMAGE_NAME}:${IMAGE_VERSION}"
+          docker run --rm --platform linux/amd64 "${IMAGE_NAME}:${IMAGE_VERSION}" --version
+          docker run --rm --platform linux/arm64 "${IMAGE_NAME}:${IMAGE_VERSION}" --version
+          bash .github/tools/smoke_container.sh "${IMAGE_NAME}:${IMAGE_VERSION}"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@f713795cb21599bc4e5c4b58cbad1da852d7eeb9 # v3
+
+      - name: Sign and verify the image digest
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          cosign sign --yes "${IMAGE_NAME}@${IMAGE_DIGEST}"
+          cosign verify \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${IMAGE_NAME}@${IMAGE_DIGEST}"
+
+      - name: Generate OCI image SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          image: ${{ env.IMAGE_NAME }}@${{ steps.image.outputs.digest }}
+          format: cyclonedx-json
+          output-file: chirondb-image.cdx.json
+
+      - name: Attest OCI image SBOM
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          cosign attest --yes --type cyclonedx \
+            --predicate chirondb-image.cdx.json \
+            "${IMAGE_NAME}@${IMAGE_DIGEST}"
+
+  sign-and-publish:
+    name: sign + publish release
+    needs: [build, publish-container]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Download all archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          pattern: chirondb-*
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@f713795cb21599bc4e5c4b58cbad1da852d7eeb9 # v3
+
+      - name: Cosign keyless sign the checksums file
+        working-directory: dist
+        run: |
+          cosign sign-blob --yes \
+            --output-signature SHA256SUMS.sig \
+            --output-certificate SHA256SUMS.pem \
+            SHA256SUMS
+
+      - name: Verify signature (fail closed before publishing)
+        working-directory: dist
+        run: |
+          cosign verify-blob \
+            --certificate SHA256SUMS.pem \
+            --signature SHA256SUMS.sig \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=()
+          if [[ "${{ github.ref_name }}" == *-* ]]; then
+            prerelease+=(--prerelease)
+          fi
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            "${prerelease[@]}" \
+            dist/*

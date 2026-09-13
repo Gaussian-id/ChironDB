@@ -1,0 +1,406 @@
+syntax = "proto3";
+
+package gaussdb.v1;
+
+service GaussDb {
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc CreateCollection(CreateCollectionRequest) returns (CollectionConfig);
+  rpc ListCollections(ListCollectionsRequest) returns (ListCollectionsResponse);
+  rpc DeleteCollection(DeleteCollectionRequest) returns (DeleteCollectionResponse);
+  rpc UpdatePayloadSchema(UpdatePayloadSchemaRequest) returns (CollectionConfig);
+  rpc Upsert(UpsertRequest) returns (UpsertResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc GetPoints(GetPointsRequest) returns (GetPointsResponse);
+  rpc SetPayload(SetPayloadRequest) returns (SetPayloadResponse);
+  rpc DeleteByFilter(DeleteByFilterRequest) returns (DeleteByFilterResponse);
+  rpc Search(SearchRequest) returns (SearchResponse);
+  rpc HybridSearch(HybridSearchRequest) returns (SearchResponse);
+  rpc TextHybridSearch(TextHybridSearchRequest) returns (SearchResponse);
+  rpc MultiSearch(MultiSearchRequest) returns (MultiSearchResponse);
+  rpc Recommend(RecommendRequest) returns (SearchResponse);
+  rpc Count(CountRequest) returns (CountResponse);
+  rpc Scroll(ScrollRequest) returns (ScrollResponse);
+  rpc Compact(CompactRequest) returns (CompactResponse);
+  rpc TierCold(ColdTierRequest) returns (ColdTierResponse);
+  rpc PruneWalArchive(PruneWalArchiveRequest) returns (WalArchivePruneResponse);
+  rpc Snapshot(SnapshotRequest) returns (StatusResponse);
+  rpc Restore(RestoreRequest) returns (StatusResponse);
+  rpc ShardMove(ShardMoveRequest) returns (StatusResponse);
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;
+  string data_dir = 2;
+  uint64 collections = 3;
+  string version = 4;
+}
+
+message CollectionConfig {
+  string name = 1;
+  uint64 vector_dim = 2;
+  string metric = 3;
+  uint32 shards = 4;
+  uint32 replicas = 5;
+  string quantization = 6;
+  map<string, string> payload_schema = 7;
+  // HNSW knobs. Zero = "use engine default".
+  optional uint32 hnsw_m = 8;
+  optional uint32 hnsw_ef_construction = 9;
+  optional uint32 hnsw_ef_search = 10;
+  // P3 — contracted recall SLA in 0.5..=1.0. Engine periodically recalibrates
+  // and emits a recall_sla_breach audit event when the active ef_search no
+  // longer hits the SLA. Unset = monitoring disabled.
+  optional float recall_sla = 11;
+  // LS-Vec mutable-streamer logical-byte cap. Zero = engine default (512 MiB).
+  uint64 streamer_max_bytes = 12;
+}
+
+message CreateCollectionRequest {
+  CollectionConfig config = 1;
+}
+
+message ListCollectionsRequest {}
+
+message ListCollectionsResponse {
+  repeated CollectionConfig collections = 1;
+}
+
+message DeleteCollectionRequest {
+  string collection = 1;
+}
+
+message DeleteCollectionResponse {
+  string deleted = 1;
+}
+
+message UpdatePayloadSchemaRequest {
+  string collection = 1;
+  map<string, string> payload_schema = 2;
+}
+
+message Point {
+  string id = 1;
+  repeated float vector = 2;
+  string payload_json = 3;
+  SparseVector sparse_vector = 4;
+  map<string, DenseVector> vectors = 5;
+}
+
+message DenseVector {
+  repeated float values = 1;
+}
+
+message SparseVector {
+  repeated uint32 indices = 1;
+  repeated float values = 2;
+}
+
+message UpsertRequest {
+  string collection = 1;
+  repeated Point points = 2;
+  /// When true, skip WAL fsync and return immediately (lower latency, less durable).
+  /// Default false = wait for fsync (safe).
+  bool no_wait = 3;
+}
+
+message UpsertResponse {
+  uint64 total = 1;
+}
+
+message DeleteRequest {
+  string collection = 1;
+  repeated string ids = 2;
+}
+
+message DeleteResponse {
+  uint64 deleted = 1;
+}
+
+message GetPointsRequest {
+  string collection = 1;
+  repeated string ids = 2;
+}
+
+message GetPointsResponse {
+  repeated Point points = 1;
+}
+
+message SetPayloadRequest {
+  string collection = 1;
+  string id = 2;
+  string payload_json = 3;
+  bool merge = 4;
+}
+
+message SetPayloadResponse {
+  Point point = 1;
+}
+
+message DeleteByFilterRequest {
+  string collection = 1;
+  string filter_json = 2;
+}
+
+message DeleteByFilterResponse {
+  uint64 deleted = 1;
+}
+
+message SearchQuery {
+  repeated float vector = 1;
+  uint64 k = 2;
+  string filter_json = 3;
+  optional uint64 budget_ms = 4;
+  string vector_name = 5;
+  // Per-query HNSW ef_search override; falls back to collection config.
+  optional uint32 ef_search = 6;
+  // Contracted recall target used to derive LS-VEC navigation and rerank work.
+  optional float recall_target = 7;
+  // Optional chirondb_types::graph::GraphConstraint encoded as JSON. Added at
+  // a new field number so existing gaussdb.v1 clients remain wire-compatible.
+  optional string graph_json = 8;
+}
+
+message SearchRequest {
+  string collection = 1;
+  SearchQuery query = 2;
+}
+
+message TextHybridSearchRequest {
+  string collection = 1;
+  repeated float vector = 2;
+  string query = 3;
+  string text_field = 4;
+  uint64 k = 5;
+  string filter_json = 6;
+  optional uint64 budget_ms = 7;
+}
+
+message HybridSearchRequest {
+  string collection = 1;
+  repeated float vector = 2;
+  SparseVector sparse_vector = 3;
+  uint64 k = 4;
+  string filter_json = 5;
+  optional uint64 budget_ms = 6;
+  string fusion = 7;
+  float dense_weight = 8;
+  float sparse_weight = 9;
+  bool use_dense_vector = 10;
+  string vector_name = 11;
+  // Optional chirondb_types::graph::GraphConstraint encoded as JSON.
+  optional string graph_json = 12;
+}
+
+message SearchHit {
+  string id = 1;
+  float score = 2;
+  string payload_json = 3;
+}
+
+message SearchResponse {
+  repeated SearchHit hits = 1;
+  bool degraded = 2;
+  uint64 searched = 3;
+  uint64 elapsed_ms = 4;
+  // GraphDispatchTrace encoded as JSON for graph-constrained retrieval.
+  optional string graph_json = 5;
+}
+
+message MultiSearchRequest {
+  string collection = 1;
+  repeated SearchQuery searches = 2;
+  string fusion = 3;
+  uint64 fused_k = 4;
+  repeated float weights = 5;
+}
+
+message MultiSearchResponse {
+  repeated SearchResponse results = 1;
+  SearchResponse fused = 2;
+}
+
+message RecommendRequest {
+  string collection = 1;
+  repeated string positive = 2;
+  repeated string negative = 3;
+  uint64 k = 4;
+  string filter_json = 5;
+  optional uint64 budget_ms = 6;
+  string vector_name = 7;
+}
+
+message CountRequest {
+  string collection = 1;
+  string filter_json = 2;
+}
+
+message CountResponse {
+  uint64 count = 1;
+}
+
+message ScrollRequest {
+  string collection = 1;
+  /// ID-based continuation token (empty string = start from beginning).
+  string offset = 2;
+  uint64 limit = 3;
+  string filter_json = 4;
+}
+
+message ScrollResponse {
+  repeated Point points = 1;
+  /// ID of the last returned point; pass as offset for the next page.
+  /// Empty string when this is the last page.
+  string next_offset = 2;
+}
+
+message CompactRequest {
+  string collection = 1;
+}
+
+message ColdTierRequest {
+  string collection = 1;
+}
+
+message CompactResponse {
+  string collection = 1;
+  string segment_id = 2;
+  uint64 points = 3;
+  uint64 h2qg_cells = 4;
+  uint64 sparse_dimensions = 5;
+  uint64 sparse_postings = 6;
+  uint64 payload_fields = 7;
+  uint64 payload_values = 8;
+  uint64 payload_postings = 9;
+  uint64 tombstones = 10;
+  uint64 wal_archived_segments = 11;
+  uint64 wal_archived_bytes = 12;
+  uint64 wal_auto_retained_archives = 13;
+  uint64 wal_auto_pruned_archives = 14;
+  uint64 wal_auto_pruned_bytes = 15;
+  uint64 wal_external_archived_segments = 16;
+  uint64 wal_external_archived_bytes = 17;
+  bool wal_archive_command_executed = 18;
+  uint64 wal_object_archived_segments = 19;
+  uint64 wal_object_archived_bytes = 20;
+  uint64 named_h2qg_fields = 21;
+}
+
+message ColdTierResponse {
+  string collection = 1;
+  uint64 segments = 2;
+  uint64 files = 3;
+  uint64 bytes = 4;
+  uint64 points = 5;
+}
+
+message PruneWalArchiveRequest {
+  string collection = 1;
+  uint64 retain_last = 2;
+}
+
+message WalArchivePruneResponse {
+  string collection = 1;
+  uint64 retained_archives = 2;
+  uint64 pruned_archives = 3;
+  uint64 pruned_bytes = 4;
+}
+
+message SnapshotRequest {
+  string path = 1;
+}
+
+message RestoreRequest {
+  string path = 1;
+  map<string, uint64> target_wal_lsns = 2;
+  map<string, uint64> target_wal_unix_ms = 3;
+  string wal_restore_archive_dir = 4;
+  string wal_restore_object_store_dir = 5;
+  string wal_restore_object_store_url = 6;
+}
+
+message ShardMoveRequest {}
+
+message StatusResponse {
+  string status = 1;
+}
+
+message WireRequest {
+  uint64 request_id = 1;
+  string api_key = 2;
+  oneof operation {
+    HealthRequest health = 10;
+    CreateCollectionRequest create_collection = 11;
+    ListCollectionsRequest list_collections = 12;
+    UpdatePayloadSchemaRequest update_payload_schema = 13;
+    UpsertRequest upsert = 14;
+    DeleteRequest delete = 15;
+    GetPointsRequest get_points = 28;
+    SetPayloadRequest set_payload = 29;
+    DeleteByFilterRequest delete_by_filter = 30;
+    SearchRequest search = 16;
+    HybridSearchRequest hybrid_search = 17;
+    TextHybridSearchRequest text_hybrid_search = 32;
+    MultiSearchRequest multi_search = 18;
+    RecommendRequest recommend = 19;
+    CountRequest count = 20;
+    ScrollRequest scroll = 21;
+    CompactRequest compact = 22;
+    SnapshotRequest snapshot = 23;
+    RestoreRequest restore = 24;
+    ShardMoveRequest shard_move = 25;
+    PruneWalArchiveRequest prune_wal_archive = 26;
+    ColdTierRequest tier_cold = 27;
+    // ChironQL is the native graph/query language carried by ChironWire.
+    // This is additive so persisted alpha envelopes keep their field numbers.
+    WireChironQlRequest chironql = 31;
+  }
+}
+
+message WireChironQlRequest {
+  string query = 1;
+  optional string collection = 2;
+  bool trace = 3;
+  bool confirm = 4;
+  // A native deferred graph session may be bound to the statement without
+  // placing the opaque token in ChironQL syntax.
+  optional string deferred_session_id = 5;
+}
+
+message WireChironQlResponse {
+  string kind = 1;
+  repeated string columns = 2;
+  repeated string rows_json = 3;
+  string stats_json = 4;
+  optional string next = 5;
+  string query_id = 6;
+  optional string trace_json = 7;
+}
+
+message WireResponse {
+  uint64 request_id = 1;
+  string error_code = 2;
+  string error_message = 3;
+  // Full stable ChironQL/graph error envelope when one is available.
+  optional string error_details_json = 4;
+  oneof payload {
+    HealthResponse health = 10;
+    CollectionConfig collection = 11;
+    ListCollectionsResponse list_collections = 12;
+    UpsertResponse upsert = 13;
+    DeleteResponse delete = 14;
+    GetPointsResponse get_points = 23;
+    SetPayloadResponse set_payload = 24;
+    DeleteByFilterResponse delete_by_filter = 25;
+    WireChironQlResponse chironql = 26;
+    SearchResponse search = 15;
+    MultiSearchResponse multi_search = 16;
+    CountResponse count = 17;
+    ScrollResponse scroll = 18;
+    CompactResponse compact = 19;
+    StatusResponse status = 20;
+    WalArchivePruneResponse wal_archive_prune = 21;
+    ColdTierResponse cold_tier = 22;
+  }
+}

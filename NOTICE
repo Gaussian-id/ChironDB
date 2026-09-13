@@ -1,0 +1,30 @@
+ChironDB (formerly GaussDB)
+Copyright 2026 Gaussian-id
+
+This product includes software developed for the ChironDB project.
+
+The current project is licensed under the GNU Affero General Public License,
+version 3 only (AGPL-3.0-only). The license is reproduced in LICENSE.
+This licensing change is dated September 9, 2026.
+
+Source repository: https://github.com/Gaussian-id/ChironDB
+Use the source revision matching your build. If you modify ChironDB and allow
+users to interact with that version over a network, provide those users a
+prominent, no-charge offer of the Corresponding Source under AGPL Section 13.
+A link to an inaccessible repository or to an unrelated revision does not
+supply the source of your running version.
+
+Historical licensing
+--------------------
+Earlier revisions were distributed under the Apache License, Version 2.0.
+Those existing grants are not revoked by this change. LICENSE-APACHE-2.0
+preserves that license text for the previously licensed material; it is not
+an alternative license for new AGPL-only contributions. Keep applicable
+copyright and attribution notices when redistributing historical material.
+Third-party components retain their respective licenses and notices.
+
+Trademarks
+----------
+ChironDB, GaussDB, their names, and related logos or brand assets are
+trademarks or service marks of Gaussian-id. No trademark permission is
+granted by this notice. See TRADEMARKS.md for the project trademark policy.

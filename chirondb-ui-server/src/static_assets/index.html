@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>GaussDB UI</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { font-family: -apple-system, system-ui, sans-serif; background: #0e1116; color: #e6edf3; margin: 0; }
+    header { padding: .9rem 1.5rem; border-bottom: 1px solid #21262d; display: flex; justify-content: space-between; align-items: center; }
+    h1 { margin: 0; font-size: 1.1rem; }
+    main { padding: 1.25rem 1.5rem; max-width: 1100px; margin: 0 auto; }
+    section { margin-bottom: 1.5rem; padding: 1rem 1.25rem; background: #161b22; border-radius: 8px; }
+    section h2 { font-size: .95rem; margin: 0 0 .75rem; opacity: .85; }
+    pre { background: #0d1117; padding: .75rem 1rem; border-radius: 6px; overflow-x: auto; font-size: .8rem; line-height: 1.4; }
+    button { background: #1f6feb; border: 0; color: white; padding: .45rem .8rem; border-radius: 6px; cursor: pointer; font: inherit; }
+    button:hover { background: #2e7eff; }
+    button.secondary { background: #21262d; }
+    .row { display: flex; gap: .5rem; flex-wrap: wrap; }
+    .events { max-height: 240px; overflow-y: auto; font-family: ui-monospace, monospace; font-size: .8rem; }
+    .event { padding: .25rem 0; border-bottom: 1px solid #21262d; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>GaussDB UI</h1>
+    <button class="secondary" id="logout">Sign out</button>
+  </header>
+  <main>
+    <section>
+      <h2>Health</h2>
+      <pre id="health">loading…</pre>
+      <div class="row"><button id="refresh">Refresh</button></div>
+    </section>
+    <section>
+      <h2>Collections</h2>
+      <pre id="collections">loading…</pre>
+    </section>
+    <section>
+      <h2>Live events (WebSocket)</h2>
+      <div class="events" id="events"></div>
+    </section>
+  </main>
+  <script>
+    async function fetchJson(path) {
+      const r = await fetch(path);
+      if (!r.ok) throw new Error(r.status + ' ' + r.statusText);
+      return r.json();
+    }
+    async function refresh() {
+      try {
+        document.getElementById('health').textContent = JSON.stringify(await fetchJson('/api/health'), null, 2);
+      } catch (e) { document.getElementById('health').textContent = String(e); }
+      try {
+        document.getElementById('collections').textContent = JSON.stringify(await fetchJson('/api/collections'), null, 2);
+      } catch (e) { document.getElementById('collections').textContent = String(e); }
+    }
+    document.getElementById('refresh').addEventListener('click', refresh);
+    document.getElementById('logout').addEventListener('click', async () => {
+      await fetch('/logout', { method: 'POST' });
+      window.location.href = '/login';
+    });
+    refresh();
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(`${proto}//${location.host}/api/ws/events`);
+    ws.onmessage = (msg) => {
+      const el = document.createElement('div');
+      el.className = 'event';
+      el.textContent = msg.data;
+      document.getElementById('events').prepend(el);
+    };
+    ws.onerror = () => { /* ignore */ };
+  </script>
+</body>
+</html>

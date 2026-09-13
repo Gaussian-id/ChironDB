@@ -1,0 +1,15 @@
+[package]
+name = "chirondb-client"
+version = "0.1.0-beta.1"
+edition = "2024"
+rust-version = "1.92"
+license = "AGPL-3.0-only"
+description = "Rust HTTP client for the ChironDB vector database"
+
+[dependencies]
+base64 = "0.22.1"
+chirondb-types = { version = "=0.1.0-beta.1", path = "../../chirondb-types" }
+reqwest = { version = "0.13", features = ["json", "rustls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"

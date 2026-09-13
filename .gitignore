@@ -1,0 +1,92 @@
+# Rust builds and profiling (keep Cargo.lock for reproducible builds)
+target/
+*.profraw
+*.profdata
+
+# Private specifications, scripts, benchmark assets, and local Helm files
+/.SPEC/
+/benchmark_results/
+/integrations/
+/scripts/
+/charts/
+/security/evidence/
+/security/G7_ACCEPTANCE.md
+
+# Generated downloads, coverage, and working SBOMs (release assets are separate)
+/.cache/
+coverage/
+*.cdx.json
+
+# Python environments, caches, and source-package build output
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+/clients/python/build/
+/clients/python/dist/
+
+# Generated gRPC clients and release bundles
+/generated/
+/dist/
+/chirondb-[0-9]*/
+/chirondb-v[0-9]*/
+/chirondb-*.tar.gz
+/chirondb-*.zip
+
+# Local databases, snapshots, process locks, and logs
+/data/
+/devdata/
+/data-example/
+/backups/
+/run-data/
+/run-snapshot*/
+/run-flamegraphs/
+*.chirondb.lock
+*.log
+
+# Local-only marketing + secrets — never push
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+/chiron-secrets/
+/api-keys.txt
+/rbac.json
+/keyring.json
+/local/
+/GaussDB/*
+/.claude/
+/.codex/
+/.hermes/
+
+# Machine-specific editor state and temporary files
+.idea/
+.vscode/
+.DS_Store
+._*
+Thumbs.db
+*.swp
+*.swo
+*~
+*.bak
+*.tmp
+
+# Local checkout of erikbern/ann-benchmarks
+/vendor/
+
+# Harness-generated skill/agent state, not project source
+/.agents/
+
+# Private AI instructions (keep local; never publish)
+/AGENTS.md
+/Agent.md
+/agent.md
+/CLAUDE.md

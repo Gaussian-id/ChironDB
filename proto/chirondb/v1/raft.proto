@@ -1,0 +1,96 @@
+syntax = "proto3";
+
+package raft.v1;
+
+// Inter-node Raft consensus RPCs and WAL streaming.
+service RaftService {
+  // Core Raft consensus RPCs.
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+  rpc RequestVote(RequestVoteRequest)     returns (RequestVoteResponse);
+  rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
+
+  // Client request forwarding: followers forward writes to the leader.
+  rpc ForwardProposal(ForwardProposalRequest) returns (ForwardProposalResponse);
+
+  // WAL streaming: followers pull WAL entries from the leader.
+  rpc StreamWal(WalStreamRequest) returns (stream WalSegment);
+}
+
+// ── Raft log entry ────────────────────────────────────────────────────────────
+
+message LogEntry {
+  uint64 term  = 1;
+  uint64 index = 2;
+  bytes  data  = 3; // serialized CatalogCommand (JSON)
+}
+
+// ── AppendEntries ─────────────────────────────────────────────────────────────
+
+message AppendEntriesRequest {
+  uint64            term              = 1;
+  uint64            leader_id         = 2;
+  uint64            prev_log_index    = 3;
+  uint64            prev_log_term     = 4;
+  repeated LogEntry entries           = 5;
+  uint64            leader_commit     = 6;
+}
+
+message AppendEntriesResponse {
+  uint64 term           = 1;
+  bool   success        = 2;
+  // Hint to allow O(log n) log backtracking on conflict.
+  uint64 conflict_index = 3;
+  uint64 conflict_term  = 4;
+}
+
+// ── RequestVote ───────────────────────────────────────────────────────────────
+
+message RequestVoteRequest {
+  uint64 term           = 1;
+  uint64 candidate_id   = 2;
+  uint64 last_log_index = 3;
+  uint64 last_log_term  = 4;
+}
+
+message RequestVoteResponse {
+  uint64 term        = 1;
+  bool   vote_granted = 2;
+}
+
+// ── InstallSnapshot ───────────────────────────────────────────────────────────
+
+message InstallSnapshotRequest {
+  uint64 term             = 1;
+  uint64 leader_id        = 2;
+  uint64 last_included_index = 3;
+  uint64 last_included_term  = 4;
+  bytes  data             = 5; // serialized catalog snapshot (JSON)
+}
+
+message InstallSnapshotResponse {
+  uint64 term = 1;
+}
+
+// ── ForwardProposal ───────────────────────────────────────────────────────────
+
+message ForwardProposalRequest {
+  bytes command = 1; // serialized CatalogCommand (JSON)
+}
+
+message ForwardProposalResponse {
+  bool   success = 1;
+  string error   = 2;
+}
+
+// ── WAL streaming ─────────────────────────────────────────────────────────────
+
+message WalStreamRequest {
+  string collection    = 1;
+  uint64 from_lsn      = 2;
+}
+
+message WalSegment {
+  string collection = 1;
+  uint64 lsn        = 2;
+  bytes  entry_json = 3; // serialized WalEntry (JSON)
+}

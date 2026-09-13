@@ -1,0 +1,151 @@
+name: cross-platform-ci
+
+# Cross-platform build + test gate. The 4 required platforms must pass on
+# every PR; Windows is best-effort (no project runner yet, allowed to fail
+# without breaking the workflow). Pair with `.github/workflows/ci.yml`
+# (Linux-only perf + recall + scale gates) — this workflow is purely the
+# cross-platform discipline check.
+#
+# Matrix:
+#   linux-x86_64      : ubuntu-latest,        native cargo
+#   linux-aarch64     : ubuntu-latest,        `cross` Docker image
+#   darwin-x86_64     : macos-15-intel,       native cargo
+#   darwin-aarch64    : macos-15,             native cargo
+#   windows-x86_64    : windows-latest,       native cargo, BEST-EFFORT
+#
+# All `unsafe` SIMD blocks in `chirondb-types` + `chirondb-core` are gated on
+# `#[cfg(target_arch = "x86_64")]` (or `aarch64`) so this matrix exercises
+# every dispatch path that ships to production. A change that only compiles
+# on one platform will fail at least one matrix entry — that's the gate.
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+      - feat/continue-dev-kevin
+
+permissions:
+  contents: read
+
+# Cancel in-progress runs for the same PR/branch — the matrix takes a while
+# and stale runs from force-pushes waste CI minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.best_effort == true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: false
+            best_effort: false
+            label: linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: true
+            best_effort: false
+            label: linux-aarch64 (cross)
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            use_cross: false
+            best_effort: false
+            label: darwin-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-15
+            use_cross: false
+            best_effort: false
+            label: darwin-aarch64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            use_cross: false
+            best_effort: true
+            label: windows-x86_64 (best-effort)
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: short
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@87eb139fed4b08a67bd1fa429a21d1f5d523e03e # 1.92.0
+        with:
+          toolchain: 1.92.0
+          components: clippy, rustfmt
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          cache-on-failure: true
+
+      - name: Install protobuf compiler (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install protobuf compiler (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install protobuf compiler (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install -y protoc
+          echo "C:\ProgramData\chocolatey\lib\protoc\tools\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Install cross (non-native Linux aarch64)
+        if: matrix.use_cross
+        run: cargo install cross --version 0.2.5 --locked
+
+      - name: cargo fmt --all -- --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        shell: bash
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross clippy --workspace --all-targets --target ${{ matrix.target }} --locked -j 2 -- -D warnings
+          else
+            cargo clippy --workspace --all-targets --target ${{ matrix.target }} --locked -j 2 -- -D warnings
+          fi
+
+      - name: cargo test
+        shell: bash
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross test --workspace --target ${{ matrix.target }} --locked -j 2
+          else
+            cargo test --workspace --target ${{ matrix.target }} --locked -j 2
+          fi
+
+      - name: cargo build --release --bins
+        shell: bash
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --locked --bins --target ${{ matrix.target }} -j 2
+          else
+            cargo build --release --locked --bins --target ${{ matrix.target }} -j 2
+          fi
+
+  required-platforms:
+    name: required-platforms
+    if: always()
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the four-platform matrix
+        env:
+          MATRIX_RESULT: ${{ needs.build.result }}
+        run: test "$MATRIX_RESULT" = success

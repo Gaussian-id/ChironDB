@@ -1,0 +1,1 @@
+SELECT id FROM docs ORDER BY embedding <-> '[1,2]' LIMIT 1;

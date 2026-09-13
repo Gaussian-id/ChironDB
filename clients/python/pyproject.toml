@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chirondb-client"
+version = "0.1.0-beta.1"
+description = "Python HTTP client for the ChironDB vector database"
+license = { text = "AGPL-3.0-only" }
+requires-python = ">=3.10"
+dependencies = ["requests>=2.28"]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
+
+[tool.setuptools]
+py-modules = ["chirondb_client", "gaussdb_client"]

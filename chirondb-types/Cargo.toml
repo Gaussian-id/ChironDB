@@ -1,0 +1,15 @@
+[package]
+name = "chirondb-types"
+version = "0.1.0-beta.1"
+edition = "2024"
+rust-version = "1.92"
+license = "AGPL-3.0-only"
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+smol_str = "0.3.6"
+thiserror = "2.0.18"
+uuid = { version = "1.23.1", features = ["v4", "serde"] }
+# M3-004: portable SIMD (AVX2/AVX-512/NEON) for distance kernels.
+wide = "0.7"

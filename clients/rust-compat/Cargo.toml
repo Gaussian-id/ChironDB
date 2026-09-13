@@ -1,0 +1,10 @@
+[package]
+name = "gaussdb-client"
+version = "0.1.0-beta.1"
+edition = "2024"
+rust-version = "1.92"
+license = "AGPL-3.0-only"
+description = "Deprecated compatibility facade for chirondb-client"
+
+[dependencies]
+chirondb-client = { version = "=0.1.0-beta.1", path = "../rust" }

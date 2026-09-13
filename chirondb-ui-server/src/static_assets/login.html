@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>GaussDB UI — Sign in</title>
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; background: #0e1116; color: #e6edf3; display: grid; place-items: center; min-height: 100vh; margin: 0; }
+    form { background: #161b22; padding: 2rem 2.5rem; border-radius: 10px; min-width: 320px; box-shadow: 0 8px 24px rgba(0,0,0,0.4); }
+    h1 { margin: 0 0 1rem; font-size: 1.25rem; }
+    label { display: block; margin: 1rem 0 .25rem; font-size: .85rem; opacity: .8; }
+    input { width: 100%; padding: .55rem .6rem; border-radius: 6px; border: 1px solid #30363d; background: #0d1117; color: inherit; font: inherit; box-sizing: border-box; }
+    button { margin-top: 1.5rem; width: 100%; padding: .6rem; border-radius: 6px; border: 0; background: #238636; color: white; font-weight: 600; cursor: pointer; }
+    button:hover { background: #2ea043; }
+    .err { color: #ff7b72; margin-top: 1rem; font-size: .85rem; min-height: 1em; }
+  </style>
+</head>
+<body>
+  <form id="f">
+    <h1>GaussDB UI</h1>
+    <label for="u">Username</label>
+    <input id="u" name="username" autocomplete="username" required />
+    <label for="p">Password</label>
+    <input id="p" name="password" type="password" autocomplete="current-password" required />
+    <button type="submit">Sign in</button>
+    <div class="err" id="err"></div>
+  </form>
+  <script>
+    document.getElementById('f').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const err = document.getElementById('err');
+      err.textContent = '';
+      const body = JSON.stringify({
+        username: document.getElementById('u').value,
+        password: document.getElementById('p').value,
+      });
+      const r = await fetch('/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body });
+      if (r.ok) { window.location.href = '/'; } else { err.textContent = 'invalid credentials'; }
+    });
+  </script>
+</body>
+</html>

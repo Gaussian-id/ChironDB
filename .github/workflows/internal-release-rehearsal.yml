@@ -1,0 +1,383 @@
+name: internal-release-rehearsal
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [labeled, reopened, synchronize]
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+env:
+  BINS: chirondb chironql chironmcp chironctl chironbench chirondrill chironrecall chirongrpcctl chironwirectl gaussdb gaussctl gaussbench gaussdrill gaussrecall gaussgrpcctl gausswirectl
+  CANDIDATE_IMAGE: ghcr.io/gaussian-id/chirondb-security-candidate
+
+jobs:
+  reproducible-target:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'security-full-gate')
+    name: reproducible (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: false
+            label: linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: true
+            label: linux-aarch64
+          - target: x86_64-apple-darwin
+            os: macos-13
+            use_cross: false
+            label: darwin-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-14
+            use_cross: false
+            label: darwin-aarch64
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@87eb139fed4b08a67bd1fa429a21d1f5d523e03e # 1.92.0
+        with:
+          toolchain: 1.92.0
+          targets: ${{ matrix.target }}
+      - name: Install protobuf compiler (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install protobuf compiler (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+      - name: Install pinned build tools
+        run: |
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cargo install cross --version 0.2.5 --locked
+          fi
+        shell: bash
+      - name: Resolve immutable build metadata
+        id: metadata
+        shell: bash
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "epoch=$(git show -s --format=%ct HEAD)" >> "$GITHUB_OUTPUT"
+          echo "core=$(git rev-parse HEAD:chirondb-core)" >> "$GITHUB_OUTPUT"
+          echo "server=$(git rev-parse HEAD:chirondb-server)" >> "$GITHUB_OUTPUT"
+      - name: Create two clean source directories
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/source-a" "${RUNNER_TEMP}/source-b"
+          git archive HEAD | tar -x -C "${RUNNER_TEMP}/source-a"
+          git archive HEAD | tar -x -C "${RUNNER_TEMP}/source-b"
+      - name: Build, canonicalize SBOMs, and package twice
+        shell: bash
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.metadata.outputs.epoch }}
+          TESTED_SHA: ${{ steps.metadata.outputs.sha }}
+          TARGET: ${{ matrix.target }}
+          USE_CROSS: ${{ matrix.use_cross }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/repro-dist"
+          build_once() {
+            label="$1"
+            source="${RUNNER_TEMP}/source-${label}"
+            stage="${RUNNER_TEMP}/stage-${label}"
+            export CARGO_INCREMENTAL=0
+            export LC_ALL=C
+            export TZ=UTC
+            export ZERO_AR_DATE=1
+            export RUSTFLAGS="--remap-path-prefix=${source}=/workspace --remap-path-prefix=${RUNNER_TEMP}=/build --remap-path-prefix=/project=/workspace --remap-path-prefix=/home/runner/.cargo=/cargo --remap-path-prefix=/Users/runner/.cargo=/cargo"
+            if [ "$USE_CROSS" = "true" ]; then
+              (cd "$source" && cross build --release --locked --bins --target "$TARGET")
+            else
+              (cd "$source" && cargo build --release --locked --bins --target "$TARGET")
+            fi
+            (cd "$source" && cargo cyclonedx --format json --spec-version 1.5 --describe binaries --target "$TARGET")
+            python3 "$source/.github/tools/canonicalize_cyclonedx.py" "$source" \
+              --epoch "$SOURCE_DATE_EPOCH" --tested-sha "$TESTED_SHA" --target "$TARGET"
+            mkdir -p "$stage/bin" "$stage/proto/chirondb/v1" "$stage/sbom"
+            extension=""
+            if [ "${{ runner.os }}" = "Windows" ]; then extension=".exe"; fi
+            for binary in $BINS; do
+              cp "$source/target/$TARGET/release/${binary}${extension}" "$stage/bin/"
+            done
+            cp "$source/proto/chirondb/v1/chirondb.proto" "$stage/proto/chirondb/v1/"
+            cp "$source/proto/chirondb/v1/compat.proto" "$stage/proto/chirondb/v1/"
+            cp "$source/LICENSE" "$source/LICENSE-APACHE-2.0" "$source/NOTICE" "$source/TRADEMARKS.md" "$stage/"
+            while IFS= read -r -d '' sbom; do
+              cp "$sbom" "$stage/sbom/$(basename "$sbom")"
+            done < <(find "$source" -name '*.cdx.json' -not -path '*/target/*' -print0)
+            count="$(find "$stage/sbom" -name '*.cdx.json' | wc -l | tr -d ' ')"
+            if [ "$count" -lt 15 ]; then
+              echo "expected at least 15 per-binary SBOMs, found $count" >&2
+              exit 1
+            fi
+            python3 "$source/.github/tools/package_reproducible.py" "$stage" \
+              "${RUNNER_TEMP}/repro-dist/archive-${label}.tar.gz" --epoch "$SOURCE_DATE_EPOCH"
+          }
+          build_once a
+          build_once b
+          cmp "${RUNNER_TEMP}/repro-dist/archive-a.tar.gz" "${RUNNER_TEMP}/repro-dist/archive-b.tar.gz"
+          archive="${RUNNER_TEMP}/repro-dist/chirondb-security-${TESTED_SHA}-${TARGET}.tar.gz"
+          cp "${RUNNER_TEMP}/repro-dist/archive-a.tar.gz" "$archive"
+          python3 - "$archive" "${RUNNER_TEMP}/repro-dist/evidence.json" <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import platform
+          import subprocess
+          import sys
+
+          archive, output = map(Path, sys.argv[1:])
+          report = {
+              "schema_version": 1,
+              "verdict": "passed",
+              "tested_sha": os.environ["TESTED_SHA"],
+              "core_tree_hash": "${{ steps.metadata.outputs.core }}",
+              "server_tree_hash": "${{ steps.metadata.outputs.server }}",
+              "target": os.environ["TARGET"],
+              "source_date_epoch": int(os.environ["SOURCE_DATE_EPOCH"]),
+              "archive_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+              "clean_builds": 2,
+              "archives_byte_identical": True,
+              "host": platform.platform(),
+              "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(),
+              "actions_run_id": os.environ.get("GITHUB_RUN_ID"),
+          }
+          output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+          PY
+          rm "${RUNNER_TEMP}/repro-dist/archive-a.tar.gz" "${RUNNER_TEMP}/repro-dist/archive-b.tar.gz"
+      - name: Upload reproducible archive evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: reproducible-${{ matrix.target }}
+          path: ${{ runner.temp }}/repro-dist/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Attest archive provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/repro-dist/*.tar.gz
+
+  sign-internal-checksums:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'security-full-gate')
+    needs: reproducible-target
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: downloaded
+          pattern: reproducible-*
+      - name: Collect archives and generate checksums
+        run: |
+          mkdir -p signed
+          find downloaded -name '*.tar.gz' -exec cp {} signed/ \;
+          (cd signed && sha256sum *.tar.gz > SHA256SUMS)
+      - uses: sigstore/cosign-installer@f713795cb21599bc4e5c4b58cbad1da852d7eeb9 # v3
+      - name: Keyless-sign and verify internal checksums
+        working-directory: signed
+        run: |
+          cosign sign-blob --yes \
+            --output-signature SHA256SUMS.sig \
+            --output-certificate SHA256SUMS.pem \
+            SHA256SUMS
+          cosign verify-blob \
+            --certificate SHA256SUMS.pem \
+            --signature SHA256SUMS.sig \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: internal-signed-checksums
+          path: signed/
+          if-no-files-found: error
+          retention-days: 30
+
+  private-candidate-image:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'security-full-gate')
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      reference: ${{ steps.reference.outputs.reference }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push private candidate only
+        id: push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.CANDIDATE_IMAGE }}:security-${{ github.sha }}
+          build-args: |
+            VCS_REF=${{ github.sha }}
+          provenance: mode=max
+          sbom: true
+          cache-to: type=gha,mode=max
+      - name: Resolve exact candidate reference and require non-public visibility
+        id: reference
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          reference="${CANDIDATE_IMAGE}@${{ steps.push.outputs.digest }}"
+          echo "reference=$reference" >> "$GITHUB_OUTPUT"
+          visibility="$(gh api "/orgs/${{ github.repository_owner }}/packages/container/chirondb-security-candidate" --jq .visibility)"
+          test "$visibility" != "public"
+      - name: Export exact pushed digest as an OCI layout
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REFERENCE: ${{ steps.reference.outputs.reference }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+          authfile="${RUNNER_TEMP}/skopeo-auth.json"
+          printf '%s' "$GH_TOKEN" | skopeo login --authfile "$authfile" \
+            --username "${{ github.actor }}" --password-stdin ghcr.io
+          skopeo copy --authfile "$authfile" \
+            "docker://$REFERENCE" "oci:${RUNNER_TEMP}/oci-layout:security-${{ github.sha }}"
+          epoch="$(git show -s --format=%ct HEAD)"
+          tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner \
+            -cf "${RUNNER_TEMP}/candidate.oci.tar" -C "${RUNNER_TEMP}/oci-layout" .
+      - uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          image: ${{ env.CANDIDATE_IMAGE }}@${{ steps.push.outputs.digest }}
+          format: cyclonedx-json
+          output-file: ${{ runner.temp }}/candidate-image.cdx.json
+      - uses: sigstore/cosign-installer@f713795cb21599bc4e5c4b58cbad1da852d7eeb9 # v3
+      - name: Sign image and attest CycloneDX SBOM
+        env:
+          REFERENCE: ${{ env.CANDIDATE_IMAGE }}@${{ steps.push.outputs.digest }}
+        run: |
+          cosign sign --yes "$REFERENCE"
+          cosign attest --yes --type cyclonedx \
+            --predicate "${RUNNER_TEMP}/candidate-image.cdx.json" "$REFERENCE"
+          cosign verify \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$REFERENCE"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          Path(os.environ["RUNNER_TEMP"], "candidate-image.json").write_text(json.dumps({
+              "schema_version": 1,
+              "verdict": "passed",
+              "tested_sha": os.environ["GITHUB_SHA"],
+              "actions_run_id": os.environ.get("GITHUB_RUN_ID"),
+              "reference": os.environ["REFERENCE"],
+          }, indent=2, sort_keys=True) + "\n")
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: internal-candidate-image
+          path: |
+            ${{ runner.temp }}/candidate.oci.tar
+            ${{ runner.temp }}/candidate-image.cdx.json
+            ${{ runner.temp }}/candidate-image.json
+          if-no-files-found: error
+          retention-days: 30
+
+  clean-runner-verification:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'security-full-gate')
+    needs: [sign-internal-checksums, private-candidate-image]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: verification
+      - uses: sigstore/cosign-installer@f713795cb21599bc4e5c4b58cbad1da852d7eeb9 # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify archives, SBOM schemas, attestations, and signature
+        run: |
+          set -euo pipefail
+          mkdir -p clean
+          find verification -name '*.tar.gz' -exec cp {} clean/ \;
+          cp verification/internal-signed-checksums/SHA256SUMS* clean/
+          (cd clean && sha256sum --check SHA256SUMS)
+          cosign verify-blob \
+            --certificate clean/SHA256SUMS.pem \
+            --signature clean/SHA256SUMS.sig \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            clean/SHA256SUMS
+          for archive in clean/*.tar.gz; do
+            gh attestation verify "$archive" --repo "${{ github.repository }}"
+            destination="${archive%.tar.gz}"
+            mkdir -p "$destination"
+            tar -xzf "$archive" -C "$destination"
+          done
+          find clean verification/internal-candidate-image -name '*.cdx.json' -print0 | while IFS= read -r -d '' sbom; do
+            version="$(python3 -c 'import json,sys; print("v" + json.load(open(sys.argv[1]))["specVersion"].replace(".", "_"))' "$sbom")"
+            docker run --rm -v "$PWD:/work:ro" \
+              cyclonedx/cyclonedx-cli@sha256:9a858a15e7b0843606efc0ff19d5f7575011a5428d7f3d343b4f6cf09d8f0d4e \
+              validate --input-file "/work/$sbom" --input-version "$version" --fail-on-errors
+          done
+      - name: Verify private candidate identity, provenance, SBOM, digest, and runtime
+        env:
+          REFERENCE: ${{ needs.private-candidate-image.outputs.reference }}
+        run: |
+          cosign verify \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$REFERENCE"
+          cosign verify-attestation --type cyclonedx \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$REFERENCE" > verification/image-sbom-attestation.json
+          cosign verify-attestation --type slsaprovenance \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$REFERENCE" > verification/image-provenance-attestation.json
+          docker pull "$REFERENCE"
+          actual="$(docker image inspect --format '{{index .RepoDigests 0}}' "$REFERENCE")"
+          test "$actual" = "$REFERENCE"
+          revision="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$REFERENCE")"
+          test "$revision" = "${{ github.sha }}"
+          mkdir -p verification/oci-layout
+          tar -xf verification/internal-candidate-image/candidate.oci.tar -C verification/oci-layout
+          python3 - "verification/oci-layout/index.json" "${{ needs.private-candidate-image.outputs.digest }}" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          index = json.loads(Path(sys.argv[1]).read_text())
+          expected = sys.argv[2]
+          assert any(manifest["digest"] == expected for manifest in index["manifests"]), (index, expected)
+          PY
+          docker run --rm "$REFERENCE" --version
+      - name: Upload clean-runner verification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: internal-clean-runner-verification
+          path: verification/
+          if-no-files-found: warn
+          retention-days: 30

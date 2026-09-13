@@ -1,0 +1,103 @@
+name: security-recovery-tiers
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [labeled, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  fixed-recovery-tiers:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'security-full-gate')
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@87eb139fed4b08a67bd1fa429a21d1f5d523e03e # 1.92.0
+        with:
+          toolchain: 1.92.0
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Build fixed-tier drill
+        run: cargo build --release --bin chirondrill --locked
+      - name: Resolve tested revision and trees
+        id: trees
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "core=$(git rev-parse HEAD:chirondb-core)" >> "$GITHUB_OUTPUT"
+          echo "server=$(git rev-parse HEAD:chirondb-server)" >> "$GITHUB_OUTPUT"
+      - name: Run fixed 1M, 10M, and guarded 100M tiers
+        env:
+          TESTED_SHA: ${{ steps.trees.outputs.sha }}
+          CORE_TREE_HASH: ${{ steps.trees.outputs.core }}
+          SERVER_TREE_HASH: ${{ steps.trees.outputs.server }}
+        run: |
+          evidence="${RUNNER_TEMP}/recovery-evidence"
+          mkdir -p "$evidence"
+          sudo --preserve-env=GITHUB_RUN_ID target/release/chirondrill \
+            --data-dir "${RUNNER_TEMP}/recovery-1m" \
+            --collection recovery-tier \
+            --recovery-tier 1m \
+            --drop-linux-page-cache \
+            --tested-sha "$TESTED_SHA" \
+            --core-tree-hash "$CORE_TREE_HASH" \
+            --server-tree-hash "$SERVER_TREE_HASH" \
+            --tier-output "$evidence/1m.json"
+          sudo --preserve-env=GITHUB_RUN_ID target/release/chirondrill \
+            --data-dir "${RUNNER_TEMP}/recovery-10m" \
+            --collection recovery-tier \
+            --recovery-tier 10m \
+            --drop-linux-page-cache \
+            --tested-sha "$TESTED_SHA" \
+            --core-tree-hash "$CORE_TREE_HASH" \
+            --server-tree-hash "$SERVER_TREE_HASH" \
+            --tier-output "$evidence/10m.json"
+          sudo --preserve-env=GITHUB_RUN_ID target/release/chirondrill \
+            --data-dir "${RUNNER_TEMP}/recovery-100m" \
+            --collection recovery-tier \
+            --recovery-tier 100m \
+            --drop-linux-page-cache \
+            --tested-sha "$TESTED_SHA" \
+            --core-tree-hash "$CORE_TREE_HASH" \
+            --server-tree-hash "$SERVER_TREE_HASH" \
+            --prior-tier-evidence "$evidence/1m.json" \
+            --prior-tier-evidence "$evidence/10m.json" \
+            --tier-output "$evidence/100m.json"
+      - name: Validate recovery evidence
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" "${RUNNER_TEMP}/recovery-evidence"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "recovery-evidence"
+          for tier in ("1m", "10m"):
+              report = json.loads((root / f"{tier}.json").read_text())
+              assert report["verdict"] == "passed", report
+              assert report["actual_points"] == report["requested_points"], report
+              assert len(report["cold_reopen_samples_ms"]) == 5, report
+              assert report["cold_reopen_valid"] is True, report
+              assert report["ann_rebuilt_on_reopen"] is False, report
+              assert report["query_validated"] is True, report
+          hundred = json.loads((root / "100m.json").read_text())
+          assert hundred["verdict"] in {"passed", "resource-blocked"}, hundred
+          if hundred["verdict"] == "passed":
+              assert hundred["actual_points"] == 100_000_000, hundred
+              assert len(hundred["cold_reopen_samples_ms"]) == 5, hundred
+          else:
+              assert hundred["actual_points"] == 0, hundred
+              assert hundred["preflight"]["blocker"], hundred
+          PY
+      - name: Upload fixed-tier evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: security-recovery-tiers-${{ github.sha }}
+          path: ${{ runner.temp }}/recovery-evidence/*.json
+          if-no-files-found: warn
+          retention-days: 30

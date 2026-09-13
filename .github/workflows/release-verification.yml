@@ -1,0 +1,60 @@
+name: release-verification
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  IMAGE_NAME: ghcr.io/gaussian-id/chirondb
+
+jobs:
+  clean-host-verification:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download public release artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "${{ github.event.release.tag_name }}" --repo "${{ github.repository }}" --dir dist
+      - name: Verify checksums
+        working-directory: dist
+        run: sha256sum --check SHA256SUMS
+      - name: Verify GitHub provenance attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          find dist -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0 |
+            while IFS= read -r -d '' artifact; do
+              gh attestation verify "$artifact" --repo "${{ github.repository }}"
+            done
+      - name: Install cosign
+        uses: sigstore/cosign-installer@f713795cb21599bc4e5c4b58cbad1da852d7eeb9 # v3
+      - name: Verify release identity and signature
+        working-directory: dist
+        run: |
+          cosign verify-blob \
+            --certificate SHA256SUMS.pem \
+            --signature SHA256SUMS.sig \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            SHA256SUMS
+      - name: Verify published image signature and runtime
+        env:
+          VERSION: ${{ github.event.release.tag_name }}
+        run: |
+          VERSION="${VERSION#v}"
+          docker pull "${IMAGE_NAME}:${VERSION}"
+          digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "${IMAGE_NAME}:${VERSION}")"
+          cosign verify \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$digest"
+          cosign verify-attestation \
+            --type cyclonedx \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$digest" > image-sbom-attestation.json
+          docker run --rm "${IMAGE_NAME}:${VERSION}" --version

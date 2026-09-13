@@ -1,0 +1,70 @@
+[package]
+name = "chirondb-core"
+version = "0.1.0-beta.1"
+edition = "2024"
+rust-version = "1.92"
+license = "AGPL-3.0-only"
+
+[features]
+default = []
+# Test-only fault injection at WAL/filesystem durability boundaries. Production
+# and release builds do not compile this infrastructure unless explicitly
+# enabled.
+fault-injection = []
+# Compatibility alias for the security branch's original test feature.
+failpoints = ["fault-injection"]
+# Per-query structural counters used only for LS-VEC diagnosis. Every call
+# site compiles out, including its argument expressions, in the default build.
+search-metrics = []
+# Internal evidence-only major compaction used by the C19 sealed-topology
+# harness. Default production builds do not expose or compile this entrypoint.
+benchmark-internals = []
+# Internal production-loader facade used only by the isolated corruption-fuzz
+# workspace. Default/release builds do not expose graph format internals.
+fuzzing = []
+
+[dependencies]
+chirondb-types = { version = "=0.1.0-beta.1", path = "../chirondb-types" }
+anyhow = "1.0.103"
+base64 = "0.22.1"
+# M4-001: per-query bump arena for candidate scratch buffers.
+bumpalo = { version = "3.16", features = ["collections"] }
+# M4-002: data-parallel candidate scoring + future segment fan-out.
+rayon = "1.10"
+crc32fast = "1.5.0"
+crc-fast = "1.10.0"
+futures-executor = "0.3.32"
+half = "2.7.1"
+memmap2 = "0.9.11"
+metrics = "0.24.5"
+metrics-exporter-prometheus = "0.18.3"
+object_store = { version = "0.14.1", features = ["aws", "http"] }
+opentelemetry = "0.31.0"
+opentelemetry-otlp = { version = "0.31.1", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace"] }
+opentelemetry_sdk = { version = "0.31.0", features = ["trace"] }
+parking_lot = "0.12.5"
+quick-xml = "0.41.0"
+reqwest = { version = "0.13.3", features = ["json", "rustls"] }
+ring = "0.17.14"
+roaring = "0.11.4"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = "0.11.0"
+smallvec = "1.15.1"
+smol_str = "0.3.6"
+subtle = "2.6.1"
+tempfile = "3.27.0"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["full"] }
+tokio-stream = "0.1.18"
+tracing = "0.1.44"
+tracing-opentelemetry = "0.32.1"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+url = "2.5.8"
+uuid = { version = "1.23.1", features = ["v4", "serde"] }
+wide = "0.7"
+zeroize = "1.8.2"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+criterion = { version = "0.5", features = ["html_reports"] }

@@ -1,0 +1,39 @@
+groups:
+  - name: chirondb-single-node
+    rules:
+      - alert: GaussDbHighErrorRate
+        expr: |
+          sum(rate(gaussdb_operations_total{status="error"}[5m]))
+            / clamp_min(sum(rate(gaussdb_operations_total[5m])), 1) > 0.01
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ChironDB operation error rate is above 1%.
+          description: Check recent deploys, auth failures, WAL errors, and restore activity.
+      - alert: GaussDbHighDegradedSearchRate
+        expr: |
+          sum(rate(gaussdb_degraded_queries_total[5m]))
+            / clamp_min(sum(rate(gaussdb_operations_total{operation="search"}[5m])), 1) > 0.01
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ChironDB degraded search rate is above the SLO budget.
+          description: Inspect search budget settings, filters, compaction state, and hardware pressure.
+      - alert: GaussDbNoOperationsObserved
+        expr: sum(rate(gaussdb_operations_total[10m])) == 0
+        for: 15m
+        labels:
+          severity: info
+        annotations:
+          summary: No ChironDB operations have been observed recently.
+          description: Confirm scrape target health and expected traffic.
+      - alert: GaussDbPointGaugeMissing
+        expr: absent(gaussdb_points)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: ChironDB point gauge is missing.
+          description: Check metrics recorder initialization and scrape configuration.

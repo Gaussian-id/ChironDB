@@ -1,0 +1,137 @@
+[package]
+name = "chirondb"
+version = "0.1.0-beta.1"
+edition = "2024"
+rust-version = "1.92"
+license = "AGPL-3.0-only"
+
+[lib]
+name = "chirondb"
+path = "src/lib.rs"
+
+[[bin]]
+name = "chirondb"
+path = "src/bin/chirondb.rs"
+
+[[bin]]
+name = "chironql"
+path = "src/bin/chironql.rs"
+
+[[bin]]
+name = "chironctl"
+path = "src/bin/chironctl.rs"
+
+[[bin]]
+name = "chironbench"
+path = "src/bin/chironbench.rs"
+
+[[bin]]
+name = "chirondrill"
+path = "src/bin/chirondrill.rs"
+
+[[bin]]
+name = "chironrecall"
+path = "src/bin/chironrecall.rs"
+
+[[bin]]
+name = "chirongrpcctl"
+path = "src/bin/chirongrpcctl.rs"
+
+[[bin]]
+name = "chironwirectl"
+path = "src/bin/chironwirectl.rs"
+
+[[bin]]
+name = "gaussdb"
+path = "src/main.rs"
+
+[[bin]]
+name = "gaussctl"
+path = "src/bin/gaussctl.rs"
+
+[[bin]]
+name = "gaussbench"
+path = "src/bin/gaussbench.rs"
+
+[[bin]]
+name = "gaussdrill"
+path = "src/bin/gaussdrill.rs"
+
+[[bin]]
+name = "gaussrecall"
+path = "src/bin/gaussrecall.rs"
+
+[[bin]]
+name = "gaussgrpcctl"
+path = "src/bin/gaussgrpcctl.rs"
+
+[[bin]]
+name = "gausswirectl"
+path = "src/bin/gausswirectl.rs"
+
+[[bin]]
+name = "chironmcp"
+path = "src/bin/chironmcp.rs"
+
+[dependencies]
+rmcp = { version = "=3.3.0", default-features = false, features = ["server", "client", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "reqwest"] }
+tokio-util = "0.7"
+chirondb-types = { version = "=0.1.0-beta.1", path = "../chirondb-types" }
+chirondb-core = { version = "=0.1.0-beta.1", path = "../chirondb-core" }
+anyhow = "1.0.103"
+axum = { version = "0.8.9", features = ["ws"] }
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+base64 = "0.22.1"
+clap = { version = "4.6.1", features = ["derive"] }
+futures-executor = "0.3.32"
+metrics = "0.24.5"
+memmap2 = "0.9.11"
+parking_lot = "0.12.5"
+prost = "0.14.3"
+reqwest = { version = "0.13.3", features = ["blocking", "json", "rustls"] }
+rustls = { version = "0.23.40", default-features = false, features = ["ring", "std"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = "0.11.0"
+smallvec = "1.15.1"
+smol_str = "0.3.6"
+subtle = "2.6.1"
+tempfile = "3.27.0"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["full"] }
+tokio-rustls = "0.26.4"
+tokio-stream = "0.1.18"
+toml = "1.1.2"
+tonic = { version = "0.14.6", features = ["tls-native-roots", "tls-ring"] }
+tonic-prost = "0.14.6"
+tonic-reflection = "0.14.6"
+tonic-web = "0.14.6"
+tower-http = { version = "0.6.10", features = ["cors", "trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.23.1", features = ["v4", "serde"] }
+num_cpus = "1.16"
+rayon = "1"
+rustyline = { version = "18.0.1", default-features = false, features = ["with-file-history", "derive"] }
+
+# M2-006: jemalloc (off by default, on by feature `jemalloc`).
+# Phase 1 OSS gate runs without it; production builds enable via
+# `cargo build --release --features jemalloc`.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.6", optional = true }
+
+[features]
+default = []
+fault-injection = ["chirondb-core/fault-injection"]
+benchmark-internals = ["chirondb-core/benchmark-internals"]
+jemalloc = ["dep:tikv-jemallocator"]
+
+[build-dependencies]
+protoc-bin-vendored = "3.2.0"
+tonic-prost-build = "0.14.6"
+
+[dev-dependencies]
+chirondb-client = { version = "=0.1.0-beta.1", path = "../clients/rust" }
+proptest = "1.11.0"
+rcgen = "0.14.9"
+tempfile = "3.27.0"

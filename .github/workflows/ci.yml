@@ -1,0 +1,81 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@87eb139fed4b08a67bd1fa429a21d1f5d523e03e # 1.92.0
+        with:
+          toolchain: 1.92.0
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Release version consistency
+        run: python3 .github/tools/check_release_version.py
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Test
+        run: cargo test --workspace --locked -j 2
+      - name: WAL phase crash matrix (non-production hooks)
+        run: cargo test -p chirondb --features fault-injection --test process_kill --locked -j 2
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -j 2 -- -D warnings
+      - name: WAL phase crash matrix clippy
+        run: cargo clippy -p chirondb --features fault-injection --test process_kill --locked -j 2 -- -D warnings
+      - name: Build release binaries
+        run: cargo build --release --locked --bins
+      - name: MCP Python SDK and stdio interoperability
+        run: |
+          python3 -m venv "$RUNNER_TEMP/mcp-venv"
+          "$RUNNER_TEMP/mcp-venv/bin/pip" install -r chirondb-server/tests/mcp_requirements.txt
+          "$RUNNER_TEMP/mcp-venv/bin/python" chirondb-server/tests/mcp_interop.py --bins target/release
+      - name: WAL recovery durability gate (100K × 128D)
+        run: >-
+          target/release/chirondrill
+          --points 100000
+          --vector-dim 128
+          --max-recovery-seconds 30
+          --max-rss-delta-mib 256
+      - name: Binary version consistency
+        run: bash .github/tools/check_binary_versions.sh target/release
+      - name: Performance regression gate
+        run: python3 .github/tools/perf_gate.py --max-search-p99-ms 50 --min-write-points-per-second 10 --min-search-queries-per-second 10
+      - name: Scale footprint gate
+        run: python3 .github/tools/scale_gate.py --points 1000 --dim 64 --batch-size 100 --searches 25 --k 10 --target-points 1000000000 --max-projected-gib 4096
+      - name: Recall regression gate
+        run: python3 .github/tools/recall_gate.py --points 200 --dim 32 --queries 20 --k 10 --min-recall 0.95
+
+  docker:
+    name: Docker deployment smoke
+    needs: rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build production image
+        run: |
+          docker build \
+            --build-arg CHIRONDB_VERSION=0.1.0-beta.1 \
+            --build-arg VCS_REF=${{ github.sha }} \
+            -t chirondb:ci .
+      - name: Three-protocol persistence smoke
+        run: bash .github/tools/smoke_container.sh chirondb:ci
+
+  required:
+    name: ci-required
+    if: always()
+    needs: [rust, docker]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require CI and deployment smoke
+        env:
+          RUST_RESULT: ${{ needs.rust.result }}
+          DOCKER_RESULT: ${{ needs.docker.result }}
+        run: test "$RUST_RESULT" = success && test "$DOCKER_RESULT" = success

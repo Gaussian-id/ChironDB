@@ -1,0 +1,221 @@
+syntax = "proto3";
+
+package chirondb.v1;
+
+import "chirondb/v1/compat.proto";
+
+// Primary ChironDB beta service. Messages intentionally reuse gaussdb.v1 so
+// existing alpha clients and persisted GaussWire envelopes remain compatible.
+service ChironDb {
+  rpc Health(gaussdb.v1.HealthRequest) returns (gaussdb.v1.HealthResponse);
+  rpc CreateCollection(gaussdb.v1.CreateCollectionRequest) returns (gaussdb.v1.CollectionConfig);
+  rpc ListCollections(gaussdb.v1.ListCollectionsRequest) returns (gaussdb.v1.ListCollectionsResponse);
+  rpc DeleteCollection(gaussdb.v1.DeleteCollectionRequest) returns (gaussdb.v1.DeleteCollectionResponse);
+  rpc UpdatePayloadSchema(gaussdb.v1.UpdatePayloadSchemaRequest) returns (gaussdb.v1.CollectionConfig);
+  rpc Upsert(gaussdb.v1.UpsertRequest) returns (gaussdb.v1.UpsertResponse);
+  rpc Delete(gaussdb.v1.DeleteRequest) returns (gaussdb.v1.DeleteResponse);
+  rpc GetPoints(gaussdb.v1.GetPointsRequest) returns (gaussdb.v1.GetPointsResponse);
+  rpc SetPayload(gaussdb.v1.SetPayloadRequest) returns (gaussdb.v1.SetPayloadResponse);
+  rpc DeleteByFilter(gaussdb.v1.DeleteByFilterRequest) returns (gaussdb.v1.DeleteByFilterResponse);
+  rpc Search(gaussdb.v1.SearchRequest) returns (gaussdb.v1.SearchResponse);
+  rpc HybridSearch(gaussdb.v1.HybridSearchRequest) returns (gaussdb.v1.SearchResponse);
+  rpc TextHybridSearch(gaussdb.v1.TextHybridSearchRequest) returns (gaussdb.v1.SearchResponse);
+  rpc MultiSearch(gaussdb.v1.MultiSearchRequest) returns (gaussdb.v1.MultiSearchResponse);
+  rpc Recommend(gaussdb.v1.RecommendRequest) returns (gaussdb.v1.SearchResponse);
+  rpc Count(gaussdb.v1.CountRequest) returns (gaussdb.v1.CountResponse);
+  rpc Scroll(gaussdb.v1.ScrollRequest) returns (gaussdb.v1.ScrollResponse);
+  rpc Compact(gaussdb.v1.CompactRequest) returns (gaussdb.v1.CompactResponse);
+  rpc TierCold(gaussdb.v1.ColdTierRequest) returns (gaussdb.v1.ColdTierResponse);
+  rpc PruneWalArchive(gaussdb.v1.PruneWalArchiveRequest) returns (gaussdb.v1.WalArchivePruneResponse);
+  rpc Snapshot(gaussdb.v1.SnapshotRequest) returns (gaussdb.v1.StatusResponse);
+  rpc Restore(gaussdb.v1.RestoreRequest) returns (gaussdb.v1.StatusResponse);
+  rpc ShardMove(gaussdb.v1.ShardMoveRequest) returns (gaussdb.v1.StatusResponse);
+
+  // Native graph overlay. These RPCs are intentionally born in chirondb.v1;
+  // the legacy GaussDb service remains frozen.
+  rpc EnableGraph(GraphLifecycleRequest) returns (GraphLifecycleResponse);
+  rpc DropGraph(GraphLifecycleRequest) returns (GraphLifecycleResponse);
+  rpc ListEdgeTypes(ListEdgeTypesRequest) returns (ListEdgeTypesResponse);
+  rpc ConfigureEdgeType(ConfigureEdgeTypeRequest) returns (ConfigureEdgeTypeResponse);
+  rpc Relate(GraphRelateRequest) returns (GraphRelateResponse);
+  rpc Unrelate(GraphUnrelateRequest) returns (GraphUnrelateResponse);
+  rpc UpdateEdge(GraphUpdateEdgeRequest) returns (GraphMutationReceipt);
+  rpc Traverse(GraphTraverseRequest) returns (GraphTraverseResponse);
+  rpc OpenDeferredGraphSession(GraphDeferredSessionRequest) returns (GraphDeferredSessionResponse);
+  rpc DeferredUpsert(GraphDeferredUpsertRequest) returns (GraphDeferredUpsertResponse);
+  rpc DeferredRelate(GraphDeferredRelateRequest) returns (GraphRelateResponse);
+  rpc CommitDeferredGraphSession(GraphDeferredSessionRequest) returns (GraphDeferredSessionResponse);
+  rpc AbortDeferredGraphSession(GraphDeferredSessionRequest) returns (GraphDeferredSessionResponse);
+
+  // ChironQL. New surface, so the messages are born in chirondb.v1 rather
+  // than deepening the legacy gaussdb.v1 package; the legacy GaussDb service
+  // is frozen at the surface it shipped with and does not get this rpc.
+  rpc ExecuteQuery(ChironQlRequest) returns (ChironQlResponse);
+}
+
+// One ChironQL statement. One statement per request: there are no
+// transactions to give a multi-statement body coherent partial-failure
+// semantics.
+message ChironQlRequest {
+  string query = 1;
+  // Session collection, as `USE <name>` would set. A collection named in the
+  // statement itself wins over this.
+  optional string collection = 2;
+  // Return the execution trace on success. Failures always carry it.
+  bool trace = 3;
+  // Proceed with a statement that would otherwise stop and ask, such as
+  // `DELETE ... WHERE`.
+  bool confirm = 4;
+}
+
+// Rows, stats and trace travel as JSON strings: payloads are arbitrary JSON
+// and protobuf has no native equivalent. Same convention as `filter_json`
+// elsewhere in this API.
+message ChironQlResponse {
+  // "rows", "affected" or "empty".
+  string kind = 1;
+  repeated string columns = 2;
+  repeated string rows_json = 3;
+  string stats_json = 4;
+  // Pagination cursor for SCROLL; absent on the last page.
+  optional string next = 5;
+  // Correlates this result with the server's own log line for it.
+  string query_id = 6;
+  optional string trace_json = 7;
+}
+
+message GraphLifecycleRequest {
+  string collection = 1;
+  // false (the proto3 default) waits for WAL durability.
+  bool no_wait = 2;
+}
+
+message GraphLifecycleResponse {
+  bool enabled = 1;
+  optional uint64 graph_epoch = 2;
+  optional uint64 operation_lsn = 3;
+  bool durable = 4;
+  bool transitioned = 5;
+  bool backfill_in_progress = 6;
+}
+
+message GraphMutationReceipt {
+  uint64 graph_epoch = 1;
+  optional uint64 operation_lsn = 2;
+  bool durable = 3;
+  bool replayed = 4;
+}
+
+message GraphEdgeType {
+  string name = 1;
+  optional string weight_property = 2;
+}
+
+message ListEdgeTypesRequest {
+  string collection = 1;
+}
+
+message ListEdgeTypesResponse {
+  repeated GraphEdgeType edge_types = 1;
+}
+
+message ConfigureEdgeTypeRequest {
+  string collection = 1;
+  string name = 2;
+  optional string weight_property = 3;
+  bool no_wait = 4;
+}
+
+message ConfigureEdgeTypeResponse {
+  GraphEdgeType edge_type = 1;
+  GraphMutationReceipt receipt = 2;
+  bool changed = 3;
+}
+
+message GraphRelateRequest {
+  string collection = 1;
+  string source_point_id = 2;
+  string target_point_id = 3;
+  string edge_type = 4;
+  // JSON object; empty means {}.
+  string properties_json = 5;
+  // "local" (default) or "admin_cross_tenant".
+  string scope = 6;
+  optional string idempotency_key = 7;
+  bool no_wait = 8;
+}
+
+message GraphRelateResponse {
+  // Opaque EdgeId token. Clients must not parse or sort it.
+  string edge_id = 1;
+  GraphMutationReceipt receipt = 2;
+}
+
+message GraphUnrelateRequest {
+  string collection = 1;
+  string edge_id = 2;
+  bool no_wait = 3;
+}
+
+message GraphUnrelateResponse {
+  uint64 deleted = 1;
+  GraphMutationReceipt receipt = 2;
+}
+
+message GraphUpdateEdgeRequest {
+  string collection = 1;
+  string edge_id = 2;
+  // "merge" or "replace".
+  string mode = 3;
+  // JSON object; empty means {}.
+  string properties_json = 4;
+  bool no_wait = 5;
+}
+
+message GraphTraverseRequest {
+  string collection = 1;
+  // GraphTraversalQueryRequest encoded as JSON. Using the common request
+  // object keeps caps, filters, and future additive budget fields identical
+  // across native protocols.
+  string request_json = 2;
+}
+
+message GraphTraverseResponse {
+  // Complete GraphTraversalQueryResult encoded as JSON.
+  string result_json = 1;
+  uint64 graph_epoch = 2;
+  string stats_json = 3;
+  optional string truncation = 4;
+  repeated string warnings = 5;
+}
+
+message GraphDeferredSessionRequest {
+  string collection = 1;
+  optional string session_id = 2;
+  bool no_wait = 3;
+}
+
+message GraphDeferredSessionResponse {
+  string session_id = 1;
+  string state = 2;
+  GraphMutationReceipt receipt = 3;
+}
+
+message GraphDeferredUpsertRequest {
+  string collection = 1;
+  string session_id = 2;
+  repeated gaussdb.v1.Point points = 3;
+  bool no_wait = 4;
+}
+
+message GraphDeferredUpsertResponse {
+  uint64 total_points = 1;
+  uint64 bound_endpoints = 2;
+  GraphMutationReceipt receipt = 3;
+}
+
+message GraphDeferredRelateRequest {
+  string collection = 1;
+  string session_id = 2;
+  GraphRelateRequest relate = 3;
+}

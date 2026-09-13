@@ -1,0 +1,138 @@
+name: wal-fuzz
+
+on:
+  pull_request:
+  release:
+    types: [published]
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+
+jobs:
+  corpus-smoke:
+    name: corpus smoke (${{ matrix.target }})
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2025-12-08
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - wal_frame_record
+          - catalog_wal
+          - archive_manifest
+          - restore_journal
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install pinned nightly toolchain
+        uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly
+        with:
+          toolchain: nightly-2025-12-08
+
+      - name: Cache Rust fuzz builds
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          workspaces: |
+            . -> target
+            fuzz -> target
+          cache-on-failure: true
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+
+      - name: Replay deterministic corpus with bounded mutations
+        run: >-
+          cargo fuzz run ${{ matrix.target }}
+          fuzz/corpus/${{ matrix.target }} --
+          -seed=1
+          -runs=256
+          -max_total_time=30
+          -timeout=5
+          -rss_limit_mb=2048
+          -max_len=1048576
+
+      - name: Upload crash artifact
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wal-fuzz-pr-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
+
+  nightly-soak:
+    name: nightly soak (${{ matrix.target }})
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'release'
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2025-12-08
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - wal_frame_record
+          - catalog_wal
+          - archive_manifest
+          - restore_journal
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install pinned nightly toolchain
+        uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly
+        with:
+          toolchain: nightly-2025-12-08
+
+      - name: Cache Rust fuzz builds
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          workspaces: |
+            . -> target
+            fuzz -> target
+          cache-on-failure: true
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+
+      - name: Run bounded nightly fuzz soak
+        run: >-
+          cargo fuzz run ${{ matrix.target }}
+          fuzz/corpus/${{ matrix.target }} --
+          -max_total_time=900
+          -timeout=10
+          -rss_limit_mb=2048
+          -max_len=1048576
+
+      - name: Upload crash artifact
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wal-fuzz-nightly-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
+
+  required:
+    name: wal-fuzz-required
+    if: github.event_name == 'pull_request' && always()
+    needs: corpus-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require WAL fuzz corpus
+        env:
+          CORPUS_RESULT: ${{ needs.corpus-smoke.result }}
+        run: test "$CORPUS_RESULT" = success

@@ -1,0 +1,66 @@
+name: fuzz-scheduled
+
+on:
+  schedule:
+    - cron: "41 1 * * *"
+  workflow_dispatch:
+  pull_request:
+    types: [labeled, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'security-full-gate')
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-08-20
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [protocol_decoders, query_decoders, storage_decoders, index_decoders]
+        mode: [asan, careful-ub-checks]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly
+        with:
+          toolchain: nightly-2026-08-20
+          components: rust-src
+      - name: Install protoc and cargo-fuzz
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Prepare artifact directory
+        run: mkdir -p "fuzz/artifacts/${{ matrix.target }}/${{ matrix.mode }}"
+      - name: Full ASan target
+        if: matrix.mode == 'asan'
+        run: >-
+          cargo fuzz run --sanitizer address "${{ matrix.target }}"
+          "fuzz/corpus/${{ matrix.target }}" --
+          -max_total_time=1800
+          -rss_limit_mb=4096
+          -artifact_prefix="fuzz/artifacts/${{ matrix.target }}/${{ matrix.mode }}/"
+      - name: Full Rust UB-check target
+        if: matrix.mode == 'careful-ub-checks'
+        run: >-
+          cargo fuzz run --careful --sanitizer none "${{ matrix.target }}"
+          "fuzz/corpus/${{ matrix.target }}" --
+          -max_total_time=1800
+          -rss_limit_mb=4096
+          -artifact_prefix="fuzz/artifacts/${{ matrix.target }}/${{ matrix.mode }}/"
+      - name: Archive corpus and crash artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-${{ matrix.target }}-${{ matrix.mode }}-${{ github.run_id }}
+          path: |
+            fuzz/corpus/${{ matrix.target }}/
+            fuzz/artifacts/${{ matrix.target }}/${{ matrix.mode }}/
+          if-no-files-found: error
+          retention-days: 30
