@@ -1,0 +1,1 @@
+ALTER COLLECTION docs SET SECURITY POLICY {department_actions:['read'],owner_actions:['read'],templates:{}} IF REVISION 1;

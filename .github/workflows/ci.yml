@@ -6,9 +6,23 @@ on:
     branches:
       - main
 
+env:
+  CARGO_BUILD_JOBS: 2
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+
 jobs:
+  trust-boundary:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Validate repository branch provenance
+        env:
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+        run: test "$HEAD_REPOSITORY" = "${{ github.repository }}"
+
   rust:
-    runs-on: ubuntu-latest
+    needs: trust-boundary
+    runs-on: ubuntu-24.04
     env:
       CARGO_BUILD_JOBS: 2
     steps:
@@ -16,8 +30,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@87eb139fed4b08a67bd1fa429a21d1f5d523e03e # 1.92.0
         with:
           toolchain: 1.92.0
+          components: clippy, rustfmt
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler python3-requests python3-protobuf ripgrep
       - name: Release version consistency
         run: python3 .github/tools/check_release_version.py
       - name: Format
@@ -32,11 +47,81 @@ jobs:
         run: cargo clippy -p chirondb --features fault-injection --test process_kill --locked -j 2 -- -D warnings
       - name: Build release binaries
         run: cargo build --release --locked --bins
+      - name: Protected reference migration crash rehearsal
+        run: |
+          cargo test -p chirondb-core --lib --features fault-injection --locked -j 2 --no-run --message-format=json > "$RUNNER_TEMP/reference-fixture-build.json"
+          python3 - "$RUNNER_TEMP/reference-fixture-build.json" "$RUNNER_TEMP/reference-fixture-path" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          artifacts = (
+              json.loads(line)
+              for line in pathlib.Path(sys.argv[1]).read_text().splitlines()
+              if line.startswith('{')
+          )
+          binaries = [
+              item['executable']
+              for item in artifacts
+              if item.get('reason') == 'compiler-artifact'
+              and item['target']['name'] == 'chirondb_core'
+              and item['profile']['test']
+              and item.get('executable')
+          ]
+          if len(binaries) != 1:
+              raise SystemExit(f'expected one core test executable, got {binaries}')
+          pathlib.Path(sys.argv[2]).write_text(binaries[0])
+          PY
+          cargo build -p chirondb --bin chironctl --features fault-injection --locked -j 2
+          python3 chirondb-server/tests/protected_reference_migration_cli.py \
+            --fixture-test "$(cat "$RUNNER_TEMP/reference-fixture-path")" \
+            --release-cli target/release/chironctl \
+            --fault-cli target/debug/chironctl \
+            --output "$RUNNER_TEMP/reference-migration.json"
+      - name: Protected reference migration real ENOSPC
+        run: |
+          image="$RUNNER_TEMP/reference-enospc.img"
+          mountpoint="$RUNNER_TEMP/reference-enospc"
+          test ! -e "$image"
+          truncate -s 64M "$image"
+          mkfs.ext4 -q -F -m 0 "$image"
+          mkdir -p "$mountpoint"
+          sudo mount -o loop "$image" "$mountpoint"
+          trap 'sudo umount "$mountpoint"' EXIT
+          sudo chown "$(id -u):$(id -g)" "$mountpoint"
+          touch "$mountpoint/.chirondb-enospc-test-device"
+          PYTHONDONTWRITEBYTECODE=1 python3 chirondb-server/tests/protected_reference_migration_enospc.py \
+            --fixture-test "$(cat "$RUNNER_TEMP/reference-fixture-path")" \
+            --release-cli target/release/chironctl \
+            --fault-cli target/debug/chironctl \
+            --mount-root "$mountpoint" \
+            --output "$RUNNER_TEMP/reference-enospc.json"
+      - name: Upload protected reference migration evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: protected-reference-migration-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/reference-migration.json
+            ${{ runner.temp }}/reference-enospc.json
+          if-no-files-found: error
       - name: MCP Python SDK and stdio interoperability
         run: |
           python3 -m venv "$RUNNER_TEMP/mcp-venv"
           "$RUNNER_TEMP/mcp-venv/bin/pip" install -r chirondb-server/tests/mcp_requirements.txt
           "$RUNNER_TEMP/mcp-venv/bin/python" chirondb-server/tests/mcp_interop.py --bins target/release
+      - name: Traditional ML worker and real protocol/SDK scenarios
+        run: |
+          python3 -m venv "$RUNNER_TEMP/chirondb-ml-python"
+          ml_python="$RUNNER_TEMP/chirondb-ml-python/bin/python"
+          "$ml_python" -m pip install -r ml-worker/requirements-traditional.txt requests==2.34.2 protobuf==7.36.2
+          PYTHONPATH=ml-worker "$ml_python" -m unittest -v test_worker
+          PYTHONPATH=clients/python "$ml_python" -m unittest -v test_ml_sdk
+          export CHIRONDB_ML_WORKER_PYTHON="$ml_python"
+          export CHIRONDB_ML_SDK_PYTHON="$ml_python"
+          export CHIRONDB_ML_WORKER_SCRIPT="$GITHUB_WORKSPACE/ml-worker/chirondb_ml_worker.py"
+          cargo test -p chirondb --test ml_materialize --locked -j 2 traditional_models_materialize_and_refresh_through_http_and_sdks -- --ignored --exact
+          cargo test -p chirondb --test ml_materialize --locked -j 2 grpc_and_chironwire_share_ml_materialization -- --ignored --exact
+          CHIRONDB_ML_WORKER_SCRIPT="$GITHUB_WORKSPACE/ml-worker/delayed_worker.py" cargo test -p chirondb --test ml_materialize --locked -j 2 job_uses_submission_snapshot_and_serializes_refreshes -- --ignored --exact
       - name: WAL recovery durability gate (100K × 128D)
         run: >-
           target/release/chirondrill
@@ -56,13 +141,13 @@ jobs:
   docker:
     name: Docker deployment smoke
     needs: rust
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Build production image
         run: |
           docker build \
-            --build-arg CHIRONDB_VERSION=0.1.0-beta.1 \
+            --build-arg CHIRONDB_VERSION=0.1.0-beta.2 \
             --build-arg VCS_REF=${{ github.sha }} \
             -t chirondb:ci .
       - name: Three-protocol persistence smoke
@@ -71,11 +156,12 @@ jobs:
   required:
     name: ci-required
     if: always()
-    needs: [rust, docker]
-    runs-on: ubuntu-latest
+    needs: [trust-boundary, rust, docker]
+    runs-on: ubuntu-24.04
     steps:
       - name: Require CI and deployment smoke
         env:
           RUST_RESULT: ${{ needs.rust.result }}
           DOCKER_RESULT: ${{ needs.docker.result }}
-        run: test "$RUST_RESULT" = success && test "$DOCKER_RESULT" = success
+          TRUST_RESULT: ${{ needs.trust-boundary.result }}
+        run: test "$TRUST_RESULT" = success && test "$RUST_RESULT" = success && test "$DOCKER_RESULT" = success

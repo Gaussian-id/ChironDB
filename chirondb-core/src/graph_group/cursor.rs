@@ -14,7 +14,7 @@ struct RangeCursor<'a> {
     section: u32,
     next: usize,
     end: usize,
-    buffer: Cow<'a, [u8]>,
+    buffer: crate::encryption::AdmittedRange<'a>,
     position: usize,
 }
 
@@ -35,7 +35,7 @@ impl<'a> RangeCursor<'a> {
             section: column.section,
             next: offset(range.start)?,
             end: offset(range.end)?,
-            buffer: Cow::Borrowed(&[]),
+            buffer: crate::encryption::AdmittedRange::borrowed(&[]),
             position: 0,
         })
     }
@@ -50,7 +50,7 @@ impl<'a> RangeCursor<'a> {
                     .next
                     .saturating_add(AUTHENTICATED_CHUNK_BYTES)
                     .min(self.end);
-                self.buffer = Cow::Borrowed(&[]);
+                self.buffer = crate::encryption::AdmittedRange::borrowed(&[]);
                 self.buffer = self
                     .artifact
                     .read_section_range(self.section, self.next..end)?;
@@ -319,6 +319,35 @@ mod tests {
                     }
                 }
                 assert!(cursor.read_next().unwrap().is_none());
+            }
+            if mode == "encrypted" {
+                use crate::relational::wal_decode::with_test_storage_pool;
+                with_test_storage_pool(1, |used| {
+                    assert!(matches!(open(0..1), Err(GaussError::ResourceExhausted(_))));
+                    assert_eq!(used(), 0);
+                });
+                with_test_storage_pool(2 * 1024 * 1024, |used| {
+                    let mut cursor = open(0..count as u64).unwrap();
+                    assert_eq!(cursor.read_next().unwrap().unwrap(), expected[0]);
+                    // A nested tiny pool evicts cache residency, but cannot release
+                    // the outer cursor's four live output reservations.
+                    with_test_storage_pool(1, |_| {
+                        assert!(matches!(
+                            artifact.read_section_range(1, 0..1),
+                            Err(GaussError::ResourceExhausted(_))
+                        ));
+                    });
+                    let retained = used();
+                    let buffers = cursor.ids.buffer.len()
+                        + cursor.types.buffer.len()
+                        + cursor.offsets.buffer.len()
+                        + cursor.neighbors.buffer.len();
+                    assert!(retained > buffers as u64);
+                    assert_eq!(cursor.read_next().unwrap().unwrap(), expected[1]);
+                    assert_eq!(used(), retained);
+                    drop(cursor);
+                    assert_eq!(used(), 0);
+                });
             }
             assert!(open(0..count as u64 + 1).is_err());
             let mut unavailable = open(0..1).unwrap();

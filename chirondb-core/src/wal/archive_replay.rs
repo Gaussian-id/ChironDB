@@ -42,7 +42,9 @@ impl Wal {
         let mut prefix = PrefixReader::new(&self.dir)?;
         scan_frames(archive, 0, TailPolicy::Strict, |record, payload| {
             match &record.entry {
-                WalEntry::CreateCollection { .. } | WalEntry::DropCollection { .. } => {
+                WalEntry::CreateCollection { .. }
+                | WalEntry::DropCollection { .. }
+                | WalEntry::DropProtectedCollection { .. } => {
                     return Err(wal_corruption(
                         archive,
                         "catalog entry found in collection WAL archive",
@@ -94,15 +96,18 @@ impl Wal {
 /// One forward reader for retained overlap, independent of archive segmentation.
 /// Only a single bounded frame is held, never a map of all historical records.
 struct PrefixReader {
-    segments: std::vec::IntoIter<WalSegment>,
+    segments: layout::WalSegmentsIter,
     reader: Option<Box<dyn Read>>,
     position: u64,
     segment_end: u64,
     path: PathBuf,
+    path_memory: Option<crate::relational::wal_decode::MetadataCharge>,
+    _memory: crate::relational::wal_decode::MetadataCharge,
 }
 
 impl PrefixReader {
     fn new(dir: &Path) -> Result<Self> {
+        let memory = layout::root(dir, std::mem::size_of::<Self>())?;
         let base = Wal::retained_base_lsn(dir)?;
         Ok(Self {
             segments: wal_segments(dir)?.into_iter(),
@@ -110,6 +115,8 @@ impl PrefixReader {
             position: base,
             segment_end: base,
             path: dir.to_path_buf(),
+            path_memory: None,
+            _memory: memory,
         })
     }
 
@@ -123,13 +130,14 @@ impl PrefixReader {
                 .next()
                 .ok_or_else(|| wal_corruption(&self.path, "missing snapshot WAL overlap"))?;
             self.position = self.segment_end;
-            let (reader, len) = open_wal_reader(&segment.path)?;
+            let (reader, len, _) = open_wal_reader(&segment.path)?;
             self.segment_end = self
                 .position
                 .checked_add(len)
                 .ok_or_else(|| wal_corruption(&segment.path, "WAL segment range overflow"))?;
             self.reader = Some(reader);
             self.path = segment.path;
+            self.path_memory = Some(segment.memory);
         }
         let reader = self.reader.as_mut().expect("selected overlap segment");
         let skip = lsn - self.position;
@@ -162,6 +170,24 @@ impl PrefixReader {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn overlap_reader_keeps_moved_path_after_inventory_is_exhausted() {
+        let temp = TempDir::new().unwrap();
+        crate::relational::wal_decode::with_test_storage_pool(1024 * 1024, |used| {
+            let mut wal = Wal::open(temp.path()).unwrap();
+            wal.append(&WalEntry::Delete { id: "one".into() }).unwrap();
+            let bytes = fs::read(wal.path()).unwrap();
+            let mut reader = PrefixReader::new(temp.path()).unwrap();
+            assert!(reader.matches(0, &bytes[HEADER_LEN..]).unwrap());
+            assert_eq!(reader.segments.len(), 0);
+            drop(wal);
+            assert!(used() > 0);
+            assert!(reader.path.exists());
+            drop(reader);
+            assert_eq!(used(), 0);
+        });
+    }
 
     #[test]
     fn replay_preserves_offsets_time_and_overlap_across_segment_boundaries() {

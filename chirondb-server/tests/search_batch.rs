@@ -19,6 +19,11 @@ use std::{
 
 use tempfile::TempDir;
 
+// Independent correctness fixtures share the process-wide storage quota.
+// Serialize their lifetimes so unrelated databases do not compete for that quota.
+// Keep original atomic requests, parallel search branches and batch oracles.
+static FIXTURE_LOAD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn lcg_vector(seed: u64, dim: usize) -> Vec<f32> {
     let mut state = seed ^ 0x517c_c1b7_2722_0a95;
     (0..dim)
@@ -86,6 +91,7 @@ fn req(query: Vec<f32>, k: usize) -> SearchRequest {
 
 #[test]
 fn batch_matches_individual_searches() {
+    let _fixture = FIXTURE_LOAD.lock().expect("fixture lifetime lock");
     let dim = 64;
     let (_dir, db, coll) = build(2_500, dim);
 
@@ -127,12 +133,15 @@ fn batch_matches_individual_searches() {
 
 #[test]
 fn batch_is_deterministic_across_runs() {
+    let _fixture = FIXTURE_LOAD.lock().expect("fixture lifetime lock");
+    // Time the query/deadlock contract, not fixture ingestion and index setup
+    // on an emulated or contended cross-platform build host.
+    let dim = 64;
+    let (directory, db, coll) = build(12_000, dim);
     let (finished_tx, finished_rx) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
+    let worker = std::thread::spawn(move || {
+        let _directory = directory;
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            let dim = 64;
-            let (_dir, db, coll) = build(12_000, dim);
-
             let queries: Vec<Vec<f32>> = (0..8).map(|q| lcg_vector(90_000 + q, dim)).collect();
 
             let build_multi = || MultiSearchRequest {
@@ -166,8 +175,15 @@ fn batch_is_deterministic_across_runs() {
     });
 
     match finished_rx.recv_timeout(Duration::from_secs(30)) {
-        Ok(Ok(())) => {}
-        Ok(Err(panic)) => resume_unwind(panic),
+        Ok(outcome) => {
+            // Join before releasing the fixture quota to the next independent test.
+            worker
+                .join()
+                .expect("batch worker panicked outside its query");
+            if let Err(panic) = outcome {
+                resume_unwind(panic);
+            }
+        }
         Err(mpsc::RecvTimeoutError::Timeout) => {
             panic!("parallel batch deadlocked while a collection writer was queued")
         }
@@ -179,6 +195,7 @@ fn batch_is_deterministic_across_runs() {
 
 #[test]
 fn batch_single_search_takes_serial_path() {
+    let _fixture = FIXTURE_LOAD.lock().expect("fixture lifetime lock");
     // Sanity: 1-branch batch still works (serial fast path inside
     // Db::multi_search when searches.len() < 2).
     let dim = 32;
@@ -202,6 +219,7 @@ fn batch_single_search_takes_serial_path() {
 
 #[test]
 fn batch_preserves_per_branch_overrides() {
+    let _fixture = FIXTURE_LOAD.lock().expect("fixture lifetime lock");
     // Different recall_target / with_payload per branch — confirms each
     // branch is independently configured under parallel dispatch.
     let dim = 64;

@@ -546,7 +546,7 @@ impl OpenedFragmentDirectory {
         stride: usize,
         width: usize,
         field: &str,
-    ) -> Result<std::borrow::Cow<'a, [u8]>> {
+    ) -> Result<crate::encryption::AdmittedRange<'a>> {
         let start = index
             .checked_mul(stride)
             .and_then(|offset| frame.payload_offset.checked_add(offset))

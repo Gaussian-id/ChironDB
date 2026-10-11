@@ -7,7 +7,9 @@ target/
 /.SPEC/
 /benchmark_results/
 /integrations/
-/scripts/
+!/scripts/
+/scripts/*
+!/scripts/chiron-ml
 /charts/
 /security/evidence/
 /security/G7_ACCEPTANCE.md

@@ -1433,6 +1433,21 @@ pub fn materialize_cold_segment_files_from_object_store(
     Ok(fetched)
 }
 
+/// Read-only admission check. Call under the collection read lock; recheck
+/// while holding its write lock before fetching/installing missing files.
+pub(crate) fn cold_materialization_needed(cold_dir: &Path) -> Result<bool> {
+    let index_path = cold_dir.join(COLD_INDEX_FILE);
+    if !index_path.exists() {
+        return Ok(false);
+    }
+    let payload = read_framed(&index_path, COLD_INDEX_MAGIC, "cold index")?;
+    let index: ColdIndexPayload = serde_json::from_slice(&payload)?;
+    Ok(index
+        .segments
+        .iter()
+        .any(|segment| !segment.object_files.is_empty() && !cold_dir.join(&segment.id).exists()))
+}
+
 pub fn materialize_missing_cold_segments_from_object_store(
     cold_dir: &Path,
     object_store_config: &ColdObjectStoreConfig,
@@ -2131,7 +2146,7 @@ fn with_paged_framed_slice<T>(
             message: format!("{label} shorter than header"),
         });
     }
-    let header = file.read_range(0..HEADER_LEN)?;
+    let header = file.read_range_admitted(0..HEADER_LEN)?;
     if &header[0..8] != magic {
         return Err(GaussError::SegmentCorruption {
             path: path.display().to_string(),
@@ -2162,7 +2177,7 @@ fn with_paged_framed_slice<T>(
                 message: format!("{label} truncated page crc at page {page_index}"),
             });
         }
-        let page_crc_bytes = file.read_range(pos..pos + 4)?;
+        let page_crc_bytes = file.read_range_admitted(pos..pos + 4)?;
         let page_crc = u32::from_le_bytes(page_crc_bytes.as_ref().try_into().expect("page crc"));
         pos += 4;
         let chunk_len = PAGE_SIZE.min(payload_len - payload.len());
@@ -2172,7 +2187,7 @@ fn with_paged_framed_slice<T>(
                 message: format!("{label} truncated page data at page {page_index}"),
             });
         }
-        let chunk = file.read_range(pos..pos + chunk_len)?;
+        let chunk = file.read_range_admitted(pos..pos + chunk_len)?;
         if checksum(&chunk) != page_crc {
             return Err(GaussError::SegmentCorruption {
                 path: path.display().to_string(),
@@ -2495,13 +2510,16 @@ struct PagedPayloadReader<'a> {
     file: &'a encryption::PersistentFile,
     pos: usize,
     remaining: usize,
-    chunk: Vec<u8>,
+    chunk: encryption::AdmittedRange<'a>,
     chunk_pos: usize,
 }
 
 impl std::io::Read for PagedPayloadReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         use std::io::{Error, ErrorKind};
+        if buf.is_empty() {
+            return Ok(0);
+        }
         if self.chunk_pos == self.chunk.len() {
             if self.remaining == 0 {
                 return Ok(0);
@@ -2510,25 +2528,27 @@ impl std::io::Read for PagedPayloadReader<'_> {
             if self.pos + 4 + chunk_len > self.file.len() {
                 return Err(Error::new(ErrorKind::InvalidData, "truncated segment page"));
             }
+            // The previous page is consumed; release it before reading another.
+            self.chunk = encryption::AdmittedRange::borrowed(&[]);
+            self.chunk_pos = 0;
             let page_crc_bytes = self
                 .file
-                .read_range(self.pos..self.pos + 4)
-                .map_err(|error| Error::other(error.to_string()))?;
+                .read_range_admitted(self.pos..self.pos + 4)
+                .map_err(Error::other)?;
             let page_crc = u32::from_le_bytes(page_crc_bytes.as_ref().try_into().unwrap());
-            self.pos += 4;
             let chunk = self
                 .file
-                .read_range(self.pos..self.pos + chunk_len)
-                .map_err(|error| Error::other(error.to_string()))?;
+                .read_range_admitted(self.pos + 4..self.pos + 4 + chunk_len)
+                .map_err(Error::other)?;
             if checksum(&chunk) != page_crc {
                 return Err(Error::new(
                     ErrorKind::InvalidData,
                     "segment page crc mismatch",
                 ));
             }
-            self.pos += chunk_len;
+            self.pos += 4 + chunk_len;
             self.remaining -= chunk_len;
-            self.chunk = chunk.into_owned();
+            self.chunk = chunk;
             self.chunk_pos = 0;
         }
         let available = self.chunk.len() - self.chunk_pos;
@@ -2542,8 +2562,7 @@ impl std::io::Read for PagedPayloadReader<'_> {
 /// Streaming V2 segment read: header + outer-CRC checks match
 /// [`with_paged_framed_slice`], but the JSON payload is parsed through
 /// [`PagedPayloadReader`] so the reassembled payload never lives in memory.
-fn read_segment_v2_streaming(path: &Path) -> Result<Vec<Point>> {
-    let file = encryption::PersistentFile::open(path)?;
+fn read_segment_v2_streaming(path: &Path, file: encryption::PersistentFile) -> Result<Vec<Point>> {
     let corrupt = |message: String| GaussError::SegmentCorruption {
         path: path.display().to_string(),
         message,
@@ -2551,7 +2570,7 @@ fn read_segment_v2_streaming(path: &Path) -> Result<Vec<Point>> {
     if file.len() < HEADER_LEN {
         return Err(corrupt("segment shorter than header".into()));
     }
-    let header = file.read_range(0..HEADER_LEN)?;
+    let header = file.read_range_admitted(0..HEADER_LEN)?;
     if &header[0..8] != VECTOR_MAGIC_V2 {
         return Err(corrupt("bad segment magic".into()));
     }
@@ -2574,19 +2593,39 @@ fn read_segment_v2_streaming(path: &Path) -> Result<Vec<Point>> {
         file: &file,
         pos: HEADER_LEN,
         remaining: payload_len,
-        chunk: Vec::new(),
+        chunk: encryption::AdmittedRange::borrowed(&[]),
         chunk_pos: 0,
     };
     let reader = std::io::BufReader::with_capacity(64 * 1024, reader);
-    Ok(serde_json::from_reader::<_, SegmentPayload>(reader)?.points)
+    decode_streamed_segment(reader)
+}
+
+fn decode_streamed_segment(reader: impl std::io::Read) -> Result<Vec<Point>> {
+    serde_json::from_reader::<_, SegmentPayload>(reader)
+        .map(|payload| payload.points)
+        .map_err(|error| {
+            if error.is_io() {
+                GaussError::from(std::io::Error::from(error))
+            } else {
+                GaussError::from(error)
+            }
+        })
 }
 
 fn read_segment(path: &Path) -> Result<Vec<Point>> {
-    // Try V2 format first.
-    if let Ok(result) = read_segment_v2_streaming(path) {
-        return Ok(result);
+    let file = encryption::PersistentFile::open(path)?;
+    if file.len() < 8 {
+        return Err(GaussError::SegmentCorruption {
+            path: path.display().to_string(),
+            message: "segment shorter than magic".into(),
+        });
     }
-    // Fall back to V1.
+    let paged = &*file.read_range_admitted(0..8)? == VECTOR_MAGIC_V2;
+    if paged {
+        return read_segment_v2_streaming(path, file);
+    }
+    drop(file);
+    // Dispatch by format: a selected V2 read error cannot become a V1 fallback.
     with_framed_slice(path, VECTOR_MAGIC, "segment", |payload| {
         Ok(serde_json::from_slice::<SegmentPayload>(payload)?.points)
     })
@@ -2651,7 +2690,7 @@ fn with_framed_slice<T>(
             message: format!("{label} shorter than header"),
         });
     }
-    let header = file.read_range(0..HEADER_LEN)?;
+    let header = file.read_range_admitted(0..HEADER_LEN)?;
     if &header[0..8] != magic {
         return Err(GaussError::SegmentCorruption {
             path: path.display().to_string(),
@@ -2679,7 +2718,7 @@ fn with_framed_slice<T>(
             message: format!("{label} crc mismatch"),
         });
     }
-    let payload = file.read_range(HEADER_LEN..file.len())?;
+    let payload = file.read_range_admitted(HEADER_LEN..file.len())?;
     f(&payload)
 }
 
@@ -3283,6 +3322,97 @@ mod tests {
 
     use crate::{model::Point, segment};
     use roaring::RoaringBitmap;
+
+    #[test]
+    fn selected_v2_stream_fault_is_preserved_without_v1_fallback() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("segment.gdx");
+        super::write_segment_v2_legacy(&path, &[]).unwrap();
+        let original = fs::read(&path).unwrap();
+        let mut damaged = original.clone();
+        damaged[super::HEADER_LEN] ^= 1;
+        // Keep the outer envelope valid so the physical page CRC fails in Read.
+        let outer = super::checksum(&damaged[super::HEADER_LEN..]);
+        damaged[16..20].copy_from_slice(&outer.to_le_bytes());
+        fs::write(&path, damaged).unwrap();
+        assert!(
+            matches!(super::read_segment(&path), Err(crate::GaussError::Io(error)) if error.to_string().contains("segment page crc mismatch"))
+        );
+        fs::write(&path, original).unwrap();
+        assert!(super::read_segment(&path).unwrap().is_empty());
+        let payload = serde_json::to_vec(&super::SegmentPayload { points: vec![] }).unwrap();
+        super::write_framed(
+            &path,
+            super::VECTOR_MAGIC,
+            &payload,
+            super::checksum(&payload),
+        )
+        .unwrap();
+        assert!(super::read_segment(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn streamed_segment_decode_preserves_typed_read_errors() {
+        struct Refused(Option<crate::GaussError>);
+        impl std::io::Read for Refused {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other(self.0.take().unwrap()))
+            }
+        }
+        assert!(matches!(
+            super::decode_streamed_segment(Refused(Some(crate::GaussError::ResourceExhausted("range budget".into())))),
+            Err(crate::GaussError::ResourceExhausted(message)) if message == "range budget"
+        ));
+        assert!(matches!(
+            super::decode_streamed_segment(Refused(Some(crate::GaussError::InvalidRequest("query canceled".into())))),
+            Err(crate::GaussError::InvalidRequest(message)) if message == "query canceled"
+        ));
+        assert!(matches!(
+            super::decode_streamed_segment(b"invalid json".as_slice()),
+            Err(crate::GaussError::Json(_))
+        ));
+    }
+
+    #[test]
+    fn paged_payload_reader_preserves_retry_position_and_plain_borrowing() {
+        use std::io::Read;
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("pages.gdx");
+        let chunk = vec![19_u8; super::PAGE_SIZE];
+        let crc = super::checksum(&chunk);
+        let mut original = Vec::new();
+        for _ in 0..2 {
+            original.extend_from_slice(&crc.to_le_bytes());
+            original.extend_from_slice(&chunk);
+        }
+        let mut damaged = original.clone();
+        damaged[super::PAGE_SIZE + 4] ^= 1;
+        fs::write(&path, &damaged).unwrap();
+        let file = crate::encryption::PersistentFile::open(&path).unwrap();
+        let mut reader = super::PagedPayloadReader {
+            file: &file,
+            pos: 0,
+            remaining: 2 * super::PAGE_SIZE,
+            chunk: crate::encryption::AdmittedRange::borrowed(&[]),
+            chunk_pos: 0,
+        };
+        crate::relational::wal_decode::with_test_storage_pool(1, |used| {
+            assert_eq!(reader.read(&mut []).unwrap(), 0);
+            assert_eq!(reader.pos, 0);
+            let mut output = vec![0; super::PAGE_SIZE];
+            reader.read_exact(&mut output).unwrap();
+            assert_eq!(output, chunk);
+            assert!(reader.chunk.borrowed_bytes().is_some());
+            let before = (reader.pos, reader.remaining);
+            assert!(reader.read(&mut output).is_err());
+            assert_eq!((reader.pos, reader.remaining), before);
+            fs::write(&path, &original).unwrap();
+            reader.read_exact(&mut output).unwrap();
+            assert_eq!(output, chunk);
+            assert_eq!(reader.read(&mut output).unwrap(), 0);
+            assert_eq!(used(), 0);
+        });
+    }
 
     #[test]
     fn loads_v4_segment_as_mmap_store() {

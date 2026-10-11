@@ -66,6 +66,49 @@ impl MutableGraphState {
         })
     }
 
+    /// Resolve only the requested edge identities. Sealed topology is streamed
+    /// under the caller's deadline; no all-edge map or point hydration is built.
+    pub(crate) fn requested_endpoints(
+        &self,
+        ids: &std::collections::HashSet<EdgeId>,
+        check: impl Fn() -> Result<()>,
+    ) -> Result<std::collections::HashMap<EdgeId, (Nid, Nid)>> {
+        let mut found = std::collections::HashMap::new();
+        for id in ids {
+            check()?;
+            if !self.edge_visible(*id) {
+                continue;
+            }
+            if let Some(edge) = self.edges.get(id) {
+                found.insert(*id, (edge.source, edge.target));
+            }
+        }
+        if found.len() != ids.len()
+            && let Some(generation) = &self.sealed_adjacency
+        {
+            let mut visited = 0usize;
+            generation.visit_topology(|_, edge| {
+                if visited.is_multiple_of(64) {
+                    check()?;
+                }
+                visited += 1;
+                if ids.contains(&edge.edge_id) && self.edge_visible(edge.edge_id) {
+                    let endpoints = (edge.source, edge.target);
+                    if let Some(previous) = found.insert(edge.edge_id, endpoints)
+                        && previous != endpoints
+                    {
+                        return Err(GaussError::WalUnavailable(
+                            "edge identity has conflicting endpoints".into(),
+                        ));
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        check()?;
+        Ok(found)
+    }
+
     /// After recovery (before replay), or after acknowledging a published cut.
     /// The pin must no longer own recovered mutable state, preventing an Arc cycle.
     pub(crate) fn attach_sealed_adjacency(&mut self, generation: Arc<GraphGeneration>) {
@@ -170,8 +213,21 @@ mod tests {
             let mut graph = MutableGraphState::new(GraphEpoch::INITIAL);
             graph.attach_sealed_adjacency(Arc::new(generation));
             assert!(graph.edges.is_empty()); // No fallback metadata can satisfy these reads.
+            let requested = HashSet::from([id(1), id(2), id(999)]);
+            let endpoints = graph.requested_endpoints(&requested, || Ok(())).unwrap();
+            assert_eq!(endpoints.len(), 2);
+            assert_eq!(endpoints[&id(1)], (nid(1), nid(2)));
+            assert_eq!(endpoints[&id(2)], (nid(1), nid(2)));
+            assert!(
+                graph
+                    .requested_endpoints(&requested, || Err(GaussError::ResourceExhausted(
+                        "cancelled".into()
+                    )))
+                    .is_err()
+            );
             let traverse = |graph: &MutableGraphState, direction, selected_types| {
                 exact_bfs(MutableTraversal {
+                    access: None,
                     graph,
                     anchors: vec![nid(if direction == GraphDirection::Incoming {
                         2
@@ -189,7 +245,7 @@ mod tests {
                         ..TraversalBudget::default()
                     },
                     cancelled: &AtomicBool::new(false),
-                    payload_for_nid: |_| Some(serde_json::json!({"tenant_id":"acme"})),
+                    payload_for_nid: |_| Ok(Some(serde_json::json!({"tenant_id":"acme"}))),
                     namespaces_for_payload: |_| vec![ns.clone()],
                 })
                 .unwrap()
@@ -238,6 +294,13 @@ mod tests {
                     .unwrap()
             );
             graph.edge_tombstones.insert(id(1).raw());
+            assert!(
+                !graph
+                    .requested_endpoints(&requested, || Ok(()))
+                    .unwrap()
+                    .contains_key(&id(1))
+            );
+
             assert!(
                 !graph
                     .has_live_incident_edge_excluding(nid(1), Some("acme"), &HashSet::from([id(2)]))

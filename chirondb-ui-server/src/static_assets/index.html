@@ -56,7 +56,8 @@
     }
     document.getElementById('refresh').addEventListener('click', refresh);
     document.getElementById('logout').addEventListener('click', async () => {
-      await fetch('/logout', { method: 'POST' });
+      const session = await fetchJson('/session');
+      await fetch('/logout', { method: 'POST', headers: { 'x-chirondb-csrf': session.csrf_token } });
       window.location.href = '/login';
     });
     refresh();

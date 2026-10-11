@@ -1048,7 +1048,8 @@ async fn gausswire_correlates_multiplexed_read_responses() {
     assert!(
         responses
             .iter()
-            .all(|response| response.error_code.is_empty())
+            .all(|response| response.error_code.is_empty()),
+        "multiplexed responses: {responses:?}"
     );
     let health = responses
         .iter()
@@ -1125,6 +1126,10 @@ async fn generated_python_protobuf_compatibility_smoke() {
     );
     let response: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(response["generated_python_protobuf"], "ok");
+    assert!(
+        response.get("skipped").is_none(),
+        "required generated protobuf check was skipped: {response}"
+    );
 }
 
 #[tokio::test]

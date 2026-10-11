@@ -36,11 +36,11 @@ jobs:
             use_cross: true
             label: linux-aarch64
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-15-intel
             use_cross: false
             label: darwin-x86_64
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
             use_cross: false
             label: darwin-aarch64
     steps:
@@ -48,6 +48,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@87eb139fed4b08a67bd1fa429a21d1f5d523e03e # 1.92.0
         with:
           toolchain: 1.92.0
+          components: clippy, rustfmt
           targets: ${{ matrix.target }}
       - name: Install protobuf compiler (Linux)
         if: runner.os == 'Linux'

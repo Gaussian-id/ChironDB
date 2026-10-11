@@ -21,29 +21,36 @@
 //! present with a zero duration, and no stage reports a recall figure — the
 //! engine does not measure one per query.
 
-use std::collections::HashSet;
+pub use crate::chironql_output::QueryResult;
+use crate::chironql_output::query::{self as receiving, JsonKey, QueryMemory};
+use crate::chironql_output::retrieval;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
+use std::mem::size_of;
 use std::time::Instant;
 
 use serde_json::{Value, json};
 
-use chirondb_core::{Db, GaussError};
+use chirondb_core::{Db, GaussError, MultiModelTransactionRequest};
+use chirondb_types::RelationalValue;
 use chirondb_types::chironql::{
     ChironQlError, ChironQlKind, ChironQlResponse, ChironQlStats, QueryTrace, stage,
 };
 use chirondb_types::graph::{
     EdgePropertyMode, EdgeToken, GraphCapability, GraphConstraint, GraphDeferredSessionId,
     GraphMutationReceipt, GraphQueryWarning, GraphRelationScope, GraphTraversalQueryRequest,
-    GraphTraversalReturn, GraphTraversalRows, GraphWarning, RelateRequest, TraversalBudget,
-    UpdateEdgeRequest,
+    GraphTraversalReturn, GraphWarning, RelateRequest, TraversalBudget, UpdateEdgeRequest,
 };
 use chirondb_types::model::{
     CollectionConfig, HybridSearchRequest, MultiSearchRequest, Point, RecommendRequest,
     SearchRequest, SearchResponse,
 };
+use chirondb_types::{RelationalType, SqlExecutionRequest, SqlResult, SqlStatementRequest};
 
 use crate::chironql_parser::{
-    self, CreateCollection, Get, GraphClause, GraphReturn, Hybrid, Multi, ParseError, Recommend,
-    Relate, Scroll, Search, Statement, StatementClass, Traverse, Unrelate, UpdateEdge,
+    self, CreateCollection, Get, GraphClause, GraphReturn, Hybrid, Multi, ParseError, Pipeline,
+    PipelineField, PipelineJoinKind, Recommend, Relate, Scroll, Search, Statement, StatementClass,
+    TransactionBlock, TransactionGraph, TransactionVector, Traverse, Unrelate, UpdateEdge,
     UpdatePayload, Upsert, VectorExpr,
 };
 use crate::rbac::Role;
@@ -76,6 +83,12 @@ pub struct ExecContext<'a> {
     /// Proceed with a statement that would otherwise stop and ask. See
     /// [`ChironQlRequest::confirm`](chirondb_types::chironql::ChironQlRequest).
     pub confirm: bool,
+    /// Typed positional parameters shared by SQL and pipeline stages.
+    pub parameters: Vec<RelationalValue>,
+    /// Stable mutation identity forwarded to the core ledger.
+    pub idempotency_key: Option<String>,
+    /// Audit correlation forwarded to standalone relational writes.
+    pub retry_id: Option<String>,
     /// Row-level tenant scope for this caller. Built from the authenticated
     /// principal, never from anything the caller sent, and passed to the
     /// engine's `_scoped` entry points so tenant rules apply here exactly as
@@ -92,16 +105,28 @@ impl ExecContext<'_> {
 }
 
 type ExecResult = Result<ChironQlResponse, ChironQlError>;
+type OwnedExecResult = Result<QueryResult, ChironQlError>;
 
 /// Parse and execute one statement.
 pub fn execute(ctx: &mut ExecContext<'_>, input: &str) -> ExecResult {
-    execute_with_parser(ctx, input, chironql_parser::parse)
+    execute_owned(ctx, input).map(QueryResult::into_dto)
+}
+
+/// Retain receiving/operation admission through transport consumption.
+pub fn execute_owned(ctx: &mut ExecContext<'_>, input: &str) -> OwnedExecResult {
+    let mut memory = QueryMemory::new().map_err(|e| receiving::error("", e))?;
+    let value = execute_with_parser(ctx, input, chironql_parser::parse, &mut memory)?;
+    memory
+        .metadata(&value)
+        .map_err(|e| receiving::error(&value.query_id, e))?;
+    Ok(QueryResult::new(value, memory))
 }
 
 fn execute_with_parser(
     ctx: &mut ExecContext<'_>,
     input: &str,
     parser: fn(&str) -> Result<Statement, ParseError>,
+    memory: &mut QueryMemory,
 ) -> ExecResult {
     let query_id = new_query_id();
     let started = Instant::now();
@@ -124,15 +149,23 @@ fn execute_with_parser(
     trace.push_ok(
         stage::PARSE,
         micros(parse_started),
+        detail(ctx.role, json!({"statement": statement.kind_name()})),
+    );
+    let classify_started = Instant::now();
+    trace.push_ok(
+        stage::CLASSIFY,
+        micros(classify_started),
         detail(
             ctx.role,
             json!({
-                "statement": statement.kind_name(),
                 "class": match statement.class() {
                     StatementClass::Read => "read",
                     StatementClass::Write => "write",
                     StatementClass::Admin => "admin",
                 },
+                "domains": statement.domains(),
+                "tables": statement.tables(),
+                "collections": statement.collections(),
             }),
         ),
     );
@@ -228,12 +261,27 @@ fn execute_with_parser(
     }
     trace.push_ok(stage::AUTHORIZE, micros(authorize_started), None);
 
+    if ctx.idempotency_key.is_some()
+        && !matches!(statement, Statement::Sql(_) | Statement::Transaction(_))
+    {
+        return Err(ChironQlError {
+            error: "idempotency_key requires a SQL mutation or atomic transaction".into(),
+            code: "chironql.idempotency_unsupported".into(),
+            hint: None,
+            position: None,
+            affected_estimate: None,
+            query_id,
+            trace: Some(Box::new(trace)),
+        });
+    }
+
     // -- dispatch ---------------------------------------------------------
-    let outcome = dispatch(ctx, &statement, &query_id, &mut trace);
+    let outcome = dispatch(ctx, &statement, &query_id, &mut trace, memory);
 
     match outcome {
         Ok(mut response) => {
             response.query_id = query_id;
+            response.domains = statement.domains();
             response.stats.took_ms = millis(started);
             response.trace = if ctx.want_trace { Some(trace) } else { None };
             Ok(response)
@@ -251,8 +299,60 @@ fn dispatch(
     statement: &Statement,
     query_id: &str,
     trace: &mut QueryTrace,
+    memory: &mut QueryMemory,
 ) -> ExecResult {
-    match statement {
+    let value = match statement {
+        Statement::MlMaterialize(definition) => {
+            if ctx.db.tenant_enforcement().blocks() {
+                return Err(ChironQlError {
+                    error: "ML materialization requires the protected tenant executor".into(),
+                    code: "chironql.ml_tenant_unsupported".into(),
+                    hint: None,
+                    position: None,
+                    affected_estimate: None,
+                    query_id: query_id.into(),
+                    trace: None,
+                });
+            }
+            let submitted = crate::ml_runtime::submit(
+                ctx.db,
+                definition,
+                ctx.tenant.actor(),
+                ctx.tenant.tenant_id(),
+            )
+            .map_err(|error| ChironQlError {
+                error: error.message,
+                code: error.code.into(),
+                hint: None,
+                position: None,
+                affected_estimate: None,
+                query_id: query_id.into(),
+                trace: None,
+            })?;
+            Ok(rows_response(
+                query_id,
+                vec!["job_id".into(), "view".into(), "status".into()],
+                vec![json!({
+                    "job_id": submitted.job_id,
+                    "view": submitted.view,
+                    "status": submitted.status,
+                })],
+            ))
+        }
+        Statement::Security(_) => Err(ChironQlError {
+            error: "security statements require the authenticated protected executor".into(),
+            code: "chironql.permission_denied".into(),
+            hint: Some("Connect with a catalog API key to a protected authority.".into()),
+            position: None,
+            affected_estimate: None,
+            query_id: query_id.into(),
+            trace: None,
+        }),
+        Statement::Sql(statement) => exec_sql(ctx, statement, query_id, trace, memory),
+        Statement::Pipeline(pipeline) => exec_pipeline(ctx, pipeline, query_id, trace, memory),
+        Statement::Transaction(transaction) => {
+            exec_transaction(ctx, transaction, query_id, trace, memory)
+        }
         Statement::Use { collection } => {
             ctx.session.collection = Some(collection.clone());
             Ok(empty_response(query_id))
@@ -267,10 +367,10 @@ fn dispatch(
             let name = resolve_collection(ctx, collection.as_deref(), query_id, trace)?;
             exec_describe(ctx, &name, query_id, trace)
         }
-        Statement::Search(search) => exec_search(ctx, search, query_id, trace),
-        Statement::Hybrid(hybrid) => exec_hybrid(ctx, hybrid, query_id, trace),
-        Statement::Multi(multi) => exec_multi(ctx, multi, query_id, trace),
-        Statement::Recommend(recommend) => exec_recommend(ctx, recommend, query_id, trace),
+        Statement::Search(search) => exec_search(ctx, search, query_id, trace, memory),
+        Statement::Hybrid(hybrid) => exec_hybrid(ctx, hybrid, query_id, trace, memory),
+        Statement::Multi(multi) => exec_multi(ctx, multi, query_id, trace, memory),
+        Statement::Recommend(recommend) => exec_recommend(ctx, recommend, query_id, trace, memory),
         Statement::Count(count) => {
             let name = resolve_collection(ctx, count.collection.as_deref(), query_id, trace)?;
             let filter = record_filter(trace, ctx.role, count.filter.as_ref());
@@ -288,17 +388,23 @@ fn dispatch(
             let rows = vec![json!({"count": response.count})];
             trace.push_ok(stage::RENDER, micros(render_started), None);
             Ok(ChironQlResponse {
+                credential: None,
                 kind: ChironQlKind::Rows,
                 columns: vec!["count".to_string()],
+                column_types: Vec::new(),
                 rows,
                 stats: ChironQlStats::default(),
                 next: None,
                 query_id: query_id.to_string(),
+                domains: Vec::new(),
+                snapshot_id: None,
+                transaction_id: None,
+                committed: None,
                 trace: None,
             })
         }
-        Statement::Scroll(scroll) => exec_scroll(ctx, scroll, query_id, trace),
-        Statement::Get(get) => exec_get(ctx, get, query_id, trace),
+        Statement::Scroll(scroll) => exec_scroll(ctx, scroll, query_id, trace, memory),
+        Statement::Get(get) => exec_get(ctx, get, query_id, trace, memory),
         Statement::Upsert(upsert) => exec_upsert(ctx, upsert, query_id, trace),
         Statement::DeletePoints { collection, ids } => {
             exec_delete_points(ctx, collection.as_deref(), ids, query_id, trace)
@@ -310,7 +416,1068 @@ fn dispatch(
         Statement::Relate(relate) => exec_relate(ctx, relate, query_id, trace),
         Statement::Unrelate(unrelate) => exec_unrelate(ctx, unrelate, query_id, trace),
         Statement::UpdateEdge(update) => exec_update_edge(ctx, update, query_id, trace),
-        Statement::Traverse(traverse) => exec_traverse(ctx, traverse, query_id, trace),
+        Statement::Traverse(traverse) => exec_traverse(ctx, traverse, query_id, trace, memory),
+    }?;
+    if !matches!(
+        statement,
+        Statement::Sql(_)
+            | Statement::Pipeline(_)
+            | Statement::Transaction(_)
+            | Statement::Search(_)
+            | Statement::Hybrid(_)
+            | Statement::Multi(_)
+            | Statement::Recommend(_)
+            | Statement::Get(_)
+            | Statement::Scroll(_)
+            | Statement::Traverse(_)
+    ) {
+        memory
+            .response(&value)
+            .map_err(|e| receiving::error(query_id, e))?;
+    }
+    Ok(value)
+}
+
+fn exec_transaction(
+    ctx: &mut ExecContext<'_>,
+    transaction: &TransactionBlock,
+    query_id: &str,
+    trace: &mut QueryTrace,
+    memory: &mut QueryMemory,
+) -> ExecResult {
+    if ctx.db.identity_authority().is_some() {
+        return Err(ChironQlError {
+            error: "atomic multi-model transactions are not enabled for protected storage yet"
+                .into(),
+            code: "chironql.protected_unsupported".into(),
+            hint: Some(
+                "Configure relational and graph authorization before enabling protected multi-model writes."
+                    .into(),
+            ),
+            position: None,
+            affected_estimate: None,
+            query_id: query_id.into(),
+            trace: None,
+        });
+    }
+    let collection =
+        resolve_collection(ctx, Some(transaction.vector.collection()), query_id, trace)?;
+    let (points, point_deletes) = match &transaction.vector {
+        TransactionVector::Create { .. } => {
+            return Err(ChironQlError {
+                error: "atomic server-ID creation requires a protected installation".into(),
+                code: "chironql.protected_required".into(),
+                hint: None,
+                position: None,
+                affected_estimate: None,
+                query_id: query_id.into(),
+                trace: None,
+            });
+        }
+        TransactionVector::Upsert(upsert) => {
+            let mut points = Vec::with_capacity(upsert.points.len());
+            for value in &upsert.points {
+                points.push(
+                    serde_json::from_value::<Point>(value.clone()).map_err(|error| {
+                        ChironQlError {
+                        error: format!("this is not a valid point: {error}"),
+                        code: "chironql.invalid_point".into(),
+                        hint: Some(
+                            "A point needs an id and a vector: {id: 'chunk-1', vector: [1,0,0]}."
+                                .into(),
+                        ),
+                        position: None,
+                        affected_estimate: None,
+                        query_id: query_id.into(),
+                        trace: None,
+                    }
+                    })?,
+                );
+            }
+            (points, Vec::new())
+        }
+        TransactionVector::DeletePoints { ids, .. } => (Vec::new(), ids.clone()),
+    };
+    let point_count = points.len();
+    let point_delete_count = point_deletes.len();
+    let mut relations = Vec::new();
+    let mut edge_deletes = Vec::new();
+    let mut edge_updates = Vec::new();
+    for mutation in &transaction.graph {
+        match mutation {
+            TransactionGraph::CreateRelation { .. } => {
+                unreachable!("CREATE is routed to the protected executor")
+            }
+            TransactionGraph::Relate(relation) => relations.push(RelateRequest {
+                source_point_id: relation.source_id.clone(),
+                target_point_id: relation.target_id.clone(),
+                edge_type: relation.edge_type.clone(),
+                properties: relation.properties.clone(),
+                scope: GraphRelationScope::Local,
+                idempotency_key: None,
+            }),
+            TransactionGraph::Unrelate(unrelate) => edge_deletes.extend(
+                unrelate
+                    .edge_ids
+                    .iter()
+                    .cloned()
+                    .map(EdgeToken::from_encoded),
+            ),
+            TransactionGraph::UpdateEdge(update) => edge_updates.push((
+                EdgeToken::from_encoded(update.edge_id.clone()),
+                UpdateEdgeRequest {
+                    mode: if update.replace {
+                        EdgePropertyMode::Replace
+                    } else {
+                        EdgePropertyMode::Merge
+                    },
+                    properties: update.properties.clone(),
+                },
+            )),
+        }
+    }
+    let request = MultiModelTransactionRequest {
+        sql: SqlExecutionRequest {
+            statements: vec![SqlStatementRequest {
+                sql: transaction.sql.sql.clone(),
+                parameters: ctx.parameters.clone(),
+            }],
+            idempotency_key: ctx.idempotency_key.clone(),
+            retry_id: ctx.retry_id.clone(),
+        },
+        collection,
+        points,
+        point_deletes,
+        relations,
+        edge_deletes,
+        edge_updates,
+    };
+    let audit_context = chirondb_core::audit::AuditContext {
+        principal_id: ctx.tenant.actor().to_string(),
+        tenant_id: ctx.tenant.tenant_id().map(str::to_string),
+        transport: "chironql".into(),
+        request_id: Some(query_id.into()),
+    };
+    let started = Instant::now();
+    let result = ctx
+        .db
+        .execute_multimodel_transaction_with_sql_rows_owned(
+            request,
+            &ctx.tenant,
+            &audit_context,
+            transaction.expected_sql_rows,
+        )
+        .map_err(|error| {
+            engine_error_at(
+                ctx.role,
+                query_id,
+                trace,
+                started,
+                stage::ENGINE_WRITE,
+                error,
+            )
+        })?;
+    let mut bytes = 4096 + (result.edge_ids.len() as u64) * (size_of::<Value>() as u64 + 1024);
+    for edge in &result.edge_ids {
+        bytes = receiving::add(bytes, edge.capacity() as u64)
+            .map_err(|e| receiving::error(query_id, e))?;
+    }
+    if let Some(id) = &result.sql.transaction_id {
+        bytes = receiving::add(bytes, id.capacity() as u64)
+            .map_err(|e| receiving::error(query_id, e))?;
+    }
+    memory.ql(bytes, query_id)?;
+    result
+        .consume(|result| {
+            Ok({
+                let relational_affected = result
+                    .sql
+                    .results
+                    .iter()
+                    .map(|value| match value {
+                        SqlResult::Mutation { affected_rows } => *affected_rows,
+                        SqlResult::Rows { rows, .. } => rows.len() as u64,
+                        SqlResult::Definition { affected_objects } => *affected_objects,
+                        SqlResult::Explain { .. } => 0,
+                    })
+                    .sum::<u64>();
+                let affected = relational_affected
+                    .saturating_add(point_count as u64)
+                    .saturating_add(point_delete_count as u64)
+                    .saturating_add(transaction.graph.len() as u64);
+                trace.push_ok(
+                    stage::ENGINE_WRITE,
+                    micros(started),
+                    detail(
+                        ctx.role,
+                        json!({
+                            "snapshot": result.sql.snapshot,
+                            "committed": result.sql.committed,
+                            "relational": relational_affected,
+                            "points": point_count,
+                            "point_deletes": point_delete_count,
+                            "edges": transaction.graph.len(),
+                        }),
+                    ),
+                );
+                let mut response = affected_response(query_id, affected);
+                response.stats = graph_mutation_stats(result.graph, Some(affected));
+                if !result.edge_ids.is_empty() {
+                    response.columns = vec!["edge_id".into()];
+                    response.rows = result
+                        .edge_ids
+                        .into_iter()
+                        .map(|id| {
+                            Value::Object(
+                                [("edge_id".into(), Value::String(id.into_encoded()))]
+                                    .into_iter()
+                                    .collect(),
+                            )
+                        })
+                        .collect();
+                }
+                response.snapshot_id = Some(format!("multi-model:{}", result.sql.snapshot));
+                response.transaction_id = result.sql.transaction_id;
+                response.committed = Some(result.sql.committed);
+                Ok(response)
+            })
+        })
+        .map_err(|e| receiving::error(query_id, e))?
+}
+
+#[derive(Clone)]
+pub(crate) struct PipelineRows {
+    pub(crate) columns: Vec<String>,
+    pub(crate) types: HashMap<String, RelationalType>,
+    pub(crate) rows: Vec<serde_json::Map<String, Value>>,
+}
+
+fn exec_pipeline(
+    ctx: &mut ExecContext<'_>,
+    pipeline: &Pipeline,
+    query_id: &str,
+    trace: &mut QueryTrace,
+    memory: &mut QueryMemory,
+) -> ExecResult {
+    if pipeline.explain {
+        memory.ql(16384, query_id)?;
+        let mut plan = vec![
+            "operator=multimodel_pipeline".to_string(),
+            "domains=vector,relational".to_string(),
+            format!("vector_stage={}", pipeline.vector.kind_name()),
+            format!("relational_tables={}", pipeline.relational.tables.join(",")),
+            format!("joins={}", pipeline.joins.len()),
+            format!("limit={}", pipeline.limit),
+            "snapshot=multimodel_read".to_string(),
+            "memory=bounded_hash_join".to_string(),
+        ];
+        if pipeline.graph.is_some() {
+            plan[1] = "domains=vector,graph,relational".to_string();
+            plan.push("graph_stage=traverse".to_string());
+        }
+        let rows = plan.into_iter().map(|line| json!({"plan": line})).collect();
+        let mut response = rows_response(query_id, vec!["plan".into()], rows);
+        response.column_types = vec![RelationalType::Text];
+        return Ok(response);
+    }
+
+    let snapshot_started = Instant::now();
+    let snapshot = ctx
+        .db
+        .begin_multimodel_read()
+        .map_err(|error| engine_error(ctx.role, query_id, trace, snapshot_started, error))?
+        .ok_or_else(|| ChironQlError {
+            error: "a committed mutation is still publishing its storage projection".into(),
+            code: "chironql.snapshot_busy".into(),
+            hint: Some("Retry the read after the current commit finishes publication.".into()),
+            position: None,
+            affected_estimate: None,
+            query_id: query_id.into(),
+            trace: None,
+        })?;
+    let frontier = snapshot.frontier();
+    trace.push_ok(
+        stage::SNAPSHOT,
+        micros(snapshot_started),
+        detail(
+            ctx.role,
+            json!({"mode": "multimodel_read", "frontier": frontier}),
+        ),
+    );
+
+    let vector_response = dispatch(ctx, &pipeline.vector, query_id, trace, memory)?;
+    let vector_namespace = pipeline
+        .vector
+        .collection()
+        .map(str::to_owned)
+        .or_else(|| ctx.session.collection.clone())
+        .ok_or_else(|| ChironQlError {
+            error: "VECTOR stage needs a collection".into(),
+            code: "chironql.no_collection".into(),
+            hint: None,
+            position: None,
+            affected_estimate: None,
+            query_id: query_id.into(),
+            trace: None,
+        })?;
+    let vector_rows = qualify_pipeline_rows(
+        &pipeline.vector_alias,
+        vector_response,
+        Some(&vector_namespace),
+        memory,
+    )?;
+
+    let graph_rows = if let Some(graph) = &pipeline.graph {
+        memory.ql(4096 + pipeline.vector_alias.len() as u64, query_id)?;
+        let anchor_key = format!("{}.id", pipeline.vector_alias);
+        let anchor_bytes = vector_rows
+            .rows
+            .iter()
+            .try_fold(4096_u64, |bytes, row| {
+                let id = row
+                    .get(&anchor_key)
+                    .and_then(Value::as_str)
+                    .map_or(0, str::len);
+                receiving::add(bytes, size_of::<String>() as u64 + id as u64)
+            })
+            .map_err(|e| receiving::error(query_id, e))?;
+        memory.ql(anchor_bytes, query_id)?;
+        let anchors = vector_rows
+            .rows
+            .iter()
+            .filter_map(|row| {
+                row.get(&anchor_key)
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        let mut traverse = graph.traverse.clone();
+        traverse.anchors = anchors;
+        if traverse.anchors.is_empty() {
+            memory.ql(4096 + traverse.collection.len() as u64, query_id)?;
+            Some(PipelineRows {
+                columns: vec![format!("{}.record_ref", graph.alias)],
+                types: HashMap::from([(
+                    format!("{}.record_ref", graph.alias),
+                    RelationalType::RecordRef {
+                        namespace: traverse.collection.clone(),
+                    },
+                )]),
+                rows: Vec::new(),
+            })
+        } else {
+            let response = exec_traverse(ctx, &traverse, query_id, trace, memory)?;
+            memory
+                .response(&response)
+                .map_err(|e| receiving::error(query_id, e))?;
+            Some(qualify_pipeline_rows(
+                &graph.alias,
+                response,
+                Some(&traverse.collection),
+                memory,
+            )?)
+        }
+    } else {
+        None
+    };
+
+    let relational_response = exec_sql(ctx, &pipeline.relational, query_id, trace, memory)?;
+    let relational_snapshot = relational_response.snapshot_id.clone();
+    let relational_rows = qualify_pipeline_rows(
+        &pipeline.relational_alias,
+        relational_response,
+        None,
+        memory,
+    )?;
+
+    let mut response = assemble_pipeline_response(
+        pipeline,
+        vector_rows,
+        graph_rows,
+        relational_rows,
+        query_id,
+        trace,
+        ctx.role,
+        memory,
+    )?;
+    let snapshot_valid = snapshot
+        .validate()
+        .map_err(|error| engine_error(ctx.role, query_id, trace, snapshot_started, error))?;
+    if !snapshot_valid {
+        return Err(ChironQlError {
+            error: "the multi-model visibility frontier changed during execution".into(),
+            code: "chironql.snapshot_changed".into(),
+            hint: Some("Retry the query; no partial rows were published.".into()),
+            position: None,
+            affected_estimate: None,
+            query_id: query_id.into(),
+            trace: None,
+        });
+    }
+    trace.push_ok(
+        stage::AUTHORIZATION_RECHECK,
+        micros(snapshot_started),
+        detail(ctx.role, json!({"frontier": frontier})),
+    );
+    let relational_snapshot = relational_snapshot.unwrap_or_else(|| "relational:unknown".into());
+    response.snapshot_id = Some(format!("multimodel:{frontier}:{relational_snapshot}"));
+    Ok(response)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn assemble_pipeline_response(
+    pipeline: &Pipeline,
+    vector_rows: PipelineRows,
+    graph_rows: Option<PipelineRows>,
+    relational_rows: PipelineRows,
+    query_id: &str,
+    trace: &mut QueryTrace,
+    role: Role,
+    memory: &mut QueryMemory,
+) -> ExecResult {
+    memory.ql(
+        4096 + pipeline.relational_alias.len() as u64
+            + pipeline.graph.as_ref().map_or(0, |graph| graph.alias.len()) as u64,
+        query_id,
+    )?;
+    let mut sources = HashMap::new();
+    sources
+        .try_reserve(2)
+        .map_err(|_| receiving::error(query_id, receiving::full()))?;
+    sources.insert(pipeline.relational_alias.clone(), relational_rows);
+    if let (Some(graph), Some(rows)) = (&pipeline.graph, graph_rows) {
+        sources.insert(graph.alias.clone(), rows);
+    }
+    let mut joined = vector_rows;
+    for join in &pipeline.joins {
+        let join_started = Instant::now();
+        let right = sources.remove(&join.alias).ok_or_else(|| ChironQlError {
+            error: format!(
+                "stage {} is joined more than once or is not available",
+                join.alias
+            ),
+            code: "chironql.invalid_pipeline_join".into(),
+            hint: None,
+            position: None,
+            affected_estimate: None,
+            query_id: query_id.into(),
+            trace: None,
+        })?;
+        joined = join_pipeline_rows(joined, right, join, query_id, memory)?;
+        trace.push_ok(
+            stage::JOIN,
+            micros(join_started),
+            detail(
+                role,
+                json!({"alias": join.alias, "rows": joined.rows.len()}),
+            ),
+        );
+    }
+    if !sources.is_empty() {
+        return Err(ChironQlError {
+            error: "every pipeline stage must be joined exactly once".into(),
+            code: "chironql.missing_join".into(),
+            hint: None,
+            position: None,
+            affected_estimate: None,
+            query_id: query_id.into(),
+            trace: None,
+        });
+    }
+
+    if let Some((field, ascending)) = &pipeline.order_by {
+        memory.ql(
+            (joined.rows.len() as u64)
+                .checked_mul(2 * size_of::<(serde_json::Map<String, Value>, JsonKey)>() as u64)
+                .and_then(|n| n.checked_add(4096))
+                .ok_or_else(|| receiving::error(query_id, receiving::full()))?,
+            query_id,
+        )?;
+        let key = pipeline_field_key(field);
+        let mut keyed = Vec::new();
+        keyed
+            .try_reserve_exact(joined.rows.len())
+            .map_err(|_| receiving::error(query_id, receiving::full()))?;
+        for row in joined.rows {
+            memory.check().map_err(|e| receiving::error(query_id, e))?;
+            let encoded = JsonKey::new(row.get(&key).unwrap_or(&Value::Null))
+                .map_err(|e| receiving::error(query_id, e))?;
+            keyed.push((row, encoded));
+        }
+        keyed.sort_by(|(left, left_key), (right, right_key)| {
+            let ordering = compare_json(
+                left.get(&key).unwrap_or(&Value::Null),
+                right.get(&key).unwrap_or(&Value::Null),
+                left_key.text(),
+                right_key.text(),
+            );
+            if *ascending {
+                ordering
+            } else {
+                ordering.reverse()
+            }
+        });
+        let mut sorted = Vec::new();
+        sorted
+            .try_reserve_exact(keyed.len())
+            .map_err(|_| receiving::error(query_id, receiving::full()))?;
+        for (row, _) in keyed {
+            sorted.push(row);
+        }
+        joined.rows = sorted;
+    }
+    let width = pipeline.projection.len();
+    let mut metadata = 4096_u64
+        + (width as u64)
+            * (4 * size_of::<String>() as u64 + size_of::<RelationalType>() as u64 + 512);
+    for field in &pipeline.projection {
+        metadata = receiving::add(
+            metadata,
+            8 * (field.alias.len() + field.field.len() + 1) as u64,
+        )
+        .map_err(|e| receiving::error(query_id, e))?;
+    }
+    for data_type in joined.types.values() {
+        metadata = receiving::add(metadata, receiving::type_heap(data_type))
+            .map_err(|e| receiving::error(query_id, e))?;
+    }
+    memory.ql(metadata, query_id)?;
+    let projection_keys = pipeline
+        .projection
+        .iter()
+        .map(pipeline_field_key)
+        .collect::<Vec<_>>();
+    let mut labels = HashSet::new();
+    let columns = pipeline
+        .projection
+        .iter()
+        .map(|field| {
+            if labels.insert(field.field.clone()) {
+                field.field.clone()
+            } else {
+                pipeline_field_key(field)
+            }
+        })
+        .collect::<Vec<_>>();
+    let column_types = pipeline
+        .projection
+        .iter()
+        .map(|field| {
+            joined
+                .types
+                .get(&pipeline_field_key(field))
+                .cloned()
+                .ok_or_else(|| ChironQlError {
+                    error: format!(
+                        "pipeline projection {} has no stable public type",
+                        pipeline_field_key(field)
+                    ),
+                    code: "chironql.pipeline_untyped_projection".into(),
+                    hint: Some("Project typed scalar, RECORD_REF, score, or depth fields.".into()),
+                    position: None,
+                    affected_estimate: None,
+                    query_id: query_id.into(),
+                    trace: None,
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let count = joined.rows.len().min(pipeline.limit);
+    let mut bytes = (count as u64) * size_of::<Value>() as u64;
+    for row in joined.rows.iter().take(count) {
+        memory.check().map_err(|e| receiving::error(query_id, e))?;
+        for (column, key) in columns.iter().zip(&projection_keys) {
+            bytes = receiving::add(bytes, 1024 + column.capacity() as u64)
+                .map_err(|e| receiving::error(query_id, e))?;
+            if let Some(value) = row.get(key) {
+                bytes = receiving::add(
+                    bytes,
+                    memory
+                        .json_heap(value)
+                        .map_err(|e| receiving::error(query_id, e))?,
+                )
+                .map_err(|e| receiving::error(query_id, e))?;
+            }
+        }
+    }
+    memory.ql(bytes, query_id)?;
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(count)
+        .map_err(|_| receiving::error(query_id, receiving::full()))?;
+    for row in joined.rows.into_iter().take(count) {
+        memory.check().map_err(|e| receiving::error(query_id, e))?;
+        rows.push(Value::Object(
+            columns
+                .iter()
+                .cloned()
+                .zip(
+                    projection_keys
+                        .iter()
+                        .map(|key| row.get(key).cloned().unwrap_or(Value::Null)),
+                )
+                .collect(),
+        ));
+    }
+    let mut response = rows_response(query_id, columns, rows);
+    response.column_types = column_types;
+    Ok(response)
+}
+
+pub(crate) fn qualify_pipeline_rows(
+    alias: &str,
+    response: ChironQlResponse,
+    record_namespace: Option<&str>,
+    memory: &mut QueryMemory,
+) -> Result<PipelineRows, ChironQlError> {
+    let mut bytes = 4096_u64
+        + (response.rows.len() as u64) * size_of::<serde_json::Map<String, Value>>() as u64
+        + (response.columns.len() as u64) * 512;
+    for column in &response.columns {
+        bytes = receiving::add(bytes, 8 * (alias.len() + column.len() + 1) as u64)
+            .map_err(|e| receiving::error(&response.query_id, e))?;
+    }
+    for value in &response.rows {
+        memory
+            .check()
+            .map_err(|e| receiving::error(&response.query_id, e))?;
+        if let Value::Object(row) = value {
+            for key in row.keys() {
+                bytes = receiving::add(bytes, 1024 + 2 * (alias.len() + key.len() + 1) as u64)
+                    .map_err(|e| receiving::error(&response.query_id, e))?;
+            }
+            if let Some(namespace) = record_namespace {
+                bytes = receiving::add(
+                    bytes,
+                    4096 + namespace.len() as u64
+                        + row.get("id").and_then(Value::as_str).map_or(0, str::len) as u64,
+                )
+                .map_err(|e| receiving::error(&response.query_id, e))?;
+            }
+        }
+    }
+    memory.ql(bytes, &response.query_id)?;
+    let mut columns = response
+        .columns
+        .iter()
+        .map(|column| format!("{alias}.{column}"))
+        .collect::<Vec<_>>();
+    let mut types = response
+        .columns
+        .iter()
+        .zip(response.column_types)
+        .map(|(column, data_type)| (format!("{alias}.{column}"), data_type))
+        .collect::<HashMap<_, _>>();
+    if response.columns.iter().any(|column| column == "score") {
+        types.insert(format!("{alias}.score"), RelationalType::Float);
+    }
+    if response.columns.iter().any(|column| column == "depth") {
+        types.insert(format!("{alias}.depth"), RelationalType::Integer);
+    }
+    if response.columns.iter().any(|column| column == "id") {
+        types.insert(format!("{alias}.id"), RelationalType::Text);
+    }
+    if let Some(namespace) = record_namespace {
+        columns.push(format!("{alias}.record_ref"));
+        types.insert(
+            format!("{alias}.record_ref"),
+            RelationalType::RecordRef {
+                namespace: namespace.to_string(),
+            },
+        );
+    }
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(response.rows.len())
+        .map_err(|_| receiving::error(&response.query_id, receiving::full()))?;
+    for value in response.rows {
+        memory
+            .check()
+            .map_err(|e| receiving::error(&response.query_id, e))?;
+        let Value::Object(object) = value else {
+            return Err(ChironQlError {
+                error: "pipeline stage returned a non-object row".into(),
+                code: "chironql.engine_error".into(),
+                hint: None,
+                position: None,
+                affected_estimate: None,
+                query_id: response.query_id,
+                trace: None,
+            });
+        };
+        let record = record_namespace.and_then(|namespace| {
+            object.get("id").and_then(Value::as_str).map(|id| {
+                Value::Object(
+                    [
+                        ("namespace".into(), Value::String(namespace.into())),
+                        ("id".into(), Value::String(id.into())),
+                    ]
+                    .into_iter()
+                    .collect(),
+                )
+            })
+        });
+        let mut qualified = object
+            .into_iter()
+            .map(|(key, value)| (format!("{alias}.{key}"), value))
+            .collect::<serde_json::Map<_, _>>();
+        if let Some(record) = record {
+            qualified.insert(format!("{alias}.record_ref"), record);
+        }
+        rows.push(qualified);
+    }
+    Ok(PipelineRows {
+        columns,
+        types,
+        rows,
+    })
+}
+
+fn join_pipeline_rows(
+    left: PipelineRows,
+    right: PipelineRows,
+    join: &crate::chironql_parser::PipelineJoin,
+    query_id: &str,
+    memory: &mut QueryMemory,
+) -> Result<PipelineRows, ChironQlError> {
+    const MAX_PIPELINE_CELLS: usize = 1_000_000;
+    let left_key = pipeline_field_key(&join.left);
+    let right_key = pipeline_field_key(&join.right);
+    let (left_key, right_key) = if right.columns.contains(&right_key) {
+        (left_key, right_key)
+    } else if right.columns.contains(&left_key) {
+        (right_key, left_key)
+    } else {
+        return Err(ChironQlError {
+            error: "join must compare one previously joined field with the named stage".into(),
+            code: "chironql.invalid_pipeline_join".into(),
+            hint: None,
+            position: None,
+            affected_estimate: None,
+            query_id: query_id.into(),
+            trace: None,
+        });
+    };
+    if left.types.get(&left_key) != right.types.get(&right_key) {
+        return Err(ChironQlError {
+            error: format!("join fields {left_key} and {right_key} have different types"),
+            code: "chironql.pipeline_type_mismatch".into(),
+            hint: Some("Join RECORD_REF values with the same namespace.".into()),
+            position: None,
+            affected_estimate: None,
+            query_id: query_id.into(),
+            trace: None,
+        });
+    }
+    let width = left.columns.len() + right.columns.len();
+    let input_cells = left
+        .rows
+        .len()
+        .saturating_add(right.rows.len())
+        .saturating_mul(width);
+    if input_cells > MAX_PIPELINE_CELLS {
+        return Err(ChironQlError {
+            error: "pipeline join exceeds its bounded memory budget".into(),
+            code: "chironql.resource_exhausted".into(),
+            hint: Some("Reduce VECTOR, GRAPH, or final LIMIT.".into()),
+            position: None,
+            affected_estimate: None,
+            query_id: query_id.into(),
+            trace: None,
+        });
+    }
+    let buckets = right
+        .rows
+        .len()
+        .checked_next_power_of_two()
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| receiving::error(query_id, receiving::full()))?;
+    memory.ql(
+        (buckets as u64)
+            * (size_of::<(JsonKey, Vec<&serde_json::Map<String, Value>>)>() as u64 + 64)
+            + (right.rows.len() as u64) * 6 * size_of::<&serde_json::Map<String, Value>>() as u64
+            + 4096,
+        query_id,
+    )?;
+    // Equality and hashing read only immutable text; the retained lease never
+    // participates in the key.
+    #[allow(clippy::mutable_key_type)]
+    let mut right_index: HashMap<JsonKey, Vec<&serde_json::Map<String, Value>>> = HashMap::new();
+    right_index
+        .try_reserve(right.rows.len())
+        .map_err(|_| receiving::error(query_id, receiving::full()))?;
+    for row in &right.rows {
+        let Some(value) = row.get(&right_key).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        memory.check().map_err(|e| receiving::error(query_id, e))?;
+        let key = JsonKey::new(value).map_err(|e| receiving::error(query_id, e))?;
+        let group = right_index.entry(key).or_default();
+        group
+            .try_reserve(1)
+            .map_err(|_| receiving::error(query_id, receiving::full()))?;
+        group.push(row);
+    }
+    let mut rows = Vec::new();
+    for left_row in left.rows {
+        memory.check().map_err(|e| receiving::error(query_id, e))?;
+        let mut matched = false;
+        if let Some(value) = left_row.get(&left_key).filter(|value| !value.is_null())
+            && let Some(matches) =
+                right_index.get(&JsonKey::new(value).map_err(|e| receiving::error(query_id, e))?)
+        {
+            for right_row in matches {
+                if rows.len().saturating_add(1).saturating_mul(width) > MAX_PIPELINE_CELLS {
+                    return Err(ChironQlError {
+                        error: "pipeline join result exceeds its bounded memory budget".into(),
+                        code: "chironql.resource_exhausted".into(),
+                        hint: Some("Reduce VECTOR, GRAPH, or final LIMIT.".into()),
+                        position: None,
+                        affected_estimate: None,
+                        query_id: query_id.into(),
+                        trace: None,
+                    });
+                }
+                admit_join_row(memory, &left_row, Some(right_row), &right.columns, query_id)?;
+                rows.try_reserve(1)
+                    .map_err(|_| receiving::error(query_id, receiving::full()))?;
+                matched = true;
+                let mut combined = left_row.clone();
+                combined.extend((*right_row).clone());
+                rows.push(combined);
+            }
+        }
+        if !matched && join.kind == PipelineJoinKind::Left {
+            admit_join_row(memory, &left_row, None, &right.columns, query_id)?;
+            rows.try_reserve(1)
+                .map_err(|_| receiving::error(query_id, receiving::full()))?;
+            let mut combined = left_row;
+            for column in &right.columns {
+                combined.insert(column.clone(), Value::Null);
+            }
+            rows.push(combined);
+        }
+    }
+    let schema = 4096
+        + (width as u64)
+            * 6
+            * (size_of::<String>() as u64 + size_of::<RelationalType>() as u64 + 64);
+    memory.ql(schema, query_id)?;
+    let mut columns = left.columns;
+    columns
+        .try_reserve_exact(right.columns.len())
+        .map_err(|_| receiving::error(query_id, receiving::full()))?;
+    columns.extend(right.columns);
+    let mut types = left.types;
+    types
+        .try_reserve(right.types.len())
+        .map_err(|_| receiving::error(query_id, receiving::full()))?;
+    types.extend(right.types);
+    Ok(PipelineRows {
+        columns,
+        types,
+        rows,
+    })
+}
+
+fn admit_join_row(
+    memory: &mut QueryMemory,
+    left: &serde_json::Map<String, Value>,
+    right: Option<&&serde_json::Map<String, Value>>,
+    columns: &[String],
+    query_id: &str,
+) -> Result<(), ChironQlError> {
+    let mut bytes = 6 * size_of::<serde_json::Map<String, Value>>() as u64;
+    for (key, value) in left
+        .iter()
+        .chain(right.into_iter().flat_map(|row| row.iter()))
+    {
+        bytes = receiving::add(bytes, 1024 + key.capacity() as u64)
+            .and_then(|n| receiving::add(n, memory.json_heap(value)?))
+            .map_err(|e| receiving::error(query_id, e))?;
+    }
+    if right.is_none() {
+        for column in columns {
+            bytes = receiving::add(bytes, 1024 + column.capacity() as u64)
+                .map_err(|e| receiving::error(query_id, e))?;
+        }
+    }
+    memory.ql(bytes, query_id)
+}
+
+fn pipeline_field_key(field: &PipelineField) -> String {
+    format!("{}.{}", field.alias, field.field)
+}
+
+fn compare_json(left: &Value, right: &Value, left_encoded: &str, right_encoded: &str) -> Ordering {
+    match (left, right) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Greater,
+        (_, Value::Null) => Ordering::Less,
+        (Value::Number(left), Value::Number(right)) => {
+            match (left.as_i64(), right.as_i64(), left.as_u64(), right.as_u64()) {
+                (Some(left), Some(right), _, _) => left.cmp(&right),
+                (_, _, Some(left), Some(right)) => left.cmp(&right),
+                (Some(left), None, _, Some(_)) if left < 0 => Ordering::Less,
+                (None, Some(right), Some(_), _) if right < 0 => Ordering::Greater,
+                _ => left
+                    .as_f64()
+                    .partial_cmp(&right.as_f64())
+                    .unwrap_or(Ordering::Equal),
+            }
+        }
+        (Value::String(left), Value::String(right)) => left.cmp(right),
+        _ => left_encoded.cmp(right_encoded),
+    }
+}
+
+fn exec_sql(
+    ctx: &mut ExecContext<'_>,
+    statement: &crate::chironql_parser::SqlStatement,
+    query_id: &str,
+    trace: &mut QueryTrace,
+    memory: &mut QueryMemory,
+) -> ExecResult {
+    if ctx.db.identity_authority().is_some() {
+        return Err(ChironQlError {
+            error: "native relational SQL requires a protected authorization context".into(),
+            code: "chironql.protected_unsupported".into(),
+            hint: Some(
+                "Use the authenticated protected ChironQL, HTTP, gRPC, or ChironWire route.".into(),
+            ),
+            position: None,
+            affected_estimate: None,
+            query_id: query_id.into(),
+            trace: None,
+        });
+    }
+    let request = SqlExecutionRequest {
+        statements: vec![SqlStatementRequest {
+            sql: statement.sql.clone(),
+            parameters: ctx.parameters.clone(),
+        }],
+        idempotency_key: ctx.idempotency_key.clone(),
+        retry_id: ctx.retry_id.clone(),
+    };
+    let audit_context = chirondb_core::audit::AuditContext {
+        principal_id: ctx.tenant.actor().to_string(),
+        tenant_id: ctx.tenant.tenant_id().map(str::to_string),
+        transport: "chironql".into(),
+        request_id: ctx.retry_id.clone(),
+    };
+    let started = Instant::now();
+    let result = ctx
+        .db
+        .execute_sql_with_audit_owned(request, &audit_context)
+        .map_err(|error| engine_error(ctx.role, query_id, trace, started, error))?;
+    trace.push_ok(
+        if statement.class == StatementClass::Read {
+            stage::RELATIONAL_SCAN
+        } else {
+            stage::ENGINE_WRITE
+        },
+        micros(started),
+        detail(
+            ctx.role,
+            json!({"snapshot": result.snapshot, "committed": result.committed}),
+        ),
+    );
+
+    sql_execution_admitted(result, query_id, memory)
+}
+
+pub(crate) fn sql_execution_admitted(
+    result: crate::SqlResponse,
+    query_id: &str,
+    memory: &mut QueryMemory,
+) -> ExecResult {
+    memory
+        .sql(&result)
+        .map_err(|e| receiving::error(query_id, e))?;
+    result
+        .consume(|value| Ok(sql_execution_response(value, query_id)))
+        .map_err(|e| receiving::error(query_id, e))?
+}
+
+pub(crate) fn sql_execution_response(
+    result: chirondb_core::SqlExecutionResponse,
+    query_id: &str,
+) -> ExecResult {
+    if !result.committed && matches!(result.outcome, chirondb_core::SqlOutcome::Rejected) {
+        let mut response = empty_response(query_id);
+        response.transaction_id = result.transaction_id;
+        response.committed = Some(false);
+        return Ok(response);
+    }
+    let sql_result = result
+        .results
+        .into_iter()
+        .next()
+        .ok_or_else(|| ChironQlError {
+            error: "relational executor returned no result".into(),
+            code: "chironql.engine_error".into(),
+            hint: None,
+            position: None,
+            affected_estimate: None,
+            query_id: query_id.into(),
+            trace: None,
+        })?;
+    let mut response = match sql_result {
+        SqlResult::Definition { affected_objects } => affected_response(query_id, affected_objects),
+        SqlResult::Mutation { affected_rows } => affected_response(query_id, affected_rows),
+        SqlResult::Rows {
+            columns,
+            column_types,
+            rows,
+        } => {
+            let mut json_rows = Vec::new();
+            json_rows
+                .try_reserve_exact(rows.len())
+                .map_err(|_| receiving::error(query_id, receiving::full()))?;
+            for row in rows {
+                let object = columns
+                    .iter()
+                    .cloned()
+                    .zip(row.into_iter().map(relational_value_json))
+                    .collect();
+                json_rows.push(Value::Object(object));
+            }
+            let mut response = rows_response(query_id, columns, json_rows);
+            response.column_types = column_types;
+            response
+        }
+        SqlResult::Explain { plan } => {
+            let rows = plan.into_iter().map(|line| json!({"plan": line})).collect();
+            let mut response = rows_response(query_id, vec!["plan".into()], rows);
+            response.column_types = vec![RelationalType::Text];
+            response
+        }
+    };
+    response.snapshot_id = Some(format!("relational:{}", result.snapshot));
+    response.transaction_id = result.transaction_id;
+    response.committed = Some(result.committed);
+    Ok(response)
+}
+
+fn relational_value_json(value: RelationalValue) -> Value {
+    match value {
+        RelationalValue::Null => Value::Null,
+        RelationalValue::Boolean(value) => json!(value),
+        RelationalValue::Integer(value) => json!(value),
+        RelationalValue::Float(value) => json!(value),
+        RelationalValue::Decimal(value)
+        | RelationalValue::Text(value)
+        | RelationalValue::Date(value)
+        | RelationalValue::TimestampUtc(value) => Value::String(value),
+        RelationalValue::Bytes(value) => json!(value),
+        RelationalValue::Uuid(value) => json!(value.to_string()),
+        RelationalValue::Json(value) => value,
+        RelationalValue::Vector(value) => json!(value),
+        RelationalValue::RecordRef(value) => Value::Object(
+            [
+                ("namespace".into(), Value::String(value.namespace)),
+                ("id".into(), Value::String(value.id)),
+            ]
+            .into_iter()
+            .collect(),
+        ),
     }
 }
 
@@ -680,6 +1847,7 @@ fn exec_search(
     search: &Search,
     query_id: &str,
     trace: &mut QueryTrace,
+    memory: &mut QueryMemory,
 ) -> ExecResult {
     let collection = resolve_collection(ctx, search.collection.as_deref(), query_id, trace)?;
     let vector_expr = search
@@ -719,12 +1887,7 @@ fn exec_search(
         .map_err(|error| engine_error(ctx.role, query_id, trace, started, error))?;
     push_search_stage(ctx.role, trace, started, &response);
 
-    Ok(hits_response(
-        query_id,
-        &response,
-        search.recall_target,
-        trace,
-    ))
+    hits_response(query_id, response, search.recall_target, trace, memory)
 }
 
 fn exec_hybrid(
@@ -732,6 +1895,7 @@ fn exec_hybrid(
     hybrid: &Hybrid,
     query_id: &str,
     trace: &mut QueryTrace,
+    memory: &mut QueryMemory,
 ) -> ExecResult {
     let collection = resolve_collection(ctx, hybrid.collection.as_deref(), query_id, trace)?;
     let vector = match hybrid.vector.as_ref() {
@@ -747,6 +1911,27 @@ fn exec_hybrid(
     };
     let filter = record_filter(trace, ctx.role, hybrid.filter.as_ref());
 
+    if let Some(text) = &hybrid.text {
+        let started = Instant::now();
+        let response = ctx
+            .db
+            .text_hybrid_search_scoped(
+                &collection,
+                crate::TextHybridSearchRequest {
+                    vector: vector.unwrap_or_default(),
+                    query: text.query.clone(),
+                    text_field: text.field.clone(),
+                    k: hybrid.limit.unwrap_or(10),
+                    filter,
+                    budget_ms: hybrid.budget_ms,
+                },
+                &ctx.tenant,
+            )
+            .map_err(|error| engine_error(ctx.role, query_id, trace, started, error))?;
+        push_search_stage(ctx.role, trace, started, &response);
+        return hits_response(query_id, response, None, trace, memory);
+    }
+
     let request = HybridSearchRequest {
         graph: hybrid
             .graph
@@ -757,7 +1942,7 @@ fn exec_hybrid(
         sparse_vector: hybrid.sparse.clone(),
         k: hybrid.limit.unwrap_or(10),
         filter,
-        budget_ms: None,
+        budget_ms: hybrid.budget_ms,
         fusion: hybrid.fusion.unwrap_or_default(),
         dense_weight: hybrid.dense_weight.unwrap_or(1.0),
         sparse_weight: hybrid.sparse_weight.unwrap_or(1.0),
@@ -770,7 +1955,7 @@ fn exec_hybrid(
         .map_err(|error| engine_error(ctx.role, query_id, trace, started, error))?;
     push_search_stage(ctx.role, trace, started, &response);
 
-    Ok(hits_response(query_id, &response, None, trace))
+    hits_response(query_id, response, None, trace, memory)
 }
 
 fn exec_multi(
@@ -778,6 +1963,7 @@ fn exec_multi(
     multi: &Multi,
     query_id: &str,
     trace: &mut QueryTrace,
+    memory: &mut QueryMemory,
 ) -> ExecResult {
     let collection = resolve_collection(ctx, multi.collection.as_deref(), query_id, trace)?;
     let filter = record_filter(trace, ctx.role, multi.filter.as_ref());
@@ -827,28 +2013,25 @@ fn exec_multi(
     // returns one result set per branch. Either way the first result set is
     // what a terminal wants to show, and the trace says how many there were.
     let fuse_started = Instant::now();
+    let result_sets = response.results.len();
     let hits = response
         .results
-        .first()
-        .map(|result| result.hits.clone())
+        .into_iter()
+        .next()
+        .map(|result| result.hits)
         .unwrap_or_default();
     trace.push_ok(
         stage::FUSE,
         micros(fuse_started),
         detail(
             ctx.role,
-            json!({"fusion": multi.fusion, "result_sets": response.results.len()}),
+            json!({"fusion": multi.fusion, "result_sets": result_sets}),
         ),
     );
-
     let render_started = Instant::now();
-    let rows = hits
-        .iter()
-        .map(|hit| json!({"id": hit.id, "score": hit.score, "payload": hit.payload}))
-        .collect();
+    let mut result =
+        retrieval::hits(hits, query_id, memory).map_err(|e| receiving::error(query_id, e))?;
     trace.push_ok(stage::RENDER, micros(render_started), None);
-
-    let mut result = rows_response(query_id, hit_columns(), rows);
     result.stats.searched = Some(searched);
     result.stats.degraded = Some(degraded);
     Ok(result)
@@ -859,6 +2042,7 @@ fn exec_recommend(
     recommend: &Recommend,
     query_id: &str,
     trace: &mut QueryTrace,
+    memory: &mut QueryMemory,
 ) -> ExecResult {
     let collection = resolve_collection(ctx, recommend.collection.as_deref(), query_id, trace)?;
     let filter = record_filter(trace, ctx.role, recommend.filter.as_ref());
@@ -879,7 +2063,7 @@ fn exec_recommend(
         .map_err(|error| engine_error(ctx.role, query_id, trace, started, error))?;
     push_search_stage(ctx.role, trace, started, &response);
 
-    Ok(hits_response(query_id, &response, None, trace))
+    hits_response(query_id, response, None, trace, memory)
 }
 
 fn exec_scroll(
@@ -887,6 +2071,7 @@ fn exec_scroll(
     scroll: &Scroll,
     query_id: &str,
     trace: &mut QueryTrace,
+    memory: &mut QueryMemory,
 ) -> ExecResult {
     let collection = resolve_collection(ctx, scroll.collection.as_deref(), query_id, trace)?;
     let filter = record_filter(trace, ctx.role, scroll.filter.as_ref());
@@ -909,11 +2094,15 @@ fn exec_scroll(
     );
 
     let render_started = Instant::now();
-    let rows = response.points.iter().map(point_row).collect();
+    let result = retrieval::points(
+        response.points,
+        response.next_offset,
+        false,
+        query_id,
+        memory,
+    )
+    .map_err(|e| receiving::error(query_id, e))?;
     trace.push_ok(stage::RENDER, micros(render_started), None);
-
-    let mut result = rows_response(query_id, point_columns(), rows);
-    result.next = response.next_offset;
     Ok(result)
 }
 
@@ -922,6 +2111,7 @@ fn exec_get(
     get: &Get,
     query_id: &str,
     trace: &mut QueryTrace,
+    memory: &mut QueryMemory,
 ) -> ExecResult {
     let collection = resolve_collection(ctx, get.collection.as_deref(), query_id, trace)?;
 
@@ -940,10 +2130,10 @@ fn exec_get(
     );
 
     let render_started = Instant::now();
-    let rows = points.iter().map(point_row).collect();
+    let result = retrieval::points(points, None, false, query_id, memory)
+        .map_err(|e| receiving::error(query_id, e))?;
     trace.push_ok(stage::RENDER, micros(render_started), None);
-
-    Ok(rows_response(query_id, point_columns(), rows))
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -1297,6 +2487,7 @@ fn exec_traverse(
     traverse: &Traverse,
     query_id: &str,
     trace: &mut QueryTrace,
+    memory: &mut QueryMemory,
 ) -> ExecResult {
     let collection = resolve_collection(ctx, Some(&traverse.collection), query_id, trace)?;
     let defaults = TraversalBudget::default();
@@ -1350,59 +2541,10 @@ fn exec_traverse(
     );
 
     let render_started = Instant::now();
-    let (columns, rows) = match response.result {
-        GraphTraversalRows::Nodes(rows) => {
-            let mut columns = vec!["id".to_string(), "depth".to_string()];
-            if traverse.with_payload {
-                columns.push("payload".to_string());
-            }
-            (
-                columns,
-                rows.into_iter().map(|row| json!(row)).collect::<Vec<_>>(),
-            )
-        }
-        GraphTraversalRows::Edges(rows) => {
-            let mut columns = vec![
-                "id".to_string(),
-                "source".to_string(),
-                "target".to_string(),
-                "type".to_string(),
-            ];
-            if traverse.with_payload {
-                columns.push("properties".to_string());
-            }
-            (
-                columns,
-                rows.into_iter().map(|row| json!(row)).collect::<Vec<_>>(),
-            )
-        }
-        GraphTraversalRows::Paths(rows) => (
-            vec!["nodes".to_string(), "edges".to_string()],
-            rows.into_iter()
-                .map(|row| json!({"nodes": row.nodes, "edges": row.edges}))
-                .collect::<Vec<_>>(),
-        ),
-    };
+    let result = retrieval::graph(response, traverse.with_payload, query_id, memory)
+        .map_err(|e| receiving::error(query_id, e))?;
     trace.push_ok(stage::RENDER, micros(render_started), None);
-    Ok(ChironQlResponse {
-        kind: ChironQlKind::Rows,
-        columns,
-        rows,
-        stats: ChironQlStats {
-            graph_epoch: Some(response.graph_epoch.raw()),
-            truncation: response.truncation,
-            warnings: response
-                .warnings
-                .into_iter()
-                .map(graph_warning_code)
-                .map(str::to_string)
-                .collect(),
-            ..ChironQlStats::default()
-        },
-        next: None,
-        query_id: query_id.to_string(),
-        trace: None,
-    })
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -1411,12 +2553,14 @@ fn exec_traverse(
 
 fn required_graph_capability(statement: &Statement) -> Option<GraphCapability> {
     match statement {
+        Statement::Transaction(_) => Some(GraphCapability::Write),
         Statement::Relate(_) | Statement::Unrelate(_) | Statement::UpdateEdge(_) => {
             Some(GraphCapability::Write)
         }
         Statement::Traverse(_) => Some(GraphCapability::Read),
         Statement::Search(search) if search.graph.is_some() => Some(GraphCapability::Read),
         Statement::Hybrid(hybrid) if hybrid.graph.is_some() => Some(GraphCapability::Read),
+        Statement::Pipeline(pipeline) if pipeline.graph.is_some() => Some(GraphCapability::Read),
         _ => None,
     }
 }
@@ -1524,6 +2668,27 @@ fn resolve_vector(
 ) -> Result<Vec<f32>, ChironQlError> {
     match expr {
         VectorExpr::Literal(values) => Ok(values.clone()),
+        VectorExpr::Parameter(index) => match ctx.parameters.get(*index) {
+            Some(RelationalValue::Vector(values)) => Ok(values.clone()),
+            Some(_) => Err(ChironQlError {
+                error: format!("parameter ${} must be a vector", index + 1),
+                code: "chironql.parameter_type".into(),
+                hint: Some("Bind a typed vector value for a NEAR parameter.".into()),
+                position: None,
+                affected_estimate: None,
+                query_id: query_id.into(),
+                trace: None,
+            }),
+            None => Err(ChironQlError {
+                error: format!("missing parameter ${}", index + 1),
+                code: "chironql.missing_parameter".into(),
+                hint: None,
+                position: None,
+                affected_estimate: None,
+                query_id: query_id.into(),
+                trace: None,
+            }),
+        },
         VectorExpr::Point { id, vector_name } => {
             let started = Instant::now();
             let wanted = vector_name.as_deref().or(clause_vector_name);
@@ -1660,78 +2825,70 @@ fn push_search_stage(
 // Rendering
 // ---------------------------------------------------------------------------
 
-fn hit_columns() -> Vec<String> {
-    vec!["id".to_string(), "score".to_string(), "payload".to_string()]
-}
-
-fn point_columns() -> Vec<String> {
-    vec!["id".to_string(), "payload".to_string()]
-}
-
-/// Points render without their vectors. A terminal has no use for 960 floats,
-/// and a JSON pipe can fetch them from the REST API deliberately.
-fn point_row(point: &Point) -> Value {
-    json!({"id": point.id, "payload": point.payload})
-}
-
 fn hits_response(
     query_id: &str,
-    response: &SearchResponse,
+    response: SearchResponse,
     recall_target: Option<f32>,
     trace: &mut QueryTrace,
-) -> ChironQlResponse {
+    memory: &mut QueryMemory,
+) -> ExecResult {
     let render_started = Instant::now();
-    let rows = response
-        .hits
-        .iter()
-        .map(|hit| json!({"id": hit.id, "score": hit.score, "payload": hit.payload}))
-        .collect();
-    trace.push_ok(stage::RENDER, micros(render_started), None);
-
-    ChironQlResponse {
-        kind: ChironQlKind::Rows,
-        columns: hit_columns(),
-        rows,
-        stats: ChironQlStats {
-            took_ms: 0.0,
-            searched: Some(response.searched),
-            degraded: Some(response.degraded),
-            affected: None,
-            // Echoed as a request, never as an achievement.
-            recall_target_requested: recall_target,
-            warnings: response
-                .graph
-                .as_ref()
-                .into_iter()
-                .flat_map(|graph| graph.warnings.iter().copied())
-                .map(graph_query_warning_code)
-                .map(str::to_string)
-                .collect(),
-            graph: response.graph.clone(),
-            ..ChironQlStats::default()
-        },
-        next: None,
-        query_id: query_id.to_string(),
-        trace: None,
+    if let Some(graph) = &response.graph {
+        let warnings = receiving::add(
+            graph.warnings.capacity() as u64,
+            graph.warnings.len() as u64,
+        )
+        .and_then(|n| n.checked_mul(256).ok_or_else(receiving::full))
+        .map_err(|e| receiving::error(query_id, e))?;
+        memory.ql(warnings, query_id)?;
     }
+    let mut result = retrieval::hits(response.hits, query_id, memory)
+        .map_err(|e| receiving::error(query_id, e))?;
+    result.stats.searched = Some(response.searched);
+    result.stats.degraded = Some(response.degraded);
+    result.stats.recall_target_requested = recall_target;
+    if let Some(graph) = &response.graph {
+        result
+            .stats
+            .warnings
+            .try_reserve_exact(graph.warnings.len())
+            .map_err(|_| receiving::error(query_id, receiving::full()))?;
+        for warning in &graph.warnings {
+            result
+                .stats
+                .warnings
+                .push(graph_query_warning_code(*warning).into());
+        }
+    }
+    result.stats.graph = response.graph;
+    trace.push_ok(stage::RENDER, micros(render_started), None);
+    Ok(result)
 }
 
 fn rows_response(query_id: &str, columns: Vec<String>, rows: Vec<Value>) -> ChironQlResponse {
     ChironQlResponse {
+        credential: None,
         kind: ChironQlKind::Rows,
         columns,
+        column_types: Vec::new(),
         rows,
         stats: ChironQlStats::default(),
         next: None,
         query_id: query_id.to_string(),
+        domains: Vec::new(),
+        snapshot_id: None,
+        transaction_id: None,
+        committed: None,
         trace: None,
     }
 }
 
 fn affected_response(query_id: &str, affected: u64) -> ChironQlResponse {
     ChironQlResponse {
+        credential: None,
         kind: ChironQlKind::Affected,
         columns: Vec::new(),
+        column_types: Vec::new(),
         rows: Vec::new(),
         stats: ChironQlStats {
             affected: Some(affected),
@@ -1739,6 +2896,10 @@ fn affected_response(query_id: &str, affected: u64) -> ChironQlResponse {
         },
         next: None,
         query_id: query_id.to_string(),
+        domains: Vec::new(),
+        snapshot_id: None,
+        transaction_id: None,
+        committed: None,
         trace: None,
     }
 }
@@ -1762,7 +2923,7 @@ fn graph_query_warning_code(warning: GraphQueryWarning) -> &'static str {
     }
 }
 
-fn graph_warning_code(warning: GraphWarning) -> &'static str {
+pub(crate) fn graph_warning_code(warning: GraphWarning) -> &'static str {
     match warning {
         GraphWarning::ResultTruncated => "graph.result_truncated",
         GraphWarning::ConstraintTruncated => "graph.constraint_truncated",
@@ -1774,12 +2935,18 @@ fn graph_warning_code(warning: GraphWarning) -> &'static str {
 
 fn empty_response(query_id: &str) -> ChironQlResponse {
     ChironQlResponse {
+        credential: None,
         kind: ChironQlKind::Empty,
         columns: Vec::new(),
+        column_types: Vec::new(),
         rows: Vec::new(),
         stats: ChironQlStats::default(),
         next: None,
         query_id: query_id.to_string(),
+        domains: Vec::new(),
+        snapshot_id: None,
+        transaction_id: None,
+        committed: None,
         trace: None,
     }
 }
@@ -1822,6 +2989,34 @@ fn engine_error(
     engine_error_at(role, query_id, trace, started, stage::ENGINE_SEARCH, error)
 }
 
+pub(crate) fn outcome_unknown_error(query_id: &str, transaction_id: &str) -> ChironQlError {
+    ChironQlError {
+        error: format!("transaction outcome is unknown: {transaction_id}"),
+        code: "chironql.outcome_unknown".into(),
+        hint: Some(format!(
+            "Reconcile GET /v1/transactions/{transaction_id} or retry the identical mutation with the same idempotency_key."
+        )),
+        position: None,
+        affected_estimate: None,
+        query_id: query_id.into(),
+        trace: None,
+    }
+}
+
+pub(crate) fn commit_rejected_error(query_id: &str, transaction_id: &str) -> ChironQlError {
+    ChironQlError {
+        error: format!("transaction rejected; key remains consumed: {transaction_id}"),
+        code: "chironql.transaction_rejected".into(),
+        hint: Some(format!(
+            "Reconcile GET /v1/transactions/{transaction_id}; this key cannot execute again."
+        )),
+        position: None,
+        affected_estimate: None,
+        query_id: query_id.into(),
+        trace: None,
+    }
+}
+
 fn engine_error_at(
     role: Role,
     query_id: &str,
@@ -1830,6 +3025,26 @@ fn engine_error_at(
     failed_stage: &str,
     error: GaussError,
 ) -> ChironQlError {
+    if let GaussError::CommitRejected { transaction_id } = &error {
+        let error = commit_rejected_error(query_id, transaction_id);
+        trace.push_failed(
+            failed_stage,
+            micros(started),
+            &error.code,
+            error.error.clone(),
+        );
+        return error;
+    }
+    if let GaussError::CommitOutcomeUnknown { transaction_id } = &error {
+        let error = outcome_unknown_error(query_id, transaction_id);
+        trace.push_failed(
+            failed_stage,
+            micros(started),
+            &error.code,
+            error.error.clone(),
+        );
+        return error;
+    }
     let (code, message) = describe_engine_error(role, &error);
     trace.push_failed(failed_stage, micros(started), code, message.clone());
     ChironQlError {
@@ -1848,6 +3063,7 @@ fn engine_error_at(
 /// operator can read the real one in the server log, keyed by `query_id`.
 fn describe_engine_error(role: Role, error: &GaussError) -> (&'static str, String) {
     match error {
+        GaussError::Security(error) => (error.code(), error.to_string()),
         GaussError::Graph(error) => (error.code.as_str(), error.message.clone()),
         GaussError::CollectionNotFound(name) => (
             "chironql.collection_not_found",
@@ -1861,6 +3077,9 @@ fn describe_engine_error(role: Role, error: &GaussError) -> (&'static str, Strin
             "chironql.dimension_mismatch",
             format!("this collection stores {expected}-dimensional vectors, got {actual}"),
         ),
+        GaussError::SqlRowPreconditionFailed { .. } => {
+            ("chironql.sql_row_precondition_failed", error.to_string())
+        }
         GaussError::InvalidRequest(message) => ("chironql.invalid_request", message.clone()),
         GaussError::ResourceExhausted(message) => ("chironql.resource_exhausted", message.clone()),
         GaussError::WalUnavailable(message) => ("chironql.wal_unavailable", message.clone()),
@@ -2027,3 +3246,6 @@ mod tests {
         assert!(message.contains('3') && message.contains('5'));
     }
 }
+
+#[cfg(test)]
+mod query_ownership_tests;

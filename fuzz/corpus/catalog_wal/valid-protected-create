@@ -1,0 +1,1 @@
+F{"lsn":1,"unix_ms":1,"entry":{"CreateProtectedCollection":{"config":{"name":"docs","vector_dim":2},"security":{"version":1,"collection":"docs","incarnation":"93da23e8-0d07-4a6e-bac3-38f2b4a6cbbf","revision":1,"data_generation":1,"policy":{"department_actions":[],"owner_actions":[],"templates":{}},"resources":[]},"expected_revision":1,"revision":2}}}

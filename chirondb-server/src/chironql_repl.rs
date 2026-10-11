@@ -34,6 +34,7 @@ use chirondb_core::Db;
 use chirondb_types::chironql::{
     ChironQlError, ChironQlKind, ChironQlResponse, QueryTrace, StageOutcome,
 };
+use chirondb_types::relational::RelationalValue;
 
 use crate::chironql_exec::{self, ExecContext, Session};
 use crate::rbac::Role;
@@ -59,6 +60,38 @@ pub trait QuerySink {
     fn role(&self) -> Option<Role> {
         None
     }
+    /// Set typed positional parameters for the next statement.
+    fn set_parameters(&mut self, _parameters: Vec<RelationalValue>) -> Result<(), ChironQlError> {
+        Err(ChironQlError {
+            error: "this query transport does not support parameters".into(),
+            code: "chironql.parameters_unsupported".into(),
+            hint: None,
+            position: None,
+            affected_estimate: None,
+            query_id: String::new(),
+            trace: None,
+        })
+    }
+    fn redact_query_input(&self) -> bool {
+        false
+    }
+    fn write_output(&self, out: &mut dyn Write, bytes: &[u8]) -> std::io::Result<()> {
+        out.write_all(bytes)
+    }
+}
+
+struct SinkWriter<'a, S, W> {
+    sink: &'a S,
+    out: &'a mut W,
+}
+impl<S: QuerySink, W: Write> Write for SinkWriter<'_, S, W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.sink.write_output(self.out, bytes)?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.out.flush()
+    }
 }
 
 /// In-process sink: no socket, no serialization, no auth round trip.
@@ -67,6 +100,12 @@ pub struct LocalSink {
     session: Session,
     role: Role,
     tenant: TenantScope,
+    token: Option<String>,
+    key_out: Option<PathBuf>,
+    publication: Option<crate::chironql_protected::PublicationGuard>,
+    pending_confirmation: Option<(String, String)>,
+    work: Option<tokio::sync::OwnedSemaphorePermit>,
+    parameters: Vec<RelationalValue>,
 }
 
 impl LocalSink {
@@ -79,6 +118,12 @@ impl LocalSink {
             // machinery rather than as a tenant. `with_tenant` narrows it when
             // a session should be scoped.
             tenant: TenantScope::system(),
+            token: None,
+            key_out: None,
+            publication: None,
+            pending_confirmation: None,
+            work: None,
+            parameters: Vec::new(),
         }
     }
 
@@ -92,14 +137,155 @@ impl LocalSink {
         self.session.collection = collection;
         self
     }
+    pub fn with_credential(mut self, token: String, key_out: Option<PathBuf>) -> Self {
+        self.token = Some(token);
+        self.key_out = key_out;
+        self
+    }
+
+    fn protected_execute(
+        &mut self,
+        query: &str,
+        options: ExecuteOptions,
+    ) -> Result<ChironQlResponse, ChironQlError> {
+        use crate::{
+            chironql_credentials::{KeyDestination, with_revision},
+            chironql_parser::{SecurityCommand, Statement},
+            chironql_protected,
+        };
+        self.publication = None;
+        self.work = None;
+        let token = self
+            .token
+            .as_deref()
+            .ok_or_else(|| chironql_protected::error("", "security.unauthenticated"))?;
+        let authority = self
+            .db
+            .identity_authority()
+            .ok_or_else(|| chironql_protected::error("", "security.unavailable"))?;
+        let work = authority
+            .work_pool()
+            .try_acquire_owned()
+            .map_err(|_| chironql_protected::error("", "security.budget_exceeded"))?;
+        let parsed = crate::chironql_parser::parse(query).ok();
+        let security = match &parsed {
+            Some(Statement::Security(statement)) => Some(statement),
+            _ => None,
+        };
+        let mut destination =
+            if security.is_some_and(|s| s.issues_key()) {
+                let path = self
+                    .key_out
+                    .as_deref()
+                    .ok_or_else(|| chironql_protected::error("", "chironql.key_output_required"))?;
+                Some(KeyDestination::create(path).map_err(|_| {
+                    chironql_protected::error("", "chironql.key_output_unavailable")
+                })?)
+            } else {
+                None
+            };
+        let pending = self
+            .pending_confirmation
+            .take()
+            .filter(|(original, _)| options.confirm && original == query);
+        let prepared = if let Some((_, prepared)) = pending {
+            prepared
+        } else if let Some(statement) =
+            security.filter(|s| s.requires_revision() && s.expected_revision.is_none())
+        {
+            let revision_query = match &statement.command {
+                SecurityCommand::CreateProtectedCollection { .. } => {
+                    "SHOW CATALOG REVISION;".into()
+                }
+                SecurityCommand::SetGraphLifecycle { collection, .. }
+                | SecurityCommand::SetEdgeType { collection, .. }
+                | SecurityCommand::SetCollectionPolicy { collection, .. }
+                | SecurityCommand::ObjectPrivileges { collection, .. }
+                | SecurityCommand::AlterPoint { collection, .. } => {
+                    format!("SHOW SECURITY REVISION ON COLLECTION '{collection}';")
+                }
+                _ => "SHOW SECURITY REVISION;".into(),
+            };
+            let revision = chironql_protected::execute(
+                &self.db,
+                token,
+                &chirondb_types::chironql::ChironQlRequest {
+                    query: revision_query,
+                    ..Default::default()
+                },
+            )?
+            .publish(|reply| {
+                reply
+                    .rows
+                    .first()
+                    .and_then(|row| row.get("revision"))
+                    .and_then(Value::as_u64)
+            })
+            .map_err(|_| chironql_protected::error("", "security.conflict"))?
+            .ok_or_else(|| chironql_protected::error("", "security.unavailable"))?;
+            with_revision(query, revision)
+        } else {
+            query.into()
+        };
+        let result = chironql_protected::execute(
+            &self.db,
+            token,
+            &chirondb_types::chironql::ChironQlRequest {
+                query: prepared.clone(),
+                collection: self.session.collection.clone(),
+                trace: options.trace,
+                confirm: options.confirm,
+                parameters: std::mem::take(&mut self.parameters),
+                idempotency_key: None,
+                retry_id: None,
+            },
+        );
+        let output = match result {
+            Ok(output) => output,
+            Err(error) => {
+                if error.code == "chironql.confirmation_required" {
+                    self.pending_confirmation = Some((query.into(), prepared));
+                }
+                return Err(error);
+            }
+        };
+        self.publication = Some(output.guard());
+        let mut rotated = None;
+        let response = output.publish(|mut response| {
+            if let Some(credential) = response.credential.take() {
+                let destination = destination.as_mut().ok_or_else(|| chironql_protected::error("", "chironql.key_output_required"))?;
+                destination.save(&credential.secret).map_err(|_| chironql_protected::error("", "chironql.key_output_failed"))?;
+                if matches!(security.map(|s| &s.command), Some(SecurityCommand::RotateKey { id }) if token.starts_with(&format!("chiron.{id}."))) {
+                    rotated = Some(credential.secret);
+                }
+                response.rows.push(serde_json::json!({"credential_id":credential.id,"saved":true}));
+                response.columns.extend(["credential_id".into(), "saved".into()]);
+            }
+            Ok(response)
+        }).map_err(|_| chironql_protected::error("", "security.conflict"))??;
+        if let Some(token) = rotated {
+            self.token = Some(token);
+        }
+        if let Some(Statement::Use { collection }) = parsed {
+            self.session.collection = Some(collection);
+        }
+        self.work = Some(work);
+        Ok(response)
+    }
 }
 
 impl QuerySink for LocalSink {
+    fn redact_query_input(&self) -> bool {
+        self.db.identity_authority().is_some()
+    }
     fn execute(
         &mut self,
         query: &str,
         options: ExecuteOptions,
     ) -> Result<ChironQlResponse, ChironQlError> {
+        if self.db.identity_authority().is_some() {
+            return self.protected_execute(query, options);
+        }
         let mut ctx = ExecContext {
             db: &self.db,
             session: &mut self.session,
@@ -109,13 +295,32 @@ impl QuerySink for LocalSink {
             allowed_collections: None,
             want_trace: options.trace,
             confirm: options.confirm,
+            parameters: std::mem::take(&mut self.parameters),
+            idempotency_key: None,
+            retry_id: None,
             tenant: self.tenant.clone(),
         };
         chironql_exec::execute(&mut ctx, query)
     }
 
     fn role(&self) -> Option<Role> {
-        Some(self.role)
+        self.db.identity_authority().is_none().then_some(self.role)
+    }
+    fn set_parameters(&mut self, parameters: Vec<RelationalValue>) -> Result<(), ChironQlError> {
+        self.parameters = parameters;
+        Ok(())
+    }
+    fn write_output(&self, out: &mut dyn Write, bytes: &[u8]) -> std::io::Result<()> {
+        if let Some(guard) = &self.publication {
+            guard
+                .publish(|| {
+                    out.write_all(bytes)?;
+                    out.flush()
+                })
+                .map_err(std::io::Error::other)?
+        } else {
+            out.write_all(bytes)
+        }
     }
 }
 
@@ -209,6 +414,9 @@ where
                         out,
                     )? {
                         failures += 1;
+                        if !options.interactive {
+                            return Ok(failures);
+                        }
                     }
                 }
             }
@@ -223,9 +431,12 @@ where
             buffer.push('\n');
         }
         buffer.push_str(&line);
+        if buffer.len() > 8 * 1024 * 1024 {
+            return Err(std::io::Error::other("query exceeds server byte limit"));
+        }
 
         // Statements end at `;`. Anything else continues.
-        if !buffer.trim_end().ends_with(';') {
+        if crate::chironql_credentials::statement_terminator(&buffer).is_none() {
             if options.interactive && !buffer.trim().is_empty() {
                 write!(out, "{CONTINUATION}")?;
                 out.flush()?;
@@ -237,17 +448,22 @@ where
             continue;
         }
 
-        let statement = std::mem::take(&mut buffer);
-        if !statement.trim().is_empty()
-            && !run_statement(
-                sink,
-                &statement,
-                settings(format, trace_on, timing_on, confirm),
-                None,
-                out,
-            )?
-        {
-            failures += 1;
+        while let Some(end) = crate::chironql_credentials::statement_terminator(&buffer) {
+            let statement: String = buffer.drain(..=end).collect();
+            if !statement.trim().is_empty()
+                && !run_statement(
+                    sink,
+                    &statement,
+                    settings(format, trace_on, timing_on, confirm),
+                    None,
+                    out,
+                )?
+            {
+                failures += 1;
+                if !options.interactive {
+                    return Ok(failures);
+                }
+            }
         }
 
         if options.interactive {
@@ -258,7 +474,7 @@ where
 
     // Trailing input without a `;` is still a statement worth running — a
     // piped heredoc that forgets the semicolon should not silently do nothing.
-    if !buffer.trim().is_empty()
+    if crate::chironql_parser::leading_keyword(&buffer).is_some()
         && !run_statement(
             sink,
             &buffer,
@@ -274,6 +490,31 @@ where
         writeln!(out)?;
     }
     Ok(failures)
+}
+
+/// Execute exactly one statement without the REPL's semicolon splitting.
+///
+/// `--exec` uses this path so a second statement cannot run after the first
+/// one has already changed state. The language parser remains the authority
+/// for deciding whether the supplied text contains exactly one statement.
+pub fn run_one<S, W>(
+    sink: &mut S,
+    statement: &str,
+    out: &mut W,
+    options: ReplOptions,
+) -> std::io::Result<usize>
+where
+    S: QuerySink,
+    W: Write,
+{
+    let succeeded = run_statement(
+        sink,
+        statement,
+        settings(options.format, options.trace, false, options.confirm),
+        None,
+        out,
+    )?;
+    Ok(usize::from(!succeeded))
 }
 
 /// Interactive loop with history and line editing.
@@ -365,38 +606,46 @@ where
                 }
                 buffer.push_str(&line);
 
-                if !buffer.trim_end().ends_with(';') {
-                    if buffer.trim().is_empty() {
-                        buffer.clear();
-                    }
+                if buffer.len() > 8 * 1024 * 1024 {
+                    writeln!(out, "chironql.query_too_large")?;
+                    buffer.clear();
+                    failures += 1;
                     continue;
                 }
-
-                let statement = std::mem::take(&mut buffer);
-                let _ = editor.add_history_entry(statement.trim());
-
-                // `readline` is how the confirmation is asked, so the prompt
-                // borrows the same editor the loop reads from.
-                let mut ask = |message: &str, _affected: u32| -> std::io::Result<bool> {
-                    // The server already said what would happen and to what,
-                    // so the question repeats its sentence rather than
-                    // inventing a second description that could disagree.
-                    let question = format!("{message}. Type yes to proceed: ");
-                    match editor.readline(&question) {
-                        Ok(answer) => Ok(answer.trim().eq_ignore_ascii_case("yes")),
-                        // Ctrl-C or Ctrl-D at the question means no.
-                        Err(_) => Ok(false),
+                while let Some(end) = crate::chironql_credentials::statement_terminator(&buffer) {
+                    let statement: String = buffer.drain(..=end).collect();
+                    if !sink.redact_query_input() && !security_input(&statement) {
+                        let _ = editor.add_history_entry(statement.trim());
                     }
-                };
 
-                if !run_statement(
-                    sink,
-                    &statement,
-                    settings(format, trace_on, timing_on, confirm),
-                    Some(&mut ask),
-                    &mut out,
-                )? {
-                    failures += 1;
+                    // `readline` is how the confirmation is asked, so the prompt
+                    // borrows the same editor the loop reads from.
+                    let mut ask = |message: &str, _affected: u32| -> std::io::Result<bool> {
+                        // The server already said what would happen and to what,
+                        // so the question repeats its sentence rather than
+                        // inventing a second description that could disagree.
+                        let question = format!("{message}. Type yes to proceed: ");
+                        match editor.readline(&question) {
+                            Ok(answer) => Ok(answer.trim().eq_ignore_ascii_case("yes")),
+                            // Ctrl-C or Ctrl-D at the question means no.
+                            Err(_) => Ok(false),
+                        }
+                    };
+
+                    if !run_statement(
+                        sink,
+                        &statement,
+                        settings(format, trace_on, timing_on, confirm),
+                        Some(&mut ask),
+                        &mut out,
+                    )? {
+                        failures += 1;
+                        buffer.clear();
+                        break;
+                    }
+                }
+                if crate::chironql_parser::leading_keyword(&buffer).is_none() {
+                    buffer.clear();
                 }
             }
             // Ctrl-C with a half-typed statement abandons the statement. On an
@@ -503,8 +752,17 @@ where
         }
     }
 
+    let mut guarded = SinkWriter { sink, out };
+    let out = &mut guarded;
     match outcome {
         Ok(response) => {
+            if response.credential.is_some() {
+                writeln!(
+                    out,
+                    "credential response suppressed: configure a private key destination"
+                )?;
+                return Ok(false);
+            }
             match format {
                 Format::Json => writeln!(
                     out,
@@ -537,11 +795,36 @@ where
                 )?,
                 // The trace is printed on failure whether or not it was asked
                 // for. This is the moment it exists for.
-                Format::Table => render_error(&error, statement, out)?,
+                Format::Table => render_error(
+                    &error,
+                    if sink.redact_query_input() || security_input(statement) {
+                        ""
+                    } else {
+                        statement
+                    },
+                    out,
+                )?,
             }
             Ok(false)
         }
     }
+}
+
+fn security_input(query: &str) -> bool {
+    let upper = query.to_ascii_uppercase();
+    if upper.contains("PASSWORD") || upper.contains("CHIRON.") {
+        return true;
+    }
+    matches!(
+        crate::chironql_parser::parse(query),
+        Ok(crate::chironql_parser::Statement::Security(_))
+    ) || crate::chironql_parser::leading_keyword(query).is_some_and(|(first, _, next)| {
+        matches!(
+            first.as_str(),
+            "GRANT" | "REVOKE" | "DENY" | "ISSUE" | "ROTATE" | "RENAME"
+        ) || matches!(first.as_str(), "CREATE" | "ALTER" | "DROP")
+            && matches!(next.as_str(), "USER" | "ROLE")
+    })
 }
 
 /// Whether a line is a meta-command rather than the start of a statement.
@@ -563,7 +846,7 @@ enum MetaOutcome {
 }
 
 fn meta_command<S, W>(
-    sink: &S,
+    sink: &mut S,
     line: &str,
     format: &mut Format,
     trace_on: &mut bool,
@@ -623,6 +906,23 @@ where
             *timing_on = !*timing_on;
             writeln!(out, " timing {}", on_off(*timing_on))?;
         }
+        "\\params" => {
+            let json = line
+                .strip_prefix(command)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("[]");
+            match serde_json::from_str::<Vec<RelationalValue>>(json) {
+                Ok(parameters) => match sink.set_parameters(parameters) {
+                    Ok(()) => writeln!(out, " parameters set for next statement")?,
+                    Err(error) => writeln!(out, " {}: {}", error.code, error.error)?,
+                },
+                Err(error) => writeln!(
+                    out,
+                    " chironql.invalid_parameters: expected a tagged RelationalValue JSON array ({error})"
+                )?,
+            }
+        }
         "\\format" => match argument {
             Some("json") => {
                 *format = Format::Json;
@@ -645,14 +945,31 @@ where
 
 const HELP: &str = "\
  Read         SEARCH · HYBRID · MULTI · RECOMMEND · COUNT · SCROLL · GET
+ Relational   SQL SELECT/EXPLAIN · SQL INSERT/UPDATE/DELETE · SQL CREATE/DROP TABLE
+ Multi-model  PIPELINE vector → [graph] → relational · EXPLAIN PIPELINE
  Introspect   SHOW COLLECTIONS · DESCRIBE · USE
  Write        UPSERT · UPDATE ... SET PAYLOAD · DELETE ... POINTS
               DELETE ... WHERE   (counts first, then asks)
  Admin        CREATE COLLECTION ... DIM <n> [METRIC …] [WITH {…}]
               DROP COLLECTION ... [IF EXISTS]   (counts first, then asks)
 
- Collection DDL needs a read_write role. Snapshots, restore and compaction stay
- in `chironctl`.
+ Protected    GET · COUNT · SCROLL · SEARCH NEAR [vector]
+              CREATE PROTECTED COLLECTION ... DIM <n> [METRIC …]
+              SHOW CATALOG REVISION · SHOW COLLECTION ... SECURITY POLICY
+              ALTER COLLECTION ... SET SECURITY POLICY {...}
+              CREATE POINTS ... USING TEMPLATE ... REQUEST 'retry-id'
+              UPDATE POINTS ... · DELETE ...
+ Security     CREATE / ALTER / RENAME / DROP USER · CREATE / RENAME / DROP ROLE
+              GRANT / REVOKE ROLE · GRANT / REVOKE actions
+              GRANT / DENY point access · ALTER POINT security labels
+ Inspect      SHOW CURRENT USER [PRIVILEGES] · SHOW USERS
+              SHOW ROLES WITH USERS · SHOW ROLE ... PRIVILEGES
+ Keys         ISSUE API KEY FOR USER · ROTATE / REVOKE API KEY
+              SHOW API KEYS FOR USER (issuance requires --key-out)
+
+ Protected operations require explicit capabilities. Legacy UPSERT, collection
+ lifecycle and retrieval modes without a protected path are rejected there.
+ Snapshots, restore and compaction stay in `chironctl`.
 
  \\h           this help
  clear;       clear the screen (also \\clear)
@@ -661,11 +978,14 @@ const HELP: &str = "\
  \\c <coll>    use a collection for later statements
  \\trace       show the server's execution trace (always shown on failure)
  \\timing      show client-side elapsed time
+ \\params [...] set typed positional parameters for the next statement
  \\format      table | json
  \\role        the role this session runs as
  \\q           quit
 
- Statements end with `;` and may span lines. Full reference: docs/CHIRONQL.md
+ Statements end with `;` and may span lines. Scripts stop on the first failure.
+ Security changes support IF REVISION <n>; conflicts are not retried.
+ Reference: docs/HTTP_API.md#protected-chironql-administration-language-12
 ";
 
 // ---------------------------------------------------------------------------
@@ -731,7 +1051,7 @@ fn render_table<W: Write>(response: &ChironQlResponse, out: &mut W) -> std::io::
 
 fn cell(value: &Value) -> String {
     let rendered = match value {
-        Value::Null => String::new(),
+        Value::Null => "NULL".to_string(),
         Value::String(text) => text.clone(),
         // Floats render at a fixed width so a score column lines up; integers
         // stay exact. `number.is_f64()` is what separates an engine score from
@@ -917,8 +1237,10 @@ mod tests {
     impl FakeSink {
         fn ok(rows: Vec<Value>) -> ChironQlResponse {
             ChironQlResponse {
+                credential: None,
                 kind: ChironQlKind::Rows,
                 columns: vec!["id".to_string(), "score".to_string()],
+                column_types: Vec::new(),
                 rows,
                 stats: ChironQlStats {
                     took_ms: 3.1,
@@ -928,6 +1250,10 @@ mod tests {
                 },
                 next: None,
                 query_id: "q_test".to_string(),
+                domains: Vec::new(),
+                snapshot_id: None,
+                transaction_id: None,
+                committed: None,
                 trace: None,
             }
         }
@@ -974,6 +1300,48 @@ mod tests {
     }
 
     #[test]
+    fn table_distinguishes_null_from_empty_text_zero_and_confidence() {
+        let mut answer = FakeSink::ok(vec![json!({
+            "actual": null,
+            "empty_text": "",
+            "zero": 0,
+            "confidence": 0.5347
+        })]);
+        answer.columns = ["actual", "empty_text", "zero", "confidence"]
+            .map(str::to_string)
+            .to_vec();
+        let (output, failures, _) = piped("SQL SELECT * FROM predictions;", vec![Ok(answer)]);
+        assert_eq!(failures, 0);
+        assert!(
+            output.contains(" NULL              0    0.5347"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn json_preserves_null_and_empty_text() {
+        let mut sink = FakeSink {
+            seen: Vec::new(),
+            answers: vec![Ok(FakeSink::ok(vec![json!({"id": "", "score": null})]))],
+        };
+        let mut out = Vec::new();
+        run(
+            &mut sink,
+            "SQL SELECT * FROM predictions;".as_bytes(),
+            &mut out,
+            ReplOptions {
+                interactive: false,
+                format: Format::Json,
+                ..Default::default()
+            },
+        )
+        .expect("repl runs");
+        let parsed: Value = serde_json::from_slice(&out).expect("valid json");
+        assert!(parsed["rows"][0]["score"].is_null());
+        assert_eq!(parsed["rows"][0]["id"], "");
+    }
+
+    #[test]
     fn splits_input_on_semicolons() {
         let (_, _, seen) = piped("COUNT a;\nCOUNT b;\n", Vec::new());
         assert_eq!(seen, vec!["COUNT a;", "COUNT b;"]);
@@ -984,6 +1352,15 @@ mod tests {
         let (_, _, seen) = piped("SEARCH products\n  NEAR [1,0,0]\n  LIMIT 5;\n", Vec::new());
         assert_eq!(seen.len(), 1);
         assert!(seen[0].contains("NEAR [1,0,0]"));
+    }
+
+    #[test]
+    fn keeps_transaction_block_as_one_terminal_statement() {
+        let input = "TRANSACTION {\n  SQL INSERT INTO t VALUES ('a;b');\n  VECTOR UPSERT INTO c {id: 'a', vector: [1]};\n  GRAPH CONNECT c 'a' -> E -> 'a';\n};\n";
+        let (_, _, seen) = piped(input, Vec::new());
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].starts_with("TRANSACTION {"));
+        assert!(seen[0].contains("GRAPH CONNECT"));
     }
 
     #[test]
@@ -1137,7 +1514,7 @@ mod tests {
     /// so "until" can mean "never". This was the actual bug.
     #[test]
     fn clearing_flushes_what_it_wrote() {
-        let sink = FakeSink {
+        let mut sink = FakeSink {
             seen: Vec::new(),
             answers: Vec::new(),
         };
@@ -1146,7 +1523,7 @@ mod tests {
         let (mut trace, mut timing) = (false, false);
 
         meta_command(
-            &sink,
+            &mut sink,
             "clear;",
             &mut format,
             &mut trace,
@@ -1156,6 +1533,54 @@ mod tests {
         .expect("clear runs");
 
         assert_eq!(out.flushes, 1, "the sequence is pushed out, not buffered");
+    }
+
+    #[test]
+    fn params_meta_command_sets_typed_values_for_the_next_statement() {
+        struct ParamSink(Vec<RelationalValue>);
+        impl QuerySink for ParamSink {
+            fn execute(
+                &mut self,
+                _query: &str,
+                _options: ExecuteOptions,
+            ) -> Result<ChironQlResponse, ChironQlError> {
+                Ok(FakeSink::ok(Vec::new()))
+            }
+            fn set_parameters(
+                &mut self,
+                parameters: Vec<RelationalValue>,
+            ) -> Result<(), ChironQlError> {
+                self.0 = parameters;
+                Ok(())
+            }
+        }
+
+        let mut sink = ParamSink(Vec::new());
+        let mut output = Vec::new();
+        let mut format = Format::Table;
+        let (mut trace, mut timing) = (false, false);
+        meta_command(
+            &mut sink,
+            r#"\params [{"type":"text","value":"doc-1"},{"type":"integer","value":7}]"#,
+            &mut format,
+            &mut trace,
+            &mut timing,
+            &mut output,
+        )
+        .expect("parameters accepted");
+
+        assert_eq!(
+            sink.0,
+            vec![
+                RelationalValue::Text("doc-1".into()),
+                RelationalValue::Integer(7)
+            ]
+        );
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("next statement")
+        );
     }
 
     /// The semicolon is the request. Without it the word is ordinary input,

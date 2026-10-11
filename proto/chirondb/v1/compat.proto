@@ -355,6 +355,12 @@ message WireRequest {
     // ChironQL is the native graph/query language carried by ChironWire.
     // This is additive so persisted alpha envelopes keep their field numbers.
     WireChironQlRequest chironql = 31;
+    // Native relational request encoded with the tagged SqlExecutionRequest
+    // JSON schema. Additive field preserves historical ChironWire envelopes.
+    WireSqlRequest sql = 33;
+    // Interactive native relational transaction lifecycle. `action` is one
+    // of begin, execute, commit, or rollback; execute carries request_json.
+    WireSqlTransactionRequest sql_transaction = 34;
   }
 }
 
@@ -366,6 +372,10 @@ message WireChironQlRequest {
   // A native deferred graph session may be bound to the statement without
   // placing the opaque token in ChironQL syntax.
   optional string deferred_session_id = 5;
+  // Strict JSON arrays using RelationalValue's tagged representation.
+  optional string parameters_json = 6;
+  optional string retry_id = 7;
+  optional string idempotency_key = 8;
 }
 
 message WireChironQlResponse {
@@ -376,6 +386,26 @@ message WireChironQlResponse {
   optional string next = 5;
   string query_id = 6;
   optional string trace_json = 7;
+  optional string credential_json = 8;
+  repeated string column_types_json = 9;
+  repeated string domains = 10;
+  optional string snapshot_id = 11;
+  optional string transaction_id = 12;
+  optional bool committed = 13;
+}
+
+message WireSqlRequest {
+  string request_json = 1;
+}
+
+message WireSqlResponse {
+  string response_json = 1;
+}
+
+message WireSqlTransactionRequest {
+  string action = 1;
+  optional string handle = 2;
+  optional string request_json = 3;
 }
 
 message WireResponse {
@@ -394,6 +424,7 @@ message WireResponse {
     SetPayloadResponse set_payload = 24;
     DeleteByFilterResponse delete_by_filter = 25;
     WireChironQlResponse chironql = 26;
+    WireSqlResponse sql = 27;
     SearchResponse search = 15;
     MultiSearchResponse multi_search = 16;
     CountResponse count = 17;

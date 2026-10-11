@@ -5,15 +5,23 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chirondb_core::{
-    CollectionConfig, Db, DistanceMetric, Point,
+    CollectionConfig, Db, DistanceMetric, MultiModelTransactionRequest, Point, RelationalValue,
+    SqlExecutionRequest, SqlResult, SqlStatementRequest, audit,
     encryption::{self, FileType, Keyring},
-    fs_util, storage_layout,
+    fs_util,
+    graph::{
+        ConfigureEdgeTypeRequest, GraphDirection, GraphRelationScope, GraphTraverseRequest,
+        RelateRequest, TraversalBudget,
+    },
+    storage_layout,
+    tenant::TenantScope,
 };
 use serde_json::json;
 
@@ -75,6 +83,61 @@ fn encryption_migration_resumes_from_every_publication_boundary() {
         let _ = storage_layout::migrate_encryption(&data_dir, &keyring);
         return;
     }
+    if child_mode("migration-verify") {
+        let data_dir = required_path("CHIRONDB_DATA_DIR");
+        let keyring = Keyring::load(required_path("CHIRONDB_KEYRING")).unwrap();
+        encryption::install_process_keyring(keyring, true).unwrap();
+        let db = Db::open(&data_dir).unwrap();
+        let selected = db
+            .execute_sql(SqlExecutionRequest {
+                statements: vec![SqlStatementRequest {
+                    sql: "SELECT id, title FROM documents WHERE id = 'doc-1'".into(),
+                    parameters: vec![],
+                }],
+                idempotency_key: None,
+                retry_id: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            &selected.results[0],
+            SqlResult::Rows { rows, .. }
+                if rows == &vec![vec![
+                    RelationalValue::Text("doc-1".into()),
+                    RelationalValue::Text("Atomic knowledge".into()),
+                ]]
+        ));
+        let scope = TenantScope::tenant("migration-reader", "acme");
+        assert_eq!(
+            db.get_points_scoped("chunks", &["chunk-1".into(), "source-1".into()], &scope)
+                .unwrap()
+                .len(),
+            2
+        );
+        let traversal = db
+            .traverse_scoped(
+                "chunks",
+                GraphTraverseRequest {
+                    anchors: vec!["chunk-1".into()],
+                    edge_types: vec!["cites".into()],
+                    direction: GraphDirection::Outgoing,
+                    node_filter: None,
+                    edge_filter: None,
+                    budget: TraversalBudget {
+                        max_depth: 1,
+                        ..TraversalBudget::default()
+                    },
+                },
+                &scope,
+            )
+            .unwrap();
+        assert!(
+            traversal
+                .nodes
+                .iter()
+                .any(|node| node.point_id == "source-1")
+        );
+        return;
+    }
 
     for boundary in [
         "migration.after_copy_journal",
@@ -87,8 +150,69 @@ fn encryption_migration_resumes_from_every_publication_boundary() {
         let temp = tempfile::tempdir().unwrap();
         let data_dir = temp.path().join("data");
         prepare_database(&data_dir, "old-point");
+        {
+            let db = Db::open(&data_dir).unwrap();
+            let scope = TenantScope::tenant("migration-writer", "acme");
+            let mut chunks = collection_config();
+            chunks.name = "chunks".into();
+            db.create_collection(chunks).unwrap();
+            db.set_graph_lifecycle_scoped("chunks", true, true, &scope)
+                .unwrap();
+            db.configure_edge_type_scoped(
+                "chunks",
+                ConfigureEdgeTypeRequest {
+                    name: "cites".into(),
+                    weight_property: None,
+                },
+                true,
+                &scope,
+            )
+            .unwrap();
+            db.execute_sql(SqlExecutionRequest {
+                statements: vec![SqlStatementRequest {
+                    sql: "CREATE TABLE documents (id TEXT PRIMARY KEY, title TEXT NOT NULL)".into(),
+                    parameters: vec![],
+                }],
+                idempotency_key: None,
+                retry_id: None,
+            })
+            .unwrap();
+            db.execute_multimodel_transaction(
+                MultiModelTransactionRequest {
+                    sql: SqlExecutionRequest {
+                        statements: vec![SqlStatementRequest {
+                            sql: "INSERT INTO documents (id, title) VALUES ('doc-1', 'Atomic knowledge')".into(),
+                            parameters: vec![],
+                        }],
+                        idempotency_key: Some("migration-doc-1".into()),
+                        retry_id: None,
+                    },
+                    collection: "chunks".into(),
+                    points: vec![point("chunk-1"), point("source-1")],
+                    point_deletes: vec![],
+                    relations: vec![RelateRequest {
+                        source_point_id: "chunk-1".into(),
+                        target_point_id: "source-1".into(),
+                        edge_type: "cites".into(),
+                        properties: json!({"kind": "source"}),
+                        scope: GraphRelationScope::Local,
+                        idempotency_key: None,
+                    }],
+                    edge_deletes: vec![],
+                    edge_updates: vec![],
+                },
+                &scope,
+                &audit::AuditContext::embedded(),
+            )
+            .unwrap();
+            db.prepare_encryption_migration().unwrap();
+        }
         let keyring_path = temp.path().join("keyring.json");
         write_keyring(&keyring_path, "key-new1");
+        let keyring = Keyring::load(&keyring_path).unwrap();
+        let before = storage_layout::resolve(&data_dir).unwrap();
+        let before_digest =
+            encryption::logical_tree_digest(&before.active_root, Some(&keyring)).unwrap();
 
         assert_crashed(run_child(
             "encryption_migration_resumes_from_every_publication_boundary",
@@ -100,7 +224,17 @@ fn encryption_migration_resumes_from_every_publication_boundary() {
             ],
         ));
 
-        let keyring = Keyring::load(&keyring_path).unwrap();
+        let interrupted = storage_layout::resolve(&data_dir).unwrap();
+        if boundary == "migration.after_current_switch" {
+            assert_ne!(interrupted.generation, before.generation, "{boundary}");
+        } else {
+            assert_eq!(interrupted.generation, before.generation, "{boundary}");
+        }
+        assert_eq!(
+            encryption::logical_tree_digest(&interrupted.active_root, Some(&keyring)).unwrap(),
+            before_digest,
+            "active generation changed logically at {boundary}"
+        );
         let migration = storage_layout::migrate_encryption(&data_dir, &keyring).unwrap();
         assert_eq!(
             storage_layout::resolve(&data_dir)
@@ -113,6 +247,15 @@ fn encryption_migration_resumes_from_every_publication_boundary() {
         assert_eq!(report.plaintext_files, 0, "boundary {boundary}");
         assert!(report.encrypted_files > 0, "boundary {boundary}");
         assert!(!data_dir.join(".generation-migration.json").exists());
+        assert_succeeded(run_child(
+            "encryption_migration_resumes_from_every_publication_boundary",
+            "migration-verify",
+            "none",
+            &[
+                ("CHIRONDB_DATA_DIR", &data_dir),
+                ("CHIRONDB_KEYRING", &keyring_path),
+            ],
+        ));
     }
 }
 
@@ -212,6 +355,168 @@ fn restore_restart_observes_only_complete_old_or_new_generation() {
 
 #[cfg(unix)]
 #[test]
+fn sql_vector_graph_restore_survives_real_sigkill_and_subsequent_commits() {
+    if child_mode("restore-sql-control") {
+        let db = Db::open(required_path("CHIRONDB_DATA_DIR")).unwrap();
+        let _ = db.restore(required_path("CHIRONDB_SNAPSHOT_DIR"));
+        return;
+    }
+
+    for generation in [false, true] {
+        for (boundary, expected) in [
+            ("restore.after_relational_validation", vec![1, 2]),
+            ("restore.before_relational_publication", vec![1]),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path().join("live");
+            let snapshot = temp.path().join("snapshot");
+            if generation {
+                storage_layout::initialize_empty(&data).unwrap();
+            }
+            {
+                let db = Db::open(&data).unwrap();
+                db.create_collection(collection_config()).unwrap();
+                let scope = TenantScope::tenant("restore-writer", "acme");
+                db.set_graph_lifecycle_scoped("docs", true, true, &scope)
+                    .unwrap();
+                db.configure_edge_type_scoped(
+                    "docs",
+                    ConfigureEdgeTypeRequest {
+                        name: "cites".into(),
+                        weight_property: None,
+                    },
+                    true,
+                    &scope,
+                )
+                .unwrap();
+                restore_sql(&db, "CREATE TABLE documents (id BIGINT PRIMARY KEY)");
+                restore_knowledge(&db, 1);
+                db.snapshot(&snapshot).unwrap();
+                restore_knowledge(&db, 2);
+            }
+            assert_sigkilled(run_sigkill_child(
+                "sql_vector_graph_restore_survives_real_sigkill_and_subsequent_commits",
+                "restore-sql-control",
+                boundary,
+                &temp.path().join("marker"),
+                &[
+                    ("CHIRONDB_DATA_DIR", &data),
+                    ("CHIRONDB_SNAPSHOT_DIR", &snapshot),
+                ],
+                &[],
+            ));
+            let db = Db::open(&data).unwrap();
+            assert_restored_knowledge(&db, &expected);
+            restore_knowledge(&db, 3);
+            drop(db);
+            let mut acknowledged = expected;
+            acknowledged.push(3);
+            assert_restored_knowledge(&Db::open(&data).unwrap(), &acknowledged);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn restore_sql(db: &Db, sql: &str) -> chirondb_core::SqlExecutionResponse {
+    db.execute_sql(SqlExecutionRequest {
+        statements: vec![SqlStatementRequest {
+            sql: sql.into(),
+            parameters: vec![],
+        }],
+        idempotency_key: None,
+        retry_id: None,
+    })
+    .unwrap()
+}
+
+#[cfg(unix)]
+fn restore_knowledge(db: &Db, id: i64) {
+    let response = db
+        .execute_multimodel_transaction(
+            MultiModelTransactionRequest {
+                sql: SqlExecutionRequest {
+                    statements: vec![SqlStatementRequest {
+                        sql: format!("INSERT INTO documents (id) VALUES ({id})"),
+                        parameters: vec![],
+                    }],
+                    idempotency_key: Some(format!("restore-document-{id}")),
+                    retry_id: None,
+                },
+                collection: "docs".into(),
+                points: vec![
+                    point(&format!("document-{id}")),
+                    point(&format!("source-{id}")),
+                ],
+                point_deletes: vec![],
+                relations: vec![RelateRequest {
+                    source_point_id: format!("document-{id}"),
+                    target_point_id: format!("source-{id}"),
+                    edge_type: "cites".into(),
+                    properties: json!({"source": id}),
+                    scope: GraphRelationScope::Local,
+                    idempotency_key: None,
+                }],
+                edge_deletes: vec![],
+                edge_updates: vec![],
+            },
+            &TenantScope::tenant("restore-writer", "acme"),
+            &audit::AuditContext::embedded(),
+        )
+        .unwrap();
+    assert!(response.sql.committed);
+}
+
+#[cfg(unix)]
+fn assert_restored_knowledge(db: &Db, expected: &[i64]) {
+    let response = restore_sql(db, "SELECT id FROM documents ORDER BY id");
+    let rows = expected
+        .iter()
+        .map(|id| vec![RelationalValue::Integer(*id)])
+        .collect::<Vec<_>>();
+    assert!(
+        matches!(&response.results[0], SqlResult::Rows { rows: actual, .. } if actual == &rows)
+    );
+    assert_eq!(db.count("docs", None).unwrap().count, expected.len() * 2);
+    let scope = TenantScope::tenant("restore-reader", "acme");
+    for id in expected {
+        assert_eq!(
+            db.get_points_scoped(
+                "docs",
+                &[format!("document-{id}"), format!("source-{id}")],
+                &scope
+            )
+            .unwrap()
+            .len(),
+            2
+        );
+        let traversal = db
+            .traverse_scoped(
+                "docs",
+                GraphTraverseRequest {
+                    anchors: vec![format!("document-{id}")],
+                    edge_types: vec!["cites".into()],
+                    direction: GraphDirection::Outgoing,
+                    node_filter: None,
+                    edge_filter: None,
+                    budget: TraversalBudget {
+                        max_depth: 1,
+                        ..TraversalBudget::default()
+                    },
+                },
+                &scope,
+            )
+            .unwrap();
+        assert!(
+            traversal
+                .nodes
+                .iter()
+                .any(|node| node.point_id == format!("source-{id}"))
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn wait_true_write_survives_real_sigkill_after_durable_boundary() {
     if child_mode("acknowledged-upsert") {
         let data_dir = required_path("CHIRONDB_DATA_DIR");
@@ -294,7 +599,11 @@ fn wal_append_and_rotation_are_recoverable_after_real_sigkill() {
         ));
         let reopened = Db::open(&data_dir).unwrap();
         let ids = ["old-point".to_string(), "rotation-first".to_string()];
-        assert_eq!(reopened.get_points("docs", &ids).unwrap().len(), 2);
+        assert_eq!(
+            reopened.get_points("docs", &ids).unwrap().len(),
+            2,
+            "boundary {boundary}"
+        );
     }
 }
 
@@ -424,6 +733,100 @@ fn snapshot_marker_never_publishes_a_partial_snapshot_after_real_sigkill() {
             );
         }
     }
+}
+
+#[test]
+fn snapshot_holds_sql_commits_until_its_tree_is_published() {
+    if child_mode("snapshot-sql-barrier") {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        storage_layout::initialize_empty(&data_dir).unwrap();
+        let db = Db::open(&data_dir).unwrap();
+        db.execute_sql(SqlExecutionRequest {
+            statements: vec![SqlStatementRequest {
+                sql: "CREATE TABLE receipts (id BIGINT PRIMARY KEY)".into(),
+                parameters: vec![],
+            }],
+            idempotency_key: None,
+            retry_id: None,
+        })
+        .unwrap();
+        let snapshot = temp.path().join("snapshot");
+        let snapshot_db = db.clone();
+        let snapshot_path = snapshot.clone();
+        let copying = thread::spawn(move || snapshot_db.snapshot(&snapshot_path));
+        let marker = required_path("CHIRONDB_FAILPOINT_MARKER");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !marker.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(marker.exists(), "snapshot did not reach publication pause");
+        let writer_db = db.clone();
+        let (sent, received) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            sent.send(writer_db.execute_sql(SqlExecutionRequest {
+                statements: vec![SqlStatementRequest {
+                    sql: "INSERT INTO receipts (id) VALUES (1)".into(),
+                    parameters: vec![],
+                }],
+                idempotency_key: None,
+                retry_id: None,
+            }))
+            .unwrap();
+        });
+        let committed_during_snapshot = received.recv_timeout(Duration::from_millis(250)).is_ok();
+        fs::write(required_path("CHIRONDB_FAILPOINT_RELEASE"), b"release").unwrap();
+        copying.join().unwrap().unwrap();
+        writer.join().unwrap();
+        if !committed_during_snapshot {
+            received
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+        }
+        assert!(
+            !committed_during_snapshot,
+            "SQL commit bypassed the snapshot publication barrier"
+        );
+        let snapshot_db = Db::open(&snapshot).unwrap();
+        let selected = snapshot_db
+            .execute_sql(SqlExecutionRequest {
+                statements: vec![SqlStatementRequest {
+                    sql: "SELECT id FROM receipts".into(),
+                    parameters: vec![],
+                }],
+                idempotency_key: None,
+                retry_id: None,
+            })
+            .unwrap();
+        assert!(matches!(&selected.results[0], SqlResult::Rows { rows, .. } if rows.is_empty()));
+        let live = db
+            .execute_sql(SqlExecutionRequest {
+                statements: vec![SqlStatementRequest {
+                    sql: "SELECT id FROM receipts".into(),
+                    parameters: vec![],
+                }],
+                idempotency_key: None,
+                retry_id: None,
+            })
+            .unwrap();
+        assert!(matches!(&live.results[0], SqlResult::Rows { rows, .. } if rows.len() == 1));
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("snapshot.marker");
+    let release = temp.path().join("snapshot.release");
+    assert_succeeded(run_child_with_action(
+        "snapshot_holds_sql_commits_until_its_tree_is_published",
+        "snapshot-sql-barrier",
+        "pause",
+        "snapshot.after_tree_sync",
+        &[
+            ("CHIRONDB_FAILPOINT_MARKER", &marker),
+            ("CHIRONDB_FAILPOINT_RELEASE", &release),
+        ],
+    ));
 }
 
 fn child_mode(expected: &str) -> bool {

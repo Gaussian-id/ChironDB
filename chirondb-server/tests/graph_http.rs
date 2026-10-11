@@ -138,7 +138,7 @@ async fn legacy_and_v1_share_graph_lifecycle_crud_traversal_and_search() {
         .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{lifecycle}");
     assert_eq!(lifecycle["enabled"], json!(true));
-    assert_eq!(lifecycle["durable"], json!(false));
+    assert_eq!(lifecycle["durable"], json!(true));
     assert!(lifecycle["graph_epoch"].is_number(), "{lifecycle}");
 
     let (status, configured) = harness
@@ -151,7 +151,7 @@ async fn legacy_and_v1_share_graph_lifecycle_crud_traversal_and_search() {
         .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{configured}");
     assert_eq!(configured["edge_type"]["name"], json!("knows"));
-    assert_eq!(configured["receipt"]["durable"], json!(false));
+    assert_eq!(configured["receipt"]["durable"], json!(true));
 
     let (status, catalog) = harness
         .send(Method::GET, "/collections/docs/graph/types", None, None)
@@ -246,7 +246,7 @@ async fn legacy_and_v1_share_graph_lifecycle_crud_traversal_and_search() {
         .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{deleted}");
     assert_eq!(deleted["deleted"], json!(1));
-    assert_eq!(deleted["receipt"]["durable"], json!(false));
+    assert_eq!(deleted["receipt"]["durable"], json!(true));
 
     let (status, dropped) = harness
         .send(Method::DELETE, "/v1/collections/docs/graph", None, None)

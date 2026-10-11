@@ -256,6 +256,35 @@ fn encode(state: GraphIdentitySnapshot) -> [u8; GRAPH_IDENTITY_BYTES] {
     bytes
 }
 
+pub(crate) fn validate_materialized_allocator(current: &Path, materialized: &Path) -> Result<()> {
+    let current_path = current.join(GRAPH_IDENTITY_FILE);
+    let base_path = materialized.join(GRAPH_IDENTITY_FILE);
+    for path in [&current_path, &base_path] {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() > MAX_ENCODED_IDENTITY_BYTES
+        {
+            return Err(GaussError::InvalidRequest(
+                "invalid common frontier allocator file".into(),
+            ));
+        }
+    }
+    let current = decode(&current_path, &read_persistent(&current_path)?)?;
+    let base = decode(&base_path, &read_persistent(&base_path)?)?;
+    if current.database_id != base.database_id
+        || current.allocator_epoch < base.allocator_epoch
+        || (current.allocator_epoch == base.allocator_epoch
+            && (current.node_high_water < base.node_high_water
+                || current.edge_high_water < base.edge_high_water))
+    {
+        return Err(GaussError::InvalidRequest(
+            "common frontier allocator lineage regressed".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn decode(path: &Path, bytes: &[u8]) -> Result<GraphIdentitySnapshot> {
     if bytes.len() != GRAPH_IDENTITY_BYTES {
         return Err(corruption(

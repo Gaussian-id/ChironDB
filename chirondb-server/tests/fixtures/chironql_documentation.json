@@ -1,0 +1,1566 @@
+{
+  "language": "1.4",
+  "examples": [
+    {
+      "id": "current-user",
+      "variant": "ShowCurrentUser",
+      "section": "Identity and revisions",
+      "description": "Inspect your server-authenticated identity; available to every active user.",
+      "sql": "SHOW CURRENT USER;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "current-privileges",
+      "variant": "ShowCurrentUser",
+      "section": "Identity and revisions",
+      "description": "List effective action capabilities; this is not a list of every readable document.",
+      "sql": "SHOW CURRENT USER PRIVILEGES;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "identity-revision",
+      "variant": "ShowRevision",
+      "section": "Identity and revisions",
+      "description": "Read the identity/user/role/key catalog revision; administrative authority required.",
+      "sql": "SHOW SECURITY REVISION;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "catalog-revision",
+      "variant": "ShowCatalogRevision",
+      "section": "Identity and revisions",
+      "description": "Read the collection catalog revision; designated installation administrator required.",
+      "sql": "SHOW CATALOG REVISION;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "create-protected",
+      "variant": "CreateProtectedCollection",
+      "section": "Collections and ingestion policy",
+      "description": "Create a deny-all two-dimensional collection. Initially no ingest template exists.",
+      "sql": "CREATE PROTECTED COLLECTION docs DIM 2 METRIC cosine;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "enable-protected-graph",
+      "variant": "SetGraphLifecycle",
+      "section": "Protected graph setup",
+      "description": "Enable graph storage on the newly created empty collection at its current security revision.",
+      "sql": "ALTER COLLECTION docs SET GRAPH ENABLED IF REVISION 1;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "configure-protected-edge-type",
+      "variant": "SetEdgeType",
+      "section": "Protected graph setup",
+      "description": "Configure an unweighted edge type after graph enablement advances the collection security revision.",
+      "sql": "ALTER COLLECTION docs SET EDGE TYPE cites IF REVISION 2;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "collection-revision",
+      "variant": "ShowRevision",
+      "section": "Identity and revisions",
+      "description": "Read the policy/ACL/label revision for this collection, not the identity revision.",
+      "sql": "SHOW SECURITY REVISION ON COLLECTION docs;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "show-policy",
+      "variant": "ShowCollectionPolicy",
+      "section": "Collections and ingestion policy",
+      "description": "Inspect policy and its revision before replacing it.",
+      "sql": "SHOW COLLECTION docs SECURITY POLICY;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "set-policy",
+      "variant": "SetCollectionPolicy",
+      "section": "Collections and ingestion policy",
+      "description": "Replace the whole typed policy. Preserve required templates when editing; this is not a partial merge.",
+      "sql": "ALTER COLLECTION docs SET SECURITY POLICY {\n  'department_actions': [\n    'read',\n    'search'\n  ],\n  'owner_actions': [\n    'read',\n    'search',\n    'update',\n    'delete'\n  ],\n  'templates': {\n    'finance': {\n      'department': 'Finance',\n      'classification': 'internal',\n      'properties': {\n        '/text': {\n          'classification': 'internal',\n          'actions': [\n            'read',\n            'query',\n            'write'\n          ]\n        }\n      },\n      'representations': {\n        'dense': {\n          'source_fields': [\n            '/text'\n          ],\n          'classification': 'internal'\n        }\n      }\n    },\n    'hr': {\n      'department': 'HR',\n      'classification': 'internal',\n      'properties': {\n        '/text': {\n          'classification': 'internal',\n          'actions': [\n            'read',\n            'query',\n            'write'\n          ]\n        }\n      },\n      'representations': {\n        'dense': {\n          'source_fields': [\n            '/text'\n          ],\n          'classification': 'internal'\n        }\n      }\n    }\n  }\n};",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "create-role",
+      "variant": "CreateRole",
+      "section": "Roles and users",
+      "description": "Create a role with zero permissions; its name has no special meaning.",
+      "sql": "CREATE ROLE finance_reader;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "grant-collection",
+      "variant": "RolePrivileges",
+      "section": "Roles and users",
+      "description": "Allow read operations and dense search on the exact active docs incarnation.",
+      "sql": "GRANT READ, SEARCH ON COLLECTION docs TO ROLE finance_reader;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "create-user",
+      "variant": "CreateUser",
+      "section": "Roles and users",
+      "description": "Both department and clearance are required. The new user is active but has no key or privileges.",
+      "sql": "CREATE USER ana SET DEPARTMENT Finance SET CLEARANCE CONFIDENTIAL;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "grant-role",
+      "variant": "AssignRole",
+      "section": "Roles and users",
+      "description": "Assign the existing role to the existing user.",
+      "sql": "GRANT ROLE finance_reader TO USER ana;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "show-role",
+      "variant": "ShowRolePrivileges",
+      "section": "Roles and users",
+      "description": "Inspect the role capability grants.",
+      "sql": "SHOW ROLE finance_reader PRIVILEGES;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "show-roles",
+      "variant": "ShowRoles",
+      "section": "Roles and users",
+      "description": "List role names; membership is requested separately with WITH USERS.",
+      "sql": "SHOW ROLES;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "show-memberships",
+      "variant": "ShowRoles",
+      "section": "Roles and users",
+      "description": "List roles and their user names.",
+      "sql": "SHOW ROLES WITH USERS;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "show-users",
+      "variant": "ShowUsers",
+      "section": "Roles and users",
+      "description": "List users, trusted attributes, enabled status, and role names.",
+      "sql": "SHOW USERS;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "writer-role",
+      "variant": "CreateRole",
+      "section": "Five-profile setup",
+      "description": "Create a separate ingestion role.",
+      "sql": "CREATE ROLE ingestion_writer;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "writer-capabilities",
+      "variant": "RolePrivileges",
+      "section": "Five-profile setup",
+      "description": "Raw vector/source ingestion requires INGEST as well as CREATE/UPDATE.",
+      "sql": "GRANT READ, SEARCH, CREATE, INGEST, UPDATE, DELETE ON COLLECTION docs TO ROLE ingestion_writer;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "writer-user",
+      "variant": "CreateUser",
+      "section": "Five-profile setup",
+      "description": "The ingestion principal has sufficient clearance to ingest the trusted templates.",
+      "sql": "CREATE USER writer SET DEPARTMENT Ingestion SET CLEARANCE RESTRICTED;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "writer-membership",
+      "variant": "AssignRole",
+      "section": "Five-profile setup",
+      "description": "Give the ingestion user only the defined writer role.",
+      "sql": "GRANT ROLE ingestion_writer TO USER writer;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "ops-role",
+      "variant": "CreateRole",
+      "section": "Five-profile setup",
+      "description": "Create an operations role independently of the security administrator.",
+      "sql": "CREATE ROLE operations;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "grant-system",
+      "variant": "RolePrivileges",
+      "section": "Five-profile setup",
+      "description": "ON SYSTEM is for installation actions. OBSERVE permits operator metrics, not document access.",
+      "sql": "GRANT OBSERVE ON SYSTEM TO ROLE operations;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "ops-user",
+      "variant": "CreateUser",
+      "section": "Five-profile setup",
+      "description": "Create an operator identity.",
+      "sql": "CREATE USER ops SET DEPARTMENT Operations SET CLEARANCE INTERNAL;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "ops-membership",
+      "variant": "AssignRole",
+      "section": "Five-profile setup",
+      "description": "Assign observation privileges.",
+      "sql": "GRANT ROLE operations TO USER ops;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "hr-role",
+      "variant": "CreateRole",
+      "section": "Five-profile setup",
+      "description": "Create a separate HR role.",
+      "sql": "CREATE ROLE hr_reader;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "hr-capabilities",
+      "variant": "RolePrivileges",
+      "section": "Five-profile setup",
+      "description": "Object policy still separates HR from Finance despite the same collection capability.",
+      "sql": "GRANT READ, SEARCH ON COLLECTION docs TO ROLE hr_reader;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "hr-user",
+      "variant": "CreateUser",
+      "section": "Five-profile setup",
+      "description": "Create the HR reader.",
+      "sql": "CREATE USER ben SET DEPARTMENT HR SET CLEARANCE INTERNAL;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "hr-membership",
+      "variant": "AssignRole",
+      "section": "Five-profile setup",
+      "description": "Assign the HR reader role.",
+      "sql": "GRANT ROLE hr_reader TO USER ben;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "issue-writer",
+      "variant": "IssueKey",
+      "section": "API keys",
+      "description": "Use CLI --key-out with a new private filename. No secret is printed; each issuance creates a new credential.",
+      "sql": "ISSUE API KEY FOR USER writer;",
+      "mode": "execute",
+      "actor": "admin",
+      "issue": "writer"
+    },
+    {
+      "id": "issue-ana",
+      "variant": "IssueKey",
+      "section": "API keys",
+      "description": "Use CLI --key-out with a new private filename. No secret is printed; each issuance creates a new credential.",
+      "sql": "ISSUE API KEY FOR USER ana;",
+      "mode": "execute",
+      "actor": "admin",
+      "issue": "ana"
+    },
+    {
+      "id": "issue-ben",
+      "variant": "IssueKey",
+      "section": "API keys",
+      "description": "Use CLI --key-out with a new private filename. No secret is printed; each issuance creates a new credential.",
+      "sql": "ISSUE API KEY FOR USER ben;",
+      "mode": "execute",
+      "actor": "admin",
+      "issue": "ben"
+    },
+    {
+      "id": "issue-ops",
+      "variant": "IssueKey",
+      "section": "API keys",
+      "description": "Use CLI --key-out with a new private filename. No secret is printed; each issuance creates a new credential.",
+      "sql": "ISSUE API KEY FOR USER ops;",
+      "mode": "execute",
+      "actor": "admin",
+      "issue": "ops"
+    },
+    {
+      "id": "show-keys",
+      "variant": "ShowCredentials",
+      "section": "API keys",
+      "description": "List credential IDs and revocation status only; no secret or hash is recoverable here.",
+      "sql": "SHOW API KEYS FOR USER ana;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "create-point",
+      "variant": "CreatePoints",
+      "section": "Protected data",
+      "description": "Run as writer. Save the returned ID as POINT_ID; do not send an id field on create.",
+      "sql": "CREATE POINTS INTO docs USING TEMPLATE finance {vector:[1,0],payload:{text:'finance report'}} REQUEST 'manual-finance-001';",
+      "mode": "execute",
+      "actor": "writer",
+      "save": "POINT_ID"
+    },
+    {
+      "id": "create-batch",
+      "variant": "CreatePoints",
+      "section": "Protected data",
+      "description": "Point objects are comma-separated without an outer array. Save the two returned IDs as SECOND_ID and THIRD_ID.",
+      "sql": "CREATE POINTS INTO docs USING TEMPLATE finance {vector:[0,1],payload:{text:'second report'}}, {vector:[1,1],payload:{text:'third report'}} REQUEST 'manual-finance-002';",
+      "mode": "execute",
+      "actor": "writer",
+      "save_batch": [
+        "SECOND_ID",
+        "THIRD_ID"
+      ]
+    },
+    {
+      "id": "create-hr",
+      "variant": "CreatePoints",
+      "section": "Protected data",
+      "description": "The trusted template determines the department; it is not supplied as an authoritative payload field.",
+      "sql": "CREATE POINTS INTO docs USING TEMPLATE hr {vector:[0,1],payload:{text:'hr policy'}} REQUEST 'manual-hr-001';",
+      "mode": "execute",
+      "actor": "writer",
+      "save": "HR_ID"
+    },
+    {
+      "id": "retry-create",
+      "variant": "CreatePoints",
+      "section": "Protected data",
+      "description": "Same principal, request ID and identical content returns the original IDs after reauthorization; it must not insert a duplicate.",
+      "sql": "CREATE POINTS INTO docs USING TEMPLATE finance {vector:[1,0],payload:{text:'finance report'}} REQUEST 'manual-finance-001';",
+      "mode": "execute",
+      "actor": "writer",
+      "same_id": "POINT_ID"
+    },
+    {
+      "id": "get-point",
+      "variant": "base:Get",
+      "section": "Protected data",
+      "description": "Use a real server-assigned ID. Hidden and missing IDs both yield no readable rows.",
+      "sql": "GET docs POINTS 'POINT_ID';",
+      "mode": "execute",
+      "actor": "ana",
+      "expected_rows": 1
+    },
+    {
+      "id": "get-batch",
+      "variant": "base:Get",
+      "section": "Protected data",
+      "description": "Retrieve multiple IDs under the same access domain.",
+      "sql": "GET docs POINTS 'POINT_ID', 'SECOND_ID';",
+      "mode": "execute",
+      "actor": "ana",
+      "expected_rows": 2
+    },
+    {
+      "id": "count",
+      "variant": "base:Count",
+      "section": "Protected data",
+      "description": "Finance sees its three documents, not the HR document.",
+      "sql": "COUNT docs;",
+      "mode": "execute",
+      "actor": "ana",
+      "count": 3
+    },
+    {
+      "id": "count-filter",
+      "variant": "base:Count",
+      "section": "Protected data",
+      "description": "Query permission on /text is required, independently of permission to read it.",
+      "sql": "COUNT docs WHERE text = 'finance report';",
+      "mode": "execute",
+      "actor": "ana",
+      "count": 1
+    },
+    {
+      "id": "scroll",
+      "variant": "base:Scroll",
+      "section": "Protected data",
+      "description": "Read an authorized page. For pagination use the response next cursor, not a numeric offset.",
+      "sql": "SCROLL docs LIMIT 2;",
+      "mode": "execute",
+      "actor": "ana",
+      "save_cursor": "CURSOR_ID",
+      "expected_rows": 2
+    },
+    {
+      "id": "scroll-after",
+      "variant": "base:Scroll",
+      "section": "Protected data",
+      "description": "Replace CURSOR_ID with the preceding response next cursor.",
+      "sql": "SCROLL docs AFTER 'CURSOR_ID' LIMIT 2;",
+      "mode": "execute",
+      "actor": "ana",
+      "expected_rows": 1
+    },
+    {
+      "id": "dense",
+      "variant": "base:Search",
+      "section": "Protected data",
+      "description": "Inline vectors must match the collection dimension. The result contains only authorized points.",
+      "sql": "SEARCH docs NEAR [1,0] LIMIT 10 WITH PAYLOAD;",
+      "mode": "execute",
+      "actor": "ana",
+      "expected_rows": 3
+    },
+    {
+      "id": "dense-filter",
+      "variant": "base:Search",
+      "section": "Protected data",
+      "description": "Filter fields require query permission; budget cannot increase the server ceiling.",
+      "sql": "SEARCH docs NEAR [1,0] WHERE text CONTAINS 'finance' LIMIT 2 BUDGET 1000 WITH PAYLOAD;",
+      "mode": "execute",
+      "actor": "ana",
+      "expected_rows": 1
+    },
+    {
+      "id": "use",
+      "variant": "base:Use",
+      "section": "Protected data",
+      "description": "Session collection selection requires Read on the collection. It does not grant access.",
+      "sql": "USE docs;",
+      "mode": "execute",
+      "actor": "ana"
+    },
+    {
+      "id": "update-point",
+      "variant": "UpdatePoints",
+      "section": "Protected data",
+      "description": "Replace an authorized existing object using its server ID; this is not a payload patch.",
+      "sql": "UPDATE POINTS IN docs {id:'POINT_ID',vector:[1,0],payload:{text:'updated finance report'}};",
+      "mode": "execute",
+      "actor": "writer"
+    },
+    {
+      "id": "update-batch",
+      "variant": "UpdatePoints",
+      "section": "Protected data",
+      "description": "A mixed unauthorized explicit batch is rejected atomically.",
+      "sql": "UPDATE POINTS IN docs {id:'SECOND_ID',vector:[0,1],payload:{text:'obsolete'}}, {id:'THIRD_ID',vector:[1,1],payload:{text:'third revised'}};",
+      "mode": "execute",
+      "actor": "writer"
+    },
+    {
+      "id": "delete-ids",
+      "variant": "base:DeletePoints",
+      "section": "Protected data",
+      "description": "Explicit IDs need Delete permission; read permission alone never permits deletion.",
+      "sql": "DELETE FROM docs POINTS 'THIRD_ID';",
+      "mode": "execute",
+      "actor": "writer"
+    },
+    {
+      "id": "delete-filter",
+      "variant": "base:DeleteWhere",
+      "section": "Protected data",
+      "description": "Requires confirmation (CLI --yes in scripts); selection uses the delete-authorized domain. Protected preview omits counts.",
+      "sql": "DELETE FROM docs WHERE text = 'obsolete';",
+      "mode": "execute",
+      "actor": "writer",
+      "confirm": true
+    },
+    {
+      "id": "grant-point",
+      "variant": "ObjectPrivileges",
+      "section": "Document ACL and labels",
+      "description": "An explicit object grant can share across departments in the same tenant. READ does not automatically grant SEARCH.",
+      "sql": "GRANT READ, SEARCH ON POINT 'POINT_ID' IN docs TO USER ben;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "deny-point",
+      "variant": "ObjectPrivileges",
+      "section": "Document ACL and labels",
+      "description": "Explicit deny overrides the permit, role and department. It does not raise clearance.",
+      "sql": "DENY READ, SEARCH ON POINT 'POINT_ID' IN docs TO USER ben;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "revoke-deny",
+      "variant": "ObjectPrivileges",
+      "section": "Document ACL and labels",
+      "description": "Remove the deny while keeping the independent explicit permit.",
+      "sql": "REVOKE DENY READ, SEARCH ON POINT 'POINT_ID' IN docs FROM USER ben;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "revoke-grant",
+      "variant": "ObjectPrivileges",
+      "section": "Document ACL and labels",
+      "description": "Remove the explicit permit. Department/owner/group/inherited permits may still apply.",
+      "sql": "REVOKE GRANT READ, SEARCH ON POINT 'POINT_ID' IN docs FROM USER ben;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "grant-group",
+      "variant": "ObjectPrivileges",
+      "section": "Document ACL and labels",
+      "description": "Conditional syntax: payroll must already exist in the trusted identity authority. Group creation/membership has no ChironQL command in 1.3.",
+      "sql": "GRANT READ ON POINT 'POINT_ID' IN docs TO GROUP payroll;",
+      "mode": "conditional",
+      "actor": "admin"
+    },
+    {
+      "id": "deny-group",
+      "variant": "ObjectPrivileges",
+      "section": "Document ACL and labels",
+      "description": "Conditional syntax: payroll must already exist in the trusted identity authority. Group creation/membership has no ChironQL command in 1.3.",
+      "sql": "DENY READ ON POINT 'POINT_ID' IN docs TO GROUP payroll;",
+      "mode": "conditional",
+      "actor": "admin"
+    },
+    {
+      "id": "revoke-grant-group",
+      "variant": "ObjectPrivileges",
+      "section": "Document ACL and labels",
+      "description": "Conditional syntax: payroll must already exist in the trusted identity authority. Group creation/membership has no ChironQL command in 1.3.",
+      "sql": "REVOKE GRANT READ ON POINT 'POINT_ID' IN docs FROM GROUP payroll;",
+      "mode": "conditional",
+      "actor": "admin"
+    },
+    {
+      "id": "revoke-deny-group",
+      "variant": "ObjectPrivileges",
+      "section": "Document ACL and labels",
+      "description": "Conditional syntax: payroll must already exist in the trusted identity authority. Group creation/membership has no ChironQL command in 1.3.",
+      "sql": "REVOKE DENY READ ON POINT 'POINT_ID' IN docs FROM GROUP payroll;",
+      "mode": "conditional",
+      "actor": "admin"
+    },
+    {
+      "id": "point-owner",
+      "variant": "AlterPoint",
+      "section": "Document ACL and labels",
+      "description": "Owner is resolved to an immutable user ID. Content writers cannot change this by editing payload.",
+      "sql": "ALTER POINT 'POINT_ID' IN docs SET OWNER ana;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "point-department",
+      "variant": "AlterPoint",
+      "section": "Document ACL and labels",
+      "description": "Changing the security department can change visibility; LabelsManage/delegation checks apply.",
+      "sql": "ALTER POINT 'POINT_ID' IN docs SET DEPARTMENT HR;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "point-classification",
+      "variant": "AlterPoint",
+      "section": "Document ACL and labels",
+      "description": "Raising classification also tightens derived representation labels; existing lower-clearance readers lose access.",
+      "sql": "ALTER POINT 'POINT_ID' IN docs SET CLASSIFICATION RESTRICTED;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "point-combined",
+      "variant": "AlterPoint",
+      "section": "Document ACL and labels",
+      "description": "Several distinct SET clauses are one security transaction. Duplicate SET attributes are rejected.",
+      "sql": "ALTER POINT 'POINT_ID' IN docs SET OWNER writer SET DEPARTMENT Finance SET CLASSIFICATION RESTRICTED;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "alter-department",
+      "variant": "AlterUser",
+      "section": "User lifecycle and revocation",
+      "description": "Changes trusted identity attributes and drains the old authorization context.",
+      "sql": "ALTER USER ana SET DEPARTMENT Finance;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "alter-clearance",
+      "variant": "AlterUser",
+      "section": "User lifecycle and revocation",
+      "description": "A role does not change clearance; explicit identity administration does.",
+      "sql": "ALTER USER ana SET CLEARANCE INTERNAL;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "suspend-user",
+      "variant": "AlterUser",
+      "section": "User lifecycle and revocation",
+      "description": "Requires confirmation; existing credentials stop authenticating while suspended.",
+      "sql": "ALTER USER ana SET STATUS SUSPENDED;",
+      "mode": "execute",
+      "actor": "admin",
+      "confirm": true
+    },
+    {
+      "id": "activate-user",
+      "variant": "AlterUser",
+      "section": "User lifecycle and revocation",
+      "description": "Reactivate the identity; revoked credentials remain revoked.",
+      "sql": "ALTER USER ana SET STATUS ACTIVE;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "alter-combined",
+      "variant": "AlterUser",
+      "section": "User lifecycle and revocation",
+      "description": "Apply several distinct identity attributes in one transaction.",
+      "sql": "ALTER USER ana SET DEPARTMENT Finance SET CLEARANCE CONFIDENTIAL SET STATUS ACTIVE;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "rotate-key",
+      "variant": "RotateKey",
+      "section": "API keys",
+      "description": "Replace KEY_ID with the ID from SHOW API KEYS. Requires --key-out pointing to a new file; the old credential is revoked.",
+      "sql": "ROTATE API KEY 'KEY_ID';",
+      "mode": "execute",
+      "actor": "admin",
+      "rotate": "ana"
+    },
+    {
+      "id": "revoke-key",
+      "variant": "RevokeKey",
+      "section": "API keys",
+      "description": "Use the new credential ID for this example. Revocation cannot be undone by reactivating a user.",
+      "sql": "REVOKE API KEY 'ROTATED_KEY_ID';",
+      "mode": "execute",
+      "actor": "admin",
+      "revoke": "ana"
+    },
+    {
+      "id": "revoke-role",
+      "variant": "AssignRole",
+      "section": "User lifecycle and revocation",
+      "description": "Remove membership without deleting the role or user; existing sessions observe revocation.",
+      "sql": "REVOKE ROLE finance_reader FROM USER ana;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "revoke-collection",
+      "variant": "RolePrivileges",
+      "section": "User lifecycle and revocation",
+      "description": "Edit the role itself; this affects every member, unlike REVOKE ROLE ... FROM USER.",
+      "sql": "REVOKE SEARCH ON COLLECTION docs FROM ROLE finance_reader;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "revoke-system",
+      "variant": "RolePrivileges",
+      "section": "User lifecycle and revocation",
+      "description": "Remove the installation action from all members of the role.",
+      "sql": "REVOKE OBSERVE ON SYSTEM FROM ROLE operations;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "rename-user",
+      "variant": "RenameUser",
+      "section": "User lifecycle and revocation",
+      "description": "Only the display name changes; ID, ownership and grants retain identity.",
+      "sql": "RENAME USER ana TO ana_archive;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "rename-role",
+      "variant": "RenameRole",
+      "section": "User lifecycle and revocation",
+      "description": "Renaming preserves the internal role ID and memberships.",
+      "sql": "RENAME ROLE finance_reader TO finance_viewer;",
+      "mode": "execute",
+      "actor": "admin"
+    },
+    {
+      "id": "drop-role",
+      "variant": "DropRole",
+      "section": "User lifecycle and revocation",
+      "description": "Requires confirmation. Recreating the same name never restores old grants/memberships.",
+      "sql": "DROP ROLE finance_viewer;",
+      "mode": "execute",
+      "actor": "admin",
+      "confirm": true
+    },
+    {
+      "id": "drop-user",
+      "variant": "DropUser",
+      "section": "User lifecycle and revocation",
+      "description": "Requires confirmation; retire the user and revoke credentials. Existing object ownership is not transferred.",
+      "sql": "DROP USER ana_archive;",
+      "mode": "execute",
+      "actor": "admin",
+      "confirm": true
+    },
+    {
+      "id": "explicit-revision",
+      "variant": "CreateRole",
+      "section": "Identity and revisions",
+      "description": "Use the current value returned by SHOW SECURITY REVISION. Here 9 is illustrative, not a reusable token.",
+      "sql": "CREATE ROLE revision_guard IF REVISION 9;",
+      "mode": "execute",
+      "actor": "admin",
+      "revision": true
+    },
+    {
+      "id": "stale-revision",
+      "variant": "CreateRole",
+      "section": "Identity and revisions",
+      "description": "Intentional conflict: revision zero is stale on an initialized installation. No role is created.",
+      "sql": "CREATE ROLE stale_example IF REVISION 0;",
+      "mode": "execute",
+      "actor": "admin",
+      "exit": 1
+    },
+    {
+      "id": "nondelegable",
+      "variant": "RolePrivileges",
+      "section": "Deliberately rejected requests",
+      "description": "Identity management is bootstrap authority; this parses but authorization rejects it.",
+      "sql": "GRANT IDENTITY_MANAGE ON SYSTEM TO ROLE operations;",
+      "mode": "execute",
+      "actor": "admin",
+      "exit": 1
+    },
+    {
+      "id": "legacy-upsert-denied",
+      "variant": "base:Upsert",
+      "section": "Deliberately rejected requests",
+      "description": "Protected collections reject client-ID UPSERT; use CREATE POINTS or UPDATE POINTS.",
+      "sql": "UPSERT INTO docs {id:'chosen',vector:[1,0],payload:{text:'wrong create API'}};",
+      "mode": "execute",
+      "actor": "admin",
+      "exit": 1
+    },
+    {
+      "id": "base-create",
+      "variant": "base:CreateCollection",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Legacy collection creation; protected installations require CREATE PROTECTED COLLECTION.",
+      "sql": "CREATE COLLECTION products DIM 3 METRIC cosine WITH {named_vector_dims:{image:3}};",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-create-l2",
+      "variant": "base:CreateCollection",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Alternative Euclidean distance metric.",
+      "sql": "CREATE COLLECTION euclidean DIM 3 METRIC l2;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-create-dot",
+      "variant": "base:CreateCollection",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Alternative dot-product metric.",
+      "sql": "CREATE COLLECTION dot_products DIM 3 METRIC dot;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-upsert",
+      "variant": "base:Upsert",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Explicit client IDs and asynchronous WAL acknowledgement on the legacy surface.",
+      "sql": "UPSERT INTO products {id:'phone',vector:[1,0,0],vectors:{image:[0,1,0]},payload:{category:'electronics',price:699,title:'wireless phone',meta:{brand:'acme'}}}, {id:'book',vector:[0,1,0],payload:{category:'books',price:25}} NO WAIT;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-search",
+      "variant": "base:Search",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "All ordinary search control clauses; RECALL is a target, not a measured result. Protected dense search uses exact evaluation.",
+      "sql": "SEARCH products NEAR [1,0,0] LIMIT 5 WITH PAYLOAD EF 64 RECALL 0.95 BUDGET 1000;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-stored-vector",
+      "variant": "base:Search",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Stored-vector references require a readable existing point; unavailable on protected ChironQL.",
+      "sql": "SEARCH products NEAR @phone LIMIT 5;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-named-vector",
+      "variant": "base:Search",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Named vector space must be configured and populated.",
+      "sql": "SEARCH products NEAR @phone USING image LIMIT 5;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-filter-eq",
+      "variant": "base:Search",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Equality, conjunction and a bounded numeric range.",
+      "sql": "SEARCH products NEAR [1,0,0] WHERE category = 'electronics' AND price >= 100 AND price <= 700 LIMIT 5;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-filter-ne",
+      "variant": "base:Count",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Not-equal and strict numeric comparisons.",
+      "sql": "COUNT products WHERE category != 'books' AND price > 100 AND price < 1000;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-filter-in",
+      "variant": "base:Scroll",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Single-field membership implements a disjunction without OR.",
+      "sql": "SCROLL products WHERE category IN ['electronics','books'] LIMIT 10;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-filter-contains",
+      "variant": "base:Count",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Token intersection on a string field.",
+      "sql": "COUNT products WHERE title CONTAINS 'wireless phone';",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-filter-nested",
+      "variant": "base:Count",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Dotted nested payload path.",
+      "sql": "COUNT products WHERE meta.brand = 'acme';",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-hybrid",
+      "variant": "base:Hybrid",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Numeric sparse-vector fusion; TEXT is not a natural-language string or the native BM25 API.",
+      "sql": "HYBRID products NEAR [1,0,0] TEXT {12:1.2,98:0.7} FUSION rrf LIMIT 5;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-hybrid-weighted",
+      "variant": "base:Hybrid",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Explicit dense/sparse weights.",
+      "sql": "HYBRID products NEAR [1,0,0] TEXT {12:1.2} FUSION weighted DENSE 0.7 SPARSE 0.3 LIMIT 5;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-hybrid-named",
+      "variant": "base:Hybrid",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Named-vector hybrid with query filter.",
+      "sql": "HYBRID products NEAR [0,1,0] USING image TEXT {12:1} WHERE price <= 700 LIMIT 5;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-multi",
+      "variant": "base:Multi",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Fuse multiple dense query vectors with matching weights.",
+      "sql": "MULTI products NEAR [1,0,0], NEAR [0,1,0] FUSION weighted WEIGHTS 0.6,0.4 LIMIT 5;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-multi-rrf",
+      "variant": "base:Multi",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "RRF multi-query fusion.",
+      "sql": "MULTI products NEAR [1,0,0], NEAR [0,1,0] FUSION rrf WHERE price <= 700 LIMIT 5;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-recommend",
+      "variant": "base:Recommend",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Positive and negative examples; existing points required.",
+      "sql": "RECOMMEND products LIKE phone UNLIKE book LIMIT 5;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-recommend-named",
+      "variant": "base:Recommend",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Named-space recommendation.",
+      "sql": "RECOMMEND products LIKE phone USING image WHERE price <= 700 LIMIT 5;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-count",
+      "variant": "base:Count",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Count matches on legacy authorization surface.",
+      "sql": "COUNT products;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-scroll",
+      "variant": "base:Scroll",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "ID-based cursor; use the previous response cursor.",
+      "sql": "SCROLL products AFTER 'phone' LIMIT 20;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-get",
+      "variant": "base:Get",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Batch point retrieval.",
+      "sql": "GET products POINTS phone, book;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-list",
+      "variant": "base:ShowCollections",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Not exposed by protected ChironQL; use known protected collection names.",
+      "sql": "SHOW COLLECTIONS;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-describe",
+      "variant": "base:Describe",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Legacy schema/config inspection; protected policy has SHOW COLLECTION ... SECURITY POLICY.",
+      "sql": "DESCRIBE products;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-update",
+      "variant": "base:UpdatePayload",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Merge ordinary payload fields; protected partial update is not supported.",
+      "sql": "UPDATE products POINT phone SET PAYLOAD {featured:true};",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-replace",
+      "variant": "base:UpdatePayload",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Replace the legacy payload object.",
+      "sql": "UPDATE products POINT phone SET PAYLOAD {category:'electronics',price:699} REPLACE;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-delete",
+      "variant": "base:DeletePoints",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Explicit ID deletion.",
+      "sql": "DELETE FROM products POINTS phone, book;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-delete-filter",
+      "variant": "base:DeleteWhere",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Filtered deletion requires confirmation; legacy preview counts matches.",
+      "sql": "DELETE FROM products WHERE category = 'archived';",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-relate",
+      "variant": "base:Relate",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Requires graph lifecycle and edge-type setup via a native administrative API.",
+      "sql": "RELATE products phone -> related_to -> book SET {strength:0.8} IDEMPOTENCY KEY 'relation-001' NO WAIT;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-deferred",
+      "variant": "base:Relate",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Conditional: requires a server-bound deferred session; stateless requests reject it.",
+      "sql": "RELATE products phone -> related_to -> book WITH DEFERRED ENDPOINTS;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-unrelate",
+      "variant": "base:Unrelate",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Replace EDGE_ID with a returned opaque edge token, not a point ID.",
+      "sql": "UNRELATE products EDGE 'EDGE_ID' NO WAIT;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-edge-update",
+      "variant": "base:UpdateEdge",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Merge edge properties.",
+      "sql": "UPDATE products EDGE 'EDGE_ID' SET PROPERTIES {strength:0.9} NO WAIT;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-edge-replace",
+      "variant": "base:UpdateEdge",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Replace edge properties.",
+      "sql": "UPDATE products EDGE 'EDGE_ID' SET PROPERTIES {strength:0.9} REPLACE NO WAIT;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-traverse-nodes",
+      "variant": "base:Traverse",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Exact traversal, requires enabled graph.",
+      "sql": "TRAVERSE products FROM phone VIA related_to DIRECTION OUT DEPTH 2 LIMIT 20 WITH PAYLOAD RETURN NODES;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-traverse-edges",
+      "variant": "base:Traverse",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Incoming edges with a property filter.",
+      "sql": "TRAVERSE products FROM phone DIRECTION IN DEPTH 1 EDGE WHERE strength >= 0.5 LIMIT 20 RETURN EDGES;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-traverse-paths",
+      "variant": "base:Traverse",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Simple paths require LIMIT; WHERE is not a protected security policy.",
+      "sql": "TRAVERSE products FROM phone, book VIA related_to DIRECTION ANY DEPTH 2 WHERE price <= 700 EDGE WHERE strength >= 0.5 BUDGET 1000 MS LIMIT 20 WITH PAYLOAD RETURN PATHS;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-connected-search",
+      "variant": "base:Search",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Graph-constrained search; ALLOW DEGRADED does not bypass authorization.",
+      "sql": "SEARCH products NEAR [1,0,0] CONNECTED TO phone VIA related_to DIRECTION OUT WITHIN 2 HOPS ALLOW DEGRADED LIMIT 10;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-connected-hybrid",
+      "variant": "base:Hybrid",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Graph-constrained numeric hybrid.",
+      "sql": "HYBRID products NEAR [1,0,0] TEXT {12:1} CONNECTED TO phone VIA related_to DIRECTION ANY WITHIN 2 HOPS ALLOW DEGRADED LIMIT 10;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-drop",
+      "variant": "base:DropCollection",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Destructive legacy lifecycle operation; protected drop remains rejected.",
+      "sql": "DROP COLLECTION products;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-drop-if-before",
+      "variant": "base:DropCollection",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Equivalent placement of IF EXISTS before the collection name.",
+      "sql": "DROP COLLECTION IF EXISTS products;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-drop-if",
+      "variant": "base:DropCollection",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Suppress a missing legacy collection error, not authorization errors.",
+      "sql": "DROP COLLECTION products IF EXISTS;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-use",
+      "variant": "base:Use",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Set the session collection.",
+      "sql": "USE products;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-session-search",
+      "variant": "base:Search",
+      "section": "Legacy 1.0–1.1 reference",
+      "description": "Run after USE products in the same session or pass --collection products.",
+      "sql": "SEARCH NEAR [1,0,0] LIMIT 5;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "bad-or",
+      "variant": "reject",
+      "section": "Rejected grammar",
+      "description": "Intentional parser rejection; do not use this syntax.",
+      "sql": "COUNT docs WHERE text = 'a' OR text = 'b';",
+      "mode": "reject",
+      "actor": "admin"
+    },
+    {
+      "id": "bad-login",
+      "variant": "reject",
+      "section": "Rejected grammar",
+      "description": "Intentional parser rejection; do not use this syntax.",
+      "sql": "LOGIN admin;",
+      "mode": "reject",
+      "actor": "admin"
+    },
+    {
+      "id": "bad-group-create",
+      "variant": "reject",
+      "section": "Rejected grammar",
+      "description": "Intentional parser rejection; do not use this syntax.",
+      "sql": "CREATE GROUP payroll;",
+      "mode": "reject",
+      "actor": "admin"
+    },
+    {
+      "id": "bad-point-revoke",
+      "variant": "reject",
+      "section": "Rejected grammar",
+      "description": "Intentional parser rejection; do not use this syntax.",
+      "sql": "REVOKE READ ON POINT 'POINT_ID' IN docs FROM USER ben;",
+      "mode": "reject",
+      "actor": "admin"
+    },
+    {
+      "id": "bad-create-id",
+      "variant": "reject",
+      "section": "Rejected grammar",
+      "description": "Intentional parser rejection; do not use this syntax.",
+      "sql": "CREATE POINTS INTO docs USING TEMPLATE finance {id:'chosen',vector:[1,0]} REQUEST 'bad';",
+      "mode": "reject",
+      "actor": "admin"
+    },
+    {
+      "id": "bad-role-inherit",
+      "variant": "reject",
+      "section": "Rejected grammar",
+      "description": "Intentional parser rejection; do not use this syntax.",
+      "sql": "GRANT ROLE finance_reader TO ROLE operations;",
+      "mode": "reject",
+      "actor": "admin"
+    },
+    {
+      "id": "bad-password",
+      "variant": "reject",
+      "section": "Rejected grammar",
+      "description": "Intentional parser rejection; do not use this syntax.",
+      "sql": "CREATE USER password_user SET PASSWORD 'example';",
+      "mode": "reject",
+      "actor": "admin"
+    },
+    {
+      "id": "bad-show-revision",
+      "variant": "reject",
+      "section": "Rejected grammar",
+      "description": "Intentional parser rejection; do not use this syntax.",
+      "sql": "SHOW CURRENT USER IF REVISION 9;",
+      "mode": "reject",
+      "actor": "admin"
+    },
+    {
+      "id": "action-read",
+      "variant": "RolePrivileges",
+      "section": "Action vocabulary",
+      "description": "Vocabulary example only: scope, administrator delegation and feature availability are checked separately.",
+      "sql": "GRANT READ ON COLLECTION docs TO ROLE operations;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "action-search",
+      "variant": "RolePrivileges",
+      "section": "Action vocabulary",
+      "description": "Vocabulary example only: scope, administrator delegation and feature availability are checked separately.",
+      "sql": "GRANT SEARCH ON COLLECTION docs TO ROLE operations;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "action-create",
+      "variant": "RolePrivileges",
+      "section": "Action vocabulary",
+      "description": "Vocabulary example only: scope, administrator delegation and feature availability are checked separately.",
+      "sql": "GRANT CREATE ON COLLECTION docs TO ROLE operations;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "action-ingest",
+      "variant": "RolePrivileges",
+      "section": "Action vocabulary",
+      "description": "Vocabulary example only: scope, administrator delegation and feature availability are checked separately.",
+      "sql": "GRANT INGEST ON COLLECTION docs TO ROLE operations;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "action-update",
+      "variant": "RolePrivileges",
+      "section": "Action vocabulary",
+      "description": "Vocabulary example only: scope, administrator delegation and feature availability are checked separately.",
+      "sql": "GRANT UPDATE ON COLLECTION docs TO ROLE operations;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "action-delete",
+      "variant": "RolePrivileges",
+      "section": "Action vocabulary",
+      "description": "Vocabulary example only: scope, administrator delegation and feature availability are checked separately.",
+      "sql": "GRANT DELETE ON COLLECTION docs TO ROLE operations;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "action-graph_read",
+      "variant": "RolePrivileges",
+      "section": "Action vocabulary",
+      "description": "Vocabulary example only: scope, administrator delegation and feature availability are checked separately.",
+      "sql": "GRANT GRAPH_READ ON COLLECTION docs TO ROLE operations;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "action-graph_write",
+      "variant": "RolePrivileges",
+      "section": "Action vocabulary",
+      "description": "Vocabulary example only: scope, administrator delegation and feature availability are checked separately.",
+      "sql": "GRANT GRAPH_WRITE ON COLLECTION docs TO ROLE operations;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "action-traverse",
+      "variant": "RolePrivileges",
+      "section": "Action vocabulary",
+      "description": "Vocabulary example only: scope, administrator delegation and feature availability are checked separately.",
+      "sql": "GRANT TRAVERSE ON COLLECTION docs TO ROLE operations;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "action-schema",
+      "variant": "RolePrivileges",
+      "section": "Action vocabulary",
+      "description": "Vocabulary example only: scope, administrator delegation and feature availability are checked separately.",
+      "sql": "GRANT SCHEMA ON COLLECTION docs TO ROLE operations;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "action-collection_create",
+      "variant": "RolePrivileges",
+      "section": "Action vocabulary",
+      "description": "Vocabulary example only: scope, administrator delegation and feature availability are checked separately.",
+      "sql": "GRANT COLLECTION_CREATE ON SYSTEM TO ROLE operations;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "action-collection_drop",
+      "variant": "RolePrivileges",
+      "section": "Action vocabulary",
+      "description": "Vocabulary example only: scope, administrator delegation and feature availability are checked separately.",
+      "sql": "GRANT COLLECTION_DROP ON SYSTEM TO ROLE operations;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "action-maintain",
+      "variant": "RolePrivileges",
+      "section": "Action vocabulary",
+      "description": "Vocabulary example only: scope, administrator delegation and feature availability are checked separately.",
+      "sql": "GRANT MAINTAIN ON SYSTEM TO ROLE operations;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "action-observe",
+      "variant": "RolePrivileges",
+      "section": "Action vocabulary",
+      "description": "Vocabulary example only: scope, administrator delegation and feature availability are checked separately.",
+      "sql": "GRANT OBSERVE ON SYSTEM TO ROLE operations;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "action-identity_manage",
+      "variant": "RolePrivileges",
+      "section": "Action vocabulary",
+      "description": "Vocabulary example only: scope, administrator delegation and feature availability are checked separately.",
+      "sql": "GRANT IDENTITY_MANAGE ON SYSTEM TO ROLE operations;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "action-policy_manage",
+      "variant": "RolePrivileges",
+      "section": "Action vocabulary",
+      "description": "Vocabulary example only: scope, administrator delegation and feature availability are checked separately.",
+      "sql": "GRANT POLICY_MANAGE ON COLLECTION docs TO ROLE operations;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "action-labels_manage",
+      "variant": "RolePrivileges",
+      "section": "Action vocabulary",
+      "description": "Vocabulary example only: scope, administrator delegation and feature availability are checked separately.",
+      "sql": "GRANT LABELS_MANAGE ON COLLECTION docs TO ROLE operations;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "action-grants_manage",
+      "variant": "RolePrivileges",
+      "section": "Action vocabulary",
+      "description": "Vocabulary example only: scope, administrator delegation and feature availability are checked separately.",
+      "sql": "GRANT GRANTS_MANAGE ON COLLECTION docs TO ROLE operations;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "action-export",
+      "variant": "RolePrivileges",
+      "section": "Action vocabulary",
+      "description": "Vocabulary example only: scope, administrator delegation and feature availability are checked separately.",
+      "sql": "GRANT EXPORT ON COLLECTION docs TO ROLE operations;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "action-snapshot",
+      "variant": "RolePrivileges",
+      "section": "Action vocabulary",
+      "description": "Vocabulary example only: scope, administrator delegation and feature availability are checked separately.",
+      "sql": "GRANT SNAPSHOT ON SYSTEM TO ROLE operations;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "action-restore",
+      "variant": "RolePrivileges",
+      "section": "Action vocabulary",
+      "description": "Vocabulary example only: scope, administrator delegation and feature availability are checked separately.",
+      "sql": "GRANT RESTORE ON SYSTEM TO ROLE operations;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "bad-double-quoted-object",
+      "variant": "reject",
+      "section": "Rejected grammar",
+      "description": "HTTP JSON syntax is not a ChironQL object literal. Use single-quoted strings inside SQL.",
+      "sql": "CREATE POINTS INTO docs USING TEMPLATE finance {\"vector\":[1,0],\"payload\":{\"text\":\"x\"}} REQUEST 'bad-json';",
+      "mode": "reject",
+      "actor": "admin"
+    },
+    {
+      "id": "base-sql",
+      "variant": "base:Sql",
+      "section": "ChironQL 1.4 relational",
+      "description": "One native SQL statement routed through the relational analyzer and executor.",
+      "sql": "SQL SELECT id, title FROM documents LIMIT 20;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-pipeline",
+      "variant": "base:Pipeline",
+      "section": "ChironQL 1.4 multi-model",
+      "description": "Bounded read-only vector and relational pipeline; protected execution remains fail-closed.",
+      "sql": "PIPELINE\n  VECTOR v { SEARCH chunks NEAR [1,0] LIMIT 20 }\n  RELATIONAL r { SQL SELECT id, chunk_ref FROM documents LIMIT 20 }\n  INNER JOIN r ON r.chunk_ref = v.record_ref\n  RETURN r.id, v.score\n  LIMIT 10;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-transaction-multimodel",
+      "variant": "base:Transaction",
+      "section": "ChironQL 1.4 atomic multi-model mutation",
+      "description": "One durable decision for a relational mutation, vector points, and graph relation.",
+      "sql": "TRANSACTION {\n  SQL INSERT INTO documents (id, title) VALUES ('doc-1', 'Atomic document');\n  VECTOR UPSERT INTO chunks {id: 'chunk-1', vector: [1,0]}, {id: 'source-1', vector: [0,1]};\n  GRAPH CONNECT chunks 'chunk-1' -> CITES -> 'source-1';\n};",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "base-ml-materialize",
+      "variant": "base:MlMaterialize",
+      "section": "Traditional ML evaluation",
+      "description": "Parse optional Decision Tree regression syntax; ML execution requires an unprotected installation and a separately provisioned worker.",
+      "sql": "ML MATERIALIZE demo_regression FROM ml_demo TARGET amount FEATURES (price) TASK REGRESSION USING DECISION_TREE;",
+      "mode": "syntax",
+      "actor": "admin"
+    }
+  ],
+  "meta_commands": [
+    {
+      "input": "\\h",
+      "denied": false,
+      "expected_output": "Introspect"
+    },
+    {
+      "input": "\\?",
+      "denied": false,
+      "expected_output": "Introspect"
+    },
+    {
+      "input": "\\help",
+      "denied": false,
+      "expected_output": "Introspect"
+    },
+    {
+      "input": "clear;",
+      "denied": false,
+      "expected_output": ""
+    },
+    {
+      "input": "\\clear",
+      "denied": false,
+      "expected_output": ""
+    },
+    {
+      "input": "\\l",
+      "denied": true,
+      "expected_output": "chironql.protected_unsupported"
+    },
+    {
+      "input": "\\d",
+      "denied": true,
+      "expected_output": "chironql.protected_unsupported"
+    },
+    {
+      "input": "\\d docs",
+      "denied": true,
+      "expected_output": "chironql.protected_unsupported"
+    },
+    {
+      "input": "\\c docs",
+      "denied": false,
+      "expected_output": "\"kind\": \"rows\""
+    },
+    {
+      "input": "\\use docs",
+      "denied": false,
+      "expected_output": "\"kind\": \"rows\""
+    },
+    {
+      "input": "\\trace",
+      "denied": false,
+      "expected_output": "trace on"
+    },
+    {
+      "input": "\\trace on",
+      "denied": false,
+      "expected_output": "trace on"
+    },
+    {
+      "input": "\\trace off",
+      "denied": false,
+      "expected_output": "trace off"
+    },
+    {
+      "input": "\\timing",
+      "denied": false,
+      "expected_output": "timing on"
+    },
+    {
+      "input": "\\format table",
+      "denied": false,
+      "expected_output": "format table"
+    },
+    {
+      "input": "\\format json",
+      "denied": false,
+      "expected_output": "format json"
+    },
+    {
+      "input": "\\params []",
+      "denied": false,
+      "expected_output": "parameters set for next statement"
+    },
+    {
+      "input": "\\role",
+      "denied": false,
+      "expected_output": "role is enforced by the server for this connection"
+    },
+    {
+      "input": "\\q",
+      "denied": false
+    },
+    {
+      "input": "\\quit",
+      "denied": false
+    }
+  ]
+}

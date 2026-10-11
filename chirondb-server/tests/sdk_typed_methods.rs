@@ -7,11 +7,12 @@
 
 use chirondb::{CollectionConfig, Db, DistanceMetric, Point, api};
 use chirondb_client::{
-    ChironDbClient, Fusion, GraphConstraint, GraphDeferredSessionState, GraphDirection,
-    GraphRelationScope, GraphTraversalQueryRequest, GraphTraversalReturn, GraphTraversalRows,
-    GraphTraverseRequest, HybridQuery, MultiSearchQuery, RecommendQuery, RelateRequest,
-    RerankQuery, ScoreBoost, SearchQuery, SparseVector, StructuralPoint as ClientStructuralPoint,
-    TraversalBudget, UnsafeStructuralEmbeddingOverride,
+    ChironDbClient, ChironQlRequest, ExecutionDomain, Fusion, GraphConstraint,
+    GraphDeferredSessionState, GraphDirection, GraphRelationScope, GraphTraversalQueryRequest,
+    GraphTraversalReturn, GraphTraversalRows, GraphTraverseRequest, HybridQuery, MultiSearchQuery,
+    RecommendQuery, RelateRequest, RelationalValue, RerankQuery, ScoreBoost, SearchQuery,
+    SparseVector, SqlExecutionRequest, SqlResult, SqlStatementRequest,
+    StructuralPoint as ClientStructuralPoint, TraversalBudget, UnsafeStructuralEmbeddingOverride,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -123,6 +124,156 @@ async fn list_collections_decodes_the_http_array_contract() {
         .expect("list collections");
     assert_eq!(collections.len(), 1);
     assert_eq!(collections[0].name, COLLECTION);
+}
+
+#[tokio::test]
+async fn relational_sql_uses_typed_sdk_contract() {
+    let harness = Harness::start().await;
+    harness
+        .client
+        .execute_sql(&SqlExecutionRequest {
+            statements: vec![SqlStatementRequest {
+                sql: "CREATE TABLE sdk_rows (id INTEGER PRIMARY KEY, label TEXT NOT NULL)".into(),
+                parameters: vec![],
+            }],
+            idempotency_key: None,
+            retry_id: None,
+        })
+        .await
+        .expect("create relational table");
+    harness
+        .client
+        .execute_sql(&SqlExecutionRequest {
+            statements: vec![SqlStatementRequest {
+                sql: "INSERT INTO sdk_rows VALUES ($1, $2)".into(),
+                parameters: vec![
+                    RelationalValue::Integer(1),
+                    RelationalValue::Text("typed".into()),
+                ],
+            }],
+            idempotency_key: None,
+            retry_id: Some("rust-sdk-relational-1".into()),
+        })
+        .await
+        .expect("insert relational row");
+    let selected = harness
+        .client
+        .execute_sql(&SqlExecutionRequest {
+            statements: vec![SqlStatementRequest {
+                sql: "SELECT label FROM sdk_rows".into(),
+                parameters: vec![],
+            }],
+            idempotency_key: None,
+            retry_id: None,
+        })
+        .await
+        .expect("select relational row");
+    assert!(matches!(
+        &selected.results[0],
+        SqlResult::Rows { rows, .. }
+            if rows == &vec![vec![RelationalValue::Text("typed".into())]]
+    ));
+
+    let transaction = harness
+        .client
+        .begin_sql_transaction()
+        .await
+        .expect("begin interactive transaction");
+    let private = harness
+        .client
+        .execute_sql_transaction(
+            &transaction.handle,
+            &SqlExecutionRequest {
+                statements: vec![SqlStatementRequest {
+                    sql: "INSERT INTO sdk_rows VALUES ($1, $2) RETURNING label".into(),
+                    parameters: vec![
+                        RelationalValue::Integer(2),
+                        RelationalValue::Text("private".into()),
+                    ],
+                }],
+                idempotency_key: None,
+                retry_id: None,
+            },
+        )
+        .await
+        .expect("execute in interactive transaction");
+    assert!(!private.committed);
+    let outside = harness
+        .client
+        .execute_sql(&SqlExecutionRequest {
+            statements: vec![SqlStatementRequest {
+                sql: "SELECT COUNT(*) FROM sdk_rows".into(),
+                parameters: vec![],
+            }],
+            idempotency_key: None,
+            retry_id: None,
+        })
+        .await
+        .expect("read outside transaction");
+    assert!(matches!(
+        &outside.results[0],
+        SqlResult::Rows { rows, .. }
+            if rows == &vec![vec![RelationalValue::Integer(1)]]
+    ));
+    let committed = harness
+        .client
+        .commit_sql_transaction(&transaction.handle)
+        .await
+        .expect("commit interactive transaction");
+    assert!(committed.committed);
+    assert!(committed.transaction_id.is_some());
+
+    let rollback = harness
+        .client
+        .begin_sql_transaction()
+        .await
+        .expect("begin rollback transaction");
+    harness
+        .client
+        .execute_sql_transaction(
+            &rollback.handle,
+            &SqlExecutionRequest {
+                statements: vec![SqlStatementRequest {
+                    sql: "DELETE FROM sdk_rows".into(),
+                    parameters: vec![],
+                }],
+                idempotency_key: None,
+                retry_id: None,
+            },
+        )
+        .await
+        .expect("execute rollback mutation");
+    harness
+        .client
+        .rollback_sql_transaction(&rollback.handle)
+        .await
+        .expect("rollback interactive transaction");
+}
+
+#[tokio::test]
+async fn chironql_sdk_routes_native_sql_with_typed_metadata() {
+    let harness = Harness::start().await;
+    harness
+        .client
+        .execute_chironql(&ChironQlRequest {
+            query: "SQL CREATE TABLE cql_sdk (id TEXT PRIMARY KEY);".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("create through ChironQL");
+    let response = harness
+        .client
+        .execute_chironql(&ChironQlRequest {
+            query: "SQL INSERT INTO cql_sdk VALUES ($1);".into(),
+            parameters: vec![RelationalValue::Text("sdk-1".into())],
+            retry_id: Some("rust-sdk-chironql-1".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("insert through ChironQL");
+    assert_eq!(response.domains, vec![ExecutionDomain::Relational]);
+    assert_eq!(response.committed, Some(true));
+    assert!(response.transaction_id.is_some());
 }
 
 fn graph_constraint(anchor: &str, edge_type: &str) -> GraphConstraint {
@@ -251,7 +402,7 @@ async fn graph_sdk_covers_lifecycle_crud_traversal_and_constrained_search() {
         .await
         .expect("unrelate");
     assert_eq!(deleted.deleted, 1);
-    assert!(!deleted.receipt.durable);
+    assert!(deleted.receipt.durable);
     let dropped = harness
         .client
         .drop_graph(COLLECTION, true)
@@ -688,4 +839,27 @@ async fn rerank_applies_payload_score_boosts() {
     // descending, so it only lifts a match when scores are positive. This
     // collection is cosine. Under L2 the score is a negated distance, and a
     // boost above 1.0 pushes a match *down* — see the note on RerankQuery.
+}
+
+#[tokio::test]
+async fn http_collection_hnsw_one_is_rejected_and_zero_retains_default_contract() {
+    let harness = Harness::start().await;
+    let http = reqwest::Client::new();
+    let endpoint = format!("{}/v1/collections", harness.base_url);
+    let rejected = http
+        .post(&endpoint)
+        .json(&json!({"name":"invalid_hnsw","vector_dim":2,"metric":"l2","hnsw_m":1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(rejected.text().await.unwrap().contains("hnsw_m"));
+    assert_eq!(harness.client.list_collections().await.unwrap().len(), 1);
+    let response=http.post(&endpoint).json(&json!({"name":"zero_default","vector_dim":2,"metric":"l2","hnsw_m":0,"hnsw_ef_construction":0,"hnsw_ef_search":0})).send().await.unwrap();
+    assert!(response.status().is_success());
+    let config = response.json::<CollectionConfig>().await.unwrap();
+    assert_eq!(config.hnsw_m, None);
+    assert_eq!(config.hnsw_ef_construction, None);
+    assert_eq!(config.hnsw_ef_search, None);
+    assert_eq!(harness.client.list_collections().await.unwrap().len(), 2);
 }

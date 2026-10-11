@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Local ML playground: one Rust process serves APIs and the ChironQL console.
+set -euo pipefail
+
+fail() {
+  printf 'chiron-ml: %s\n' "$*" >&2
+  exit 1
+}
+
+[[ -t 0 && -t 1 ]] || fail 'Open an interactive terminal, then run ./scripts/chiron-ml.'
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+binary="$root/target/ml-isolated/debug/chirondb"
+[[ -x "$binary" ]] || fail "Missing server binary. In $root run: CARGO_TARGET_DIR=target/ml-isolated cargo build -j1 -p chirondb --bin chirondb --bin chironql --locked"
+python=${CHIRONDB_ML_WORKER_PYTHON:-"$root/target/ml-worker-venv/bin/python"}
+python=$(command -v -- "$python") || fail 'Python is unavailable. Set CHIRONDB_ML_WORKER_PYTHON to the provisioned interpreter; see ml-worker/README.md.'
+worker=${CHIRONDB_ML_WORKER_SCRIPT:-"$root/ml-worker/chirondb_ml_worker.py"}
+[[ -r "$worker" ]] || fail "Worker script is unavailable: $worker. Set CHIRONDB_ML_WORKER_SCRIPT to a readable worker."
+
+# Check the selected environment without installing or downloading anything.
+"$python" - <<'PYTHON'
+import importlib.util
+import sys
+missing = [name for name in ("pandas", "numpy", "scipy", "sklearn")
+           if importlib.util.find_spec(name) is None]
+if missing:
+    sys.exit("chiron-ml: Missing Python dependencies: " + ", ".join(missing) +
+             ". Install ml-worker/requirements-traditional.txt in the selected environment.")
+PYTHON
+export CHIRONDB_ML_WORKER_PYTHON="$python"
+export CHIRONDB_ML_WORKER_SCRIPT="$worker"
+
+has_option() {
+  local option=$1 argument
+  shift
+  for argument in "$@"; do
+    [[ "$argument" == "$option" || "$argument" == "$option="* ]] && return 0
+  done
+  return 1
+}
+
+defaults=()
+has_option --console "$@" || defaults+=(--console)
+has_option --console-role "$@" || defaults+=(--console-role admin)
+has_option --data-dir "$@" || defaults+=(--data-dir "$root/target/ml-playground-data")
+has_option --listen-http "$@" || defaults+=(--listen-http 127.0.0.1:7401)
+has_option --listen-grpc "$@" || defaults+=(--listen-grpc 127.0.0.1:7402)
+has_option --listen-wire "$@" || defaults+=(--listen-wire 127.0.0.1:7403)
+# macOS Bash 3.2 treats an empty array expansion as unset under nounset.
+if [[ ${#defaults[@]} -gt 0 ]]; then
+  exec "$binary" "${defaults[@]}" "$@"
+fi
+exec "$binary" "$@"

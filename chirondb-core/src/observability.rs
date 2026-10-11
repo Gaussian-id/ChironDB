@@ -549,6 +549,133 @@ fn describe_metrics() {
         "gaussdb_sparse_postings",
         "Current number of sparse vector postings in memory."
     );
+    metrics::describe_gauge!(
+        "chirondb_resource_effective_memory_bytes",
+        metrics::Unit::Bytes,
+        "Effective host or cgroup memory used to derive the automatic runtime profile."
+    );
+    metrics::describe_gauge!(
+        "chirondb_resource_engine_budget_bytes",
+        metrics::Unit::Bytes,
+        "Automatic process engine memory budget after OS and page-cache reserve."
+    );
+    metrics::describe_gauge!(
+        "chirondb_resource_sql_pool_bytes",
+        metrics::Unit::Bytes,
+        "Process-wide SQL admission pool capacity."
+    );
+    metrics::describe_gauge!(
+        "chirondb_pgwire_session_reserved_bytes",
+        metrics::Unit::Bytes,
+        "Bytes reserved by protected PostgreSQL session state and admitted request copies."
+    );
+    metrics::describe_gauge!(
+        "chirondb_pgwire_session_capacity_bytes",
+        metrics::Unit::Bytes,
+        "Shared byte capacity for protected PostgreSQL frontend state and request copies."
+    );
+    metrics::describe_counter!(
+        "chirondb_pgwire_memory_rejections_total",
+        "Protected PostgreSQL byte reservations refused by local or shared capacity."
+    );
+    metrics::describe_gauge!(
+        "chirondb_sql_history_reserved_bytes",
+        metrics::Unit::Bytes,
+        "Bytes reserved by interactive SQL history, savepoints and replay copies across transports."
+    );
+    metrics::describe_gauge!(
+        "chirondb_sql_history_capacity_bytes",
+        metrics::Unit::Bytes,
+        "Shared byte capacity for interactive SQL history and replay copies."
+    );
+    metrics::describe_counter!(
+        "chirondb_sql_history_rejections_total",
+        "Interactive SQL history reservations refused by transaction or shared capacity."
+    );
+    metrics::describe_gauge!(
+        "chirondb_resource_effective_cores",
+        "Effective physical or cgroup CPU core budget."
+    );
+    metrics::describe_gauge!(
+        "chirondb_resource_query_workers",
+        "Automatic query worker limit."
+    );
+    metrics::describe_gauge!(
+        "chirondb_resource_background_workers",
+        "Automatic shared background worker limit."
+    );
+    metrics::describe_gauge!(
+        "chirondb_query_arena_high_water_bytes",
+        metrics::Unit::Bytes,
+        "Largest per-thread query arena allocation observed by the process."
+    );
+    metrics::describe_counter!(
+        "chirondb_query_arena_shrinks_total",
+        "Oversized per-thread query arenas released after request completion."
+    );
+    metrics::describe_gauge!(
+        "chirondb_process_rss_bytes",
+        metrics::Unit::Bytes,
+        "Current process resident set size, including resident mmap pages."
+    );
+    metrics::describe_gauge!(
+        "chirondb_process_pss_bytes",
+        metrics::Unit::Bytes,
+        "Linux proportional set size, including proportionally charged mmap pages."
+    );
+    metrics::describe_gauge!(
+        "chirondb_cgroup_memory_current_bytes",
+        metrics::Unit::Bytes,
+        "Current Linux cgroup memory charge, including charged page cache."
+    );
+    metrics::describe_gauge!(
+        "chirondb_process_threads",
+        "Current Linux process thread count."
+    );
+    metrics::describe_counter!(
+        "chirondb_audit_worker_wake_total",
+        "Audit group-commit worker wakeups caused by queued work."
+    );
+    metrics::describe_counter!(
+        "chirondb_audit_worker_flush_total",
+        "Completed event-driven audit group flushes."
+    );
+    metrics::describe_counter!(
+        "chirondb_wal_flush_worker_wake_total",
+        "WAL flush worker wakeups caused by dirty projections."
+    );
+    metrics::describe_counter!(
+        "chirondb_wal_flush_worker_flush_total",
+        "Completed event-driven background WAL flushes."
+    );
+    metrics::describe_gauge!(
+        "chirondb_shutdown_phase",
+        "Process shutdown phase: 0 running, 1 draining, 2 finalizing, 3 stopped."
+    );
+    metrics::describe_gauge!(
+        "chirondb_shutdown_inflight_requests",
+        "In-flight tracked retrieval and SQL work observed while shutdown drains."
+    );
+    metrics::describe_histogram!(
+        "chirondb_shutdown_duration_seconds",
+        metrics::Unit::Seconds,
+        "Bounded engine finalization duration."
+    );
+    metrics::describe_counter!("chirondb_shutdown_total", "Shutdown finalization outcomes.");
+    metrics::describe_gauge!(
+        "chirondb_persistent_cache_bytes",
+        metrics::Unit::Bytes,
+        "Current bounded encrypted persistent-file cache occupancy."
+    );
+    metrics::describe_gauge!(
+        "chirondb_persistent_cache_high_water_bytes",
+        metrics::Unit::Bytes,
+        "Largest encrypted persistent-file cache occupancy observed by the process."
+    );
+    metrics::describe_counter!(
+        "chirondb_persistent_cache_pressure_shrinks_total",
+        "Encrypted persistent-file cache shrink operations caused by cgroup pressure."
+    );
     metrics::describe_counter!(
         "chirondb_wal_append_records_total",
         "Total CRC-framed WAL records appended."

@@ -313,12 +313,11 @@ pub(crate) fn remove_workspace(workspace: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     }
-    let Some(builds_dir) = workspace.parent() else {
-        return Ok(());
-    };
-    if fs::read_dir(builds_dir)?.next().is_none() {
-        durable_remove_dir_all(builds_dir)?;
-    }
+    // Keep the shared .builds directory. A successor can begin preparing its
+    // workspace as soon as the previous seal publishes. Checking this parent
+    // for emptiness and then recursively removing it can delete that live
+    // successor; even empty-only removal can race its directory fsync.
+    // Offline recovery may remove an empty parent under exclusive admission.
     Ok(())
 }
 
@@ -543,6 +542,33 @@ mod tests {
             base_lsn: 4,
             end_lsn: 8,
         }
+    }
+
+    #[test]
+    fn completed_build_cleanup_keeps_parent_available_to_successor() {
+        let temp = tempdir().unwrap();
+        let searchers = temp.path().join("searchers");
+        let completed = workspace(&searchers, "completed");
+        let successor = workspace(&searchers, "successor");
+        durable_create_dir(&completed).unwrap();
+        fs::write(completed.join("finished"), b"old build").unwrap();
+
+        // A successor has reached reset's parent-creation step, but has not
+        // created its own workspace yet. Cleanup must not invalidate that
+        // directory before the successor synchronizes or populates it.
+        let parent = successor.parent().unwrap();
+        fs::create_dir_all(parent).unwrap();
+        remove_workspace(&completed).unwrap();
+        crate::fs_util::sync_directory(parent).unwrap();
+        fs::create_dir(&successor).unwrap();
+        fs::write(successor.join("in-progress"), b"new build").unwrap();
+
+        remove_workspace(&completed).unwrap();
+        assert!(!completed.exists());
+        assert_eq!(
+            fs::read(successor.join("in-progress")).unwrap(),
+            b"new build"
+        );
     }
 
     #[test]

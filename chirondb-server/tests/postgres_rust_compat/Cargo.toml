@@ -1,0 +1,16 @@
+[package]
+name = "chirondb-postgres-rust-compat"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+sqlx = { version = "=0.8.6", default-features = false, features = ["runtime-tokio", "postgres", "tls-rustls-ring-webpki"] }
+diesel = { version = "=2.3.13", default-features = false, features = ["postgres"] }
+# Enable bundling on the bindings crate so libpq's OpenSSL link dependencies
+# propagate to the executable as well as its native search path.
+pq-sys = { version = "=0.7.5", features = ["bundled"] }

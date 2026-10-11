@@ -25,6 +25,7 @@ use crate::{
 };
 
 pub(crate) mod graph;
+use crate::index::VectorRead;
 
 pub const VECTOR_FILE: &str = "vec.gdx";
 pub const IDS_FILE: &str = "ids.gdx";
@@ -111,7 +112,11 @@ impl crate::index::ivf::VectorSource for PagedVectorSource {
                 "paged seal vector ordinal {ordinal} is out of bounds"
             )));
         }
-        Ok(self.0.get(ordinal))
+        self.0.try_get(ordinal).map(VectorRead::into_compat)
+    }
+
+    fn read_vector(&self, ordinal: usize) -> Result<VectorRead<'_>> {
+        self.0.try_get(ordinal)
     }
 }
 
@@ -207,6 +212,31 @@ struct OwnedPointAux {
     payload: serde_json::Value,
 }
 
+/// Private point adoption: payload, vectors and IDs die before their leases.
+pub(crate) struct AdmittedPoint {
+    value: Point,
+    _decoded: crate::relational::wal_decode::Reservation,
+    _memory: crate::relational::wal_decode::MetadataCharge,
+}
+
+impl std::ops::Deref for AdmittedPoint {
+    type Target = Point;
+    fn deref(&self) -> &Point {
+        &self.value
+    }
+}
+
+impl AdmittedPoint {
+    pub(crate) fn copy(point: &Point) -> Result<Self> {
+        let (value, reservation) = crate::relational::wal_decode::copy(point)?.into_parts();
+        Ok(Self {
+            value,
+            _decoded: reservation,
+            _memory: Default::default(),
+        })
+    }
+}
+
 struct NamedVectorWriter {
     vectors: BufWriter<File>,
     ids: Vec<String>,
@@ -266,7 +296,7 @@ impl NamedV4Store {
                 "named-vector file is shorter than its header",
             ));
         }
-        let header = vectors.read_range(0..24)?;
+        let header = vectors.read_range_admitted(0..24)?;
         let vector_encoding = match header.get(..8) {
             Some(magic) if magic == h2qg::HNSW_VECS_MAGIC => DenseVectorEncoding::F32,
             Some(magic) if magic == VECTOR_MAGIC_V5 => DenseVectorEncoding::ScaledF16,
@@ -337,47 +367,17 @@ impl NamedV4Store {
         self.ordinals.get(id).copied()
     }
 
-    pub(crate) fn vector_cow(&self, ordinal: usize) -> Option<Cow<'_, [f32]>> {
-        match self.vector_encoding {
-            DenseVectorEncoding::F32 => {
-                let row_bytes = self.vector_dim.checked_mul(std::mem::size_of::<f32>())?;
-                let start = 24_usize.checked_add(ordinal.checked_mul(row_bytes)?)?;
-                let bytes = self
-                    .vectors
-                    .read_range(start..start.checked_add(row_bytes)?)
-                    .ok()?;
-                match bytes {
-                    Cow::Borrowed(bytes) => Some(Cow::Borrowed(unsafe {
-                        std::slice::from_raw_parts(bytes.as_ptr().cast::<f32>(), self.vector_dim)
-                    })),
-                    Cow::Owned(bytes) => Some(Cow::Owned(decode_f32_row(&bytes)?)),
-                }
-            }
-            DenseVectorEncoding::ScaledF16 => self.scaled_f16_vector(ordinal).map(Cow::Owned),
+    pub(crate) fn vector_cow(&self, ordinal: usize) -> Result<VectorRead<'_>> {
+        if ordinal >= self.ids.len() {
+            return Err(GaussError::InvalidRequest(
+                "vector ordinal out of range".into(),
+            ));
         }
-    }
-
-    fn scaled_f16_vector(&self, ordinal: usize) -> Option<Vec<f32>> {
-        if ordinal >= self.ids.len() || self.vector_encoding != DenseVectorEncoding::ScaledF16 {
-            return None;
-        }
-        let row_bytes = self.vector_encoding.row_bytes(self.vector_dim)?;
-        let start = 24_usize.checked_add(ordinal.checked_mul(row_bytes)?)?;
-        let end = start.checked_add(row_bytes)?;
-        let row = self.vectors.read_range(start..end).ok()?;
-        let scale_end = std::mem::size_of::<f32>();
-        let scale = f32::from_le_bytes(row.get(..scale_end)?.try_into().ok()?);
-        Some(
-            row.get(scale_end..)?
-                .chunks_exact(2)
-                .map(|bytes| {
-                    f16::from_bits(u16::from_le_bytes(
-                        bytes.try_into().expect("two-byte f16 component"),
-                    ))
-                    .to_f32()
-                        * scale
-                })
-                .collect(),
+        read_dense_row(
+            &self.vectors,
+            self.vector_encoding,
+            self.vector_dim,
+            ordinal,
         )
     }
 }
@@ -417,8 +417,11 @@ impl crate::index::ivf::VectorSource for NamedV4Store {
     }
 
     fn vector(&self, ordinal: usize) -> Result<Cow<'_, [f32]>> {
+        self.vector_cow(ordinal).map(VectorRead::into_compat)
+    }
+
+    fn read_vector(&self, ordinal: usize) -> Result<VectorRead<'_>> {
         self.vector_cow(ordinal)
-            .ok_or_else(|| GaussError::InvalidRequest("vector ordinal out of range".to_string()))
     }
 }
 
@@ -534,7 +537,7 @@ impl V4Store {
             )
         } else {
             let vectors = encryption::PersistentFile::open(&dir.join(VECTOR_FILE))?;
-            let vector_header = vectors.read_range(0..24)?;
+            let vector_header = vectors.read_range_admitted(0..24)?;
             let (vector_count, vector_dim, vector_encoding) =
                 read_vector_header(&vector_header, &dir.join(VECTOR_FILE))?;
             if !matches!(
@@ -583,7 +586,7 @@ impl V4Store {
         for ordinal in 0..marker.points {
             let range = payload_range(&payload_offsets, payload_start, ordinal)
                 .ok_or_else(|| corrupt(dir, "v4 payload offset is out of bounds"))?;
-            let payload = payloads.read_range(range)?;
+            let payload = payloads.read_range_admitted(range)?;
             serde_json::from_slice::<OwnedPointAux>(&payload).map_err(|error| {
                 corrupt(
                     dir,
@@ -632,7 +635,13 @@ impl V4Store {
     /// Hydrate only the dense row. Algorithm 2 uses this for its final exact
     /// rescore without parsing payload JSON for candidates that do not win.
     pub fn vector(&self, ordinal: usize) -> Option<Vec<f32>> {
-        Some(self.vector_cow(ordinal)?.into_owned())
+        self.try_vector(ordinal).ok()
+    }
+
+    /// Read one dense row, retaining storage and admission errors.
+    pub fn try_vector(&self, ordinal: usize) -> Result<Vec<f32>> {
+        self.vector_cow(ordinal)
+            .map(|row| row.into_compat().into_owned())
     }
 
     pub fn exact_vector_bytes_per_component(&self) -> f64 {
@@ -656,72 +665,120 @@ impl V4Store {
         self.segment_format_version
     }
 
-    pub(crate) fn vector_cow(&self, ordinal: usize) -> Option<Cow<'_, [f32]>> {
+    pub(crate) fn vector_cow(&self, ordinal: usize) -> Result<VectorRead<'_>> {
+        if ordinal >= self.ids.len() {
+            return Err(GaussError::InvalidRequest(
+                "vector ordinal out of range".into(),
+            ));
+        }
         match &self.vectors {
-            PrimaryVectorStore::Persistent(vectors) => match self.vector_encoding {
-                DenseVectorEncoding::F32 => {
-                    let row_bytes = self.vector_dim.checked_mul(std::mem::size_of::<f32>())?;
-                    let start = 24_usize.checked_add(ordinal.checked_mul(row_bytes)?)?;
-                    let bytes = vectors
-                        .read_range(start..start.checked_add(row_bytes)?)
-                        .ok()?;
-                    match bytes {
-                        Cow::Borrowed(bytes) => Some(Cow::Borrowed(unsafe {
-                            std::slice::from_raw_parts(
-                                bytes.as_ptr().cast::<f32>(),
-                                self.vector_dim,
-                            )
-                        })),
-                        Cow::Owned(bytes) => Some(Cow::Owned(decode_f32_row(&bytes)?)),
-                    }
-                }
-                DenseVectorEncoding::ScaledF16 => self.scaled_f16_vector(ordinal).map(Cow::Owned),
-            },
-            PrimaryVectorStore::DiskAnn(diskann) => diskann.vector(ordinal).map(Cow::Owned),
+            PrimaryVectorStore::Persistent(vectors) => {
+                read_dense_row(vectors, self.vector_encoding, self.vector_dim, ordinal)
+            }
+            PrimaryVectorStore::DiskAnn(diskann) => diskann.try_vector_admitted(ordinal),
         }
-    }
-
-    fn scaled_f16_vector(&self, ordinal: usize) -> Option<Vec<f32>> {
-        if ordinal >= self.ids.len() || self.vector_encoding != DenseVectorEncoding::ScaledF16 {
-            return None;
-        }
-        let row_bytes = self.vector_encoding.row_bytes(self.vector_dim)?;
-        let start = 24_usize.checked_add(ordinal.checked_mul(row_bytes)?)?;
-        let PrimaryVectorStore::Persistent(vectors) = &self.vectors else {
-            return None;
-        };
-        let row = vectors
-            .read_range(start..start.checked_add(row_bytes)?)
-            .ok()?;
-        let scale_end = std::mem::size_of::<f32>();
-        let scale = f32::from_le_bytes(row.get(..scale_end)?.try_into().ok()?);
-        let values = row.get(scale_end..)?;
-        Some(
-            values
-                .chunks_exact(2)
-                .map(|bytes| {
-                    f16::from_bits(u16::from_le_bytes(
-                        bytes.try_into().expect("two-byte f16 component"),
-                    ))
-                    .to_f32()
-                        * scale
-                })
-                .collect(),
-        )
     }
 
     pub fn get(&self, id: &str) -> Option<Point> {
-        self.ordinals
-            .get(id)
-            .and_then(|ordinal| self.get_ordinal(*ordinal))
+        self.try_get(id).ok().flatten()
+    }
+
+    /// Absent IDs return None; storage failures retain their original error.
+    pub fn try_get(&self, id: &str) -> Result<Option<Point>> {
+        self.ordinal(id)
+            .map(|ordinal| self.try_get_ordinal(ordinal))
+            .transpose()
+    }
+
+    pub(crate) fn try_get_admitted(&self, id: &str) -> Result<Option<AdmittedPoint>> {
+        self.ordinal(id)
+            .map(|ordinal| self.get_ordinal_admitted(ordinal))
+            .transpose()
+    }
+
+    fn get_ordinal_admitted(&self, ordinal: usize) -> Result<AdmittedPoint> {
+        self.get_ordinal_admitted_with(ordinal, || self.try_vector(ordinal))
+    }
+
+    pub(crate) fn get_ordinal_admitted_with(
+        &self,
+        ordinal: usize,
+        vector: impl FnOnce() -> Result<Vec<f32>>,
+    ) -> Result<AdmittedPoint> {
+        let exhausted = || GaussError::ResourceExhausted("point read memory is full".into());
+        let id = self
+            .ids
+            .get(ordinal)
+            .ok_or_else(|| GaussError::InvalidRequest("point ordinal out of range".into()))?;
+        let range =
+            payload_range(&self.payload_offsets, self.payload_start, ordinal).ok_or_else(|| {
+                corrupt(
+                    self.payloads.path(),
+                    "point payload offset is out of bounds",
+                )
+            })?;
+        let vector_bytes = self
+            .vector_dim
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(exhausted)?;
+        let vector_peak = match &self.vectors {
+            PrimaryVectorStore::Persistent(_) => {
+                (vector_bytes as u64).checked_mul(4).ok_or_else(exhausted)?
+            }
+            PrimaryVectorStore::DiskAnn(diskann) => diskann.vector_read_workspace_bytes()?,
+        };
+        let retained = (id.len() as u64)
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(vector_bytes as u64))
+            .and_then(|n| n.checked_add(std::mem::size_of::<AdmittedPoint>() as u64 + 4096))
+            .ok_or_else(exhausted)?;
+        let mut memory = crate::relational::wal_decode::MetadataCharge::default();
+        memory.prepare(retained.checked_add(vector_peak).ok_or_else(exhausted)?)?;
+        let vector = vector()?;
+        memory.reduce(retained);
+        let mut input_memory = crate::relational::wal_decode::MetadataCharge::default();
+        input_memory.prepare(
+            (range.len() as u64)
+                .checked_mul(2)
+                .and_then(|n| n.checked_add(8192))
+                .ok_or_else(exhausted)?,
+        )?;
+        let input = self.payloads.read_range_admitted(range)?;
+        let aux =
+            crate::relational::wal_decode::decode::<OwnedPointAux>(&input).map_err(|error| {
+                match error {
+                    GaussError::Json(error) => corrupt(
+                        self.payloads.path(),
+                        &format!("point payload record {ordinal} is invalid: {error}"),
+                    ),
+                    error => error,
+                }
+            })?;
+        let (aux, reservation) = aux.into_parts();
+        Ok(AdmittedPoint {
+            value: Point {
+                id: id.clone(),
+                vector,
+                vectors: aux.vectors,
+                sparse_vector: aux.sparse_vector,
+                payload: aux.payload,
+            },
+            _decoded: reservation,
+            _memory: memory,
+        })
     }
 
     pub fn get_ordinal(&self, ordinal: usize) -> Option<Point> {
-        let vector = self.vector(ordinal)?;
+        self.try_get_ordinal(ordinal).ok()
+    }
+
+    /// Hydrate a validated point ordinal, retaining vector and payload errors.
+    pub fn try_get_ordinal(&self, ordinal: usize) -> Result<Point> {
+        let vector = self.try_vector(ordinal)?;
         self.get_ordinal_with_vector(ordinal, vector)
     }
 
-    pub(crate) fn get_ordinal_for_aux_indexes(&self, ordinal: usize) -> Option<Point> {
+    pub(crate) fn get_ordinal_for_aux_indexes(&self, ordinal: usize) -> Result<Point> {
         self.get_ordinal_with_vector(ordinal, Vec::new())
     }
 
@@ -729,16 +786,32 @@ impl V4Store {
         &self,
         ordinal: usize,
         vector: Vec<f32>,
-    ) -> Option<Point> {
+    ) -> Result<Point> {
         if !vector.is_empty() && vector.len() != self.vector_dim {
-            return None;
+            return Err(GaussError::InvalidRequest(
+                "point vector dimension mismatch".into(),
+            ));
         }
-        let id = self.ids.get(ordinal)?.clone();
-        let range = payload_range(&self.payload_offsets, self.payload_start, ordinal)?;
-        let payload = self.payloads.read_range(range).ok()?;
-        let aux: OwnedPointAux = serde_json::from_slice(&payload).ok()?;
-        Some(Point {
-            id,
+        let id = self
+            .ids
+            .get(ordinal)
+            .ok_or_else(|| GaussError::InvalidRequest("point ordinal out of range".into()))?;
+        let range =
+            payload_range(&self.payload_offsets, self.payload_start, ordinal).ok_or_else(|| {
+                corrupt(
+                    self.payloads.path(),
+                    "point payload offset is out of bounds",
+                )
+            })?;
+        let payload = self.payloads.read_range_admitted(range)?;
+        let aux: OwnedPointAux = serde_json::from_slice(&payload).map_err(|error| {
+            corrupt(
+                self.payloads.path(),
+                &format!("point payload record {ordinal} is invalid: {error}"),
+            )
+        })?;
+        Ok(Point {
+            id: id.clone(),
             vector,
             vectors: aux.vectors,
             sparse_vector: aux.sparse_vector,
@@ -1459,7 +1532,7 @@ fn read_marker_inner(path: &Path, external_diskann_len: Option<u64>) -> Result<S
     if file.len() > 20 + MAX_MARKER_BYTES {
         return Err(corrupt(path, "sealed-segment marker exceeds size cap"));
     }
-    let bytes = file.read_range(0..file.len())?;
+    let bytes = file.read_range_admitted(0..file.len())?;
     let header = &bytes[..20];
     if &header[..8] != SEAL_MAGIC {
         return Err(GaussError::SegmentCorruption {
@@ -2058,16 +2131,52 @@ fn read_vector_header(bytes: &[u8], path: &Path) -> Result<(usize, usize, DenseV
     ))
 }
 
-fn decode_f32_row(bytes: &[u8]) -> Option<Vec<f32>> {
-    bytes
-        .len()
-        .is_multiple_of(std::mem::size_of::<f32>())
-        .then(|| {
-            bytes
-                .chunks_exact(4)
-                .map(|value| f32::from_le_bytes(value.try_into().expect("four-byte f32 component")))
-                .collect()
-        })
+fn read_dense_row(
+    vectors: &encryption::PersistentFile,
+    encoding: DenseVectorEncoding,
+    dim: usize,
+    ordinal: usize,
+) -> Result<VectorRead<'_>> {
+    let invalid = || corrupt(vectors.path(), "sealed vector row range overflow");
+    let row_bytes = encoding.row_bytes(dim).ok_or_else(invalid)?;
+    let start = ordinal
+        .checked_mul(row_bytes)
+        .and_then(|offset| offset.checked_add(24))
+        .ok_or_else(invalid)?;
+    let end = start.checked_add(row_bytes).ok_or_else(invalid)?;
+    let row = vectors.read_range_admitted(start..end)?;
+    match encoding {
+        DenseVectorEncoding::F32 => {
+            if let Some(bytes) = row.borrowed_bytes() {
+                // SAFETY: validated immutable rows start after an aligned
+                // 24-byte header, with a stride and length divisible by four.
+                Ok(VectorRead::borrowed(unsafe {
+                    std::slice::from_raw_parts(bytes.as_ptr().cast::<f32>(), dim)
+                }))
+            } else {
+                VectorRead::decode(
+                    dim,
+                    row.chunks_exact(4).map(|value| {
+                        f32::from_le_bytes(value.try_into().expect("four-byte f32 component"))
+                    }),
+                )
+            }
+        }
+        DenseVectorEncoding::ScaledF16 => {
+            let scale = f32::from_le_bytes(row[..4].try_into().expect("validated scale width"));
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(corrupt(vectors.path(), "invalid sealed f16 decode scale"));
+            }
+            VectorRead::decode(
+                dim,
+                row[4..].chunks_exact(2).map(|bytes| {
+                    f16::from_bits(u16::from_le_bytes(bytes.try_into().expect("f16 width")))
+                        .to_f32()
+                        * scale
+                }),
+            )
+        }
+    }
 }
 
 fn read_ids_file(
@@ -2078,7 +2187,7 @@ fn read_ids_file(
     if file.len() < 16 {
         return Err(corrupt(path, "bad or truncated v4 ids header"));
     }
-    let header = file.read_range(0..16)?;
+    let header = file.read_range_admitted(0..16)?;
     if &header[..8] != IDS_MAGIC {
         return Err(corrupt(path, "bad or truncated v4 ids header"));
     }
@@ -2095,12 +2204,12 @@ fn read_ids_file(
         let len_end = pos
             .checked_add(4)
             .ok_or_else(|| corrupt(path, "v4 ids offset overflow"))?;
-        let len_bytes = file.read_range(pos..len_end)?;
+        let len_bytes = file.read_range_admitted(pos..len_end)?;
         let len = u32::from_le_bytes(len_bytes.as_ref().try_into().expect("id length")) as usize;
         let id_end = len_end
             .checked_add(len)
             .ok_or_else(|| corrupt(path, "v4 id length overflow"))?;
-        let id_bytes = file.read_range(len_end..id_end)?;
+        let id_bytes = file.read_range_admitted(len_end..id_end)?;
         let id = std::str::from_utf8(&id_bytes)
             .map_err(|error| corrupt(path, &format!("v4 id {ordinal} is not UTF-8: {error}")))?;
         ids.push(id.to_string());
@@ -2120,7 +2229,7 @@ fn read_payload_offsets_file(
     if file.len() < 16 {
         return Err(corrupt(path, "bad or truncated v4 payload header"));
     }
-    let header = file.read_range(0..16)?;
+    let header = file.read_range_admitted(0..16)?;
     if &header[..8] != PAYLOAD_MAGIC {
         return Err(corrupt(path, "bad or truncated v4 payload header"));
     }
@@ -2147,7 +2256,7 @@ fn read_payload_offsets_file(
         let end = position
             .checked_add(8)
             .ok_or_else(|| corrupt(path, "payload offset position overflow"))?;
-        let offset = file.read_range(position..end)?;
+        let offset = file.read_range_admitted(position..end)?;
         offsets.push(u64::from_le_bytes(
             offset.as_ref().try_into().expect("payload offset"),
         ));
@@ -2168,7 +2277,7 @@ fn payload_range(
     ordinal: usize,
 ) -> Option<std::ops::Range<usize>> {
     let start = usize::try_from(*offsets.get(ordinal)?).ok()?;
-    let end = usize::try_from(*offsets.get(ordinal + 1)?).ok()?;
+    let end = usize::try_from(*offsets.get(ordinal.checked_add(1)?)?).ok()?;
     Some(payload_start.checked_add(start)?..payload_start.checked_add(end)?)
 }
 
@@ -2189,6 +2298,200 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn decoded_f16_row_refuses_before_output_allocation_and_retains_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("decoded-f16.gdx");
+        let dim = 8192;
+        let mut bytes = vec![0; 24];
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        for _ in 0..dim {
+            bytes.extend_from_slice(&half::f16::from_f32(1.5).to_bits().to_le_bytes());
+        }
+        std::fs::write(&path, bytes).unwrap();
+        let file = encryption::PersistentFile::open(&path).unwrap();
+        crate::relational::wal_decode::with_test_storage_pool(1, |used| {
+            assert!(matches!(
+                read_dense_row(&file, DenseVectorEncoding::ScaledF16, dim, 0),
+                Err(GaussError::ResourceExhausted(_))
+            ));
+            assert_eq!(used(), 0);
+        });
+        crate::relational::wal_decode::with_test_storage_pool(64 * 1024, |used| {
+            let row = read_dense_row(&file, DenseVectorEncoding::ScaledF16, dim, 0).unwrap();
+            let retained = used();
+            assert!(retained > dim as u64 * 4);
+            let row = row.into_owned_read().unwrap();
+            assert_eq!(used(), retained);
+            assert!(row.iter().all(|&value| value == 1.5));
+            drop(row);
+            assert_eq!(used(), 0);
+        });
+    }
+
+    #[test]
+    fn admitted_points_preserve_heap_hot_cold_values_and_owner_lifetime() {
+        use crate::relational::wal_decode::with_test_storage_pool;
+        let mut expected = point("escaped\"id", vec![1.25, -3.5]);
+        expected.vectors.insert("image".into(), vec![2.0, 3.0]);
+        expected.sparse_vector = Some(crate::SparseVector {
+            indices: vec![7, 19],
+            values: vec![0.5, 2.0],
+        });
+        expected.payload = json!({"nested":[{"utf8":"日本語\n\"escaped"},null,true,19]});
+        let heap = crate::searcher::SegmentStore::Heap(HashMap::from([(
+            expected.id.clone(),
+            expected.clone(),
+        )]));
+        with_test_storage_pool(2 * 1024 * 1024, |used| {
+            let owner = heap.try_get_admitted(&expected.id).unwrap().unwrap();
+            let bytes = used();
+            assert!(bytes > 0);
+            drop(heap);
+            assert_eq!(used(), bytes);
+            assert_eq!(serde_json::to_value(&*owner).unwrap(), json!(expected));
+            drop(owner);
+            assert_eq!(used(), 0);
+        });
+        for kind in [SealIndexKind::Hnsw, SealIndexKind::Algorithm2] {
+            let dir = TempDir::new().unwrap();
+            build_segment(
+                std::slice::from_ref(&expected),
+                dir.path(),
+                SealConfig {
+                    vector_dim: 2,
+                    metric: DistanceMetric::L2,
+                    hnsw_m: None,
+                    hnsw_ef_construction: None,
+                    index_kind: kind,
+                    base_lsn: 0,
+                    end_lsn: 1,
+                },
+            )
+            .unwrap();
+            for cold in [false, true] {
+                if cold && !matches!(kind, SealIndexKind::Algorithm2) {
+                    continue;
+                }
+                if cold {
+                    assert!(thin_algorithm2_segment_for_cold(dir.path()).unwrap());
+                }
+                let store = V4Store::open(dir.path()).unwrap();
+                with_test_storage_pool(1, |used| {
+                    assert!(matches!(
+                        store.try_get_admitted(&expected.id),
+                        Err(GaussError::ResourceExhausted(_))
+                    ));
+                    assert!(store.try_get_admitted("missing").unwrap().is_none());
+                    assert_eq!(used(), 0);
+                });
+                let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                assert!(matches!(
+                    crate::relational::with_sql_cancellation(cancel, || {
+                        store.try_get_admitted(&expected.id)
+                    }),
+                    Err(GaussError::InvalidRequest(message)) if message == "query canceled"
+                ));
+                with_test_storage_pool(2 * 1024 * 1024, |used| {
+                    let owner = store.try_get_admitted(&expected.id).unwrap().unwrap();
+                    if let PrimaryVectorStore::DiskAnn(artifact) = &store.vectors {
+                        // Measure the point owner separately from source cache residency.
+                        artifact.reset_stats();
+                    }
+                    let bytes = used();
+                    assert!(bytes > 0);
+                    drop(store);
+                    assert_eq!(used(), bytes);
+                    assert_eq!(serde_json::to_value(&*owner).unwrap(), json!(expected));
+                    drop(owner);
+                    assert_eq!(used(), 0);
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn fallible_point_decode_distinguishes_absence_bounds_and_semantic_corruption() {
+        let dir = TempDir::new().unwrap();
+        let vector_path = dir.path().join(VECTOR_FILE);
+        let payload_path = dir.path().join(PAYLOAD_FILE);
+        let mut rows = vec![0; 24];
+        rows.extend_from_slice(&1.0_f32.to_le_bytes());
+        rows.extend_from_slice(&2.0_f32.to_le_bytes());
+        fs::write(&vector_path, rows).unwrap();
+        fs::write(&payload_path, b"bad").unwrap();
+        let store = V4Store {
+            vectors: PrimaryVectorStore::Persistent(
+                encryption::PersistentFile::open(&vector_path).unwrap(),
+            ),
+            payloads: encryption::PersistentFile::open(&payload_path).unwrap(),
+            ids: vec!["a".into()],
+            ordinals: HashMap::from([("a".into(), 0)]),
+            payload_offsets: vec![0, 3],
+            vector_dim: 2,
+            vector_encoding: DenseVectorEncoding::F32,
+            segment_format_version: 4,
+            payload_start: 0,
+        };
+        assert!(store.try_get("absent").unwrap().is_none());
+        assert!(matches!(
+            store.try_get_ordinal(1),
+            Err(GaussError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            store.get_ordinal_with_vector(0, vec![1.0]),
+            Err(GaussError::InvalidRequest(_))
+        ));
+        assert!(
+            matches!(store.try_get("a"), Err(GaussError::SegmentCorruption { path, message })
+            if path == payload_path.display().to_string() && message.contains("payload record 0 is invalid"))
+        );
+        assert!(matches!(
+            store.get_ordinal_for_aux_indexes(0),
+            Err(GaussError::SegmentCorruption { .. })
+        ));
+        assert!(payload_range(&[0], 0, usize::MAX).is_none());
+    }
+
+    #[test]
+    fn fallible_sealed_rows_preserve_borrowing_bounds_and_invalid_scale() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("rows");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(VECTOR_MAGIC_V4);
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(&2_u64.to_le_bytes());
+        bytes.extend_from_slice(&1.25_f32.to_le_bytes());
+        bytes.extend_from_slice(&(-3.5_f32).to_le_bytes());
+        fs::write(&path, &bytes).unwrap();
+        let rows = encryption::PersistentFile::open(&path).unwrap();
+        let value = read_dense_row(&rows, DenseVectorEncoding::F32, 2, 0).unwrap();
+        assert!(value.is_borrowed());
+        assert_eq!(value.as_ref(), &[1.25, -3.5]);
+        assert!(matches!(
+            read_dense_row(&rows, DenseVectorEncoding::F32, 2, 1),
+            Err(GaussError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            read_dense_row(&rows, DenseVectorEncoding::F32, usize::MAX, 0),
+            Err(GaussError::SegmentCorruption { .. })
+        ));
+        drop(rows);
+        for scale in [0.0_f32, -1.0, f32::NAN, f32::INFINITY] {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(VECTOR_MAGIC_V5);
+            bytes.extend_from_slice(&1_u64.to_le_bytes());
+            bytes.extend_from_slice(&2_u64.to_le_bytes());
+            bytes.extend_from_slice(&scale.to_le_bytes());
+            bytes.extend_from_slice(&[0; 4]);
+            fs::write(&path, &bytes).unwrap();
+            let rows = encryption::PersistentFile::open(&path).unwrap();
+            assert!(
+                matches!(read_dense_row(&rows, DenseVectorEncoding::ScaledF16, 2, 0), Err(GaussError::SegmentCorruption {path: failed_path, message}) if failed_path == path.display().to_string() && message.contains("decode scale"))
+            );
+        }
+    }
 
     fn point(id: &str, vector: Vec<f32>) -> Point {
         Point {

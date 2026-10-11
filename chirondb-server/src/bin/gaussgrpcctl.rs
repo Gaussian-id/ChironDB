@@ -165,6 +165,9 @@ enum Command {
         /// delete.
         #[arg(long)]
         yes: bool,
+        /// Durable key for a standalone SQL mutation.
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
     Scroll {
         collection: String,
@@ -516,6 +519,7 @@ async fn main() -> anyhow::Result<()> {
             collection,
             trace,
             yes,
+            idempotency_key,
         } => {
             let response = client
                 .execute_query(with_auth(
@@ -524,6 +528,9 @@ async fn main() -> anyhow::Result<()> {
                         collection,
                         trace,
                         confirm: yes,
+                        parameters: Vec::new(),
+                        idempotency_key,
+                        retry_id: None,
                     },
                     api_key.as_deref(),
                 )?)

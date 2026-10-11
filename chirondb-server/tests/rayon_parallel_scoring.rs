@@ -17,6 +17,11 @@ use chirondb::{CollectionConfig, Db, DistanceMetric, Point, SearchRequest};
 use serde_json::json;
 use tempfile::TempDir;
 
+// Independent correctness fixtures share the process-wide storage quota.
+// Serialize only setup; keep original atomic requests and recall/batch oracles.
+// Search branches and dedicated concurrency tests retain their execution.
+static FIXTURE_LOAD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn lcg_vector(seed: u64, dim: usize) -> Vec<f32> {
     let mut state = seed ^ 0x517c_c1b7_2722_0a95;
     (0..dim)
@@ -44,6 +49,7 @@ fn exact_top_k(points: &[Point], query: &[f32], k: usize) -> Vec<String> {
 }
 
 fn build(n: usize, dim: usize) -> (TempDir, Db, &'static str, Vec<Point>) {
+    let _load = FIXTURE_LOAD.lock().expect("fixture load lock");
     let dir = TempDir::new().expect("tempdir");
     let db = Db::open(dir.path()).expect("open db");
     let coll = "rayon_gate";

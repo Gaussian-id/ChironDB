@@ -1,8 +1,9 @@
-//! Process-crash recovery regression for the single-node WAL contract.
+//! Process-crash recovery regression for the single-node transaction contract.
 //!
-//! This deliberately exercises an OS process kill, not simulated storage
-//! power loss. The asynchronous suffix is therefore allowed, but not required,
-//! to be lost because the kernel may already have persisted dirty pages.
+//! This deliberately exercises an OS process kill. Both wait modes must
+//! recover because the installation journal synchronizes the commit decision
+//! before either acknowledgement; `wait=false` changes the response mode, not
+//! commit durability.
 
 #[cfg(all(unix, feature = "fault-injection"))]
 use std::fs;
@@ -39,6 +40,8 @@ use tempfile::TempDir;
 
 const HELPER_ENV: &str = "CHIRONDB_PROCESS_KILL_HELPER";
 const DATA_DIR_ENV: &str = "CHIRONDB_PROCESS_KILL_DATA_DIR";
+#[cfg(all(unix, feature = "fault-injection"))]
+const TRANSACTION_HELPER_ENV: &str = "CHIRONDB_TRANSACTION_CRASH_HELPER";
 const SYNC_POINTS: usize = 24;
 const ASYNC_POINTS: usize = 64;
 const ASYNC_ACK_MARKER: &str = "CHIRONDB_ASYNC_ACKNOWLEDGED";
@@ -75,21 +78,110 @@ fn process_kill_writer_helper() {
             .expect("asynchronous upsert");
     }
 
-    println!("{ASYNC_ACK_MARKER}");
+    // A serial libtest runner prints `test ... ` without a newline before
+    // entering this helper. Keep the parent/child marker on its own line.
+    println!("\n{ASYNC_ACK_MARKER}");
     std::io::stdout()
         .flush()
         .expect("flush acknowledgement marker");
 
-    // Do not drop Db: the parent must terminate this process before graceful
-    // shutdown can flush the outstanding asynchronous WAL suffix.
+    // Do not drop Db: the parent must prove that recovery does not depend on a
+    // graceful shutdown after the wait=false acknowledgements.
     loop {
         thread::park();
     }
 }
 
+#[cfg(all(unix, feature = "fault-injection"))]
+#[test]
+#[ignore = "subprocess helper; invoked by the transaction crash matrix"]
+fn transaction_crash_helper() {
+    if env::var_os(TRANSACTION_HELPER_ENV).is_none() {
+        return;
+    }
+    let data_dir = PathBuf::from(env::var_os(DATA_DIR_ENV).expect("helper data directory"));
+    let db = Db::open(&data_dir).expect("open transaction crash database");
+    db.upsert_wait("docs", vec![test_point("candidate", 0)], true)
+        .expect("transaction crash upsert");
+    panic!("transaction failpoint returned instead of pausing");
+}
+
+#[cfg(all(unix, feature = "fault-injection"))]
+#[test]
+fn transaction_crash_boundaries_recover_exact_commit_decisions() {
+    for (failpoint, committed) in [
+        ("transaction.before_prepare", false),
+        ("transaction.after_prepare", false),
+        ("transaction.before_commit", false),
+        // SIGKILL preserves the kernel page cache. This boundary exercises
+        // recovery of a complete COMMIT frame before fsync; the synchronous
+        // error regression separately verifies the caller receives unknown.
+        ("transaction.before_commit_fsync", true),
+        ("transaction.after_commit", true),
+        ("transaction.before_storage_projection", true),
+        ("transaction.before_audit_projection", true),
+        ("db.after_upsert_durable", true),
+    ] {
+        let sandbox = TempDir::new().unwrap();
+        let db_root = sandbox.path().join("db");
+        let db = Db::open(&db_root).unwrap();
+        db.create_collection(test_collection()).unwrap();
+        db.upsert_wait("docs", vec![test_point("stable", 0)], true)
+            .unwrap();
+        drop(db);
+
+        let marker = sandbox.path().join("transaction.marker");
+        let release = sandbox.path().join("transaction.release");
+        let mut child = Command::new(env::current_exe().expect("current test executable"));
+        child
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("transaction_crash_helper")
+            .arg("--nocapture")
+            .env(TRANSACTION_HELPER_ENV, "1")
+            .env(DATA_DIR_ENV, &db_root)
+            .env("CHIRONDB_FAILPOINT", format!("pause:{failpoint}"))
+            .env("CHIRONDB_FAILPOINT_MARKER", &marker)
+            .env("CHIRONDB_FAILPOINT_RELEASE", &release)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+        let mut child = child.spawn().expect("spawn transaction crash helper");
+        wait_for_failpoint_marker_and_kill(&mut child, &marker, failpoint);
+
+        let recovered = Db::open(&db_root).expect("recover transaction crash boundary");
+        assert_eq!(
+            recovered.count("docs", None).unwrap().count,
+            1 + usize::from(committed)
+        );
+        assert_eq!(
+            recovered
+                .get_points("docs", &[point_id("candidate", 0)])
+                .unwrap()
+                .len(),
+            usize::from(committed),
+            "incorrect visibility after {failpoint}"
+        );
+        chirondb::audit::verify_hash_chain(&db_root)
+            .unwrap_or_else(|error| panic!("audit chain failed after {failpoint}: {error}"));
+        let audit = fs::read_to_string(db_root.join(chirondb::audit::AUDIT_LOG_FILE)).unwrap();
+        assert!(!audit.contains(&point_id("candidate", 0)));
+        if committed {
+            assert!(
+                audit.lines().any(|line| {
+                    serde_json::from_str::<serde_json::Value>(line).is_ok_and(|record| {
+                        record["operation"] == "upsert" && record["outcome"] == "success"
+                    })
+                }),
+                "committed transaction lacks recovered audit after {failpoint}"
+            );
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
-fn process_kill_preserves_sync_prefix_and_at_most_loses_async_suffix() {
+fn process_kill_recovers_every_acknowledged_write() {
     let data_dir = TempDir::new().unwrap();
     let mut child = spawn_writer(data_dir.path());
     wait_for_async_acknowledgement(&mut child);
@@ -187,20 +279,17 @@ fn assert_recovered_prefix(points: &[Point]) {
         );
     }
 
-    let recovered_async = (0..ASYNC_POINTS)
-        .take_while(|ordinal| actual_ids.contains(point_id("async", *ordinal).as_str()))
-        .count();
-    for ordinal in recovered_async..ASYNC_POINTS {
+    for ordinal in 0..ASYNC_POINTS {
         let id = point_id("async", ordinal);
         assert!(
-            !actual_ids.contains(id.as_str()),
-            "wait=false recovery contains a hole before {id}"
+            actual_ids.contains(id.as_str()),
+            "acknowledged wait=false point {id} was lost"
         );
     }
 
     let expected = (0..SYNC_POINTS)
         .map(|ordinal| point_id("sync", ordinal))
-        .chain((0..recovered_async).map(|ordinal| point_id("async", ordinal)))
+        .chain((0..ASYNC_POINTS).map(|ordinal| point_id("async", ordinal)))
         .collect::<HashSet<_>>();
     let unexpected = actual_ids
         .iter()
@@ -211,7 +300,7 @@ fn assert_recovered_prefix(points: &[Point]) {
         unexpected.is_empty(),
         "phantom recovered IDs: {unexpected:?}"
     );
-    assert_eq!(points.len(), SYNC_POINTS + recovered_async);
+    assert_eq!(points.len(), SYNC_POINTS + ASYNC_POINTS);
 }
 
 /// Feature-only helper used by the phase-specific crash matrix below.
@@ -540,6 +629,28 @@ fn wait_for_hook_marker_and_kill(child: &mut Child, marker: &Path, hook: &str) {
         if Instant::now() >= deadline {
             terminate_and_reap(child);
             panic!("phase helper did not reach {hook} within {HELPER_TIMEOUT:?}");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(all(unix, feature = "fault-injection"))]
+fn wait_for_failpoint_marker_and_kill(child: &mut Child, marker: &Path, failpoint: &str) {
+    let expected = format!("failpoint={failpoint}");
+    let deadline = Instant::now() + HELPER_TIMEOUT;
+    loop {
+        if fs::read_to_string(marker).is_ok_and(|contents| contents.contains(&expected)) {
+            child.kill().expect("SIGKILL transaction helper");
+            let status = child.wait().expect("reap transaction helper");
+            assert!(!status.success(), "transaction helper exited gracefully");
+            return;
+        }
+        if let Some(status) = child.try_wait().expect("poll transaction helper") {
+            panic!("transaction helper exited before {failpoint} marker: {status}");
+        }
+        if Instant::now() >= deadline {
+            terminate_and_reap(child);
+            panic!("transaction helper did not reach {failpoint} within {HELPER_TIMEOUT:?}");
         }
         thread::sleep(Duration::from_millis(10));
     }

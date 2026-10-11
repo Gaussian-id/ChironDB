@@ -431,6 +431,12 @@ pub(crate) fn copy_dir_contents(source: &Path, destination: &Path) -> Result<()>
             continue;
         }
         let file_type = entry.file_type()?;
+        if file_type.is_dir()
+            && (crate::wal::Wal::is_snapshot_scratch(&entry.path())
+                || crate::relational::disk_map::DiskMap::is_journal_scratch(&entry.path()))
+        {
+            continue;
+        }
         let target = destination.join(entry.file_name());
         if file_type.is_symlink() {
             return Err(std::io::Error::new(
@@ -539,21 +545,19 @@ mod tests {
             crash_hook(HOOK_WAL_AFTER_FRAME_HEADER).unwrap();
         });
 
+        let expected_marker = format!("{HOOK_WAL_AFTER_FRAME_HEADER}\n");
         for _ in 0..200 {
-            if marker.exists() {
+            if std::fs::read_to_string(&marker).is_ok_and(|contents| contents == expected_marker) {
                 break;
             }
             thread::sleep(Duration::from_millis(10));
         }
-        if !marker.exists() {
+        if !std::fs::read_to_string(&marker).is_ok_and(|contents| contents == expected_marker) {
             std::fs::write(&release, b"release timed-out hook").unwrap();
             worker.join().unwrap();
             panic!("crash hook marker was not published");
         }
-        assert_eq!(
-            std::fs::read_to_string(&marker).unwrap(),
-            format!("{HOOK_WAL_AFTER_FRAME_HEADER}\n")
-        );
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), expected_marker);
         assert!(!worker.is_finished());
 
         std::fs::write(release, b"continue").unwrap();

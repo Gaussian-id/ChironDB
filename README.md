@@ -5,11 +5,11 @@
 <h1 align="center">ChironDB</h1>
 
 <p align="center">
-  <strong>Vector search, hybrid retrieval, and connected context. One Rust engine.</strong>
+  <strong>Relational data, vector search, hybrid retrieval, and connected context. One Rust engine.</strong>
 </p>
 
 <p align="center">
-  <a href="docs/releases/0.1.0-beta.1.md"><img alt="Version: 0.1.0-beta.1" src="https://img.shields.io/badge/version-0.1.0--beta.1-1677F0?style=flat-square"></a>
+  <a href="docs/releases/0.1.0-beta.2.md"><img alt="Version: 0.1.0-beta.2" src="https://img.shields.io/badge/version-0.1.0--beta.2-1677F0?style=flat-square"></a>
   <a href="rust-toolchain.toml"><img alt="Rust: 1.92" src="https://img.shields.io/badge/Rust-1.92-0D213B?style=flat-square"></a>
   <a href="LICENSE"><img alt="License: AGPL-3.0-only" src="https://img.shields.io/badge/license-AGPL--3.0--only-1677F0?style=flat-square"></a>
 </p>
@@ -24,10 +24,18 @@
 
 <br>
 
-ChironDB is a self-hosted retrieval database for applications that need to find
-relevant information and follow its relationships. Store embeddings and JSON
-payloads, combine dense search with sparse BM25, and query through HTTP, gRPC,
+ChironDB is a self-hosted multi-model database with an implemented native
+relational database, vector search, hybrid retrieval, and a property-graph overlay.
+Store typed SQL tables alongside embeddings and JSON payloads, combine dense
+search with sparse BM25, and query through HTTP, gRPC,
 ChironWire, read-only MCP tools, or an interactive ChironQL console.
+
+> **Evaluation only — not production ready.** The implemented features can be
+> used and tested now, including native relational SQL. ChironDB still has open
+> compatibility, durability, security, resource, and release validation gates.
+> Do not use this preview for production workloads or depend on a production SLA.
+> TabFM model integration is excluded because the project does not have the
+> required model usage rights; no TabFM weights are distributed.
 
 A single LS-VEC engine manages dense retrieval. The beta also includes a
 single-node property-graph overlay: points become vertices, typed edges connect
@@ -47,6 +55,9 @@ authentication plus RBAC.
 
 ## Why ChironDB
 
+- **Query relational data.** Native typed SQL tables, constraints, scalar indexes,
+  transactions, savepoints, and bounded equijoins are implemented as an evaluation
+  preview. Use the documented SQL subset through ChironQL or native PostgreSQL wire.
 - **Bring semantic and lexical retrieval together.** Dense vectors, sparse BM25,
   payload filters, and reciprocal rank or weighted fusion share one storage engine.
 - **Search connected data.** Add typed relationships to existing points, traverse
@@ -62,8 +73,9 @@ authentication plus RBAC.
 
 ## Status
 
-The current source version is **`0.1.0-beta.1`**. ChironDB is under active beta
-development; this is not a stable compatibility or uptime SLA. Start with a
+The current source version is **`0.1.0-beta.2`**. ChironDB is under active beta
+development and **is not production ready**. Features are available for evaluation;
+this is not a stable compatibility or uptime SLA. Start with a
 source build. Tagged binary releases and prebuilt images should be used
 only when their artifacts are available and verified.
 
@@ -73,20 +85,61 @@ previews, and distributed graph traversal is outside the beta scope. Python
 and Rust clients are distributed from source. The MCP surface is configuration
 gated and read-only. Windows support is best-effort.
 
-ChironDB complements PostgreSQL/pgvector for vector retrieval. Its PostgreSQL
-wire surface accepts six vector-only SQL shapes; joins, CTEs, transactions,
-and `CREATE INDEX … USING hnsw` return SQLSTATE `0A000`. ChironQL is a separate
-retrieval language. See the [usage guide](docs/GETTING_STARTED.md#postgresql-and-pgvector-boundary)
-for the supported boundary.
+ChironDB complements PostgreSQL/pgvector for vector retrieval. Its legacy
+pgvector profile accepts six vector-only SQL shapes and still rejects features
+outside that profile with SQLSTATE `0A000`. The implemented native relational
+database is a preview on the same PostgreSQL wire and supports transaction control and a documented SQL
+subset, including bounded native relational equijoins. Its preliminary
+`pg_catalog` shim exposes native tables, columns, scalar type OIDs, indexes,
+and the constraint plus minimal `information_schema.tables`/`columns`
+projections used by the checked psycopg 3, SQLAlchemy 2,
+Alembic migration, SQLx 0.8, and Diesel 2 smoke scenarios. The Rust probes exercise
+binary results, prepared parameters, transactions, savepoints, reconnect,
+nullable values, and unique-violation mapping. Broad catalog compatibility,
+the broad migration matrix, and full ORM acceptance remain under development. The current relational preview
+supports the documented non-recursive CTE/subquery subset; recursive, correlated
+and lateral queries remain unsupported.
+`CREATE INDEX … USING hnsw` remains rejected because LS-VEC is automatic.
+ChironQL is a separate retrieval language. See the
+[usage guide](docs/GETTING_STARTED.md#postgresql-and-pgvector-boundary) for the
+supported boundary.
+
+## Local ML preview
+
+Decision Tree and Random Forest materialized views are available through ChironQL.
+After the explicit build and Python setup in [the worker guide](ml-worker/README.md),
+run `./scripts/chiron-ml` to start the server and interactive console together.
+Regression confidence displays `NULL`; classification confidence is a class probability.
+Use distinct view names to compare models. This local preview is not production ready.
+TabFM integration, downloads and weights are excluded pending model usage rights.
 
 ## Quickstart
+
+### Offline transaction authority migration
+
+For an existing protected installation, stop the server and run:
+
+```bash
+./target/release/chironctl security migrate-transaction-authority \
+  --data-dir /srv/chirondb --keyring /etc/chirondb/storage-keyring.json
+```
+
+This requires the complete journal and finished storage/audit projections.
+It atomically activates transaction format 3 and installation reader format 6;
+older binaries refuse the upgraded installation. Repeating the command resumes
+an interrupted migration or reports `migrated: false` after activation. Backups
+must retain `transactions/authority`. Missing or corrupt authority rejects startup.
+Consumed request keys remain permanent after retry receipts expire. Keep the
+complete journal until the common model frontier and archive reclamation are
+qualified; this migration does not enable production journal pruning.
+
+### Build and start
 
 Install Git, a C/C++ build toolchain, [Rust via rustup](https://rustup.rs), and
 `protoc` (`brew install protobuf` on macOS, or
 `sudo apt-get install build-essential protobuf-compiler` on Debian/Ubuntu).
-The repository pins Rust `1.92.0`. On macOS, install the command-line
-developer tools with `xcode-select --install` if needed. The examples also
-use `curl`. If you already have a checkout, skip `git clone` and `cd`.
+The repository pins Rust `1.92.0`. If you already have a checkout, start there and
+skip `git clone` and `cd`.
 
 ```bash
 git clone https://github.com/Gaussian-id/ChironDB.git
@@ -98,21 +151,21 @@ cargo build --release --locked -p chirondb \
 To use `chirondb --console` without the `./target/release/` prefix, follow
 [command installation](docs/GETTING_STARTED.md#make-the-commands-available-in-new-terminals).
 
-Start the server and its interactive console from the repository root:
+Check whether a server is already running:
+
+```bash
+curl --fail --connect-timeout 2 http://127.0.0.1:7401/health
+```
+
+If it returns `status: ok`, attach with the client command below. If the
+connection is refused, start the server with its console:
 
 ```bash
 ./target/release/chirondb --console
 ```
 
-The server stores data in `./data` and listens on loopback. This local
-development example uses no authentication; see the
-[security setup](docs/GETTING_STARTED.md#authentication-and-network-access)
-before deploying remotely. If the default ports are occupied, connect to your
-existing server with the client command below or follow the
-[alternate-port setup](docs/GETTING_STARTED.md#1-build-and-start).
-
-At the `chiron>` prompt, run one statement at a time. If `products` already
-exists from this example, skip its creation.
+At the `chiron>` prompt, run one statement at a time. Use an unused collection
+name; if `products` already exists from this example, skip its creation.
 
 ```sql
 CREATE COLLECTION products DIM 3 METRIC cosine;
@@ -130,6 +183,21 @@ already running, use the separate client instead:
 ```bash
 ./target/release/chironql --url http://127.0.0.1:7401
 ```
+
+### Try native relational SQL
+
+At the `chiron>` prompt on an unprotected local server, use an unused table name:
+
+```sql
+SQL CREATE TABLE demo_orders (id INTEGER PRIMARY KEY, customer TEXT NOT NULL, amount DOUBLE PRECISION);
+SQL INSERT INTO demo_orders VALUES (1, 'trial', 29.5), (2, 'trial', NULL);
+SQL SELECT id, customer, amount FROM demo_orders ORDER BY id;
+```
+
+The second row displays `NULL` for its unavailable amount. Native relational SQL
+is implemented, but the database remains **not production ready**. Use the
+[documented SQL boundary](docs/GETTING_STARTED.md#postgresql-and-pgvector-boundary)
+for supported types, constraints, indexes, transactions, joins and CTEs.
 
 | Interface | Default address | Guide |
 | --- | --- | --- |
@@ -151,7 +219,7 @@ For Docker, HTTP requests, hybrid search, MCP, SDKs, and restart instructions, f
 | [gRPC API](docs/GRPC_API.md) | RPCs, reflection, TLS, and generated clients |
 | [Python, Rust, and MCP clients](docs/SDKS.md) | Source installation, application examples, and MCP configuration |
 | [Tenant isolation](docs/TENANT_ISOLATION.md) | Ownership, migration, and enforcement |
-| [Beta release notes](docs/releases/0.1.0-beta.1.md) | Implemented graph surface and deliberate exclusions |
+| [Beta release notes](docs/releases/0.1.0-beta.2.md) | Relational preview, model availability, and evaluation limits |
 
 ## Coming from GaussDB
 

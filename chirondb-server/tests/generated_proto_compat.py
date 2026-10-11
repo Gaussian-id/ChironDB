@@ -55,7 +55,7 @@ def main():
         importlib.invalidate_caches()
         try:
             generated = importlib.import_module("chirondb.v1.compat_pb2")
-            importlib.import_module("chirondb.v1.chirondb_pb2")
+            primary = importlib.import_module("chirondb.v1.chirondb_pb2")
             importlib.import_module("chirondb.v1.raft_pb2")
         except Exception as error:  # noqa: BLE001 - see the check below
             # A local `protoc` newer than the installed protobuf runtime is an
@@ -115,6 +115,28 @@ def main():
             raise AssertionError("generated recall target presence failed")
         if not search_roundtrip.query.HasField("graph_json"):
             raise AssertionError("generated graph constraint presence failed")
+
+        sql = primary.SqlExecutionRequest(idempotency_key="compat-native-sql")
+        statement = sql.statements.add(sql="SELECT $1,$2,$3,$4;")
+        statement.parameters.add(integer=-(2**63))
+        statement.parameters.add(null=primary.SqlNull())
+        statement.parameters.add(record_ref=primary.SqlRecordRef(namespace="docs", id="r1"))
+        statement.parameters.add(bytes_value=b"\x00\xff")
+        decoded_sql = primary.SqlExecutionRequest.FromString(sql.SerializeToString())
+        if decoded_sql != sql or not decoded_sql.HasField("idempotency_key"):
+            raise AssertionError("native SQL typed parameters/retry presence round-trip failed")
+        if [p.WhichOneof("value") for p in decoded_sql.statements[0].parameters] != [
+            "integer", "null", "record_ref", "bytes_value"
+        ]:
+            raise AssertionError("native SQL oneof presence changed")
+        handle = primary.SqlTransactionHandleResponse(
+            handle="h1", snapshot=1, state=primary.SQL_TRANSACTION_STATE_OUTCOME_UNKNOWN,
+            transaction_id="stable-commit-id",
+        )
+        decoded_handle = primary.SqlTransactionHandleResponse.FromString(handle.SerializeToString())
+        if decoded_handle != handle or not decoded_handle.HasField("transaction_id"):
+            raise AssertionError("native SQL commit reconciliation handle changed")
+        result["native_sql_protobuf"] = "ok"
 
     result["cpp_protobuf"] = "ok"
     result["descriptor"] = "ok"
@@ -192,14 +214,18 @@ def validate_descriptor(descriptor_path):
         "CommitDeferredGraphSession",
         "AbortDeferredGraphSession",
     }
-    expected_primary_only = graph_methods | {"ExecuteQuery"}
+    sql_methods = {
+        "ExecuteSql", "BeginSqlTransaction", "ExecuteSqlTransaction",
+        "CommitSqlTransaction", "RollbackSqlTransaction",
+    }
+    expected_primary_only = graph_methods | sql_methods | {"ExecuteQuery"}
     if primary_methods != methods | expected_primary_only:
         raise AssertionError(
             "ChironDb primary-only RPC mismatch: "
             f"{sorted(primary_methods - methods)}"
         )
-    if methods & graph_methods:
-        raise AssertionError("legacy GaussDb service must remain graph-RPC free")
+    if methods & (graph_methods | sql_methods):
+        raise AssertionError("legacy GaussDb service must remain graph/SQL-RPC free")
 
     messages = {message.name: message for message in descriptor.message_type}
     if "WireRequest" not in messages or "WireResponse" not in messages:

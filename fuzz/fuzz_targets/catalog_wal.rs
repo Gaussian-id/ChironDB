@@ -16,7 +16,9 @@ fuzz_target!(|input: &[u8]| {
         return;
     }
     let _ = Wal::scan_from(directory.path(), 0, |record| match record.entry {
-        WalEntry::CreateCollection { .. } | WalEntry::DropCollection { .. } => Ok(()),
+        WalEntry::CreateCollection { .. }
+        | WalEntry::CreateProtectedCollection { .. }
+        | WalEntry::DropCollection { .. } => Ok(()),
         _ => Err(GaussError::WalCorruption {
             path: directory.path().display().to_string(),
             message: "collection record found in catalog WAL".to_string(),

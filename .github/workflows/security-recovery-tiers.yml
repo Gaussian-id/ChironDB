@@ -20,6 +20,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@87eb139fed4b08a67bd1fa429a21d1f5d523e03e # 1.92.0
         with:
           toolchain: 1.92.0
+          components: clippy, rustfmt
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Build fixed-tier drill

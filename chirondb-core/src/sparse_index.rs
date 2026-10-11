@@ -197,16 +197,17 @@ pub(crate) struct SparsePostingBlock {
 
 #[cfg(test)]
 pub(crate) fn build_sparse_index(points: &HashMap<String, Point>) -> SparseIndex {
-    build_sparse_index_iter(points.values())
+    try_build_sparse_index_iter(points.values().map(Ok)).expect("in-memory sparse fixture")
 }
 
 /// Iterator variant: builds from any live-point stream (multi-segment
 /// collections chain the streamer and every searcher store).
-pub(crate) fn build_sparse_index_iter<P: Borrow<Point>>(
-    points: impl Iterator<Item = P>,
-) -> SparseIndex {
+pub(crate) fn try_build_sparse_index_iter<P: Borrow<Point>>(
+    points: impl Iterator<Item = crate::Result<P>>,
+) -> crate::Result<SparseIndex> {
     let mut index = SparseIndex::default();
     for point in points {
+        let point = point?;
         let point = point.borrow();
         index.text.insert(point);
         let Some(sparse_vector) = &point.sparse_vector else {
@@ -227,7 +228,7 @@ pub(crate) fn build_sparse_index_iter<P: Borrow<Point>>(
     for list in index.dimensions.values_mut() {
         rebuild_sparse_posting_blocks(list);
     }
-    index
+    Ok(index)
 }
 
 pub(crate) fn insert_sparse_point(index: &mut SparseIndex, point: &Point) {

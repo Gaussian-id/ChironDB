@@ -91,6 +91,9 @@ fn run(db: &Db, query: &str, scope: &TenantScope) -> Result<ChironQlResponse, Ch
         allowed_collections: None,
         want_trace: true,
         confirm: true,
+        parameters: Vec::new(),
+        idempotency_key: None,
+        retry_id: None,
         tenant: scope.clone(),
     };
     chirondb::chironql_exec::execute(&mut ctx, query)
@@ -314,10 +317,11 @@ fn another_tenants_point_cannot_be_updated_or_deleted() {
     )
     .expect_err("refused");
 
-    // A delete by id silently affects nothing rather than reporting that the
-    // id exists elsewhere.
-    let deleted = run(&db, "DELETE FROM products POINTS globex-1;", &acme()).expect("delete");
-    assert_eq!(deleted.stats.affected, Some(0));
+    // Hidden and absent IDs are both refused before any member of a direct
+    // mutation batch is committed.
+    let hidden = run(&db, "DELETE FROM products POINTS globex-1;", &acme()).expect_err("hidden");
+    let absent = run(&db, "DELETE FROM products POINTS absent;", &acme()).expect_err("absent");
+    assert_eq!(hidden.code, absent.code);
 
     let still_there = run(&db, "GET products POINTS globex-1;", &globex()).expect("get");
     assert_eq!(ids(&still_there), vec!["globex-1"]);
@@ -360,6 +364,9 @@ fn an_admin_role_alone_does_not_cross_tenants() {
         allowed_collections: None,
         want_trace: false,
         confirm: true,
+        parameters: Vec::new(),
+        idempotency_key: None,
+        retry_id: None,
         tenant: acme(),
     };
     let response =
@@ -402,28 +409,23 @@ fn cross_read_alone_does_not_grant_cross_write() {
 }
 
 #[test]
-fn cross_write_is_the_migration_path() {
+fn cross_write_cannot_reassign_ownership_through_content_mutation() {
     let (_dir, db) = fixture();
     db.set_tenant_enforcement(TenantEnforcement::Enforced);
-
-    let migrator = TenantScope::untenanted("migration-job")
+    let writer = TenantScope::untenanted("cross-writer")
         .with_capabilities([TenantCapability::CrossRead, TenantCapability::CrossWrite]);
-
-    // Adopt the legacy row into a tenant — the operation this capability
-    // exists for, rather than borrowing ordinary write behaviour.
     run(
         &db,
-        "UPSERT INTO products {id: 'legacy-1', vector: [1,0,0], \
-         payload: {tenant_id: 'acme', category: 'electronics'}};",
-        &migrator,
+        "UPSERT INTO products {id: 'legacy-1', vector: [1,0,0], payload: {tenant_id: 'acme'}};",
+        &writer,
     )
-    .expect("adopted");
-
-    let seen = run(&db, "GET products POINTS legacy-1;", &acme()).expect("get");
-    assert_eq!(ids(&seen), vec!["legacy-1"], "now visible to its tenant");
-
-    let theirs = run(&db, "GET products POINTS legacy-1;", &globex()).expect("get");
-    assert!(theirs.rows.is_empty(), "and to nobody else");
+    .expect_err("ownership changes require the dedicated migration authority");
+    assert!(
+        run(&db, "GET products POINTS legacy-1;", &acme())
+            .unwrap()
+            .rows
+            .is_empty()
+    );
 }
 
 #[test]
@@ -567,6 +569,9 @@ fn grpc_query(
         collection: None,
         trace: false,
         confirm: true,
+        parameters: Vec::new(),
+        idempotency_key: None,
+        retry_id: None,
     });
     request.metadata_mut().insert(
         "authorization",

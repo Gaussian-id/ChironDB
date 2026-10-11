@@ -29,7 +29,7 @@ use std::fmt;
 use serde_json::{Map, Value};
 
 use chirondb_types::{
-    DistanceMetric, Filter,
+    DistanceMetric, ExecutionDomain, Filter,
     graph::{
         GraphDirection, MAX_EDGE_PROPERTY_BYTES, MAX_GRAPH_ANCHORS, MAX_GRAPH_DEPTH,
         MAX_GRAPH_EDGES_PER_BATCH, MAX_GRAPH_TYPES_PER_CLAUSE,
@@ -45,12 +45,15 @@ use chirondb_types::{
 /// language it answers is not. At 1.1 the statements, clause names, error
 /// codes and rejection taxonomy are stable — anything removed goes through a
 /// deprecation cycle rather than disappearing between releases.
-pub const LANGUAGE_VERSION: &str = "1.1";
+pub const LANGUAGE_VERSION: &str = "1.4";
+
+mod security;
+pub use security::{NamedSubject, SecurityCommand, SecurityStatement};
 
 /// Explicit alias used by the graph conformance corpus.
 #[cfg(test)]
 pub(crate) fn parse_v1_1(input: &str) -> ParseResult<Statement> {
-    parse(input)
+    parse_language(input, LanguageSurface::GraphV1_1)
 }
 
 // ---------------------------------------------------------------------------
@@ -114,6 +117,8 @@ pub type ParseResult<T> = Result<T, ParseError>;
 /// collection set by `USE`", which only the executor can resolve.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Statement {
+    Security(SecurityStatement),
+    MlMaterialize(MlMaterialize),
     Search(Search),
     Hybrid(Hybrid),
     Multi(Multi),
@@ -147,12 +152,150 @@ pub enum Statement {
     Use {
         collection: String,
     },
+    Sql(SqlStatement),
+    Pipeline(Pipeline),
+    Transaction(TransactionBlock),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SqlStatement {
+    pub sql: String,
+    pub tables: Vec<String>,
+    pub class: StatementClass,
+    pub kind: chirondb_core::SqlStatementKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MlMaterialize {
+    pub view: String,
+    pub source: String,
+    pub target: String,
+    pub features: Vec<String>,
+    pub task: MlTask,
+    pub model: MlModel,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MlTask {
+    Classification,
+    Regression,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MlModel {
+    DecisionTree,
+    RandomForest,
+}
+
+/// One atomic relational + vector + graph mutation block.
+///
+/// Domain prefixes are mandatory so classification never depends on keywords
+/// hidden in SQL text or JSON values. The first version deliberately accepts
+/// one SQL DML statement, one vector mutation, and one or more graph
+/// mutations against the same collection.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TransactionBlock {
+    pub sql: SqlStatement,
+    pub expected_sql_rows: Option<u64>,
+    pub vector: TransactionVector,
+    pub graph: Vec<TransactionGraph>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum TransactionVector {
+    Create {
+        collection: String,
+        template: String,
+        records: Vec<chirondb_core::NewRecord>,
+    },
+    Upsert(Upsert),
+    DeletePoints {
+        collection: String,
+        ids: Vec<String>,
+    },
+}
+
+impl TransactionVector {
+    pub fn collection(&self) -> &str {
+        match self {
+            Self::Upsert(upsert) => upsert
+                .collection
+                .as_deref()
+                .expect("transaction parser requires an explicit collection"),
+            Self::DeletePoints { collection, .. } | Self::Create { collection, .. } => collection,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum TransactionGraph {
+    CreateRelation {
+        collection: String,
+        relation: chirondb_core::NewRelation,
+    },
+    Relate(Relate),
+    Unrelate(Unrelate),
+    UpdateEdge(UpdateEdge),
+}
+
+impl TransactionGraph {
+    pub fn collection(&self) -> &str {
+        match self {
+            Self::CreateRelation { collection, .. } => collection,
+            Self::Relate(statement) => &statement.collection,
+            Self::Unrelate(statement) => &statement.collection,
+            Self::UpdateEdge(statement) => &statement.collection,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pipeline {
+    pub explain: bool,
+    pub vector_alias: String,
+    pub vector: Box<Statement>,
+    pub graph: Option<PipelineGraph>,
+    pub relational_alias: String,
+    pub relational: SqlStatement,
+    pub joins: Vec<PipelineJoin>,
+    pub projection: Vec<PipelineField>,
+    pub order_by: Option<(PipelineField, bool)>,
+    pub limit: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PipelineGraph {
+    pub alias: String,
+    pub source_alias: String,
+    pub traverse: Traverse,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PipelineJoinKind {
+    Inner,
+    Left,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PipelineJoin {
+    pub kind: PipelineJoinKind,
+    pub alias: String,
+    pub left: PipelineField,
+    pub right: PipelineField,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct PipelineField {
+    pub alias: String,
+    pub field: String,
 }
 
 impl Statement {
     /// Read or write. The RBAC check keys off this, before execution.
     pub fn class(&self) -> StatementClass {
         match self {
+            Self::Security(statement) => statement.class(),
+            Self::MlMaterialize(_) => StatementClass::Write,
             Self::Search(_)
             | Self::Hybrid(_)
             | Self::Multi(_)
@@ -170,9 +313,11 @@ impl Statement {
             | Self::UpdatePayload(_)
             | Self::Relate(_)
             | Self::Unrelate(_)
-            | Self::UpdateEdge(_)
-            | Self::CreateCollection(_)
-            | Self::DropCollection { .. } => StatementClass::Write,
+            | Self::UpdateEdge(_) => StatementClass::Write,
+            Self::CreateCollection(_) | Self::DropCollection { .. } => StatementClass::Admin,
+            Self::Sql(statement) => statement.class,
+            Self::Pipeline(_) => StatementClass::Read,
+            Self::Transaction(_) => StatementClass::Write,
         }
     }
 
@@ -186,6 +331,8 @@ impl Statement {
     /// The collection named in the statement itself, if any.
     pub fn collection(&self) -> Option<&str> {
         match self {
+            Self::Security(statement) => statement.collection(),
+            Self::MlMaterialize(_) => None,
             Self::Search(s) => s.collection.as_deref(),
             Self::Hybrid(s) => s.collection.as_deref(),
             Self::Multi(s) => s.collection.as_deref(),
@@ -206,12 +353,17 @@ impl Statement {
             Self::DropCollection { collection, .. } => Some(collection),
             Self::Use { collection } => Some(collection),
             Self::ShowCollections => None,
+            Self::Sql(_) => None,
+            Self::Pipeline(_) => None,
+            Self::Transaction(block) => Some(block.vector.collection()),
         }
     }
 
     /// Statement name as it appears in a trace or a log line.
     pub fn kind_name(&self) -> &'static str {
         match self {
+            Self::Security(statement) => statement.kind_name(),
+            Self::MlMaterialize(_) => "ML MATERIALIZE",
             Self::Search(_) => "SEARCH",
             Self::Hybrid(_) => "HYBRID",
             Self::Multi(_) => "MULTI",
@@ -231,6 +383,79 @@ impl Statement {
             Self::CreateCollection(_) => "CREATE COLLECTION",
             Self::DropCollection { .. } => "DROP COLLECTION",
             Self::Use { .. } => "USE",
+            Self::Sql(_) => "SQL",
+            Self::Pipeline(pipeline) if pipeline.explain => "EXPLAIN PIPELINE",
+            Self::Pipeline(_) => "PIPELINE",
+            Self::Transaction(_) => "TRANSACTION",
+        }
+    }
+
+    pub fn domains(&self) -> Vec<ExecutionDomain> {
+        use ExecutionDomain::{Catalog, Graph, Relational, Security, Vector};
+        match self {
+            Self::Security(_) => vec![Security],
+            Self::MlMaterialize(_) => vec![Relational],
+            Self::Sql(_) => vec![Relational],
+            Self::Pipeline(pipeline) => {
+                let mut domains = vec![Relational, Vector];
+                if pipeline.graph.is_some() {
+                    domains.push(Graph);
+                }
+                domains
+            }
+            Self::Transaction(_) => vec![Relational, Vector, Graph],
+            Self::Relate(_) | Self::Unrelate(_) | Self::UpdateEdge(_) | Self::Traverse(_) => {
+                vec![Graph]
+            }
+            Self::Search(search) if search.graph.is_some() => vec![Vector, Graph],
+            Self::Hybrid(hybrid) if hybrid.graph.is_some() => vec![Vector, Graph],
+            Self::Search(_)
+            | Self::Hybrid(_)
+            | Self::Multi(_)
+            | Self::Recommend(_)
+            | Self::Count(_)
+            | Self::Scroll(_)
+            | Self::Get(_)
+            | Self::Upsert(_)
+            | Self::DeletePoints { .. }
+            | Self::DeleteWhere { .. }
+            | Self::UpdatePayload(_) => vec![Vector],
+            Self::ShowCollections
+            | Self::Describe { .. }
+            | Self::CreateCollection(_)
+            | Self::DropCollection { .. }
+            | Self::Use { .. } => vec![Catalog],
+        }
+    }
+
+    pub fn tables(&self) -> &[String] {
+        match self {
+            Self::Sql(statement) => &statement.tables,
+            Self::MlMaterialize(statement) => std::slice::from_ref(&statement.source),
+            Self::Pipeline(pipeline) => &pipeline.relational.tables,
+            Self::Transaction(block) => &block.sql.tables,
+            _ => &[],
+        }
+    }
+
+    pub fn collections(&self) -> Vec<String> {
+        match self {
+            Self::Pipeline(pipeline) => {
+                let mut collections = pipeline
+                    .vector
+                    .collection()
+                    .map(str::to_owned)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                if let Some(graph) = &pipeline.graph {
+                    collections.push(graph.traverse.collection.clone());
+                }
+                collections.sort();
+                collections.dedup();
+                collections
+            }
+            Self::Transaction(block) => vec![block.vector.collection().to_string()],
+            _ => self.collection().map(str::to_owned).into_iter().collect(),
         }
     }
 }
@@ -250,6 +475,7 @@ pub enum StatementClass {
 #[derive(Clone, Debug, PartialEq)]
 pub enum VectorExpr {
     Literal(Vec<f32>),
+    Parameter(usize),
     /// `@id` — the executor fetches the point and uses its vector.
     Point {
         id: String,
@@ -271,8 +497,16 @@ pub struct Search {
     pub graph: Option<GraphClause>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextQuery {
+    pub query: String,
+    pub field: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Hybrid {
+    pub text: Option<TextQuery>,
+    pub budget_ms: Option<u64>,
     pub collection: Option<String>,
     pub vector: Option<VectorExpr>,
     pub vector_name: Option<String>,
@@ -444,12 +678,15 @@ enum Tok {
     Num(f64),
     LBracket,
     RBracket,
+    LParen,
+    RParen,
     LBrace,
     RBrace,
     Comma,
     Colon,
     Semi,
     At,
+    Parameter(usize),
     Eq,
     NotEq,
     Lt,
@@ -467,12 +704,15 @@ impl Tok {
             Tok::Num(_) => "a number".to_string(),
             Tok::LBracket => "`[`".to_string(),
             Tok::RBracket => "`]`".to_string(),
+            Tok::LParen => "`(`".to_string(),
+            Tok::RParen => "`)`".to_string(),
             Tok::LBrace => "`{`".to_string(),
             Tok::RBrace => "`}`".to_string(),
             Tok::Comma => "`,`".to_string(),
             Tok::Colon => "`:`".to_string(),
             Tok::Semi => "`;`".to_string(),
             Tok::At => "`@`".to_string(),
+            Tok::Parameter(index) => format!("`${index}`"),
             Tok::Eq => "`=`".to_string(),
             Tok::NotEq => "`!=`".to_string(),
             Tok::Lt => "`<`".to_string(),
@@ -495,8 +735,16 @@ fn lex(input: &str) -> ParseResult<Vec<Token>> {
     let bytes = input.as_bytes();
     let mut tokens = Vec::new();
     let mut i = 0usize;
+    let mut depth = 0usize;
 
     while i < bytes.len() {
+        if tokens.len() >= 262_144 {
+            return Err(ParseError::new(
+                "chironql.query_too_large",
+                "query token limit exceeded",
+                i,
+            ));
+        }
         let c = input[i..].chars().next().expect("in-bounds char");
 
         if c.is_whitespace() {
@@ -541,6 +789,38 @@ fn lex(input: &str) -> ParseResult<Vec<Token>> {
             }
             tokens.push(Token {
                 tok: Tok::Str(value),
+                at: start,
+            });
+            continue;
+        }
+
+        if c == '$' {
+            let start = i;
+            i += 1;
+            let digits = i;
+            while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
+                i += 1;
+            }
+            if i == digits {
+                return Err(ParseError::new(
+                    "chironql.invalid_parameter",
+                    "parameter must use $1 through $n",
+                    start,
+                ));
+            }
+            let index = input[digits..i]
+                .parse::<usize>()
+                .ok()
+                .and_then(|value| value.checked_sub(1))
+                .ok_or_else(|| {
+                    ParseError::new(
+                        "chironql.invalid_parameter",
+                        "parameter must use $1 through $n",
+                        start,
+                    )
+                })?;
+            tokens.push(Token {
+                tok: Tok::Parameter(index),
                 at: start,
             });
             continue;
@@ -622,6 +902,8 @@ fn lex(input: &str) -> ParseResult<Vec<Token>> {
         }
 
         let (tok, width) = match c {
+            '(' => (Tok::LParen, 1),
+            ')' => (Tok::RParen, 1),
             '[' => (Tok::LBracket, 1),
             ']' => (Tok::RBracket, 1),
             '{' => (Tok::LBrace, 1),
@@ -653,6 +935,20 @@ fn lex(input: &str) -> ParseResult<Vec<Token>> {
                 ));
             }
         };
+        match tok {
+            Tok::LBracket | Tok::LBrace | Tok::LParen => {
+                depth += 1;
+                if depth > 32 {
+                    return Err(ParseError::new(
+                        "chironql.query_too_deep",
+                        "query nesting limit exceeded",
+                        start,
+                    ));
+                }
+            }
+            Tok::RBracket | Tok::RBrace | Tok::RParen => depth = depth.saturating_sub(1),
+            _ => {}
+        }
         i += width;
         tokens.push(Token { tok, at: start });
     }
@@ -668,7 +964,1011 @@ fn lex(input: &str) -> ParseResult<Vec<Token>> {
 /// is a reject, because there are no transactions to give multi-statement
 /// bodies coherent partial-failure semantics.
 pub fn parse(input: &str) -> ParseResult<Statement> {
-    parse_language(input, LanguageSurface::GraphV1_1)
+    if input.len() > 8 * 1024 * 1024 {
+        return Err(ParseError::new(
+            "chironql.query_too_large",
+            "query exceeds server byte limit",
+            0,
+        ));
+    }
+    if let Some((keyword, at, _)) = leading_keyword(input)
+        && keyword.eq_ignore_ascii_case("SQL")
+    {
+        return parse_sql_statement(input, at);
+    }
+    if let Some((keyword, at, _)) = leading_keyword(input)
+        && keyword.eq_ignore_ascii_case("TRANSACTION")
+    {
+        return parse_transaction(input, at);
+    }
+    if let Some((keyword, at, next)) = leading_keyword(input) {
+        if keyword.eq_ignore_ascii_case("PIPELINE") {
+            return parse_pipeline(input, at, false);
+        }
+        if keyword.eq_ignore_ascii_case("EXPLAIN") && next == "PIPELINE" {
+            return parse_pipeline(input, at, true);
+        }
+    }
+    if leading_keyword(input).is_some_and(|(keyword, _, _)| keyword.eq_ignore_ascii_case("HYBRID"))
+    {
+        let mut parser = Parser {
+            tokens: lex(input)?,
+            pos: 1,
+            len: input.len(),
+            surface: LanguageSurface::GraphV1_1,
+        };
+        let statement = parser.parse_hybrid(true)?;
+        return parser.finish(statement);
+    }
+    if leading_keyword(input).is_some_and(|(keyword, _, _)| keyword.eq_ignore_ascii_case("ML")) {
+        return parse_ml_materialize(input);
+    }
+    security::parse(input).unwrap_or_else(|| parse_language(input, LanguageSurface::GraphV1_1))
+}
+
+fn parse_ml_materialize(input: &str) -> ParseResult<Statement> {
+    let mut parser = Parser {
+        tokens: lex(input)?,
+        pos: 1,
+        len: input.len(),
+        surface: LanguageSurface::GraphV1_1,
+    };
+    parser.expect_keyword("MATERIALIZE")?;
+    let view = parser.expect_word()?;
+    parser.expect_keyword("FROM")?;
+    let source = parser.expect_word()?;
+    parser.expect_keyword("TARGET")?;
+    let target = parser.expect_word()?;
+    parser.expect_keyword("FEATURES")?;
+    parser.expect(&Tok::LParen)?;
+    let mut features = vec![parser.expect_word()?];
+    while parser.eat(&Tok::Comma) {
+        features.push(parser.expect_word()?);
+    }
+    parser.expect(&Tok::RParen)?;
+    parser.expect_keyword("TASK")?;
+    let task = match parser.expect_word()?.to_ascii_uppercase().as_str() {
+        "CLASSIFICATION" => MlTask::Classification,
+        "REGRESSION" => MlTask::Regression,
+        _ => {
+            return Err(ParseError::new(
+                "chironql.ml_task",
+                "TASK must be CLASSIFICATION or REGRESSION",
+                parser.at(),
+            ));
+        }
+    };
+    parser.expect_keyword("USING")?;
+    let model = match parser.expect_word()?.to_ascii_uppercase().as_str() {
+        "DECISION_TREE" => MlModel::DecisionTree,
+        "RANDOM_FOREST" => MlModel::RandomForest,
+        _ => {
+            return Err(ParseError::new(
+                "chironql.ml_model",
+                "USING must name DECISION_TREE or RANDOM_FOREST",
+                parser.at(),
+            ));
+        }
+    };
+    if view == source
+        || target == view
+        || features.iter().any(|feature| feature == &target)
+        || features
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            != features.len()
+    {
+        return Err(ParseError::new(
+            "chironql.ml_columns",
+            "ML view, source, target, and features must not conflict",
+            parser.at(),
+        ));
+    }
+    parser.finish(Statement::MlMaterialize(MlMaterialize {
+        view,
+        source,
+        target,
+        features,
+        task,
+        model,
+    }))
+}
+
+fn parse_transaction(input: &str, at: usize) -> ParseResult<Statement> {
+    let rest = input[at + "TRANSACTION".len()..].trim_start();
+    let (body, tail) = take_braced_transaction_body(rest, at)?;
+    if !tail.trim().trim_end_matches(';').trim().is_empty() {
+        return Err(ParseError::new(
+            "chironql.trailing_input",
+            "TRANSACTION must contain exactly one braced block",
+            at + "TRANSACTION".len(),
+        ));
+    }
+    let stages = split_transaction_stages(body, at)?;
+    let mut sql = None;
+    let mut expected_sql_rows = None;
+    let mut vector = None;
+    let mut graph = Vec::new();
+    for stage in stages {
+        let Some((domain, _, _)) = leading_keyword(stage) else {
+            continue;
+        };
+        let body = stage[domain.len()..].trim_start();
+        match domain.to_ascii_uppercase().as_str() {
+            "SQL" => {
+                if sql.is_some() {
+                    return Err(ParseError::new(
+                        "chironql.duplicate_transaction_stage",
+                        "TRANSACTION accepts exactly one SQL stage",
+                        at,
+                    ));
+                }
+                let Statement::Sql(statement) = parse(stage)? else {
+                    unreachable!("SQL prefix always routes to the SQL parser")
+                };
+                if !matches!(
+                    statement.kind,
+                    chirondb_core::SqlStatementKind::Insert
+                        | chirondb_core::SqlStatementKind::Update
+                        | chirondb_core::SqlStatementKind::Delete
+                ) {
+                    return Err(ParseError::new(
+                        "chironql.invalid_transaction_sql",
+                        "TRANSACTION SQL stage supports INSERT, UPDATE, or DELETE",
+                        at,
+                    ));
+                }
+                sql = Some(statement);
+            }
+            "EXPECT" => {
+                let words = body.split_whitespace().collect::<Vec<_>>();
+                if sql.is_none()
+                    || vector.is_some()
+                    || !graph.is_empty()
+                    || expected_sql_rows.is_some()
+                    || words.len() != 3
+                    || !words[0].eq_ignore_ascii_case("SQL")
+                    || !words[1].eq_ignore_ascii_case("ROWS")
+                    || words[2].is_empty()
+                    || !words[2].bytes().all(|byte| byte.is_ascii_digit())
+                {
+                    return Err(ParseError::new(
+                        "chironql.invalid_transaction_precondition",
+                        "EXPECT SQL ROWS <unsigned integer> is allowed once immediately after the SQL stage",
+                        at,
+                    ));
+                }
+                expected_sql_rows = Some(words[2].parse::<u64>().map_err(|_| {
+                    ParseError::new(
+                        "chironql.invalid_transaction_precondition",
+                        "SQL row count exceeds u64",
+                        at,
+                    )
+                })?);
+            }
+            "VECTOR" => {
+                if vector.is_some() {
+                    return Err(ParseError::new(
+                        "chironql.duplicate_transaction_stage",
+                        "TRANSACTION accepts exactly one VECTOR stage",
+                        at,
+                    ));
+                }
+                if starts_keyword(body, "CREATE") {
+                    vector = Some(parse_transaction_create(body)?);
+                    continue;
+                }
+                vector = Some(match parse(body)? {
+                    Statement::Upsert(upsert) => {
+                        if upsert.collection.is_none() {
+                            return Err(ParseError::new(
+                                "chironql.transaction_collection_required",
+                                "VECTOR UPSERT must name its collection explicitly",
+                                at,
+                            ));
+                        }
+                        if !upsert.wait {
+                            return Err(ParseError::new(
+                                "chironql.invalid_transaction_wait",
+                                "NO WAIT is not allowed inside an atomic TRANSACTION",
+                                at,
+                            ));
+                        }
+                        TransactionVector::Upsert(upsert)
+                    }
+                    Statement::DeletePoints {
+                        collection: Some(collection),
+                        ids,
+                    } => TransactionVector::DeletePoints { collection, ids },
+                    _ => {
+                        return Err(ParseError::new(
+                            "chironql.invalid_transaction_vector",
+                            "VECTOR stage must contain one UPSERT or DELETE ... IDS statement",
+                            at,
+                        ));
+                    }
+                });
+            }
+            "GRAPH" => {
+                if let Some(relation) = parse_transaction_new_relation(body)? {
+                    graph.push(relation);
+                    continue;
+                }
+                let graph_statement = if starts_keyword(body, "CONNECT") {
+                    format!("RELATE{}", &body["CONNECT".len()..])
+                } else {
+                    body.to_string()
+                };
+                let graph_mutation = match parse(&graph_statement)? {
+                    Statement::Relate(relate) => {
+                        if !relate.wait
+                            || relate.deferred_endpoints
+                            || relate.idempotency_key.is_some()
+                        {
+                            return Err(ParseError::new(
+                                "chironql.invalid_transaction_graph",
+                                "GRAPH stages in an atomic TRANSACTION cannot use NO WAIT, deferred endpoints, or per-edge idempotency keys",
+                                at,
+                            ));
+                        }
+                        TransactionGraph::Relate(relate)
+                    }
+                    Statement::Unrelate(unrelate) if unrelate.wait => {
+                        TransactionGraph::Unrelate(unrelate)
+                    }
+                    Statement::UpdateEdge(update) if update.wait => {
+                        TransactionGraph::UpdateEdge(update)
+                    }
+                    _ => {
+                        return Err(ParseError::new(
+                            "chironql.invalid_transaction_graph",
+                            "GRAPH stage must contain CONNECT, RELATE, UNRELATE, or UPDATE EDGE without NO WAIT",
+                            at,
+                        ));
+                    }
+                };
+                graph.push(graph_mutation);
+            }
+            _ => {
+                return Err(ParseError::new(
+                    "chironql.invalid_transaction_domain",
+                    "TRANSACTION stages must start with SQL, VECTOR, or GRAPH",
+                    at,
+                ));
+            }
+        }
+    }
+    let sql = sql.ok_or_else(|| {
+        ParseError::new(
+            "chironql.missing_transaction_stage",
+            "TRANSACTION requires one SQL mutation stage",
+            at,
+        )
+    })?;
+    let vector = vector.ok_or_else(|| {
+        ParseError::new(
+            "chironql.missing_transaction_stage",
+            "TRANSACTION requires one VECTOR UPSERT or DELETE stage",
+            at,
+        )
+    })?;
+    if graph.is_empty() {
+        return Err(ParseError::new(
+            "chironql.missing_transaction_stage",
+            "TRANSACTION requires at least one GRAPH CONNECT, RELATE, UNRELATE, or UPDATE EDGE stage",
+            at,
+        ));
+    }
+    let collection = vector.collection();
+    if graph
+        .iter()
+        .any(|mutation| mutation.collection() != collection)
+    {
+        return Err(ParseError::new(
+            "chironql.transaction_collection_mismatch",
+            "VECTOR and GRAPH stages must use the same collection",
+            at,
+        ));
+    }
+    let create = matches!(vector, TransactionVector::Create { .. });
+    if (create && sql.kind != chirondb_core::SqlStatementKind::Insert)
+        || graph
+            .iter()
+            .any(|mutation| matches!(mutation, TransactionGraph::CreateRelation { .. }) != create)
+    {
+        return Err(ParseError::new(
+            "chironql.invalid_transaction_create",
+            "VECTOR CREATE requires SQL INSERT and GRAPH CONNECT with explicit NEW or EXISTING endpoints",
+            at,
+        ));
+    }
+    Ok(Statement::Transaction(TransactionBlock {
+        sql,
+        expected_sql_rows,
+        vector,
+        graph,
+    }))
+}
+
+fn parse_transaction_create(input: &str) -> ParseResult<TransactionVector> {
+    let mut parser = Parser {
+        tokens: lex(input)?,
+        pos: 0,
+        len: input.len(),
+        surface: LanguageSurface::GraphV1_1,
+    };
+    for keyword in ["CREATE", "POINTS", "INTO"] {
+        parser.expect_keyword(keyword)?;
+    }
+    let collection = parser.expect_word()?;
+    parser.expect_keyword("USING")?;
+    parser.expect_keyword("TEMPLATE")?;
+    let template = parser.expect_id()?;
+    let mut records = Vec::new();
+    loop {
+        let value = parser.parse_json_value()?;
+        records.push(serde_json::from_value(value).map_err(|_| {
+            ParseError::new(
+                "chironql.invalid_transaction_create",
+                "each record requires binding and a point object without an ID",
+                parser.at(),
+            )
+        })?);
+        if records.len() > 1024 {
+            return Err(ParseError::new(
+                "chironql.invalid_transaction_create",
+                "record batch exceeds 1024",
+                parser.at(),
+            ));
+        }
+        if !parser.eat(&Tok::Comma) {
+            break;
+        }
+    }
+    parser.eat(&Tok::Semi);
+    if parser.peek().is_some() {
+        return Err(ParseError::new(
+            "chironql.trailing_input",
+            "VECTOR CREATE uses the request-level idempotency_key and implicit durable commit",
+            parser.at(),
+        ));
+    }
+    Ok(TransactionVector::Create {
+        collection,
+        template,
+        records,
+    })
+}
+
+fn parse_transaction_new_relation(input: &str) -> ParseResult<Option<TransactionGraph>> {
+    if !starts_keyword(input, "CONNECT") && !starts_keyword(input, "RELATE") {
+        return Ok(None);
+    }
+    let mut parser = Parser {
+        tokens: lex(input)?,
+        pos: 0,
+        len: input.len(),
+        surface: LanguageSurface::GraphV1_1,
+    };
+    parser.pos += 1;
+    let collection = parser.expect_word()?;
+    if !matches!(parser.peek(), Some(Tok::Word(word)) if word.eq_ignore_ascii_case("NEW") || word.eq_ignore_ascii_case("EXISTING"))
+        || matches!(
+            parser.tokens.get(parser.pos + 1).map(|token| &token.tok),
+            Some(Tok::Arrow)
+        )
+    {
+        return Ok(None);
+    }
+    let endpoint = |parser: &mut Parser| -> ParseResult<chirondb_core::RecordEndpoint> {
+        if parser.eat_keyword("NEW") {
+            Ok(chirondb_core::RecordEndpoint::New(parser.expect_id()?))
+        } else {
+            parser.expect_keyword("EXISTING")?;
+            Ok(chirondb_core::RecordEndpoint::Existing(parser.expect_id()?))
+        }
+    };
+    let source = endpoint(&mut parser)?;
+    parser.expect(&Tok::Arrow)?;
+    let edge_type = parser.expect_word()?;
+    parser.expect(&Tok::Arrow)?;
+    let target = endpoint(&mut parser)?;
+    let properties = if parser.eat_keyword("SET") {
+        parser.parse_json_value()?
+    } else {
+        serde_json::json!({})
+    };
+    if !properties.is_object() {
+        return Err(ParseError::new(
+            "chironql.invalid_transaction_create",
+            "edge properties must be an object",
+            parser.at(),
+        ));
+    }
+    parser.eat(&Tok::Semi);
+    if parser.peek().is_some() {
+        return Err(ParseError::new(
+            "chironql.trailing_input",
+            "atomic relation uses implicit durable commit",
+            parser.at(),
+        ));
+    }
+    Ok(Some(TransactionGraph::CreateRelation {
+        collection,
+        relation: chirondb_core::NewRelation {
+            source,
+            target,
+            edge_type,
+            properties,
+        },
+    }))
+}
+
+fn take_braced_transaction_body(input: &str, at: usize) -> ParseResult<(&str, &str)> {
+    if !input.starts_with('{') {
+        return Err(ParseError::new(
+            "chironql.invalid_transaction",
+            "TRANSACTION body must be enclosed in braces",
+            at,
+        ));
+    }
+    let mut depth = 0_usize;
+    let mut single = false;
+    let mut double = false;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    let bytes = input.as_bytes();
+    let mut index = 0_usize;
+    while index < bytes.len() {
+        let character = bytes[index] as char;
+        let next = bytes.get(index + 1).copied().map(char::from);
+        if line_comment {
+            if character == '\n' {
+                line_comment = false;
+            }
+            index += 1;
+            continue;
+        }
+        if block_comment {
+            if character == '*' && next == Some('/') {
+                block_comment = false;
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if character == '\\' && (single || double) {
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        if character == '\'' && !double {
+            if single && next == Some('\'') {
+                index += 2;
+                continue;
+            }
+            single = !single;
+            index += 1;
+            continue;
+        }
+        if character == '"' && !single {
+            if double && next == Some('"') {
+                index += 2;
+                continue;
+            }
+            double = !double;
+            index += 1;
+            continue;
+        }
+        if single || double {
+            index += 1;
+            continue;
+        }
+        if character == '-' && next == Some('-') {
+            line_comment = true;
+            index += 2;
+            continue;
+        }
+        if character == '/' && next == Some('*') {
+            block_comment = true;
+            index += 2;
+            continue;
+        }
+        match character {
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Ok((&input[1..index], &input[index + 1..]));
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    Err(ParseError::new(
+        "chironql.unclosed_transaction",
+        "TRANSACTION body is missing `}`",
+        at,
+    ))
+}
+
+fn split_transaction_stages(body: &str, at: usize) -> ParseResult<Vec<&str>> {
+    let mut stages = Vec::new();
+    let mut start = 0_usize;
+    let mut depth = 0_usize;
+    let mut single = false;
+    let mut double = false;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    let bytes = body.as_bytes();
+    let mut index = 0_usize;
+    while index < bytes.len() {
+        let character = bytes[index] as char;
+        let next = bytes.get(index + 1).copied().map(char::from);
+        if line_comment {
+            if character == '\n' {
+                line_comment = false;
+            }
+            index += 1;
+            continue;
+        }
+        if block_comment {
+            if character == '*' && next == Some('/') {
+                block_comment = false;
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if character == '\\' && (single || double) {
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        if character == '\'' && !double {
+            if single && next == Some('\'') {
+                index += 2;
+                continue;
+            }
+            single = !single;
+            index += 1;
+            continue;
+        }
+        if character == '"' && !single {
+            if double && next == Some('"') {
+                index += 2;
+                continue;
+            }
+            double = !double;
+            index += 1;
+            continue;
+        }
+        if single || double {
+            index += 1;
+            continue;
+        }
+        if character == '-' && next == Some('-') {
+            line_comment = true;
+            index += 2;
+            continue;
+        }
+        if character == '/' && next == Some('*') {
+            block_comment = true;
+            index += 2;
+            continue;
+        }
+        match character {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ';' if depth == 0 => {
+                let stage = body[start..index].trim();
+                if !stage.is_empty() {
+                    stages.push(stage);
+                }
+                start = index + 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    if single || double || block_comment || depth != 0 {
+        return Err(ParseError::new(
+            "chironql.invalid_transaction",
+            "TRANSACTION contains an unclosed string, comment, or delimiter",
+            at,
+        ));
+    }
+    let tail = body[start..].trim();
+    if !tail.is_empty() {
+        stages.push(tail);
+    }
+    if stages.is_empty() {
+        return Err(ParseError::new(
+            "chironql.invalid_transaction",
+            "TRANSACTION body is empty",
+            at,
+        ));
+    }
+    Ok(stages)
+}
+
+fn parse_pipeline(input: &str, at: usize, explain: bool) -> ParseResult<Statement> {
+    let prefix = if explain {
+        "EXPLAIN PIPELINE"
+    } else {
+        "PIPELINE"
+    };
+    let mut rest = input[at + prefix.len()..].trim();
+    rest = rest.strip_suffix(';').unwrap_or(rest).trim();
+
+    let (vector_alias, vector_body, after_vector) = take_pipeline_stage(rest, "VECTOR", at)?;
+    let vector = parse(vector_body.trim())?;
+    let bounded = match &vector {
+        Statement::Search(value) => value.limit.is_some(),
+        Statement::Hybrid(value) => value.limit.is_some(),
+        Statement::Multi(value) => value.limit.is_some(),
+        Statement::Recommend(value) => value.limit.is_some(),
+        _ => false,
+    };
+    if !bounded {
+        return Err(ParseError::with_hint(
+            "chironql.unbounded_pipeline",
+            "VECTOR stage must be a bounded SEARCH, HYBRID, MULTI, or RECOMMEND",
+            "Add LIMIT to the vector stage.",
+            at,
+        ));
+    }
+
+    let after_vector = after_vector.trim_start();
+    let (graph, after_graph) = if starts_keyword(after_vector, "GRAPH") {
+        let (alias, body, after) = take_pipeline_stage(after_vector, "GRAPH", at)?;
+        let Statement::Traverse(traverse) = parse(body.trim())? else {
+            return Err(ParseError::new(
+                "chironql.invalid_pipeline_graph",
+                "GRAPH stage must contain one TRAVERSE statement",
+                at,
+            ));
+        };
+        if traverse.anchors.len() != 1 {
+            return Err(ParseError::new(
+                "chironql.invalid_pipeline_anchor",
+                "GRAPH stage must read one <alias>.record_ref source",
+                at,
+            ));
+        }
+        let source = parse_pipeline_field(&traverse.anchors[0], at)?;
+        if source.alias != vector_alias || source.field != "record_ref" {
+            return Err(ParseError::new(
+                "chironql.invalid_pipeline_anchor",
+                "GRAPH stage source must be VECTOR_ALIAS.record_ref",
+                at,
+            ));
+        }
+        let mut traverse = traverse;
+        traverse.anchors.clear();
+        (
+            Some(PipelineGraph {
+                alias,
+                source_alias: source.alias,
+                traverse,
+            }),
+            after,
+        )
+    } else {
+        (None, after_vector)
+    };
+
+    let (relational_alias, relational_body, tail) =
+        take_pipeline_stage(after_graph.trim_start(), "RELATIONAL", at)?;
+    let Statement::Sql(relational) = parse(relational_body.trim())? else {
+        return Err(ParseError::new(
+            "chironql.invalid_pipeline_relational",
+            "RELATIONAL stage must start with SQL SELECT",
+            at,
+        ));
+    };
+    if relational.kind != chirondb_core::SqlStatementKind::Select {
+        return Err(ParseError::new(
+            "chironql.pipeline_write",
+            "PIPELINE relational stages are read-only SELECT statements",
+            at,
+        ));
+    }
+
+    let mut joins = Vec::new();
+    let mut projection = Vec::new();
+    let mut order_by = None;
+    let mut limit = None;
+    for line in tail.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let upper = line.to_ascii_uppercase();
+        if upper.starts_with("INNER JOIN ") || upper.starts_with("LEFT JOIN ") {
+            joins.push(parse_pipeline_join(line, at)?);
+        } else if upper.starts_with("RETURN ") {
+            if !projection.is_empty() {
+                return Err(ParseError::new(
+                    "chironql.duplicate_clause",
+                    "PIPELINE has more than one RETURN clause",
+                    at,
+                ));
+            }
+            projection = line[7..]
+                .split(',')
+                .map(|field| parse_pipeline_field(field.trim(), at))
+                .collect::<ParseResult<_>>()?;
+        } else if upper.starts_with("ORDER BY ") {
+            let parts = line[9..].split_whitespace().collect::<Vec<_>>();
+            if parts.is_empty() || parts.len() > 2 {
+                return Err(ParseError::new(
+                    "chironql.invalid_pipeline_order",
+                    "ORDER BY requires one field and optional ASC or DESC",
+                    at,
+                ));
+            }
+            let direction = parts.get(1).map(|value| value.to_ascii_uppercase());
+            let ascending = match direction.as_deref() {
+                None | Some("ASC") => true,
+                Some("DESC") => false,
+                _ => {
+                    return Err(ParseError::new(
+                        "chironql.invalid_pipeline_order",
+                        "ORDER BY direction must be ASC or DESC",
+                        at,
+                    ));
+                }
+            };
+            order_by = Some((parse_pipeline_field(parts[0], at)?, ascending));
+        } else if upper.starts_with("LIMIT ") {
+            limit = Some(line[6..].trim().parse::<usize>().map_err(|_| {
+                ParseError::new(
+                    "chironql.invalid_limit",
+                    "PIPELINE LIMIT must be a positive integer",
+                    at,
+                )
+            })?);
+        } else {
+            return Err(ParseError::new(
+                "chironql.invalid_pipeline_clause",
+                format!("unsupported PIPELINE clause `{line}`"),
+                at,
+            ));
+        }
+    }
+    let limit = limit.filter(|limit| *limit > 0).ok_or_else(|| {
+        ParseError::with_hint(
+            "chironql.unbounded_pipeline",
+            "PIPELINE requires a positive final LIMIT",
+            "Add LIMIT after RETURN/ORDER BY.",
+            at,
+        )
+    })?;
+    if projection.is_empty() {
+        return Err(ParseError::new(
+            "chironql.missing_return",
+            "PIPELINE requires a RETURN clause",
+            at,
+        ));
+    }
+    if joins.is_empty() {
+        return Err(ParseError::new(
+            "chironql.missing_join",
+            "PIPELINE requires at least one typed equijoin",
+            at,
+        ));
+    }
+    let declared = [
+        Some(vector_alias.as_str()),
+        graph.as_ref().map(|g| g.alias.as_str()),
+        Some(relational_alias.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<std::collections::HashSet<_>>();
+    if declared.len() != if graph.is_some() { 3 } else { 2 }
+        || joins.iter().any(|join| {
+            !declared.contains(join.alias.as_str())
+                || !declared.contains(join.left.alias.as_str())
+                || !declared.contains(join.right.alias.as_str())
+        })
+        || projection
+            .iter()
+            .any(|field| !declared.contains(field.alias.as_str()))
+    {
+        return Err(ParseError::new(
+            "chironql.unknown_pipeline_alias",
+            "PIPELINE aliases must be unique and every reference must name a declared stage",
+            at,
+        ));
+    }
+    Ok(Statement::Pipeline(Pipeline {
+        explain,
+        vector_alias,
+        vector: Box::new(vector),
+        graph,
+        relational_alias,
+        relational,
+        joins,
+        projection,
+        order_by,
+        limit,
+    }))
+}
+
+fn starts_keyword(input: &str, keyword: &str) -> bool {
+    input
+        .get(..keyword.len())
+        .is_some_and(|value| value.eq_ignore_ascii_case(keyword))
+        && input[keyword.len()..]
+            .chars()
+            .next()
+            .is_none_or(char::is_whitespace)
+}
+
+fn take_pipeline_stage<'a>(
+    input: &'a str,
+    keyword: &str,
+    at: usize,
+) -> ParseResult<(String, &'a str, &'a str)> {
+    if !starts_keyword(input, keyword) {
+        return Err(ParseError::new(
+            "chironql.missing_pipeline_stage",
+            format!("expected {keyword} stage"),
+            at,
+        ));
+    }
+    let rest = input[keyword.len()..].trim_start();
+    let alias_end = rest.find(char::is_whitespace).ok_or_else(|| {
+        ParseError::new(
+            "chironql.invalid_pipeline_stage",
+            "stage alias is required",
+            at,
+        )
+    })?;
+    let alias = rest[..alias_end].to_ascii_lowercase();
+    if alias.is_empty()
+        || !alias
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return Err(ParseError::new(
+            "chironql.invalid_pipeline_alias",
+            "stage alias must contain letters, digits, or underscore",
+            at,
+        ));
+    }
+    let rest = rest[alias_end..].trim_start();
+    if !rest.starts_with('{') {
+        return Err(ParseError::new(
+            "chironql.invalid_pipeline_stage",
+            "stage body must be enclosed in braces",
+            at,
+        ));
+    }
+    let mut depth = 0usize;
+    let mut quote = false;
+    let mut chars = rest.char_indices().peekable();
+    while let Some((index, character)) = chars.next() {
+        if character == '\'' {
+            if quote && chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                chars.next();
+                continue;
+            }
+            quote = !quote;
+            continue;
+        }
+        if quote {
+            continue;
+        }
+        match character {
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Ok((alias, &rest[1..index], &rest[index + 1..]));
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(ParseError::new(
+        "chironql.unclosed_pipeline_stage",
+        "stage body is missing `}`",
+        at,
+    ))
+}
+
+fn parse_pipeline_field(value: &str, at: usize) -> ParseResult<PipelineField> {
+    let Some((alias, field)) = value.split_once('.') else {
+        return Err(ParseError::new(
+            "chironql.invalid_pipeline_field",
+            "pipeline fields must use <alias>.<field>",
+            at,
+        ));
+    };
+    if alias.is_empty() || field.is_empty() || field.contains('.') {
+        return Err(ParseError::new(
+            "chironql.invalid_pipeline_field",
+            "pipeline fields must use <alias>.<field>",
+            at,
+        ));
+    }
+    Ok(PipelineField {
+        alias: alias.to_ascii_lowercase(),
+        field: field.to_ascii_lowercase(),
+    })
+}
+
+fn parse_pipeline_join(line: &str, at: usize) -> ParseResult<PipelineJoin> {
+    let parts = line.split_whitespace().collect::<Vec<_>>();
+    if parts.len() != 7
+        || !parts[1].eq_ignore_ascii_case("JOIN")
+        || !parts[3].eq_ignore_ascii_case("ON")
+        || parts[5] != "="
+    {
+        return Err(ParseError::new(
+            "chironql.invalid_pipeline_join",
+            "join syntax is INNER|LEFT JOIN <alias> ON <field> = <field>",
+            at,
+        ));
+    }
+    let kind = if parts[0].eq_ignore_ascii_case("INNER") {
+        PipelineJoinKind::Inner
+    } else if parts[0].eq_ignore_ascii_case("LEFT") {
+        PipelineJoinKind::Left
+    } else {
+        return Err(ParseError::new(
+            "chironql.invalid_pipeline_join",
+            "only INNER and LEFT pipeline joins are supported",
+            at,
+        ));
+    };
+    Ok(PipelineJoin {
+        kind,
+        alias: parts[2].to_ascii_lowercase(),
+        left: parse_pipeline_field(parts[4], at)?,
+        right: parse_pipeline_field(parts[6], at)?,
+    })
+}
+
+fn parse_sql_statement(input: &str, at: usize) -> ParseResult<Statement> {
+    let body = input[at + 3..].trim();
+    let body = body.strip_suffix(';').unwrap_or(body).trim();
+    if body.is_empty() {
+        return Err(ParseError::with_hint(
+            "chironql.missing_sql",
+            "SQL requires one native relational statement",
+            "Example: SQL SELECT id FROM documents LIMIT 10;",
+            at + 3,
+        ));
+    }
+    let analysis = chirondb_core::RelationalEngine::analyze_statement(body)
+        .map_err(|error| ParseError::new("chironql.invalid_sql", error.to_string(), at + 3))?;
+    let class = match analysis.class {
+        chirondb_core::SqlStatementClass::Read => StatementClass::Read,
+        chirondb_core::SqlStatementClass::Write => StatementClass::Write,
+        chirondb_core::SqlStatementClass::Admin => StatementClass::Admin,
+    };
+    Ok(Statement::Sql(SqlStatement {
+        sql: body.to_string(),
+        tables: analysis.tables,
+        class,
+        kind: analysis.kind,
+    }))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -713,19 +2013,7 @@ fn parse_language(input: &str, surface: LanguageSurface) -> ParseResult<Statemen
         surface,
     };
     let statement = parser.parse_statement()?;
-    parser.eat(&Tok::Semi);
-    if let Some(token) = parser.peek_token() {
-        return Err(ParseError::with_hint(
-            "chironql.multiple_statements",
-            format!(
-                "unexpected {} after the end of the statement",
-                token.tok.describe()
-            ),
-            "Send one statement per request. The REPL splits on `;` for you.",
-            token.at,
-        ));
-    }
-    Ok(statement)
+    parser.finish(statement)
 }
 
 struct Parser {
@@ -736,6 +2024,22 @@ struct Parser {
 }
 
 impl Parser {
+    fn finish(&mut self, statement: Statement) -> ParseResult<Statement> {
+        self.eat(&Tok::Semi);
+        if let Some(token) = self.peek_token() {
+            return Err(ParseError::with_hint(
+                "chironql.multiple_statements",
+                format!(
+                    "unexpected {} after the end of the statement",
+                    token.tok.describe()
+                ),
+                "Send one statement per request. The REPL splits on `;` for you.",
+                token.at,
+            ));
+        }
+        Ok(statement)
+    }
+
     // -- token helpers ------------------------------------------------------
 
     fn peek_token(&self) -> Option<&Token> {
@@ -952,7 +2256,7 @@ impl Parser {
         self.pos += 1;
         match upper.as_str() {
             "SEARCH" => self.parse_search(),
-            "HYBRID" => self.parse_hybrid(),
+            "HYBRID" => self.parse_hybrid(false),
             "RELATE" if self.surface == LanguageSurface::GraphV1_1 => self.parse_relate(),
             "UNRELATE" if self.surface == LanguageSurface::GraphV1_1 => self.parse_unrelate(),
             "TRAVERSE" if self.surface == LanguageSurface::GraphV1_1 => self.parse_traverse(),
@@ -1196,7 +2500,7 @@ impl Parser {
         Ok(Statement::Search(search))
     }
 
-    fn parse_hybrid(&mut self) -> ParseResult<Statement> {
+    fn parse_hybrid(&mut self, allow_text: bool) -> ParseResult<Statement> {
         let mut hybrid = Hybrid {
             collection: self.parse_optional_search_collection(),
             ..Hybrid::default()
@@ -1223,10 +2527,21 @@ impl Parser {
                 }
                 "TEXT" => {
                     self.pos += 1;
-                    if self.surface == LanguageSurface::GraphV1_1 && hybrid.sparse.is_some() {
+                    if self.surface == LanguageSurface::GraphV1_1
+                        && (hybrid.sparse.is_some() || hybrid.text.is_some())
+                    {
                         return Err(duplicate_clause("TEXT", at));
                     }
-                    hybrid.sparse = Some(self.parse_sparse_vector()?);
+                    if allow_text && matches!(self.peek(), Some(Tok::Str(_))) {
+                        let query = self.expect_string()?;
+                        self.expect_keyword("FIELD")?;
+                        hybrid.text = Some(TextQuery {
+                            query,
+                            field: self.expect_id()?,
+                        });
+                    } else {
+                        hybrid.sparse = Some(self.parse_sparse_vector()?);
+                    }
                 }
                 "FUSION" => {
                     self.pos += 1;
@@ -1271,6 +2586,13 @@ impl Parser {
                         return Err(duplicate_clause("LIMIT", at));
                     }
                     hybrid.limit = Some(self.expect_usize()?);
+                }
+                "BUDGET" if allow_text => {
+                    self.pos += 1;
+                    if hybrid.budget_ms.is_some() {
+                        return Err(duplicate_clause("BUDGET", at));
+                    }
+                    hybrid.budget_ms = Some(self.expect_usize()? as u64);
                 }
                 "WITH" if self.surface == LanguageSurface::GraphV1_1 => {
                     self.pos += 1;
@@ -1336,11 +2658,26 @@ impl Parser {
             }
         }
 
-        if hybrid.vector.is_none() && hybrid.sparse.is_none() {
+        if hybrid.vector.is_none() && hybrid.sparse.is_none() && hybrid.text.is_none() {
             return Err(ParseError::with_hint(
                 "chironql.missing_hybrid_operand",
                 "HYBRID needs at least one of NEAR or TEXT",
                 "HYBRID docs NEAR [1,0,0] TEXT {12:1.2} FUSION rrf LIMIT 5;",
+                self.at(),
+            ));
+        }
+        if hybrid.text.is_some()
+            && (hybrid.vector_name.is_some()
+                || hybrid.graph.is_some()
+                || hybrid.dense_weight.is_some()
+                || hybrid.sparse_weight.is_some()
+                || hybrid
+                    .fusion
+                    .is_some_and(|fusion| fusion != HybridFusion::Rrf))
+        {
+            return Err(ParseError::new(
+                "chironql.unsupported_text_option",
+                "text retrieval supports the default dense vector and RRF, without graph clauses or weights",
                 self.at(),
             ));
         }
@@ -2078,6 +3415,10 @@ impl Parser {
 
     fn parse_vector_expr(&mut self) -> ParseResult<VectorExpr> {
         let at = self.at();
+        if let Some(Tok::Parameter(index)) = self.peek().cloned() {
+            self.pos += 1;
+            return Ok(VectorExpr::Parameter(index));
+        }
         if self.eat(&Tok::At) {
             let id = self.expect_id()?;
             let vector_name = if self.eat_keyword("USING") {
@@ -2445,7 +3786,7 @@ fn validate_graph_clause(graph: Option<&GraphClause>, at: usize) -> ParseResult<
 /// uppercased, or empty. The second word is what separates
 /// `CREATE COLLECTION` from `CREATE INDEX`, and that has to be decided before
 /// the lexer meets the `(` in `CREATE INDEX ... (embedding)`.
-fn leading_keyword(input: &str) -> Option<(String, usize, String)> {
+pub(crate) fn leading_keyword(input: &str) -> Option<(String, usize, String)> {
     let (word, at) = leading_keyword_at(input, 0)?;
     let next = leading_keyword_at(input, at + word.len())
         .map(|(word, _)| word.to_ascii_uppercase())
@@ -2511,7 +3852,7 @@ fn reject_leading_keyword(word: &str, next: &str, at: usize) -> Option<ParseErro
         "SELECT" => ParseError::with_hint(
             "chironql.not_sql",
             "ChironQL is not SQL",
-            "Did you mean SEARCH? For SQL, use the pgvector wire on port 7403.",
+            "Prefix native relational queries with SQL, for example: SQL SELECT ...;",
             at,
         ),
         "INSERT" => ParseError::with_hint(
@@ -2613,6 +3954,55 @@ fn format_number(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ml_materialize_uses_one_shape_for_all_models_and_tasks() {
+        for model in ["DECISION_TREE", "RANDOM_FOREST"] {
+            for task in ["CLASSIFICATION", "REGRESSION"] {
+                let query = format!(
+                    "ML MATERIALIZE forecast FROM sales TARGET outcome FEATURES (day, region, price) TASK {task} USING {model};"
+                );
+                let parsed = parse(&query).unwrap();
+                assert_eq!(parsed.tables(), ["sales"]);
+                let Statement::MlMaterialize(statement) = parsed else {
+                    panic!("expected ML MATERIALIZE");
+                };
+                assert_eq!(statement.view, "forecast");
+                assert_eq!(statement.source, "sales");
+                assert_eq!(statement.target, "outcome");
+                assert_eq!(statement.features, ["day", "region", "price"]);
+            }
+        }
+    }
+
+    #[test]
+    fn ml_materialize_rejects_conflicts_and_extra_statements() {
+        for query in [
+            "ML MATERIALIZE forecast FROM sales TARGET price FEATURES (price) TASK REGRESSION USING DECISION_TREE;",
+            "ML MATERIALIZE forecast FROM sales TARGET outcome FEATURES (day, day) TASK REGRESSION USING DECISION_TREE;",
+        ] {
+            assert_eq!(parse(query).unwrap_err().code, "chironql.ml_columns");
+        }
+        assert_eq!(
+            parse("ML MATERIALIZE forecast FROM sales TARGET outcome FEATURES (day) TASK REGRESSION USING DECISION_TREE; DROP COLLECTION sales;")
+                .unwrap_err()
+                .code,
+            "chironql.multiple_statements"
+        );
+    }
+
+    #[test]
+    fn ml_materialize_rejects_removed_models() {
+        for model in ["TABFM", "CAUSILO", "TABPFN", "PRIOR_LABS"] {
+            assert_eq!(
+                parse(&format!("ML MATERIALIZE forecast FROM sales TARGET outcome FEATURES (price) TASK REGRESSION USING {model};"))
+                    .unwrap_err()
+                    .code,
+                "chironql.ml_model"
+            );
+        }
+    }
+
     use serde_json::json;
 
     fn ok(input: &str) -> Statement {
@@ -2971,6 +4361,155 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transaction_block_sql_row_precondition_is_strict_and_optional() {
+        let plain = "TRANSACTION { SQL UPDATE docs SET title='changed' WHERE id='a'; \
+            VECTOR UPSERT INTO chunks {id:'a',vector:[1]}; \
+            GRAPH CONNECT chunks a -> cites -> b; };";
+        for rows in [0, 1, u64::MAX] {
+            let guarded = plain.replace("; VECTOR", &format!("; EXPECT SQL ROWS {rows}; VECTOR"));
+            let Statement::Transaction(block) = ok(&guarded) else {
+                panic!("transaction")
+            };
+            assert_eq!(block.expected_sql_rows, Some(rows));
+        }
+        let Statement::Transaction(block) = ok(plain) else {
+            panic!("transaction")
+        };
+        assert_eq!(block.expected_sql_rows, None);
+        for clause in [
+            "EXPECT SQL ROWS -1",
+            "EXPECT SQL ROWS 1.0",
+            "EXPECT SQL ROWS 18446744073709551616",
+            "EXPECT SQL ROWS 1 EXTRA",
+            "EXPECT SQL ROWS",
+            "EXPECT SQL ROWS 1; EXPECT SQL ROWS 1",
+        ] {
+            assert!(parse(&plain.replace("; VECTOR", &format!("; {clause}; VECTOR"))).is_err());
+        }
+        for bad in [
+            plain.replace("SQL UPDATE", "EXPECT SQL ROWS 1; SQL UPDATE"),
+            plain.replace("; GRAPH", "; EXPECT SQL ROWS 1; GRAPH"),
+        ] {
+            assert!(parse(&bad).is_err());
+        }
+    }
+
+    #[test]
+    fn transaction_block_is_typed_by_domain_and_preserves_nested_semicolons() {
+        let statement = ok(r#"TRANSACTION {
+  SQL INSERT INTO documents (id, title) VALUES ($1, 'title;still-sql');
+  VECTOR UPSERT INTO chunks
+    {id: 'chunk-1', vector: [1,0], payload: {note: 'vector;json'}},
+    {id: 'source-1', vector: [0,1]};
+  GRAPH CONNECT chunks 'chunk-1' -> CITES -> 'source-1'
+    SET {note: 'graph;json'};
+};"#);
+        let Statement::Transaction(block) = statement else {
+            panic!("expected TRANSACTION")
+        };
+        assert_eq!(block.sql.kind, chirondb_core::SqlStatementKind::Insert);
+        assert!(matches!(
+            &block.vector,
+            TransactionVector::Upsert(upsert) if upsert.points.len() == 2
+        ));
+        assert_eq!(block.graph.len(), 1);
+        let statement = Statement::Transaction(block);
+        assert_eq!(statement.class(), StatementClass::Write);
+        assert_eq!(
+            statement.domains(),
+            vec![
+                ExecutionDomain::Relational,
+                ExecutionDomain::Vector,
+                ExecutionDomain::Graph,
+            ]
+        );
+        assert_eq!(statement.tables(), &["documents"]);
+        assert_eq!(statement.collections(), vec!["chunks"]);
+    }
+
+    #[test]
+    fn transaction_block_types_vector_and_graph_update_delete_mutations() {
+        let Statement::Transaction(update) = ok(
+            "TRANSACTION { SQL UPDATE documents SET title = $1 WHERE id = $2; \
+             VECTOR UPSERT INTO chunks {id: 'chunk-1', vector: [0.8,0.2]}; \
+             GRAPH UPDATE chunks EDGE edge-token SET PROPERTIES {kind: 'revised'} REPLACE; };",
+        ) else {
+            panic!("expected update TRANSACTION")
+        };
+        assert_eq!(update.sql.kind, chirondb_core::SqlStatementKind::Update);
+        assert!(matches!(update.vector, TransactionVector::Upsert(_)));
+        assert!(matches!(
+            update.graph.as_slice(),
+            [TransactionGraph::UpdateEdge(edge)] if edge.replace && edge.edge_id == "edge-token"
+        ));
+
+        let Statement::Transaction(delete) =
+            ok("TRANSACTION { SQL DELETE FROM documents WHERE id = $1; \
+             VECTOR DELETE FROM chunks POINTS chunk-1; \
+             GRAPH UNRELATE chunks EDGE edge-token; };")
+        else {
+            panic!("expected delete TRANSACTION")
+        };
+        assert_eq!(delete.sql.kind, chirondb_core::SqlStatementKind::Delete);
+        assert!(matches!(
+            delete.vector,
+            TransactionVector::DeletePoints { ref collection, ref ids }
+                if collection == "chunks" && ids == &vec!["chunk-1".to_string()]
+        ));
+        assert!(matches!(
+            delete.graph.as_slice(),
+            [TransactionGraph::Unrelate(edge)]
+                if edge.edge_ids == vec!["edge-token".to_string()]
+        ));
+    }
+
+    #[test]
+    fn atomic_create_requires_explicit_bindings_and_insert() {
+        let query = "TRANSACTION { SQL INSERT INTO docs VALUES (RECORD_REF('docs', NEW_RECORD('a'))); \
+            VECTOR CREATE POINTS INTO docs USING TEMPLATE standard {binding:'a',point:{vector:[1],payload:{}}}; \
+            GRAPH CONNECT docs NEW a -> cites -> EXISTING 'old'; };";
+        let Statement::Transaction(block) = ok(query) else {
+            panic!("transaction expected")
+        };
+        assert!(matches!(block.vector, TransactionVector::Create { .. }));
+        assert!(
+            matches!(&block.graph[0], TransactionGraph::CreateRelation { relation, .. }
+            if relation.source == chirondb_core::RecordEndpoint::New("a".into())
+            && relation.target == chirondb_core::RecordEndpoint::Existing("old".into()))
+        );
+        for bad in [
+            query.replace(
+                "INSERT INTO docs VALUES (RECORD_REF('docs', NEW_RECORD('a')))",
+                "UPDATE docs SET id = 1",
+            ),
+            query.replace("point:{vector", "point:{id:'chosen',vector"),
+            query.replace("NEW a -> cites -> EXISTING 'old'", "a -> cites -> old"),
+            query.replace("INTO docs USING TEMPLATE", "INTO other USING TEMPLATE"),
+            query.replace("payload:{}}};", "payload:{}}} NO WAIT;"),
+        ] {
+            assert!(parse(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn transaction_block_rejects_ambiguous_or_non_atomic_stages() {
+        let missing_graph = err(
+            "TRANSACTION { SQL INSERT INTO documents (id) VALUES ('a'); VECTOR UPSERT INTO chunks {id: 'a', vector: [1]}; };",
+        );
+        assert_eq!(missing_graph.code, "chironql.missing_transaction_stage");
+
+        let mismatched = err(
+            "TRANSACTION { SQL INSERT INTO documents (id) VALUES ('a'); VECTOR UPSERT INTO chunks {id: 'a', vector: [1]}; GRAPH CONNECT other 'a' -> CITES -> 'a'; };",
+        );
+        assert_eq!(mismatched.code, "chironql.transaction_collection_mismatch");
+
+        let no_wait = err(
+            "TRANSACTION { SQL INSERT INTO documents (id) VALUES ('a'); VECTOR UPSERT INTO chunks {id: 'a', vector: [1]} NO WAIT; GRAPH CONNECT chunks 'a' -> CITES -> 'a'; };",
+        );
+        assert_eq!(no_wait.code, "chironql.invalid_transaction_wait");
+    }
+
     // -- reject corpus -----------------------------------------------------
 
     #[test]
@@ -2978,7 +4517,7 @@ mod tests {
         let error = err("SELECT * FROM products;");
         assert_eq!(error.code, "chironql.not_sql");
         assert_eq!(error.position, 0);
-        assert!(error.hint.expect("hint").contains("SEARCH"));
+        assert!(error.hint.expect("hint").contains("SQL SELECT"));
     }
 
     #[test]
@@ -3217,12 +4756,12 @@ mod tests {
     }
 
     #[test]
-    fn collection_ddl_is_write_class() {
+    fn collection_ddl_requires_admin() {
         assert_eq!(
             ok("CREATE COLLECTION c DIM 3;").class(),
-            StatementClass::Write
+            StatementClass::Admin
         );
-        assert_eq!(ok("DROP COLLECTION c;").class(), StatementClass::Write);
+        assert_eq!(ok("DROP COLLECTION c;").class(), StatementClass::Admin);
     }
 
     /// The DDL that arrived did not open the door to the DDL that did not.
@@ -3244,8 +4783,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn production_parser_is_v1_1_and_frozen_v1_0_stays_closed() {
-        assert_eq!(LANGUAGE_VERSION, "1.1");
+    fn production_parser_is_v1_4_and_frozen_v1_0_stays_closed() {
+        assert_eq!(LANGUAGE_VERSION, "1.4");
         assert!(matches!(
             ok("RELATE docs a -> CITES -> b;"),
             Statement::Relate(_)
@@ -3256,6 +4795,62 @@ mod tests {
                 .code,
             "chironql.unknown_statement"
         );
+    }
+
+    #[test]
+    fn sql_wrapper_is_typed_and_does_not_enable_raw_sql() {
+        let Statement::Sql(statement) = ok("SQL SELECT id FROM documents LIMIT 10;") else {
+            panic!("SQL statement");
+        };
+        assert_eq!(statement.class, StatementClass::Read);
+        assert_eq!(statement.kind, chirondb_core::SqlStatementKind::Select);
+        assert_eq!(statement.tables, vec!["documents"]);
+        assert_eq!(err("SELECT id FROM documents;").code, "chironql.not_sql");
+        assert_eq!(
+            ok("SQL INSERT INTO documents (id) VALUES ($1);").class(),
+            StatementClass::Write
+        );
+        assert_eq!(
+            ok("SQL CREATE TABLE documents (id UUID PRIMARY KEY);").class(),
+            StatementClass::Admin
+        );
+        assert_eq!(
+            err("SQL EXPLAIN ANALYZE SELECT id FROM documents;").code,
+            "chironql.invalid_sql"
+        );
+        let commented = r#"PIPELINE
+  VECTOR v { SEARCH chunks NEAR [1,0] LIMIT 5 }
+  RELATIONAL r { SQL /* SELECT is classified from the AST */ SELECT id, chunk_ref FROM documents LIMIT 5 }
+  INNER JOIN r ON r.chunk_ref = v.record_ref
+  RETURN r.id
+  LIMIT 5;"#;
+        assert!(matches!(ok(commented), Statement::Pipeline(_)));
+    }
+
+    #[test]
+    fn pipeline_declares_domains_resources_and_bounded_joins() {
+        let query = r#"PIPELINE
+  VECTOR v { SEARCH chunks NEAR $1 LIMIT 50 }
+  GRAPH g { TRAVERSE knowledge FROM v.record_ref VIA cites DEPTH 2 RETURN NODES LIMIT 200 }
+  RELATIONAL r { SQL SELECT id, title, chunk_ref, source_ref FROM documents WHERE tenant_id = $2 }
+  INNER JOIN r ON r.chunk_ref = v.record_ref
+  LEFT JOIN g ON g.record_ref = r.source_ref
+  RETURN r.id, r.title, v.score, g.depth
+  ORDER BY v.score DESC
+  LIMIT 10;"#;
+        let statement = ok(query);
+        assert_eq!(statement.class(), StatementClass::Read);
+        assert_eq!(statement.kind_name(), "PIPELINE");
+        assert_eq!(
+            statement.domains(),
+            vec![
+                ExecutionDomain::Relational,
+                ExecutionDomain::Vector,
+                ExecutionDomain::Graph
+            ]
+        );
+        assert_eq!(statement.tables(), &["documents"]);
+        assert_eq!(statement.collections(), vec!["chunks", "knowledge"]);
     }
 
     #[test]
@@ -3406,11 +5001,16 @@ mod tests {
 
     #[test]
     fn connected_to_extends_search_and_hybrid_without_redefining_where() {
-        match graph_ok(
+        let search_statement = graph_ok(
             "SEARCH docs NEAR [1,0] CONNECTED TO root-a, root-b VIA CITES \
              DIRECTION IN WITHIN 2 HOPS WHERE status = 'ready' LIMIT 7 \
              WITH PAYLOAD ALLOW DEGRADED;",
-        ) {
+        );
+        assert_eq!(
+            search_statement.domains(),
+            vec![ExecutionDomain::Vector, ExecutionDomain::Graph]
+        );
+        match search_statement {
             Statement::Search(search) => {
                 let graph = search.graph.expect("graph clause");
                 assert_eq!(graph.anchors, vec!["root-a", "root-b"]);
@@ -3426,11 +5026,16 @@ mod tests {
             other => panic!("expected SEARCH, got {other:?}"),
         }
 
-        match graph_ok(
+        let hybrid_statement = graph_ok(
             "HYBRID docs NEAR [1,0] TEXT {4417:2.0, 9:1.0} \
              CONNECTED TO line-3 VIA MENTIONS WITHIN 2 HOPS FUSION weighted \
              WEIGHTS 0.7 0.3 WHERE status = 'RESOLVED' LIMIT 10 WITH PAYLOAD;",
-        ) {
+        );
+        assert_eq!(
+            hybrid_statement.domains(),
+            vec![ExecutionDomain::Vector, ExecutionDomain::Graph]
+        );
+        match hybrid_statement {
             Statement::Hybrid(hybrid) => {
                 assert_eq!(hybrid.dense_weight, Some(0.7));
                 assert_eq!(hybrid.sparse_weight, Some(0.3));
@@ -3541,5 +5146,48 @@ mod tests {
         assert_eq!(traverse.class(), StatementClass::Read);
         assert_eq!(traverse.collection(), Some("docs"));
         assert_eq!(traverse.kind_name(), "TRAVERSE");
+    }
+    #[test]
+    fn text_hybrid_is_additive_typed_and_rejects_ignored_options() {
+        let legacy_tail = "HYBRID docs NEAR [1,0]; COUNT docs;";
+        assert_eq!(
+            parse(legacy_tail).unwrap_err().code,
+            parse_v1_1(legacy_tail).unwrap_err().code
+        );
+
+        for query in [
+            "HYBRID docs TEXT 'refund policy' FIELD text LIMIT 5;",
+            "HYBRID docs NEAR [1,0] TEXT 'refund' FIELD 'a/b~c' FUSION rrf BUDGET 100;",
+        ] {
+            let Statement::Hybrid(hybrid) = parse(query).unwrap() else {
+                panic!("hybrid expected")
+            };
+            assert!(hybrid.text.is_some());
+            assert!(hybrid.sparse.is_none());
+            assert!(parse_v1_1(query).is_err());
+            assert!(parse_v1_0(query).is_err());
+        }
+        for tail in [
+            "TEXT {1:1}",
+            "TEXT 'other' FIELD text",
+            "USING title",
+            "FUSION weighted",
+            "DENSE 1",
+            "SPARSE 1",
+            "CONNECTED TO a",
+            "BUDGET 1 BUDGET 2",
+            "; COUNT docs",
+        ] {
+            assert!(
+                parse(&format!("HYBRID docs TEXT 'refund' FIELD text {tail}")).is_err(),
+                "{tail}"
+            );
+        }
+        assert!(
+            parse("HYBRID TEXT 'refund' FIELD text LIMIT 5")
+                .unwrap()
+                .collection()
+                .is_none()
+        );
     }
 }

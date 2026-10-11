@@ -83,13 +83,43 @@ impl TraversalGraph for MutableGraphState {
     }
 }
 
+/// Query-bound graph authority. Endpoint visibility precedes edge property I/O;
+/// node predicates use the authority's property projection, not raw payloads.
+pub(crate) trait TraversalAccess {
+    fn check(&self) -> Result<()>;
+    fn visible(&self, nid: Nid) -> Result<bool>;
+    fn matches_node(&self, nid: Nid, payload: &Value) -> Result<bool>;
+}
+
+fn access_check(access: Option<&dyn TraversalAccess>) -> Result<()> {
+    access.map_or(Ok(()), TraversalAccess::check)
+}
+
+fn access_visible(access: Option<&dyn TraversalAccess>, nid: Nid) -> Result<bool> {
+    access.map_or(Ok(true), |access| access.visible(nid))
+}
+
+fn matches_node(
+    access: Option<&dyn TraversalAccess>,
+    nid: Nid,
+    node_filter: Option<&Filter>,
+    statement_filter: Option<&Filter>,
+    payload: &Value,
+) -> Result<bool> {
+    match access {
+        Some(access) => access.matches_node(nid, payload),
+        None => Ok(node_filters_match(node_filter, statement_filter, payload)),
+    }
+}
+
 pub(crate) struct MutableTraversal<'a, G, FPayload, FNamespaces>
 where
     G: TraversalGraph,
-    FPayload: Fn(Nid) -> Option<Value>,
+    FPayload: Fn(Nid) -> Result<Option<Value>>,
     FNamespaces: Fn(&Value) -> Vec<GraphNamespace>,
 {
     pub(crate) graph: &'a G,
+    pub(crate) access: Option<&'a dyn TraversalAccess>,
     pub(crate) anchors: Vec<Nid>,
     pub(crate) visible_anchor_count: u64,
     pub(crate) selected_types: Option<HashSet<crate::graph::TypeId>>,
@@ -144,7 +174,7 @@ pub(crate) fn exact_bfs<G, FPayload, FNamespaces>(
 ) -> Result<TraversalExecution>
 where
     G: TraversalGraph,
-    FPayload: Fn(Nid) -> Option<Value>,
+    FPayload: Fn(Nid) -> Result<Option<Value>>,
     FNamespaces: Fn(&Value) -> Vec<GraphNamespace>,
 {
     exact_bfs_internal(traversal, false)
@@ -155,7 +185,7 @@ pub(crate) fn exact_bfs_with_edges<G, FPayload, FNamespaces>(
 ) -> Result<TraversalExecution>
 where
     G: TraversalGraph,
-    FPayload: Fn(Nid) -> Option<Value>,
+    FPayload: Fn(Nid) -> Result<Option<Value>>,
     FNamespaces: Fn(&Value) -> Vec<GraphNamespace>,
 {
     exact_bfs_internal(traversal, true)
@@ -167,10 +197,11 @@ fn exact_bfs_internal<G, FPayload, FNamespaces>(
 ) -> Result<TraversalExecution>
 where
     G: TraversalGraph,
-    FPayload: Fn(Nid) -> Option<Value>,
+    FPayload: Fn(Nid) -> Result<Option<Value>>,
     FNamespaces: Fn(&Value) -> Vec<GraphNamespace>,
 {
     let MutableTraversal {
+        access,
         graph,
         mut anchors,
         visible_anchor_count,
@@ -185,6 +216,7 @@ where
         namespaces_for_payload,
     } = traversal;
     let started = Instant::now();
+    access_check(access)?;
     if cancelled.load(Ordering::Acquire) {
         return Err(cancelled_error());
     }
@@ -207,22 +239,20 @@ where
 
     let mut visited = anchors.iter().copied().collect::<HashSet<_>>();
     let mut frontier = anchors;
-    let mut visits = if budget.max_depth == 0 {
-        frontier
-            .iter()
-            .filter(|nid| {
-                payload_for_nid(**nid).is_some_and(|payload| {
-                    node_filters_match(node_filter, statement_filter, &payload)
-                })
-            })
-            .map(|nid| TraversalVisit {
-                nid: *nid,
-                depth: 0,
-            })
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
+    let mut visits = Vec::new();
+    if budget.max_depth == 0 {
+        for nid in &frontier {
+            if access_visible(access, *nid)?
+                && let Some(payload) = payload_for_nid(*nid)?
+                && matches_node(access, *nid, node_filter, statement_filter, &payload)?
+            {
+                visits.push(TraversalVisit {
+                    nid: *nid,
+                    depth: 0,
+                });
+            }
+        }
+    }
 
     let cursor_memory = if budget.max_depth == 0 {
         0
@@ -259,6 +289,7 @@ where
     let mut captured_edges = Vec::new();
     let mut truncation = None;
     for depth in 1..=budget.max_depth {
+        access_check(access)?;
         if let Some(reason) = boundary_reason(cancelled, started, &budget, frontier.len())? {
             truncation = Some(reason);
             break;
@@ -266,7 +297,10 @@ where
 
         let mut next = Vec::new();
         'frontier: for current in &frontier {
-            let Some(current_payload) = payload_for_nid(*current) else {
+            if !access_visible(access, *current)? {
+                continue;
+            }
+            let Some(current_payload) = payload_for_nid(*current)? else {
                 continue;
             };
             for namespace in namespaces_for_payload(&current_payload) {
@@ -287,6 +321,7 @@ where
                 for (step, from_outgoing) in edges {
                     let step = step?;
                     let Some(edge) = step.edge() else {
+                        access_check(access)?;
                         stats.fragments_read = stats.fragments_read.saturating_add(1);
                         if cancelled.load(Ordering::Acquire) {
                             return Err(cancelled_error());
@@ -316,6 +351,7 @@ where
                     }
                     internal_edges += 1;
                     if internal_edges.is_multiple_of(EDGE_CHECK_INTERVAL) {
+                        access_check(access)?;
                         if cancelled.load(Ordering::Acquire) {
                             return Err(cancelled_error());
                         }
@@ -340,11 +376,16 @@ where
                         edge.source
                     };
                     // VIA is evaluated before edge-property hydration, and
-                    // EDGE WHERE before node payload hydration.
+                    // EDGE WHERE before node payload hydration (after endpoint authority).
                     if selected_types
                         .as_ref()
                         .is_some_and(|types| !types.contains(&edge.type_id))
                     {
+                        continue;
+                    }
+                    // Both endpoints are authorized before property reads or
+                    // errors from a hidden edge can affect this query.
+                    if !access_visible(access, neighbour)? {
                         continue;
                     }
                     if let Some(filter) = edge_filter {
@@ -380,12 +421,18 @@ where
                         // Anchors are exempt only while acting as expansion
                         // roots. When an edge reaches an anchor again it is a
                         // neighbour and must pass the node predicates.
-                        let Some(payload) = payload_for_nid(neighbour) else {
+                        let Some(payload) = payload_for_nid(neighbour)? else {
                             continue;
                         };
                         stats.visible_edges_examined += 1;
                         record_resolution(&mut stats, graph, edge, neighbour);
-                        if !node_filters_match(node_filter, statement_filter, &payload) {
+                        if !matches_node(
+                            access,
+                            neighbour,
+                            node_filter,
+                            statement_filter,
+                            &payload,
+                        )? {
                             continue;
                         }
                         let capture = capture_edges && !captured_edge_ids.contains(&edge_id);
@@ -409,14 +456,14 @@ where
                         }
                         continue;
                     }
-                    let Some(payload) = payload_for_nid(neighbour) else {
+                    let Some(payload) = payload_for_nid(neighbour)? else {
                         continue;
                     };
                     // This counter is observable, so it advances only after
                     // namespace and neighbour visibility have been proven.
                     stats.visible_edges_examined += 1;
                     record_resolution(&mut stats, graph, edge, neighbour);
-                    if !node_filters_match(node_filter, statement_filter, &payload) {
+                    if !matches_node(access, neighbour, node_filter, statement_filter, &payload)? {
                         continue;
                     }
                     let capture = capture_edges && !captured_edge_ids.contains(&edge_id);
@@ -506,10 +553,11 @@ pub(crate) fn exact_simple_paths<G, FPayload, FNamespaces>(
 ) -> Result<TraversalExecution>
 where
     G: TraversalGraph,
-    FPayload: Fn(Nid) -> Option<Value>,
+    FPayload: Fn(Nid) -> Result<Option<Value>>,
     FNamespaces: Fn(&Value) -> Vec<GraphNamespace>,
 {
     let MutableTraversal {
+        access,
         graph,
         mut anchors,
         visible_anchor_count,
@@ -524,6 +572,7 @@ where
         namespaces_for_payload,
     } = traversal;
     let started = Instant::now();
+    access_check(access)?;
     if cancelled.load(Ordering::Acquire) {
         return Err(cancelled_error());
     }
@@ -551,19 +600,18 @@ where
             edges: Vec::new(),
         })
         .collect::<Vec<_>>();
-    let mut paths = if budget.max_depth == 0 {
-        frontier
-            .iter()
-            .filter(|path| {
-                payload_for_nid(path.nodes[0]).is_some_and(|payload| {
-                    node_filters_match(node_filter, statement_filter, &payload)
-                })
-            })
-            .cloned()
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
+    let mut paths = Vec::new();
+    if budget.max_depth == 0 {
+        for path in &frontier {
+            let nid = path.nodes[0];
+            if access_visible(access, nid)?
+                && let Some(payload) = payload_for_nid(nid)?
+                && matches_node(access, nid, node_filter, statement_filter, &payload)?
+            {
+                paths.push(path.clone());
+            }
+        }
+    }
     let cursor_memory = if budget.max_depth == 0 {
         0
     } else {
@@ -598,6 +646,7 @@ where
     let mut internal_edges = 0_u64;
     let mut truncation = None;
     for depth in 1..=budget.max_depth {
+        access_check(access)?;
         if let Some(reason) = boundary_reason(cancelled, started, &budget, frontier.len())? {
             truncation = Some(reason);
             break;
@@ -606,7 +655,10 @@ where
         let mut next = Vec::new();
         'frontier: for path in &frontier {
             let current = *path.nodes.last().expect("path always has an anchor");
-            let Some(current_payload) = payload_for_nid(current) else {
+            if !access_visible(access, current)? {
+                continue;
+            }
+            let Some(current_payload) = payload_for_nid(current)? else {
                 continue;
             };
             for namespace in namespaces_for_payload(&current_payload) {
@@ -627,6 +679,7 @@ where
                 for (step, from_outgoing) in edges {
                     let step = step?;
                     let Some(edge) = step.edge() else {
+                        access_check(access)?;
                         stats.fragments_read = stats.fragments_read.saturating_add(1);
                         if cancelled.load(Ordering::Acquire) {
                             return Err(cancelled_error());
@@ -651,6 +704,7 @@ where
                     }
                     internal_edges += 1;
                     if internal_edges.is_multiple_of(EDGE_CHECK_INTERVAL) {
+                        access_check(access)?;
                         if cancelled.load(Ordering::Acquire) {
                             return Err(cancelled_error());
                         }
@@ -679,6 +733,11 @@ where
                     {
                         continue;
                     }
+                    // Both endpoints are authorized before property reads or
+                    // errors from a hidden edge can affect this query.
+                    if !access_visible(access, neighbour)? {
+                        continue;
+                    }
                     if let Some(filter) = edge_filter {
                         if estimated_path_memory(&frontier, &next, &paths)
                             .saturating_add(cursor_memory)
@@ -702,12 +761,12 @@ where
                             continue;
                         }
                     }
-                    let Some(payload) = payload_for_nid(neighbour) else {
+                    let Some(payload) = payload_for_nid(neighbour)? else {
                         continue;
                     };
                     stats.visible_edges_examined += 1;
                     record_resolution(&mut stats, graph, edge, neighbour);
-                    if !node_filters_match(node_filter, statement_filter, &payload)
+                    if !matches_node(access, neighbour, node_filter, statement_filter, &payload)?
                         || path.nodes.contains(&neighbour)
                     {
                         continue;
@@ -1019,6 +1078,7 @@ mod tests {
                 fail,
             };
             let result = exact_bfs(MutableTraversal {
+                access: None,
                 graph: &graph,
                 anchors: vec![nid(1)],
                 visible_anchor_count: 1,
@@ -1032,7 +1092,7 @@ mod tests {
                     ..TraversalBudget::default()
                 },
                 cancelled: &cancelled,
-                payload_for_nid: |_| Some(serde_json::json!({"tenant_id":"acme"})),
+                payload_for_nid: |_| Ok(Some(serde_json::json!({"tenant_id":"acme"}))),
                 namespaces_for_payload: |_| vec![GraphNamespace::Tenant("acme".into())],
             });
             let error = match result {
@@ -1076,6 +1136,7 @@ mod tests {
         let filter = Filter(json!({"name":"fixture"}));
         for case in 0..5 {
             let execution = exact_bfs(MutableTraversal {
+                access: None,
                 graph: &graph,
                 anchors: vec![nid(1)],
                 visible_anchor_count: 1,
@@ -1095,7 +1156,7 @@ mod tests {
                     ..TraversalBudget::default()
                 },
                 cancelled: &cancelled,
-                payload_for_nid: |_| Some(json!({"tenant_id":"acme"})),
+                payload_for_nid: |_| Ok(Some(json!({"tenant_id":"acme"}))),
                 namespaces_for_payload: |_| vec![GraphNamespace::Tenant("acme".into())],
             });
             if case == 4 {
@@ -1187,6 +1248,7 @@ mod tests {
         options: TestOptions<'_>,
     ) -> Result<TraversalResult> {
         exact_bfs(MutableTraversal {
+            access: None,
             graph,
             anchors: vec![nid(1)],
             visible_anchor_count: 1,
@@ -1197,7 +1259,7 @@ mod tests {
             edge_filter: options.edge_filter,
             budget: options.budget,
             cancelled: options.cancelled,
-            payload_for_nid: |nid| payloads.get(&nid).cloned(),
+            payload_for_nid: |nid| Ok(payloads.get(&nid).cloned()),
             namespaces_for_payload: |_| vec![GraphNamespace::Tenant("acme".to_string())],
         })
         .map(|execution| execution.result)
@@ -1310,6 +1372,7 @@ mod tests {
     fn edge_capture_is_distinct_and_simple_paths_keep_multiedges_without_cycles() {
         let (graph, payloads) = fixture();
         let execution = exact_bfs_with_edges(MutableTraversal {
+            access: None,
             graph: &graph,
             anchors: vec![nid(1)],
             visible_anchor_count: 1,
@@ -1323,7 +1386,7 @@ mod tests {
                 ..TraversalBudget::default()
             },
             cancelled: &AtomicBool::new(false),
-            payload_for_nid: |nid| payloads.get(&nid).cloned(),
+            payload_for_nid: |nid| Ok(payloads.get(&nid).cloned()),
             namespaces_for_payload: |_| vec![GraphNamespace::Tenant("acme".to_string())],
         })
         .unwrap();
@@ -1339,6 +1402,7 @@ mod tests {
 
         let paths = exact_simple_paths(
             MutableTraversal {
+                access: None,
                 graph: &graph,
                 anchors: vec![nid(1)],
                 visible_anchor_count: 1,
@@ -1352,7 +1416,7 @@ mod tests {
                     ..TraversalBudget::default()
                 },
                 cancelled: &AtomicBool::new(false),
-                payload_for_nid: |nid| payloads.get(&nid).cloned(),
+                payload_for_nid: |nid| Ok(payloads.get(&nid).cloned()),
                 namespaces_for_payload: |_| vec![GraphNamespace::Tenant("acme".to_string())],
             },
             100,
@@ -1384,6 +1448,7 @@ mod tests {
 
         let limited = exact_simple_paths(
             MutableTraversal {
+                access: None,
                 graph: &graph,
                 anchors: vec![nid(1)],
                 visible_anchor_count: 1,
@@ -1397,7 +1462,7 @@ mod tests {
                     ..TraversalBudget::default()
                 },
                 cancelled: &AtomicBool::new(false),
-                payload_for_nid: |nid| payloads.get(&nid).cloned(),
+                payload_for_nid: |nid| Ok(payloads.get(&nid).cloned()),
                 namespaces_for_payload: |_| vec![GraphNamespace::Tenant("acme".to_string())],
             },
             2,
@@ -1501,6 +1566,7 @@ mod tests {
                 .collect::<HashMap<_, _>>();
 
             let actual = exact_bfs(MutableTraversal {
+                access: None,
                 graph: &graph,
                 anchors: vec![nid(anchor)],
                 visible_anchor_count: 1,
@@ -1514,7 +1580,7 @@ mod tests {
                     ..TraversalBudget::default()
                 },
                 cancelled: &AtomicBool::new(false),
-                payload_for_nid: |nid| payloads.get(&nid).cloned(),
+                payload_for_nid: |nid| Ok(payloads.get(&nid).cloned()),
                 namespaces_for_payload: |_| vec![GraphNamespace::Tenant("acme".to_string())],
             })
             .unwrap()
@@ -1559,6 +1625,7 @@ mod tests {
             properties: json!({}),
         };
         let result = exact_bfs(MutableTraversal {
+            access: None,
             graph: &hub,
             anchors: vec![nid(1)],
             visible_anchor_count: 1,
@@ -1580,7 +1647,7 @@ mod tests {
                 }),
             },
             cancelled: &AtomicBool::new(false),
-            payload_for_nid: |node| (node.counter() <= 1_025).then(|| json!({"visible": true})),
+            payload_for_nid: |node| Ok((node.counter() <= 1_025).then(|| json!({"visible": true}))),
             namespaces_for_payload: |_| vec![GraphNamespace::Tenant("acme".to_string())],
         })
         .unwrap()
@@ -1596,5 +1663,199 @@ mod tests {
         assert_eq!(result.visits.first().unwrap().nid, nid(2));
         assert_eq!(result.visits.last().unwrap().nid, nid(1_025));
         assert!(result.visits.iter().all(|visit| visit.depth == 1));
+    }
+    #[test]
+    fn payload_failure_aborts_every_capture_mode_and_hidden_nodes_do_not_read() {
+        use std::cell::Cell;
+        struct Hide(Nid);
+        impl TraversalAccess for Hide {
+            fn check(&self) -> Result<()> {
+                Ok(())
+            }
+            fn visible(&self, id: Nid) -> Result<bool> {
+                Ok(id != self.0)
+            }
+            fn matches_node(&self, _: Nid, _: &Value) -> Result<bool> {
+                Ok(true)
+            }
+        }
+        let (graph, payloads) = fixture();
+        let filter = Filter(json!({"allowed": true}));
+        for capture in 0..3 {
+            for (failure, depth) in [(nid(1), 0), (nid(1), 3), (nid(2), 3), (nid(3), 3)] {
+                for hidden in [false, true] {
+                    let calls = Cell::new(0);
+                    let authority = Hide(failure);
+                    let traversal = MutableTraversal {
+                        graph: &graph,
+                        access: hidden.then_some(&authority as &dyn TraversalAccess),
+                        anchors: vec![nid(1)],
+                        visible_anchor_count: 1,
+                        selected_types: None,
+                        direction: GraphDirection::Outgoing,
+                        node_filter: Some(&filter),
+                        statement_filter: None,
+                        edge_filter: None,
+                        budget: TraversalBudget {
+                            max_depth: depth,
+                            ..Default::default()
+                        },
+                        cancelled: &AtomicBool::new(false),
+                        payload_for_nid: |id| {
+                            if id == failure {
+                                calls.set(calls.get() + 1);
+                                return Err(GaussError::ResourceExhausted(
+                                    "payload admission refused".into(),
+                                ));
+                            }
+                            Ok(payloads.get(&id).cloned())
+                        },
+                        namespaces_for_payload: |_| vec![GraphNamespace::Tenant("acme".into())],
+                    };
+                    let result = match capture {
+                        0 => exact_bfs(traversal),
+                        1 => exact_bfs_with_edges(traversal),
+                        _ => exact_simple_paths(traversal, 10),
+                    };
+                    if hidden {
+                        assert!(result.is_ok());
+                        assert_eq!(calls.get(), 0, "hidden payload must not be read");
+                    } else {
+                        assert!(matches!(result, Err(GaussError::ResourceExhausted(message))
+                            if message == "payload admission refused"));
+                        assert_eq!(calls.get(), 1);
+                    }
+                }
+            }
+            let traversal = MutableTraversal {
+                graph: &graph,
+                access: None,
+                anchors: vec![nid(1)],
+                visible_anchor_count: 1,
+                selected_types: None,
+                direction: GraphDirection::Outgoing,
+                node_filter: None,
+                statement_filter: None,
+                edge_filter: None,
+                budget: TraversalBudget {
+                    max_depth: 3,
+                    ..Default::default()
+                },
+                cancelled: &AtomicBool::new(false),
+                payload_for_nid: |_| Ok(None),
+                namespaces_for_payload: |_| vec![GraphNamespace::Tenant("acme".into())],
+            };
+            let result = match capture {
+                0 => exact_bfs(traversal),
+                1 => exact_bfs_with_edges(traversal),
+                _ => exact_simple_paths(traversal, 10),
+            }
+            .unwrap();
+            assert!(result.result.visits.is_empty());
+            assert!(result.edges.is_empty());
+            assert!(result.paths.is_empty());
+        }
+    }
+
+    #[test]
+    fn protected_endpoint_authority_precedes_edge_property_io_in_every_capture_mode() {
+        use std::cell::Cell;
+        struct Poisoned {
+            hub: SyntheticHub,
+            reads: Cell<usize>,
+        }
+        impl TraversalGraph for Poisoned {
+            type EdgeIds<'a> = SyntheticEdgeIds;
+            fn outgoing(&self, ns: &GraphNamespace, nid: Nid) -> Result<Self::EdgeIds<'_>> {
+                self.hub.outgoing(ns, nid)
+            }
+            fn incoming(&self, ns: &GraphNamespace, nid: Nid) -> Result<Self::EdgeIds<'_>> {
+                self.hub.incoming(ns, nid)
+            }
+            fn edge_properties(&self, _: EdgeId) -> Result<Option<Cow<'_, Value>>> {
+                self.reads.set(self.reads.get() + 1);
+                Err(GaussError::InvalidRequest(
+                    "hidden property I/O must be unreachable".into(),
+                ))
+            }
+        }
+        struct Authority {
+            target_visible: bool,
+            revoked: bool,
+        }
+        impl TraversalAccess for Authority {
+            fn check(&self) -> Result<()> {
+                Ok(())
+            }
+            fn visible(&self, id: Nid) -> Result<bool> {
+                if id != nid(1) && self.revoked {
+                    return Err(crate::security::SecurityError::Forbidden.into());
+                }
+                Ok(id == nid(1) || self.target_visible)
+            }
+            fn matches_node(&self, _: Nid, _: &Value) -> Result<bool> {
+                Ok(true)
+            }
+        }
+        for capture in 0..3 {
+            for (target_visible, revoked) in [(false, false), (true, false), (false, true)] {
+                let graph = Poisoned {
+                    hub: SyntheticHub {
+                        edges: 1,
+                        properties: json!({}),
+                    },
+                    reads: Cell::new(0),
+                };
+                let authority = Authority {
+                    target_visible,
+                    revoked,
+                };
+                let filter = Filter(json!({"secret":"classified"}));
+                let traversal = MutableTraversal {
+                    graph: &graph,
+                    access: Some(&authority),
+                    anchors: vec![nid(1)],
+                    visible_anchor_count: 1,
+                    selected_types: None,
+                    direction: GraphDirection::Outgoing,
+                    node_filter: None,
+                    statement_filter: None,
+                    edge_filter: Some(&filter),
+                    budget: TraversalBudget {
+                        max_depth: 1,
+                        ..Default::default()
+                    },
+                    cancelled: &AtomicBool::new(false),
+                    payload_for_nid: |_| Ok(Some(json!({}))),
+                    namespaces_for_payload: |_| vec![GraphNamespace::Tenant("acme".into())],
+                };
+                let result = match capture {
+                    0 => exact_bfs(traversal),
+                    1 => exact_bfs_with_edges(traversal),
+                    _ => exact_simple_paths(traversal, 10),
+                };
+                if revoked {
+                    assert!(matches!(
+                        result,
+                        Err(GaussError::Security(
+                            crate::security::SecurityError::Forbidden
+                        ))
+                    ));
+                    assert_eq!(graph.reads.get(), 0);
+                } else if target_visible {
+                    assert!(result.is_err());
+                    assert_eq!(graph.reads.get(), 1);
+                } else {
+                    let result = result.unwrap();
+                    assert!(
+                        result.result.visits.is_empty()
+                            && result.edges.is_empty()
+                            && result.paths.is_empty()
+                    );
+                    assert_eq!(result.result.stats.visible_edges_examined, 0);
+                    assert_eq!(graph.reads.get(), 0);
+                }
+            }
+        }
     }
 }

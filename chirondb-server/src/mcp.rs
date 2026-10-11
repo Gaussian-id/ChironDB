@@ -11,7 +11,7 @@ use std::{
 
 use crate::{
     Db, Filter, TextHybridSearchRequest,
-    auth::AuthConfig,
+    auth::{AuthConfig, WorkPermit},
     rbac::{Action, Permission, authorize},
 };
 use axum::{
@@ -242,14 +242,13 @@ impl McpServer {
 
     async fn collection_configs(
         &self,
-        principal: &Permission,
+        work: Arc<WorkPermit>,
     ) -> Result<Vec<crate::CollectionConfig>, &'static str> {
         let permit = self
             .workers
             .clone()
             .try_acquire_owned()
             .map_err(|_| "overloaded")?;
-        let work = self.auth.try_begin_work(principal).ok_or("overloaded")?;
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
             let (_permit, _work) = (permit, work);
@@ -266,6 +265,9 @@ impl McpServer {
         principal: &Permission,
         started: Instant,
     ) -> Result<CallToolResult, &'static str> {
+        // One permit covers the whole tool, including embedding I/O. Blocking
+        // tasks retain it if the caller times out or disconnects.
+        let work = Arc::new(self.auth.try_begin_work(principal).ok_or("overloaded")?);
         match name {
             "list_collections" => {
                 let _: EmptyArgs = serde_json::from_value(args).map_err(|_| "invalid_arguments")?;
@@ -273,7 +275,7 @@ impl McpServer {
                     return Err("tenant_enforcement_required");
                 }
                 let collections: Vec<_> = self
-                    .collection_configs(principal)
+                    .collection_configs(Arc::clone(&work))
                     .await?
                     .into_iter()
                     .filter(|collection| self.binding(principal, &collection.name).is_ok())
@@ -295,7 +297,6 @@ impl McpServer {
                     .clone()
                     .try_acquire_owned()
                     .map_err(|_| "overloaded")?;
-                let work = self.auth.try_begin_work(principal).ok_or("overloaded")?;
                 let points = tokio::task::spawn_blocking(move || {
                     let (_permit, _work) = (permit, work);
                     db.get_points_scoped(&args.collection, &[args.id], &scope)
@@ -331,7 +332,7 @@ impl McpServer {
                     .scope_filter(self.db.tenant_enforcement(), filter.clone())
                     .map_err(|_| "invalid_filter")?;
                 let collection = self
-                    .collection_configs(principal)
+                    .collection_configs(Arc::clone(&work))
                     .await?
                     .into_iter()
                     .find(|collection| collection.name == args.collection)
@@ -347,7 +348,6 @@ impl McpServer {
                     .clone()
                     .try_acquire_owned()
                     .map_err(|_| "overloaded")?;
-                let work = self.auth.try_begin_work(principal).ok_or("overloaded")?;
                 let cancel = CancelOnDrop(Arc::new(AtomicBool::new(false)));
                 let flag = cancel.0.clone();
                 let db = self.db.clone();

@@ -15,6 +15,12 @@ use chirondb::{CollectionConfig, Db, DistanceMetric, Filter, Point, SearchReques
 use serde_json::json;
 use tempfile::TempDir;
 
+// These independent correctness fixtures share the process-wide storage quota.
+// Serialize their bulk setup/recovery, while searches and concurrency suites
+// retain their own execution behavior. Load the complete original dataset in
+// bounded atomic batches; recall and recovery oracles keep their original scope.
+static FIXTURE_LOAD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn lcg_vector(seed: u64, dim: usize) -> Vec<f32> {
     let mut state = seed ^ 0x517c_c1b7_2722_0a95;
     (0..dim)
@@ -33,6 +39,7 @@ fn make_db_with_buckets(
     dim: usize,
     n_buckets: u64,
 ) -> (TempDir, Db, &'static str, Vec<Point>) {
+    let _load = FIXTURE_LOAD.lock().expect("fixture load lock");
     let dir = TempDir::new().expect("tempdir");
     let db = Db::open(dir.path()).expect("open db");
     let coll = "acorn_gate";
@@ -65,7 +72,20 @@ fn make_db_with_buckets(
         })
         .collect();
 
-    db.upsert(coll, points.clone()).expect("upsert");
+    for batch in points.chunks(1024) {
+        db.upsert(coll, batch.to_vec()).expect("fixture batch");
+    }
+    // A background rebuild owns the root lease after the last Db handle.
+    // Drain it before the fixture attempts its acknowledged-write reopen.
+    let shutdown = db.shutdown(std::time::Instant::now() + std::time::Duration::from_secs(30));
+    assert!(shutdown.background_drained, "fixture rebuild did not drain");
+    assert!(
+        !shutdown.fallback_required,
+        "fixture shutdown left recovery work"
+    );
+    drop(db);
+    let db = Db::open(dir.path()).expect("recover acknowledged fixture batches");
+    assert_eq!(db.count(coll, None).unwrap().count, n);
     (dir, db, coll, points)
 }
 

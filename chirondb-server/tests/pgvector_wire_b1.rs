@@ -11,7 +11,7 @@ use std::sync::Arc;
 use chirondb::Db;
 use chirondb::auth::AuthConfig;
 use chirondb::wire;
-use chirondb::wire_postgres::{PROTOCOL_V3, SSL_REQUEST_MAGIC};
+use chirondb::wire_postgres::{CANCEL_REQUEST_MAGIC, PROTOCOL_V3, SSL_REQUEST_MAGIC};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -57,6 +57,74 @@ async fn read_message(stream: &mut TcpStream) -> (u8, Vec<u8>) {
     let mut payload = vec![0_u8; len - 4];
     stream.read_exact(&mut payload).await.unwrap();
     (hdr[0], payload)
+}
+
+async fn connect_without_auth(port: u16) -> TcpStream {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    stream
+        .write_all(&startup_message("alice", "mydb"))
+        .await
+        .unwrap();
+    loop {
+        let (message_type, _body) = read_message(&mut stream).await;
+        if message_type == b'Z' {
+            return stream;
+        }
+    }
+}
+
+async fn connect_with_backend_key(port: u16) -> (TcpStream, u32, u32) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    stream
+        .write_all(&startup_message("alice", "mydb"))
+        .await
+        .unwrap();
+    let mut backend_key = None;
+    loop {
+        let (message_type, body) = read_message(&mut stream).await;
+        if message_type == b'K' {
+            backend_key = Some((
+                u32::from_be_bytes(body[..4].try_into().unwrap()),
+                u32::from_be_bytes(body[4..].try_into().unwrap()),
+            ));
+        }
+        if message_type == b'Z' {
+            let (pid, secret) = backend_key.expect("startup must return BackendKeyData");
+            return (stream, pid, secret);
+        }
+    }
+}
+
+async fn send_cancel_request(port: u16, pid: u32, secret: u32) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut request = Vec::with_capacity(16);
+    request.extend_from_slice(&16_u32.to_be_bytes());
+    request.extend_from_slice(&CANCEL_REQUEST_MAGIC.to_be_bytes());
+    request.extend_from_slice(&pid.to_be_bytes());
+    request.extend_from_slice(&secret.to_be_bytes());
+    stream.write_all(&request).await.unwrap();
+    stream.shutdown().await.unwrap();
+}
+
+async fn simple_query(stream: &mut TcpStream, sql: &str) -> Vec<(u8, Vec<u8>)> {
+    let mut body = sql.as_bytes().to_vec();
+    body.push(0);
+    let mut message = Vec::with_capacity(body.len() + 5);
+    message.push(b'Q');
+    message.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
+    message.extend_from_slice(&body);
+    stream.write_all(&message).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let mut response = Vec::new();
+    loop {
+        let message = read_message(stream).await;
+        let done = message.0 == b'Z';
+        response.push(message);
+        if done {
+            return response;
+        }
+    }
 }
 
 #[tokio::test]
@@ -111,6 +179,32 @@ async fn psql_style_connect_idle_terminate_no_auth() {
     stream.write_all(b"X").await.unwrap();
     stream.write_all(&4_u32.to_be_bytes()).await.unwrap();
     stream.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn idle_cancel_request_does_not_poison_the_next_query() {
+    let (db, _dir) = make_db();
+    let port = spawn_server(db, AuthConfig::disabled()).await;
+    let (mut stream, pid, secret) = connect_with_backend_key(port).await;
+
+    send_cancel_request(port, pid, secret).await;
+    let response = simple_query(
+        &mut stream,
+        "CREATE TABLE cancel_idle (id INTEGER PRIMARY KEY)",
+    )
+    .await;
+    assert!(
+        response
+            .iter()
+            .all(|(message_type, _)| *message_type != b'E'),
+        "an idle CancelRequest must not cancel a future query"
+    );
+    assert!(
+        response
+            .iter()
+            .any(|(message_type, _)| *message_type == b'C')
+    );
+    assert_eq!(response.last(), Some(&(b'Z', vec![b'I'])));
 }
 
 #[tokio::test]
@@ -235,7 +329,7 @@ async fn cleartext_password_auth_rejects_wrong_key() {
 }
 
 #[tokio::test]
-async fn rejected_transaction_returns_sqlstate_0a000() {
+async fn relational_transaction_reports_ready_for_query_state() {
     let (db, _dir) = make_db();
     let port = spawn_server(db, AuthConfig::disabled()).await;
 
@@ -258,23 +352,81 @@ async fn rejected_transaction_returns_sqlstate_0a000() {
     q.extend_from_slice(sql);
     stream.write_all(&q).await.unwrap();
 
-    let (msg_type, body) = read_message(&mut stream).await;
-    assert_eq!(msg_type, b'E');
-    assert!(
-        body.windows(7).any(|w| w == b"C0A000\0"),
-        "expected SQLSTATE 0A000 on BEGIN"
-    );
-    let has_hint_url = body
-        .windows(b"Hhttps://docs.gaussdb/pgvector-compat".len())
-        .any(|w| w.starts_with(b"Hhttps://docs.gaussdb/pgvector-compat"));
-    assert!(
-        has_hint_url,
-        "expected Hint URL in BEGIN reject; body={body:?}"
-    );
+    let (msg_type, _body) = read_message(&mut stream).await;
+    assert_eq!(msg_type, b'C');
+    let (t, b) = read_message(&mut stream).await;
+    assert_eq!(t, b'Z');
+    assert_eq!(b, vec![b'T']);
 
+    let sql = b"ROLLBACK;\0";
+    let mut q = Vec::new();
+    q.push(b'Q');
+    q.extend_from_slice(&((4 + sql.len()) as u32).to_be_bytes());
+    q.extend_from_slice(sql);
+    stream.write_all(&q).await.unwrap();
+    let (msg_type, _body) = read_message(&mut stream).await;
+    assert_eq!(msg_type, b'C');
     let (t, b) = read_message(&mut stream).await;
     assert_eq!(t, b'Z');
     assert_eq!(b, vec![b'I']);
+}
+
+#[tokio::test]
+async fn relational_upsert_works_over_postgres_simple_query_and_maps_cardinality_error() {
+    let (db, _dir) = make_db();
+    let port = spawn_server(db, AuthConfig::disabled()).await;
+    let mut stream = connect_without_auth(port).await;
+
+    for sql in [
+        "CREATE TABLE pg_upsert (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)",
+        "INSERT INTO pg_upsert VALUES (1, 10)",
+        "INSERT INTO pg_upsert VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET value = pg_upsert.value + excluded.value RETURNING id, value",
+    ] {
+        let response = simple_query(&mut stream, sql).await;
+        assert!(
+            response
+                .iter()
+                .any(|(message_type, _)| *message_type == b'C'),
+            "query did not complete: {sql}"
+        );
+        assert!(
+            response
+                .iter()
+                .all(|(message_type, _)| *message_type != b'E'),
+            "query returned an error: {sql}"
+        );
+    }
+
+    let selected = simple_query(&mut stream, "SELECT value FROM pg_upsert WHERE id = 1").await;
+    let data_row = selected
+        .iter()
+        .find(|(message_type, _)| *message_type == b'D')
+        .map(|(_, body)| body)
+        .expect("SELECT must return a DataRow");
+    assert!(data_row.windows(2).any(|window| window == b"15"));
+
+    let error = simple_query(
+        &mut stream,
+        "INSERT INTO pg_upsert VALUES (1, 20), (1, 30) ON CONFLICT (id) DO UPDATE SET value = excluded.value",
+    )
+    .await;
+    let error_body = error
+        .iter()
+        .find(|(message_type, _)| *message_type == b'E')
+        .map(|(_, body)| body)
+        .expect("duplicate affected row must return ErrorResponse");
+    assert!(
+        error_body.windows(7).any(|window| window == b"C21000\0"),
+        "missing cardinality-violation SQLSTATE"
+    );
+
+    let selected = simple_query(&mut stream, "SELECT value FROM pg_upsert WHERE id = 1").await;
+    let data_row = selected
+        .iter()
+        .find(|(message_type, _)| *message_type == b'D')
+        .map(|(_, body)| body)
+        .expect("row must remain visible after rejected statement");
+    assert!(data_row.windows(2).any(|window| window == b"15"));
 }
 
 #[tokio::test]

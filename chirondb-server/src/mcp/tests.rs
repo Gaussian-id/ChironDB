@@ -92,6 +92,24 @@ async fn tenant_mode_and_model_dimensions_fail_before_embedding_io() {
         "overloaded"
     );
     drop(held);
+    let mut tenant_work = Vec::new();
+    while let Some(work) = server.auth.try_begin_work(&principal) {
+        tenant_work.push(work);
+    }
+    assert!(!tenant_work.is_empty());
+    for (name, arguments) in [
+        ("list_collections", json!({})),
+        ("get_document", args.clone()),
+    ] {
+        assert_eq!(
+            server
+                .execute(name, arguments, &principal, Instant::now())
+                .await
+                .unwrap_err(),
+            "overloaded"
+        );
+    }
+    drop(tenant_work);
     assert_eq!(
         server
             .execute("get_document", args, &principal, Instant::now())

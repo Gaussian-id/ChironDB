@@ -10,11 +10,23 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::relational::{RelationalType, RelationalValue};
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionDomain {
+    Relational,
+    Vector,
+    Graph,
+    Catalog,
+    Security,
+}
+
 /// One ChironQL statement submitted for execution.
 ///
-/// One statement per request. Multi-statement bodies would need partial-failure
-/// semantics and there are no transactions to make that coherent, so the REPL
-/// splits on `;` and sends them one at a time.
+/// The request contains one top-level statement. A typed `TRANSACTION { ... }`
+/// block remains one statement and supplies the atomic semantics for its
+/// relational, vector, and graph mutation stages.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ChironQlRequest {
     pub query: String,
@@ -34,6 +46,15 @@ pub struct ChironQlRequest {
     /// them. This protects every surface, not just the ones with a prompt.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub confirm: bool,
+    /// Positional `$1` through `$n` values shared by SQL and PIPELINE stages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parameters: Vec<RelationalValue>,
+    /// Stable mutation identity, distinct from audit correlation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    /// Optional audit correlation; it does not deduplicate a request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_id: Option<String>,
 }
 
 /// What a statement produced.
@@ -100,6 +121,8 @@ pub struct ChironQlResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub columns: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub column_types: Vec<RelationalType>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rows: Vec<Value>,
     pub stats: ChironQlStats,
     /// Pagination cursor for `SCROLL`. `None` means this was the last page.
@@ -107,8 +130,33 @@ pub struct ChironQlResponse {
     pub next: Option<String>,
     /// Correlates this result with the server's own log line for it.
     pub query_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domains: Vec<ExecutionDomain>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace: Option<QueryTrace>,
+    /// Returned only by explicit credential issuance. Renderers must save this
+    /// to a private destination, never include it in result rows or traces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<ChironQlCredential>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct ChironQlCredential {
+    pub id: String,
+    pub secret: String,
+}
+impl std::fmt::Debug for ChironQlCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChironQlCredential")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A failed ChironQL execution — parse reject, permission denial, or an engine
@@ -180,7 +228,9 @@ impl StageOutcome {
 /// absent from the trace rather than present with a zero duration.
 pub mod stage {
     pub const PARSE: &str = "parse";
+    pub const CLASSIFY: &str = "classify";
     pub const AUTHORIZE: &str = "authorize";
+    pub const SNAPSHOT: &str = "snapshot";
     pub const RESOLVE_COLLECTION: &str = "resolve_collection";
     pub const RESOLVE_VECTOR: &str = "resolve_vector";
     pub const COMPILE_FILTER: &str = "compile_filter";
@@ -191,6 +241,9 @@ pub mod stage {
     pub const GRAPH_ESTIMATE: &str = "graph_estimate";
     pub const GRAPH_PLAN: &str = "graph_plan";
     pub const GRAPH_EXPAND: &str = "graph_expand";
+    pub const RELATIONAL_SCAN: &str = "relational_scan";
+    pub const JOIN: &str = "join";
+    pub const AUTHORIZATION_RECHECK: &str = "authorization_recheck";
     pub const FUSE: &str = "fuse";
     pub const RENDER: &str = "render";
 }

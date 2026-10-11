@@ -46,12 +46,17 @@ impl crate::seal::VectorInput for MergeSnapshotInput {
                 .and_then(|frozen| frozen.points.get(id))
                 .map(Cow::Borrowed)
                 .ok_or_else(|| GaussError::PointNotFound(id.clone())),
-            crate::searcher::SegLoc::Searcher(index) => self
-                .stores
-                .get(*index as usize)
-                .and_then(Option::as_ref)
-                .and_then(|store| store.get(id).map(Cow::Owned))
-                .ok_or_else(|| GaussError::PointNotFound(id.clone())),
+            crate::searcher::SegLoc::Searcher(index) => {
+                let store = self
+                    .stores
+                    .get(*index as usize)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| GaussError::PointNotFound(id.clone()))?;
+                store
+                    .try_get(id)?
+                    .map(Cow::Owned)
+                    .ok_or_else(|| GaussError::PointNotFound(id.clone()))
+            }
             crate::searcher::SegLoc::Streamer => Err(GaussError::InvalidRequest(format!(
                 "merge snapshot retained mutable streamer location for {id}"
             ))),

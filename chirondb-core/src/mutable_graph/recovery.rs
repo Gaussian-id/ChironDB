@@ -57,6 +57,8 @@ enum Record {
         id: String,
         opening_lsn: u64,
         status: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner: Option<crate::wal::GraphSessionOwner>,
     },
     Pending {
         opening_lsn: u64,
@@ -225,6 +227,7 @@ impl GraphRecoveryControl {
             Record::Session {
                 id: id.clone(),
                 opening_lsn: session.opening_lsn,
+                owner: session.owner.clone(),
                 status: match session.status {
                     DeferredSessionStatus::Open => 0,
                     DeferredSessionStatus::Committed => 1,
@@ -461,7 +464,13 @@ impl GraphRecoveryControl {
                     id,
                     opening_lsn,
                     status,
+                    owner,
                 } => {
+                    if let Some(owner) = &owner {
+                        owner
+                            .validate()
+                            .map_err(|error| corrupt(path, &error.to_string()))?;
+                    }
                     let status = match status {
                         0 => DeferredSessionStatus::Open,
                         1 => DeferredSessionStatus::Committed,
@@ -473,6 +482,7 @@ impl GraphRecoveryControl {
                         DeferredSession {
                             opening_lsn,
                             status,
+                            owner,
                         },
                     );
                 }
@@ -785,6 +795,7 @@ pub(crate) mod tests {
                     properties: json!({"pending":true}),
                 }],
                 &[GraphDeferredSessionMutation::Open {
+                    owner: None,
                     session_id: session.into(),
                 }],
             );
@@ -804,6 +815,7 @@ pub(crate) mod tests {
             13,
             &[],
             &[GraphDeferredSessionMutation::Open {
+                owner: None,
                 session_id: "committed".into(),
             }],
         );

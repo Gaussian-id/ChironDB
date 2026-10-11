@@ -63,6 +63,9 @@ fn replicated_mutations_and_background_seal_preserve_text_statistics() {
     assert_eq!(changed.0.len(), 1);
     assert_eq!(changed.1.len(), 1);
     assert_eq!(changed.1[0].0, "a2");
+    // Search visibility precedes release of the background seal's root lease.
+    let report = db.shutdown(Instant::now() + Duration::from_secs(20));
+    assert!(!report.fallback_required, "{report:?}");
     drop(db);
     let db = Db::open(root.path()).unwrap();
     db.set_tenant_enforcement(crate::TenantEnforcement::Enforced);
@@ -205,4 +208,43 @@ fn field_membership_tenant_filter_and_precancelled_search() {
         )
         .unwrap();
     assert!(result.degraded && result.hits.is_empty());
+}
+
+#[test]
+fn bm25_only_accepts_omitted_vector_and_preserves_raw_scores() {
+    let directory = TempDir::new().unwrap();
+    let db = Db::open(directory.path()).unwrap();
+    db.create_collection(serde_json::from_value(json!({"name":"docs","vector_dim":2})).unwrap())
+        .unwrap();
+    db.upsert(
+        "docs",
+        vec![
+            point("a", "refund refund policy", "a"),
+            point("b", "policy", "a"),
+        ],
+    )
+    .unwrap();
+    let query: TextHybridSearchRequest =
+        serde_json::from_value(json!({"query":"refund policy","text_field":"text","k":5})).unwrap();
+    let response = db
+        .text_hybrid_search_scoped("docs", query, &TenantScope::system())
+        .unwrap();
+    let collection = db.get_coll("docs").unwrap();
+    let collection = collection.read();
+    let expected = collection
+        .sparse_index
+        .text
+        .search("text", "refund policy", None, 5, &|_| true, &|| false)
+        .ranked;
+    assert_eq!(
+        response
+            .hits
+            .iter()
+            .map(|h| (&h.id, h.score))
+            .collect::<Vec<_>>(),
+        expected
+            .iter()
+            .map(|h| (&h.id, h.score))
+            .collect::<Vec<_>>()
+    );
 }

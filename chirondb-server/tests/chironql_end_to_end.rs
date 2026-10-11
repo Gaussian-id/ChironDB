@@ -83,6 +83,9 @@ fn exec_as(
         allowed_collections: None,
         want_trace: true,
         confirm: false,
+        parameters: Vec::new(),
+        idempotency_key: None,
+        retry_id: None,
         tenant: TenantScope::system(),
     };
     chirondb::chironql_exec::execute(&mut ctx, query)
@@ -316,6 +319,7 @@ fn a_successful_search_traces_every_stage_it_ran() {
         stages,
         vec![
             "parse",
+            "classify",
             "authorize",
             "resolve_collection",
             "compile_filter",
@@ -339,7 +343,13 @@ fn a_failure_traces_up_to_and_including_the_stage_that_failed() {
     let names: Vec<&str> = trace.stages.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(
         names,
-        vec!["parse", "authorize", "resolve_collection", "resolve_vector"]
+        vec![
+            "parse",
+            "classify",
+            "authorize",
+            "resolve_collection",
+            "resolve_vector"
+        ]
     );
 
     let failed = trace.failed_stage().expect("a failed stage");
@@ -485,7 +495,7 @@ fn a_scripted_console_session_produces_a_table() {
 }
 
 #[test]
-fn a_scripted_console_session_reports_failures_and_keeps_going() {
+fn a_scripted_console_session_stops_after_the_first_failure() {
     let (_dir, db) = fixture();
     let mut sink = LocalSink::new(db, Role::ReadOnly);
     let mut out = Vec::new();
@@ -504,8 +514,8 @@ fn a_scripted_console_session_reports_failures_and_keeps_going() {
     let output = String::from_utf8(out).expect("utf8");
     assert_eq!(failures, 1, "{output}");
     assert!(output.contains("ChironQL is not SQL"), "{output}");
-    // It kept going and ran the next statement.
-    assert!(output.contains("count"), "{output}");
+    // Scripts stop after an error; earlier successes are not rolled back.
+    assert!(!output.contains("count"), "{output}");
 }
 
 #[test]

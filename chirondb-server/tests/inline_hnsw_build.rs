@@ -72,7 +72,7 @@ fn upsert_crossing_threshold_triggers_inline_hnsw_build() {
     })
     .expect("create collection");
 
-    // Cross HNSW_THRESHOLD (10_000) in a single upsert batch.
+    // Seed below HNSW_THRESHOLD (10_000), then cross it in one atomic request.
     let n = 12_000usize;
     let points: Vec<Point> = (0..n)
         .map(|i| Point {
@@ -84,7 +84,17 @@ fn upsert_crossing_threshold_triggers_inline_hnsw_build() {
         })
         .collect();
 
-    db.upsert(coll, points.clone()).expect("bulk upsert");
+    for batch in points[..9_999].chunks(1024) {
+        db.upsert(coll, batch.to_vec()).expect("fixture batch");
+    }
+    assert_eq!(db.count(coll, None).unwrap().count, 9_999);
+    db.upsert(coll, points[9_999..10_001].to_vec())
+        .expect("atomic threshold-crossing upsert");
+    assert_eq!(db.count(coll, None).unwrap().count, 10_001);
+    for batch in points[10_001..].chunks(1024) {
+        db.upsert(coll, batch.to_vec()).expect("fixture batch");
+    }
+    assert_eq!(db.count(coll, None).unwrap().count, n);
 
     // No compaction here. Search must work and recall must stay at 1.0 — proves
     // the HNSW graph was built inline during the threshold-crossing upsert.
@@ -226,7 +236,10 @@ fn incremental_inserts_past_threshold_are_searchable_without_compact() {
             payload: json!({}),
         })
         .collect();
-    db.upsert(coll, bulk.clone()).expect("seed");
+    for batch in bulk.chunks(1024) {
+        db.upsert(coll, batch.to_vec()).expect("fixture batch");
+    }
+    assert_eq!(db.count(coll, None).unwrap().count, initial);
 
     // 100 more incremental inserts, one at a time — must end up in the HNSW
     // graph (Phase 3a contract) so subsequent searches can find them.

@@ -1,0 +1,21 @@
+{
+  "query": "How can a customer request a refund and return an order?",
+  "documents": [
+    {
+      "id": "doc-refund",
+      "title": "Customer refund procedure",
+      "chunk_id": "chunk-refund",
+      "source_id": "source-refund-policy",
+      "chunk_text": "Customers request a refund by opening a return case within thirty days.",
+      "source_text": "The approved return policy is the governing source for refund requests."
+    },
+    {
+      "id": "doc-security",
+      "title": "Security incident response",
+      "chunk_id": "chunk-security",
+      "source_id": "source-security-policy",
+      "chunk_text": "Security incidents are escalated to the incident response team.",
+      "source_text": "The security policy defines incident severity and escalation."
+    }
+  ]
+}

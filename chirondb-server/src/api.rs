@@ -3,7 +3,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use axum::{
     Json, Router,
     extract::{
-        DefaultBodyLimit, Extension, Path, Query, State,
+        DefaultBodyLimit, Extension, Path, Query, Request, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, HeaderValue, StatusCode},
@@ -20,6 +20,7 @@ use futures_executor::block_on;
 use serde_json::json;
 use tokio::{net::TcpListener, sync::mpsc};
 use tokio_stream::{Stream, wrappers::ReceiverStream};
+use tokio_util::sync::CancellationToken;
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     trace::TraceLayer,
@@ -91,6 +92,21 @@ pub fn router_with_auth(db: Db, auth: AuthConfig) -> Router {
 fn protected_routes() -> Router<AppState> {
     Router::new()
         .route("/metrics", get(metrics))
+        .route("/sql", post(sql_execute))
+        .route("/sql/transactions", post(sql_transaction_begin))
+        .route(
+            "/sql/transactions/{handle}/execute",
+            post(sql_transaction_execute),
+        )
+        .route(
+            "/sql/transactions/{handle}/commit",
+            post(sql_transaction_commit),
+        )
+        .route(
+            "/sql/transactions/{handle}",
+            delete(sql_transaction_rollback),
+        )
+        .route("/transactions/{transaction_id}", get(transaction_status))
         .route(
             "/collections",
             get(list_collections).post(create_collection),
@@ -114,6 +130,8 @@ fn protected_routes() -> Router<AppState> {
             "/collections/{collection}/points/delete/filter",
             post(delete_by_filter),
         )
+        .route("/ml/jobs/{id}", get(ml_job))
+        .route("/ml/views/{name}", get(ml_view).delete(ml_drop_view))
         .route("/chironql", post(chironql_execute))
         .route("/chironql/parse", post(chironql_parse))
         .route(
@@ -200,6 +218,13 @@ fn protected_routes() -> Router<AppState> {
 }
 
 pub fn router_with_options(db: Db, auth: AuthConfig, options: ServerOptions) -> Router {
+    let shutdown_db = db.clone();
+    if db.identity_authority().is_some() {
+        return crate::security_http::router(db, options).layer(middleware::from_fn_with_state(
+            shutdown_db,
+            shutdown_admission,
+        ));
+    }
     let _ = observability::init_metrics();
     let auth_db = db.clone();
     let state = AppState {
@@ -231,10 +256,34 @@ pub fn router_with_options(db: Db, auth: AuthConfig, options: ServerOptions) -> 
     if let Some(cors) = cors {
         router = router.layer(cors);
     }
-    router
+    router.layer(middleware::from_fn_with_state(
+        shutdown_db,
+        shutdown_admission,
+    ))
 }
 
-fn build_cors(origins: &[String]) -> Option<CorsLayer> {
+async fn shutdown_admission(
+    State(db): State<Db>,
+    request: Request,
+    next: middleware::Next,
+) -> Response {
+    let path = request.uri().path();
+    let operational_read = matches!(path, "/health" | "/v1/health" | "/metrics" | "/v1/metrics");
+    if db.is_shutting_down() && !operational_read {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "server is shutting down",
+                "code": "server.shutting_down",
+                "retryable": true,
+            })),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+pub(crate) fn build_cors(origins: &[String]) -> Option<CorsLayer> {
     if origins.is_empty() {
         return None;
     }
@@ -270,6 +319,19 @@ pub async fn serve_with_options(
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     axum::serve(listener, router_with_options(db, auth, options)).await
+}
+
+pub async fn serve_with_options_until(
+    db: Db,
+    auth: AuthConfig,
+    addr: SocketAddr,
+    options: ServerOptions,
+    shutdown: CancellationToken,
+) -> std::io::Result<()> {
+    let listener = TcpListener::bind(addr).await?;
+    axum::serve(listener, router_with_options(db, auth, options))
+        .with_graceful_shutdown(shutdown.cancelled_owned())
+        .await
 }
 
 pub async fn serve_tls_with_auth(
@@ -322,6 +384,28 @@ pub async fn serve_tls_config_with_options(
         .await
 }
 
+pub async fn serve_tls_config_with_options_until(
+    db: Db,
+    auth: AuthConfig,
+    addr: SocketAddr,
+    tls: crate::tls::ReloadingTlsConfig,
+    options: ServerOptions,
+    shutdown: CancellationToken,
+    drain_timeout: Duration,
+) -> std::io::Result<()> {
+    let config = RustlsConfig::from_config(tls.server_config());
+    let handle = axum_server::Handle::new();
+    let shutdown_handle = handle.clone();
+    tokio::spawn(async move {
+        shutdown.cancelled().await;
+        shutdown_handle.graceful_shutdown(Some(drain_timeout));
+    });
+    axum_server::bind_rustls(addr, config)
+        .handle(handle)
+        .serve(router_with_options(db, auth, options).into_make_service())
+        .await
+}
+
 pub async fn serve_listener(db: Db, listener: TcpListener) -> std::io::Result<()> {
     axum::serve(listener, router(db)).await
 }
@@ -350,6 +434,155 @@ async fn health(State(state): State<AppState>) -> Response {
         })),
     )
         .into_response()
+}
+
+async fn transaction_status(
+    State(state): State<AppState>,
+    Path(transaction_id): Path<String>,
+) -> Result<Json<chirondb_core::TransactionStatus>, ApiError> {
+    Ok(Json(state.db.transaction_status(&transaction_id)?))
+}
+
+fn sql_owned_response(response: crate::SqlResponse) -> Response {
+    match crate::response_buffer::ResponseBuffer::json_native(&response, 8 * 1024 * 1024) {
+        Ok(bytes) => (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            axum::body::Bytes::from_owner(bytes),
+        )
+            .into_response(),
+        Err(error) => ApiError::from(error).into_response(),
+    }
+}
+
+async fn sql_execute(
+    State(state): State<AppState>,
+    Extension(permission): Extension<Permission>,
+    Json(request): Json<chirondb_core::SqlExecutionRequest>,
+) -> Response {
+    let read_only = match state.db.sql_request_is_read_only(&request) {
+        Ok(read_only) => read_only,
+        Err(error) => return ApiError::from(error).into_response(),
+    };
+    if !read_only && !permission.role.allows_write() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "forbidden",
+                "code": "sql.permission_denied",
+                "message": "the authenticated role cannot mutate relational data",
+            })),
+        )
+            .into_response();
+    }
+    let audit_context = chirondb_core::audit::AuditContext {
+        principal_id: actor_name(&permission),
+        tenant_id: permission.tenant_id.clone(),
+        transport: "http".to_string(),
+        request_id: request.retry_id.clone(),
+    };
+    match state
+        .db
+        .execute_sql_with_audit_owned(request, &audit_context)
+    {
+        Ok(response) => sql_owned_response(response),
+        Err(error) => ApiError::from(error).into_response(),
+    }
+}
+
+async fn sql_transaction_begin(
+    State(state): State<AppState>,
+    Extension(permission): Extension<Permission>,
+) -> Result<Json<chirondb_core::SqlTransactionHandleResponse>, ApiError> {
+    let audit_context = chirondb_core::audit::AuditContext {
+        principal_id: actor_name(&permission),
+        tenant_id: permission.tenant_id.clone(),
+        transport: "http".to_string(),
+        request_id: None,
+    };
+    Ok(Json(state.db.begin_sql_transaction(&audit_context)?))
+}
+
+async fn sql_transaction_execute(
+    State(state): State<AppState>,
+    Path(handle): Path<String>,
+    Extension(permission): Extension<Permission>,
+    Json(request): Json<chirondb_core::SqlExecutionRequest>,
+) -> Response {
+    let read_only = match state.db.sql_request_is_read_only(&request) {
+        Ok(read_only) => read_only,
+        Err(error) => return ApiError::from(error).into_response(),
+    };
+    if !read_only && !permission.role.allows_write() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "forbidden",
+                "code": "sql.permission_denied",
+                "message": "the authenticated role cannot mutate relational data",
+            })),
+        )
+            .into_response();
+    }
+    let audit_context = chirondb_core::audit::AuditContext {
+        principal_id: actor_name(&permission),
+        tenant_id: permission.tenant_id.clone(),
+        transport: "http".to_string(),
+        request_id: request.retry_id.clone(),
+    };
+    match state
+        .db
+        .execute_sql_transaction_owned(&handle, request, &audit_context)
+    {
+        Ok(response) => sql_owned_response(response),
+        Err(error) => ApiError::from(error).into_response(),
+    }
+}
+
+async fn sql_transaction_commit(
+    State(state): State<AppState>,
+    Path(handle): Path<String>,
+    Extension(permission): Extension<Permission>,
+) -> Response {
+    if !permission.role.allows_write() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "forbidden",
+                "code": "sql.permission_denied",
+                "message": "the authenticated role cannot commit relational mutations",
+            })),
+        )
+            .into_response();
+    }
+    let audit_context = chirondb_core::audit::AuditContext {
+        principal_id: actor_name(&permission),
+        tenant_id: permission.tenant_id.clone(),
+        transport: "http".to_string(),
+        request_id: Some(handle.clone()),
+    };
+    match state
+        .db
+        .commit_sql_transaction_owned(&handle, &audit_context)
+    {
+        Ok(response) => sql_owned_response(response),
+        Err(error) => ApiError::from(error).into_response(),
+    }
+}
+
+async fn sql_transaction_rollback(
+    State(state): State<AppState>,
+    Path(handle): Path<String>,
+    Extension(permission): Extension<Permission>,
+) -> Result<Json<chirondb_core::SqlTransactionHandleResponse>, ApiError> {
+    let audit_context = chirondb_core::audit::AuditContext {
+        principal_id: actor_name(&permission),
+        tenant_id: permission.tenant_id.clone(),
+        transport: "http".to_string(),
+        request_id: Some(handle.clone()),
+    };
+    Ok(Json(
+        state.db.rollback_sql_transaction(&handle, &audit_context)?,
+    ))
 }
 
 async fn metrics(State(state): State<AppState>) -> Response {
@@ -1537,6 +1770,83 @@ fn now_ms() -> u128 {
 // ChironQL
 // ---------------------------------------------------------------------------
 
+fn ml_error_response(error: crate::ml_runtime::MlError) -> Response {
+    let status = match error.code {
+        "chironql.ml_not_found" => StatusCode::NOT_FOUND,
+        "chironql.ml_not_ready" | "chironql.ml_stale_cursor" | "chironql.ml_refresh_running" => {
+            StatusCode::CONFLICT
+        }
+        "chironql.ml_invalid_job" | "chironql.ml_invalid_name" | "chironql.ml_invalid_page" => {
+            StatusCode::BAD_REQUEST
+        }
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    (
+        status,
+        Json(json!({"error": error.message, "code": error.code})),
+    )
+        .into_response()
+}
+
+async fn ml_job(
+    State(state): State<AppState>,
+    Extension(_permission): Extension<Permission>,
+    Path(id): Path<String>,
+) -> Response {
+    if state.db.tenant_enforcement().blocks() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    match crate::ml_runtime::get_job(&state.db, &id) {
+        Ok(job) => (StatusCode::OK, Json(job)).into_response(),
+        Err(error) => ml_error_response(error),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct MlViewQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+async fn ml_view(
+    State(state): State<AppState>,
+    Extension(_permission): Extension<Permission>,
+    Path(name): Path<String>,
+    Query(query): Query<MlViewQuery>,
+) -> Response {
+    if state.db.tenant_enforcement().blocks() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    match crate::ml_runtime::get_view(
+        &state.db,
+        &name,
+        query.limit.unwrap_or(100),
+        query.cursor.as_deref(),
+    ) {
+        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Err(error) => ml_error_response(error),
+    }
+}
+
+async fn ml_drop_view(
+    State(state): State<AppState>,
+    Extension(permission): Extension<Permission>,
+    Path(name): Path<String>,
+) -> Response {
+    if state.db.tenant_enforcement().blocks() || !permission.role.allows_write() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    match crate::ml_runtime::drop_view(
+        &state.db,
+        &name,
+        &actor_name(&permission),
+        permission.tenant_id.as_deref(),
+    ) {
+        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+        Err(error) => ml_error_response(error),
+    }
+}
+
 /// `POST /v1/chironql` - parse and execute one ChironQL statement.
 ///
 /// Goes through the same `chironql_exec::execute` entry point as the embedded
@@ -1564,13 +1874,25 @@ async fn chironql_execute(
         allowed_collections: collection_scope(&perm),
         want_trace: request.trace,
         confirm: request.confirm,
+        parameters: request.parameters.clone(),
+        idempotency_key: request.idempotency_key.clone(),
+        retry_id: request.retry_id.clone(),
         // Built from the authenticated principal. Nothing the caller sent can
         // influence it.
         tenant: perm.tenant_scope(actor_name(&perm)),
     };
 
-    match chironql_exec::execute(&mut ctx, &request.query) {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+    match chironql_exec::execute_owned(&mut ctx, &request.query) {
+        Ok(response) => match response.consume(|value| {
+            crate::response_buffer::ResponseBuffer::json_native(&value, 8 * 1024 * 1024)
+        }) {
+            Ok(Ok(bytes)) => (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                axum::body::Bytes::from_owner(bytes),
+            )
+                .into_response(),
+            Ok(Err(error)) | Err(error) => ApiError::from(error).into_response(),
+        },
         Err(error) => chironql_error_response(error),
     }
 }
@@ -1587,13 +1909,24 @@ async fn chironql_parse(Json(request): Json<ChironQlRequest>) -> Response {
             StatusCode::OK,
             Json(json!({
                 "ok": true,
+                "language_version": crate::chironql_parser::LANGUAGE_VERSION,
                 "kind": match statement.class() {
+                    crate::chironql_parser::StatementClass::Read => "read",
+                    crate::chironql_parser::StatementClass::Write => "write",
+                    crate::chironql_parser::StatementClass::Admin => "admin",
+                },
+                "class": match statement.class() {
                     crate::chironql_parser::StatementClass::Read => "read",
                     crate::chironql_parser::StatementClass::Write => "write",
                     crate::chironql_parser::StatementClass::Admin => "admin",
                 },
                 "statement": statement.kind_name(),
                 "collection": statement.collection(),
+                "domains": statement.domains(),
+                "resources": {
+                    "tables": statement.tables(),
+                    "collections": statement.collections(),
+                },
             })),
         )
             .into_response(),
@@ -1642,13 +1975,22 @@ fn chironql_error_response(error: ChironQlError) -> Response {
         "chironql.not_implemented" => StatusCode::NOT_IMPLEMENTED,
         // The statement is well-formed and allowed; it is waiting on a
         // decision only the caller can make. 409 is the honest code for that.
-        "chironql.confirmation_required" => StatusCode::CONFLICT,
+        "chironql.confirmation_required"
+        | "chironql.snapshot_changed"
+        | "chironql.ml_refresh_running"
+        | "chironql.ml_definition_conflict" => StatusCode::CONFLICT,
         "chironql.storage_corruption" | "chironql.io_error" | "chironql.engine_error" => {
             StatusCode::INTERNAL_SERVER_ERROR
         }
         "chironql.resource_exhausted" => StatusCode::INSUFFICIENT_STORAGE,
         "graph.overloaded" => StatusCode::TOO_MANY_REQUESTS,
-        "chironql.storage_unavailable" | "graph.slo_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
+        "chironql.storage_unavailable"
+        | "chironql.snapshot_busy"
+        | "graph.slo_unavailable"
+        | "chironql.outcome_unknown" => StatusCode::SERVICE_UNAVAILABLE,
+        "chironql.transaction_rejected" | "chironql.sql_row_precondition_failed" => {
+            StatusCode::CONFLICT
+        }
         // Everything else is a parse reject or a bad request: the caller's text
         // is wrong, and the body says exactly where.
         _ => StatusCode::BAD_REQUEST,
@@ -1711,9 +2053,24 @@ impl IntoResponse for ApiError {
             }
         };
         let status = match &error {
+            GaussError::Security(error) => {
+                use chirondb_core::security::SecurityError;
+                match error {
+                    SecurityError::Unauthenticated => StatusCode::UNAUTHORIZED,
+                    SecurityError::Forbidden => StatusCode::FORBIDDEN,
+                    SecurityError::NotFound => StatusCode::NOT_FOUND,
+                    SecurityError::Conflict => StatusCode::CONFLICT,
+                    SecurityError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+                    SecurityError::Invalid(_) => StatusCode::BAD_REQUEST,
+                    SecurityError::BudgetExceeded => StatusCode::TOO_MANY_REQUESTS,
+                }
+            }
             GaussError::CollectionNotFound(_) | GaussError::PointNotFound(_) => {
                 StatusCode::NOT_FOUND
             }
+            GaussError::DuplicateKey
+            | GaussError::CommitRejected { .. }
+            | GaussError::SqlRowPreconditionFailed { .. } => StatusCode::CONFLICT,
             GaussError::CollectionExists(_)
             | GaussError::DimensionMismatch { .. }
             | GaussError::InvalidCollectionName(_)
@@ -1722,6 +2079,7 @@ impl IntoResponse for ApiError {
             GaussError::ResourceExhausted(_) => StatusCode::INSUFFICIENT_STORAGE,
             GaussError::WalUnavailable(_)
             | GaussError::AuditUnavailable(_)
+            | GaussError::CommitOutcomeUnknown { .. }
             | GaussError::DataDirLocked { .. } => StatusCode::SERVICE_UNAVAILABLE,
             GaussError::WalCorruption { .. }
             | GaussError::SegmentCorruption { .. }
@@ -1730,6 +2088,9 @@ impl IntoResponse for ApiError {
         };
         tracing::warn!(status = status.as_u16(), error = %error, "request failed");
         let body = match &error {
+            GaussError::Security(security) => {
+                Json(json!({ "code": security.code(), "error": security.to_string() }))
+            }
             GaussError::Graph(graph) => Json(json!({
                 "error": graph.to_string(),
                 "code": graph.code.as_str(),
@@ -1737,6 +2098,24 @@ impl IntoResponse for ApiError {
                 "item_index": graph.item_index,
                 "retry_after_ms": graph.retry_after_ms,
             })),
+            GaussError::CommitRejected { transaction_id } => Json(json!({
+                "error": error.to_string(), "code": "transaction.rejected",
+                "transaction_id": transaction_id, "retryable": false,
+            })),
+            GaussError::CommitOutcomeUnknown { transaction_id } => Json(json!({
+                "error": error.to_string(),
+                "code": "transaction.outcome_unknown",
+                "transaction_id": transaction_id,
+            })),
+            GaussError::WalUnavailable(message)
+                if message.starts_with("server is shutting down") =>
+            {
+                Json(json!({
+                    "error": "server is shutting down",
+                    "code": "server.shutting_down",
+                    "retryable": true,
+                }))
+            }
             _ => Json(json!({ "error": error.to_string() })),
         };
         (status, body).into_response()
@@ -1772,9 +2151,12 @@ fn graph_http_status(code: chirondb_types::graph::GraphErrorCode) -> StatusCode 
 
 #[cfg(test)]
 mod tests {
-    use axum::response::IntoResponse;
+    use axum::{
+        extract::{Path, State},
+        response::IntoResponse,
+    };
 
-    use super::ApiError;
+    use super::{ApiError, AppState};
     use crate::{GaussError, GraphError, GraphErrorCode};
 
     #[test]
@@ -1808,5 +2190,24 @@ mod tests {
         )))
         .into_response();
         assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn transaction_status_handler_reports_expired_ids() {
+        let root = tempfile::tempdir().unwrap();
+        let state = AppState {
+            db: chirondb_core::Db::open(root.path()).unwrap(),
+            events: crate::events::EventHub::default(),
+            ws_metrics_interval: std::time::Duration::from_secs(1),
+            storage_policy: crate::security_paths::StoragePolicy::default(),
+        };
+        let transaction_id = uuid::Uuid::new_v4().to_string();
+        let Ok(axum::Json(status)) =
+            super::transaction_status(State(state), Path(transaction_id.clone())).await
+        else {
+            panic!("transaction status handler rejected a valid transaction ID");
+        };
+        assert_eq!(status.transaction_id.to_string(), transaction_id);
+        assert_eq!(status.state, chirondb_core::TransactionState::Expired);
     }
 }

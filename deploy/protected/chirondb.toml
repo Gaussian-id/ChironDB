@@ -1,0 +1,8 @@
+# Supply certificate files for the DNS name used by your clients.
+listen_http = "0.0.0.0:7401"
+listen_grpc = "0.0.0.0:7402"
+listen_wire = "0.0.0.0:7403"
+data_dir = "/var/lib/chirondb/data"
+tls_cert = "/etc/chirondb/tls/server.pem"
+tls_key = "/etc/chirondb/tls/server.key"
+encryption_keyring_file = "/etc/chirondb/secrets/storage-keyring.json"

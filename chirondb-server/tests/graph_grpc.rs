@@ -152,7 +152,7 @@ async fn lifecycle_crud_traversal_search_errors_and_audit_share_the_core_contrac
         .expect("enable")
         .into_inner();
     assert!(enabled.enabled);
-    assert!(!enabled.durable);
+    assert!(enabled.durable);
     let epoch = enabled.graph_epoch.expect("graph epoch");
 
     let configured = client
@@ -277,7 +277,7 @@ async fn lifecycle_crud_traversal_search_errors_and_audit_share_the_core_contrac
         .expect("unrelate")
         .into_inner();
     assert_eq!(deleted.deleted, 1);
-    assert!(!deleted.receipt.expect("receipt").durable);
+    assert!(deleted.receipt.expect("receipt").durable);
 
     let dropped = client
         .drop_graph(lifecycle(false))
@@ -374,7 +374,7 @@ async fn deferred_sessions_bind_absent_endpoints_over_grpc() {
         .expect("deferred upsert")
         .into_inner();
     assert_eq!(upserted.bound_endpoints, 2);
-    assert!(!upserted.receipt.expect("receipt").durable);
+    assert!(upserted.receipt.expect("receipt").durable);
 
     let committed = client
         .commit_deferred_graph_session(chiron_pb::GraphDeferredSessionRequest {

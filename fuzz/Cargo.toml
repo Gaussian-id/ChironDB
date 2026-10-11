@@ -9,8 +9,8 @@ edition = "2024"
 cargo-fuzz = true
 
 [dependencies]
-chirondb-core = { version = "=0.1.0-beta.1", path = "../chirondb-core", features = ["fuzzing"] }
-chirondb = { version = "=0.1.0-beta.1", path = "../chirondb-server" }
+chirondb-core = { version = "=0.1.0-beta.2", path = "../chirondb-core", features = ["fuzzing"] }
+chirondb = { version = "=0.1.0-beta.2", path = "../chirondb-server" }
 crc32fast = "1.5.0"
 libfuzzer-sys = "0.4"
 prost = "0.14.3"

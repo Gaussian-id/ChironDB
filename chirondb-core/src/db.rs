@@ -2,12 +2,11 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     ffi::OsString,
-    fs::{self, File},
-    io::Write,
+    fs,
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex as StdMutex, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -30,7 +29,7 @@ use crate::{
     error::{GaussError, Result},
     fs_util::{
         copy_dir_contents, directory_size, durable_create_dir, durable_remove_dir_all,
-        durable_remove_file, durable_rename, sync_directory, sync_tree,
+        durable_rename, sync_directory, sync_tree,
     },
     graph_identity::{GRAPH_IDENTITY_FILE, GraphIdentityStore},
     model::{
@@ -50,6 +49,10 @@ use crate::{
     },
     snapshot::{SnapshotCollection, SnapshotMarker, read_snapshot_marker, write_snapshot_marker},
     snapshot_journal::{self, SnapshotJournal, SnapshotPhase},
+    transaction_journal::{
+        CommittedTransaction, ProjectionKind, TransactionAudit, TransactionId, TransactionJournal,
+        TransactionStatus, TransactionTarget,
+    },
     wal::{FrozenWalArchive, Wal, WalEntry, WalRecord, prune_archives},
     wal_archive::{
         apply_wal_archive_retention, mirror_wal_archive, mirror_wal_archive_to_object_store,
@@ -61,6 +64,10 @@ use crate::{
 
 mod build_admission;
 mod build_lifecycle;
+mod candidate_reads;
+mod catalog_reads;
+pub use catalog_reads::CollectionNameSnapshot;
+mod common_frontier;
 mod generation_builder;
 mod graph_calibration;
 mod graph_pitr;
@@ -69,6 +76,36 @@ mod graph_runtime;
 mod graph_shadow;
 mod graph_snapshot;
 mod maintenance;
+mod mutation_reads;
+mod protected_backup;
+pub use protected_backup::{
+    ProtectedBackupManifest, ProtectedJournalArchiveManifest, ProtectedRestoreReceipt,
+    create_offline_protected_backup, create_offline_protected_journal_archive,
+    restore_offline_protected_backup, verify_offline_protected_backup,
+    verify_offline_protected_journal_archive,
+};
+pub(crate) mod multimodel;
+pub use multimodel::{
+    MultiModelInsertRequest, MultiModelResponse, NewRecord, NewRelation, RecordEndpoint,
+};
+mod restore_control;
+mod security_admin;
+#[cfg(test)]
+mod security_e2e;
+mod security_graph;
+mod security_graph_retrieval;
+mod security_lifecycle;
+mod security_retrieval;
+mod security_runtime;
+mod security_text;
+mod snapshot_control;
+mod transaction_recovery;
+#[cfg(test)]
+use transaction_recovery::recover_transaction_storage_projections;
+use transaction_recovery::{
+    recover_transaction_audit_projections, recover_transaction_audit_projections_after,
+    recover_transaction_storage_projections_after,
+};
 #[cfg(test)]
 mod tenant_isolation;
 mod text_retrieval;
@@ -80,6 +117,9 @@ use generation_builder::{
 use maintenance::CollectionCompactionGuard;
 
 const CATALOG_FILE: &str = "catalog.json";
+const PROTECTED_CATALOG_MAGIC: &[u8; 8] = b"CHRNCAT1";
+const INSTALLATION_CATALOG_MAGIC: &[u8; 8] = b"CHRNCAT2";
+const TRANSACTION_CATALOG_MAGIC: &[u8; 8] = b"CHRTXN01";
 const CATALOG_WAL_DIR: &str = "catalog_wal";
 const ASYNC_WAL_FLUSH_INTERVAL: Duration = Duration::from_millis(200);
 const MAX_VECTOR_DIM: usize = 65_536;
@@ -87,6 +127,32 @@ const MAX_SEARCH_K: usize = 10_000;
 const MAX_MULTI_SEARCHES: usize = 128;
 const MAX_POINT_PAYLOAD_BYTES: usize = 1024 * 1024;
 const MAX_POINT_ID_BYTES: usize = 1024;
+
+const SHUTDOWN_RUNNING: u8 = 0;
+const SHUTDOWN_DRAINING: u8 = 1;
+const SHUTDOWN_FINALIZING: u8 = 2;
+const SHUTDOWN_STOPPED: u8 = 3;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShutdownReport {
+    pub duration_ms: u64,
+    pub requests_drained: bool,
+    pub inflight_requests_remaining: usize,
+    pub background_drained: bool,
+    pub wal_flushed: bool,
+    pub audit_flushed: bool,
+    pub deadline_exceeded: bool,
+    pub fallback_required: bool,
+}
+
+#[derive(Debug, Default)]
+struct ShutdownLifecycle {
+    phase: AtomicU8,
+    cancelled: Arc<AtomicBool>,
+    coordinator: StdMutex<()>,
+    report: StdMutex<Option<ShutdownReport>>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Db {
     inner: Arc<RwLock<DbInner>>,
@@ -94,6 +160,9 @@ pub struct Db {
     graph_identity: Arc<GraphIdentityStore>,
     maintenance_barrier: Arc<RwLock<()>>,
     audit_writer: Arc<audit::AuditWriter>,
+    transaction_journal: Arc<TransactionJournal>,
+    relational: restore_control::RelationalRoot,
+    identity_authority: Option<Arc<crate::security::IdentityAuthority>>,
     /// Process-exclusive lease for the resolved data-directory identity.
     /// Arc ownership keeps the OS lock held until the final `Db` clone drops.
     _data_dir_lock: Arc<DataDirLock>,
@@ -139,6 +208,66 @@ pub struct Db {
     wal_flusher: Arc<WalFlushCoordinator>,
     build_lifecycle: Arc<build_lifecycle::BuildLifecycle>,
     graph_shadow_runtime: Arc<graph_shadow::GraphShadowRuntime>,
+    shutdown_lifecycle: Arc<ShutdownLifecycle>,
+}
+
+/// One high-level atomic relational + vector/graph mutation request.
+///
+/// Vector points and graph edges share a collection because ChironDB's graph
+/// identity is attached to collection point incarnations. SQL mutations use
+/// the native relational engine and all domains share one journal decision.
+#[derive(Clone, Debug)]
+pub struct MultiModelTransactionRequest {
+    pub sql: crate::SqlExecutionRequest,
+    pub collection: String,
+    pub points: Vec<Point>,
+    pub point_deletes: Vec<String>,
+    pub relations: Vec<crate::graph::RelateRequest>,
+    pub edge_deletes: Vec<crate::graph::EdgeToken>,
+    pub edge_updates: Vec<(crate::graph::EdgeToken, crate::graph::UpdateEdgeRequest)>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MultiModelTransactionResponse {
+    pub sql: crate::SqlExecutionResponse,
+    pub graph: crate::graph::GraphMutationReceipt,
+    pub edge_ids: Vec<crate::graph::EdgeToken>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub records: std::collections::BTreeMap<String, crate::RecordRef>,
+    #[serde(skip)]
+    publication: Option<crate::security::AccessContext>,
+}
+
+impl MultiModelTransactionResponse {
+    /// Protected adapters retain this exact policy/identity epoch until
+    /// serialization. Rebinding after authorization would admit a newer policy
+    /// that never authorized the already computed receipt.
+    pub fn publication_context(&self) -> Option<&crate::security::AccessContext> {
+        self.publication.as_ref()
+    }
+}
+
+/// A read token for a bounded multi-model query.
+///
+/// The current single-node implementation validates an installation-wide
+/// visibility frontier before publishing results. A concurrent commit makes
+/// validation fail, so callers retry instead of returning a mixture of
+/// relational, vector, and graph versions. Version retention can replace the
+/// optimistic validation behind this type without changing query surfaces.
+#[derive(Clone, Debug)]
+pub struct MultiModelReadSnapshot {
+    db: Db,
+    frontier: u64,
+}
+
+impl MultiModelReadSnapshot {
+    pub fn frontier(&self) -> u64 {
+        self.frontier
+    }
+
+    pub fn validate(&self) -> Result<bool> {
+        Ok(self.db.multimodel_visibility_frontier()? == Some(self.frontier))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,8 +281,9 @@ struct GraphBatchCommitReceipt {
     durable: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 struct UpsertExecutionReceipt {
+    created_ids: crate::search::AdmittedVec<String>,
     total: usize,
     operation_lsn: u64,
     unsafe_override_audited: bool,
@@ -170,6 +300,11 @@ enum MutationOrigin {
 struct MutationContext {
     audit: audit::AuditContext,
     origin: MutationOrigin,
+    scope: Option<crate::tenant::TenantScope>,
+    protected_create: Option<security_runtime::ProtectedCreate>,
+    protected_update: Option<crate::security::AccessContext>,
+    protected_delete: Option<crate::security::AccessContext>,
+    protected_filter: Option<crate::security::SecurityFilter>,
 }
 
 impl MutationContext {
@@ -177,6 +312,23 @@ impl MutationContext {
         Self {
             audit,
             origin: MutationOrigin::Client,
+            scope: None,
+            protected_create: None,
+            protected_update: None,
+            protected_delete: None,
+            protected_filter: None,
+        }
+    }
+
+    fn scoped(scope: &crate::tenant::TenantScope) -> Self {
+        Self {
+            audit: audit_context(scope),
+            origin: MutationOrigin::Client,
+            scope: Some(scope.clone()),
+            protected_create: None,
+            protected_update: None,
+            protected_delete: None,
+            protected_filter: None,
         }
     }
 
@@ -184,6 +336,11 @@ impl MutationContext {
         Self {
             audit: audit::AuditContext::embedded(),
             origin: MutationOrigin::LegacyReplication,
+            scope: None,
+            protected_create: None,
+            protected_update: None,
+            protected_delete: None,
+            protected_filter: None,
         }
     }
 }
@@ -244,8 +401,12 @@ impl Drop for MaintenanceGuard {
 #[derive(Debug)]
 struct WalFlushCoordinator {
     stop: Arc<AtomicBool>,
+    dirty: Arc<AtomicBool>,
     wake: Arc<(StdMutex<()>, Condvar)>,
+    flush_gate: Arc<StdMutex<()>>,
     handle: StdMutex<Option<JoinHandle<()>>>,
+    #[cfg_attr(not(test), allow(dead_code, reason = "test-only idle wake assertion"))]
+    wakeups: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl WalFlushCoordinator {
@@ -255,21 +416,57 @@ impl WalFlushCoordinator {
         maintenance: Arc<AtomicBool>,
     ) -> Arc<Self> {
         let stop = Arc::new(AtomicBool::new(false));
+        let dirty = Arc::new(AtomicBool::new(false));
         let wake = Arc::new((StdMutex::new(()), Condvar::new()));
+        let flush_gate = Arc::new(StdMutex::new(()));
         let worker_stop = Arc::clone(&stop);
+        let worker_dirty = Arc::clone(&dirty);
         let worker_wake = Arc::clone(&wake);
+        let worker_flush_gate = Arc::clone(&flush_gate);
+        let wakeups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_wakeups = Arc::clone(&wakeups);
         let handle = std::thread::Builder::new()
             .name("chirondb-wal-flusher".to_string())
             .spawn(move || {
                 loop {
                     let (lock, signal) = &*worker_wake;
-                    let guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let (_iteration_guard, _) = signal
-                        .wait_timeout(guard, ASYNC_WAL_FLUSH_INTERVAL)
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let mut guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    while !worker_stop.load(Ordering::Acquire)
+                        && !worker_dirty.load(Ordering::Acquire)
+                    {
+                        guard = signal
+                            .wait(guard)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
                     if worker_stop.load(Ordering::Acquire) {
                         break;
                     }
+                    let deadline = Instant::now() + ASYNC_WAL_FLUSH_INTERVAL;
+                    while !worker_stop.load(Ordering::Acquire) {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            break;
+                        }
+                        let (next, wait) = signal
+                            .wait_timeout(guard, remaining)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        guard = next;
+                        if wait.timed_out() {
+                            break;
+                        }
+                    }
+                    if worker_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    worker_dirty.store(false, Ordering::Release);
+                    drop(guard);
+                    // Storage I/O runs outside the wake mutex. The separate
+                    // gate lets maintenance drain an already-started flush.
+                    let _flush = worker_flush_gate
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    worker_wakeups.fetch_add(1, Ordering::AcqRel);
+                    metrics::counter!("chirondb_wal_flush_worker_wake_total").increment(1);
                     if maintenance.load(Ordering::Acquire) {
                         continue;
                     }
@@ -284,22 +481,40 @@ impl WalFlushCoordinator {
                         )
                         .increment(1);
                         tracing::error!(%error, "background WAL flush failed; writes degraded");
+                    } else {
+                        metrics::counter!("chirondb_wal_flush_worker_flush_total").increment(1);
                     }
                 }
             })
             .expect("spawn WAL flush coordinator");
         Arc::new(Self {
             stop,
+            dirty,
             wake,
+            flush_gate,
             handle: StdMutex::new(Some(handle)),
+            wakeups,
         })
     }
 
+    fn request_flush(&self) {
+        let _guard = self.wake.0.lock().unwrap_or_else(|p| p.into_inner());
+        self.dirty.store(true, Ordering::Release);
+        self.wake.1.notify_one();
+    }
+
+    #[cfg(test)]
+    fn wakeups(&self) -> usize {
+        self.wakeups.load(Ordering::Acquire)
+    }
+
     fn shutdown(&self) {
+        let guard = self.wake.0.lock().unwrap_or_else(|p| p.into_inner());
         if self.stop.swap(true, Ordering::AcqRel) {
             return;
         }
         self.wake.1.notify_all();
+        drop(guard);
         if let Some(handle) = self
             .handle
             .lock()
@@ -311,13 +526,10 @@ impl WalFlushCoordinator {
     }
 
     fn quiesce(&self) {
-        // The worker intentionally retains this mutex guard through each
-        // flush iteration. Once maintenance is set, acquiring it proves any
-        // already-started flush has finished; later iterations observe the
-        // maintenance flag and skip storage access.
+        // Maintenance is already set. This waits for an in-flight storage
+        // sync; later iterations acquire this gate and observe maintenance.
         drop(
-            self.wake
-                .0
+            self.flush_gate
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         );
@@ -390,6 +602,7 @@ struct DbInner {
 
 #[derive(Debug)]
 struct Collection {
+    security: Option<Arc<crate::security::CollectionAuthority>>,
     config: CollectionConfig,
     /// The mutable streamer: live points + their in-memory dense indexes
     /// (LS-Vec rework D1). Holds what used to be the `points` / `h2qg` /
@@ -561,21 +774,29 @@ impl Collection {
             .read_state(self.searchers.iter().map(|searcher| searcher.id.as_str()))
     }
 
-    fn resolve_in_read_state<'a>(
+    fn try_resolve_in_read_state<'a>(
         &'a self,
         state: &crate::overlay::OverlayReadState,
         id: &str,
-    ) -> Option<Cow<'a, Point>> {
-        match self.id_index.get(id)? {
-            crate::searcher::SegLoc::Streamer => self.streamer.points.get(id).map(Cow::Borrowed),
-            crate::searcher::SegLoc::Sealing => {
-                self.sealing.as_ref()?.points.get(id).map(Cow::Borrowed)
+    ) -> Result<Option<Cow<'a, Point>>> {
+        let Some(location) = self.id_index.get(id) else {
+            return Ok(None);
+        };
+        match location {
+            crate::searcher::SegLoc::Streamer => {
+                Ok(self.streamer.points.get(id).map(Cow::Borrowed))
             }
+            crate::searcher::SegLoc::Sealing => Ok(self
+                .sealing
+                .as_ref()
+                .and_then(|sealing| sealing.points.get(id))
+                .map(Cow::Borrowed)),
             crate::searcher::SegLoc::Searcher(i) => {
                 let index = *i as usize;
-                self.searchers
-                    .get(index)?
-                    .get_visible(id, state.point_tombstones(index))
+                match self.searchers.get(index) {
+                    Some(searcher) => searcher.get_visible(id, state.point_tombstones(index)),
+                    None => Ok(None),
+                }
             }
         }
     }
@@ -598,14 +819,23 @@ impl Collection {
     }
 
     /// Resolve a live point by id through the ID authority.
-    fn resolve(&self, id: &str) -> Option<Cow<'_, Point>> {
-        match self.id_index.get(id)? {
-            crate::searcher::SegLoc::Streamer => self.streamer.points.get(id).map(Cow::Borrowed),
-            crate::searcher::SegLoc::Sealing => {
-                self.sealing.as_ref()?.points.get(id).map(Cow::Borrowed)
+    fn try_resolve(&self, id: &str) -> Result<Option<Cow<'_, Point>>> {
+        let Some(location) = self.id_index.get(id) else {
+            return Ok(None);
+        };
+        match location {
+            crate::searcher::SegLoc::Streamer => {
+                Ok(self.streamer.points.get(id).map(Cow::Borrowed))
             }
+            crate::searcher::SegLoc::Sealing => Ok(self
+                .sealing
+                .as_ref()
+                .and_then(|sealing| sealing.points.get(id))
+                .map(Cow::Borrowed)),
             crate::searcher::SegLoc::Searcher(i) => {
-                let searcher = self.searchers.get(*i as usize)?;
+                let Some(searcher) = self.searchers.get(*i as usize) else {
+                    return Ok(None);
+                };
                 searcher.get_visible(
                     id,
                     self.overlays
@@ -618,12 +848,12 @@ impl Collection {
     }
 
     /// Iterate every live point (streamer first, then searchers).
-    fn iter_live(&self) -> Box<dyn Iterator<Item = Cow<'_, Point>> + '_> {
+    fn iter_live(&self) -> Box<dyn Iterator<Item = Result<Cow<'_, Point>>> + '_> {
         Box::new(
             self.streamer
                 .points
                 .values()
-                .map(Cow::Borrowed)
+                .map(|point| Ok(Cow::Borrowed(point)))
                 .chain(
                     self.sealing
                         .iter()
@@ -631,7 +861,7 @@ impl Collection {
                         .filter(|point| {
                             self.id_index.get(&point.id) == Some(&crate::searcher::SegLoc::Sealing)
                         })
-                        .map(Cow::Borrowed),
+                        .map(|point| Ok(Cow::Borrowed(point))),
                 )
                 .chain(self.searchers.iter().flat_map(|s| {
                     s.iter_visible(self.overlays.current_ref().point_tombstones().bitmap(&s.id))
@@ -642,12 +872,12 @@ impl Collection {
     fn iter_live_in_read_state<'a>(
         &'a self,
         state: &'a crate::overlay::OverlayReadState,
-    ) -> Box<dyn Iterator<Item = Cow<'a, Point>> + 'a> {
+    ) -> Box<dyn Iterator<Item = Result<Cow<'a, Point>>> + 'a> {
         Box::new(
             self.streamer
                 .points
                 .values()
-                .map(Cow::Borrowed)
+                .map(|point| Ok(Cow::Borrowed(point)))
                 .chain(
                     self.sealing
                         .iter()
@@ -655,7 +885,7 @@ impl Collection {
                         .filter(|point| {
                             self.id_index.get(&point.id) == Some(&crate::searcher::SegLoc::Sealing)
                         })
-                        .map(Cow::Borrowed),
+                        .map(|point| Ok(Cow::Borrowed(point))),
                 )
                 .chain(
                     self.searchers
@@ -710,11 +940,11 @@ impl Collection {
         &'a self,
         state: &'a crate::overlay::OverlayReadState,
         candidates: &'a crate::payload_index::PayloadCandidateSet,
-    ) -> Box<dyn Iterator<Item = Cow<'a, Point>> + 'a> {
+    ) -> Box<dyn Iterator<Item = Result<Cow<'a, Point>>> + 'a> {
         let fallback = candidates
             .fallback
             .iter()
-            .filter_map(move |id| self.resolve_in_read_state(state, id));
+            .filter_map(move |id| self.try_resolve_in_read_state(state, id).transpose());
         let sealed = candidates
             .sealed
             .iter()
@@ -727,7 +957,9 @@ impl Collection {
             })
             .flat_map(move |(index, searcher, ordinals)| {
                 ordinals.iter().filter_map(move |ordinal| {
-                    searcher.get_ordinal_visible(ordinal, state.point_tombstones(index))
+                    searcher
+                        .get_ordinal_visible(ordinal, state.point_tombstones(index))
+                        .transpose()
                 })
             });
         Box::new(fallback.chain(sealed))
@@ -735,12 +967,12 @@ impl Collection {
 
     /// Rebuild only the permanent string fallback. Current sealed V4
     /// segments are represented by their per-segment ordinal postings.
-    fn rebuild_payload_fallback(&mut self) {
-        self.payload_index = crate::payload_index::build_payload_index_iter(
+    fn rebuild_payload_fallback(&mut self) -> Result<()> {
+        self.payload_index = crate::payload_index::try_build_payload_index_iter(
             self.streamer
                 .points
                 .values()
-                .map(Cow::Borrowed)
+                .map(|point| Ok(Cow::Borrowed(point)))
                 .chain(
                     self.sealing
                         .iter()
@@ -748,7 +980,7 @@ impl Collection {
                         .filter(|point| {
                             self.id_index.get(&point.id) == Some(&crate::searcher::SegLoc::Sealing)
                         })
-                        .map(Cow::Borrowed),
+                        .map(|point| Ok(Cow::Borrowed(point))),
                 )
                 .chain(
                     self.searchers
@@ -763,7 +995,8 @@ impl Collection {
                             )
                         }),
                 ),
-        );
+        )?;
+        Ok(())
     }
 
     fn tombstone_searcher(&mut self, index: usize, id: &str) -> Result<bool> {
@@ -834,14 +1067,18 @@ impl crate::seal::VectorInput for MergeInput<'_> {
             GaussError::InvalidRequest(format!("merge input ordinal {ordinal} is out of bounds"))
         })?;
         self.collection
-            .resolve(id)
+            .try_resolve(id)?
             .ok_or_else(|| GaussError::PointNotFound(id.clone()))
     }
 }
 
 impl crate::search::PointResolver for Collection {
-    fn resolve_point(&self, id: &str) -> Option<Cow<'_, Point>> {
-        self.resolve(id)
+    fn resolve_candidate(&self, id: &str) -> Result<Option<crate::search::CandidatePoint<'_>>> {
+        candidate_reads::resolve(self, None, id)
+    }
+
+    fn resolve_point(&self, id: &str) -> Result<Option<Cow<'_, Point>>> {
+        self.try_resolve(id)
     }
 
     fn contains_point(&self, id: &str) -> bool {
@@ -855,8 +1092,12 @@ struct CollectionReadResolver<'a> {
 }
 
 impl crate::search::PointResolver for CollectionReadResolver<'_> {
-    fn resolve_point(&self, id: &str) -> Option<Cow<'_, Point>> {
-        self.collection.resolve_in_read_state(self.state, id)
+    fn resolve_candidate(&self, id: &str) -> Result<Option<crate::search::CandidatePoint<'_>>> {
+        candidate_reads::resolve(self.collection, Some(self.state), id)
+    }
+
+    fn resolve_point(&self, id: &str) -> Result<Option<Cow<'_, Point>>> {
+        self.collection.try_resolve_in_read_state(self.state, id)
     }
 
     fn contains_point(&self, id: &str) -> bool {
@@ -885,14 +1126,20 @@ use crate::{
         validate_payload_field, validate_payload_schema,
     },
     search::{
-        RankedPoint, add_scaled, fuse_rankings, fuse_search_responses, normalize, point_vector,
-        rank_order, required_point_vector, sparse_search_ranked,
+        add_scaled, fuse_rankings, fuse_search_responses, normalize, point_vector, rank_order,
+        required_point_vector, sparse_search_ranked,
     },
     sparse_index::{SparseIndex, insert_sparse_point, remove_sparse_point},
 };
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct Catalog {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    installation: Option<uuid::Uuid>,
+    #[serde(default)]
+    security_revision: u64,
+    #[serde(default)]
+    protected: std::collections::BTreeMap<String, uuid::Uuid>,
     collections: Vec<CollectionConfig>,
     #[serde(default)]
     wal_watermark: u64,
@@ -917,19 +1164,82 @@ impl Db {
         root: impl AsRef<Path>,
         cold_object_store: Option<ColdObjectStoreConfig>,
     ) -> Result<Self> {
+        Self::open_with_background_index_rebuild(root, cold_object_store, true)
+    }
+
+    /// Recover committed content for a stopped-source maintenance operation
+    /// without building the query-only mutable ANN index from its WAL tail.
+    fn open_for_offline_maintenance(root: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_background_index_rebuild(root, None, false)
+    }
+
+    fn open_with_background_index_rebuild(
+        root: impl AsRef<Path>,
+        cold_object_store: Option<ColdObjectStoreConfig>,
+        rebuild_indexes: bool,
+    ) -> Result<Self> {
         let data_dir_lock = Arc::new(DataDirLock::acquire(root.as_ref())?);
         let data_dir = data_dir_lock.root().to_path_buf();
-        recover_interrupted_generation_restore(&data_dir, cold_object_store.as_ref())?;
+        crate::security::onboarding::validate_identity_ready(&data_dir)?;
+        TransactionJournal::validate_existing_format(&data_dir)?;
+        if crate::security::onboarding::has_common_frontier(&data_dir)? {
+            // Protected installations cannot perform native content rollback.
+            // Refuse an unexpected restore journal before it can change CURRENT.
+            if restore_journal::read(&data_dir)?.is_some() {
+                return Err(GaussError::WalCorruption {
+                    path: data_dir.display().to_string(),
+                    message: "native restore journal conflicts with common frontier authority"
+                        .into(),
+                });
+            }
+        } else {
+            recover_interrupted_generation_restore(&data_dir, cold_object_store.as_ref())?;
+        }
         let layout = crate::storage_layout::resolve(&data_dir)?;
-        let root = layout.active_root;
+        if layout.generation.is_none() && data_dir.join("security").try_exists()? {
+            return Err(crate::security::SecurityError::Invalid(
+                "identity authority requires offline migration to content generations".into(),
+            )
+            .into());
+        }
+        let validated_frontier = common_frontier::preflight(&data_dir, &layout)?;
+        let root = layout.active_root.clone();
         recover_interrupted_restore(&root, cold_object_store.as_ref())?;
+        Wal::cleanup_pins_on_exclusive_startup(&data_dir, &root)?;
         fs::create_dir_all(collections_dir(&root))?;
+
+        // Install the old-reader guard before the first journal marker or
+        // journal frame can be written. A crash at any later activation
+        // boundary therefore leaves legacy binaries unable to mutate this
+        // directory.
+        activate_transaction_catalog_guard(&root)?;
+        let transaction_journal =
+            TransactionJournal::open_with_root_lease(&data_dir, Arc::clone(&data_dir_lock))?;
+        let (root, common_frontier) = common_frontier::recover(
+            &data_dir,
+            &layout,
+            &transaction_journal,
+            cold_object_store.as_ref(),
+            validated_frontier,
+        )?;
+        crate::relational::RelationalEngine::ensure_storage(&root)?;
+        recover_transaction_storage_projections_after(
+            &transaction_journal,
+            &root,
+            common_frontier,
+        )?;
+        let relational =
+            crate::relational::RelationalEngine::open(&root, Arc::clone(&transaction_journal))?;
 
         let LoadedDbRoot {
             catalog_wal,
             collections,
             catalog_replayed,
-        } = load_db_root(&root, cold_object_store.as_ref())?;
+        } = load_db_root_with_journal(
+            &root,
+            cold_object_store.as_ref(),
+            transaction_journal.storage_projection_authority()?,
+        )?;
         // A snapshot's first activation is an import. Once identity exists,
         // legitimate live mutations may have advanced beyond its old marker.
         if !data_dir.join(GRAPH_IDENTITY_FILE).try_exists()? {
@@ -957,7 +1267,43 @@ impl Db {
             let watermark = recovered.catalog_wal.len()?;
             recovered.catalog_wal.drop_prefix(watermark)?;
         }
-        let audit_writer = audit::AuditWriter::open(&data_dir)?;
+        let audit_writer =
+            audit::AuditWriter::open_with_journal(&data_dir, Arc::clone(&transaction_journal))?;
+        recover_transaction_audit_projections_after(
+            &transaction_journal,
+            &audit_writer,
+            common_frontier,
+        )?;
+        let identity_authority = crate::security::IdentityAuthority::open_with_audit(
+            &data_dir,
+            Arc::clone(&audit_writer),
+            Arc::clone(&data_dir_lock),
+        )?;
+        let installation = read_catalog(&root)?.installation;
+        if installation
+            != identity_authority
+                .as_ref()
+                .and_then(|a| a.installation_id())
+        {
+            return Err(crate::security::SecurityError::Unavailable.into());
+        }
+        // open_with_audit already validates the versioned installation marker
+        // against this authority; the catalog comparison above binds content.
+        if identity_authority.is_none()
+            && inner
+                .read()
+                .collections
+                .values()
+                .any(|collection| collection.read().security.is_some())
+        {
+            return Err(crate::security::SecurityError::Unavailable.into());
+        }
+        if identity_authority.is_some() && layout.generation.is_none() {
+            return Err(crate::security::SecurityError::Invalid(
+                "identity authority requires offline migration to content generations".into(),
+            )
+            .into());
+        }
         let durability_degraded = Arc::new(AtomicBool::new(false));
         let maintenance = Arc::new(AtomicBool::new(false));
         let wal_flusher = WalFlushCoordinator::spawn(
@@ -972,6 +1318,9 @@ impl Db {
             _data_dir_lock: data_dir_lock,
             maintenance_barrier: Arc::new(RwLock::new(())),
             audit_writer,
+            transaction_journal,
+            relational: restore_control::root(relational)?,
+            identity_authority,
             default_with_payload: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             search_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             intra_query_parallel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -987,8 +1336,16 @@ impl Db {
             wal_flusher,
             build_lifecycle: build_lifecycle::BuildLifecycle::new(),
             graph_shadow_runtime: graph_shadow::GraphShadowRuntime::new(),
+            shutdown_lifecycle: Arc::new(ShutdownLifecycle::default()),
         };
-        db.rebuild_recovered_streamer_indexes();
+        let checkpoint_lease: Arc<dyn Send + Sync + std::fmt::Debug> = db._data_dir_lock.clone();
+        db.relational
+            .read()
+            .enable_background_checkpoints(checkpoint_lease);
+        metrics::gauge!("chirondb_shutdown_phase").set(f64::from(SHUTDOWN_RUNNING));
+        if rebuild_indexes {
+            db.rebuild_recovered_streamer_indexes();
+        }
         db.resume_graph_handle_backfills();
         db.refresh_metrics();
         Ok(db)
@@ -1114,15 +1471,1286 @@ impl Db {
     pub fn durability_ready(&self) -> bool {
         !self.durability_degraded.load(Ordering::Acquire)
             && !self.maintenance.load(Ordering::Acquire)
+            && !self.is_shutting_down()
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutdown_lifecycle.phase.load(Ordering::Acquire) != SHUTDOWN_RUNNING
+    }
+
+    pub fn begin_shutdown(&self) -> bool {
+        let started = self
+            .shutdown_lifecycle
+            .phase
+            .compare_exchange(
+                SHUTDOWN_RUNNING,
+                SHUTDOWN_DRAINING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        if started {
+            self.build_lifecycle.cancel();
+            metrics::gauge!("chirondb_shutdown_phase").set(f64::from(SHUTDOWN_DRAINING));
+        }
+        started
+    }
+
+    /// Cooperatively cancel work that did not finish during the protocol
+    /// drain window. Admission is already closed by [`Self::begin_shutdown`].
+    pub fn cancel_shutdown_work(&self) {
+        self.shutdown_lifecycle
+            .cancelled
+            .store(true, Ordering::Release);
+    }
+
+    /// Stop background admission and finalize durable projections within the
+    /// caller's process-level deadline. A protected acknowledged commit is
+    /// already authoritative in the canonical transaction journal; timeout
+    /// therefore reports that restart recovery is required instead of waiting
+    /// indefinitely for a derived projection or index build.
+    pub fn shutdown(&self, deadline: Instant) -> ShutdownReport {
+        self.begin_shutdown();
+        self.cancel_shutdown_work();
+        let _coordinator = self
+            .shutdown_lifecycle
+            .coordinator
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(report) = self
+            .shutdown_lifecycle
+            .report
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            return report;
+        }
+
+        let started = Instant::now();
+        self.shutdown_lifecycle
+            .phase
+            .store(SHUTDOWN_FINALIZING, Ordering::Release);
+        metrics::gauge!("chirondb_shutdown_phase").set(f64::from(SHUTDOWN_FINALIZING));
+
+        while self.search_inflight() != 0 && Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
+        }
+        let inflight_requests_remaining = self.search_inflight();
+        let requests_drained = inflight_requests_remaining == 0;
+        metrics::gauge!("chirondb_shutdown_inflight_requests")
+            .set(inflight_requests_remaining as f64);
+        let drain_budget = deadline.saturating_duration_since(Instant::now());
+        let builds_drained = self.build_lifecycle.cancel_and_drain(drain_budget);
+        while !self
+            .compactions_in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+            && Instant::now() < deadline
+        {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
+        }
+        let compactions_drained = self
+            .compactions_in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty();
+        let relational_drained = self.relational.read().cancel_and_drain_checkpoint(deadline);
+        let background_drained = builds_drained && compactions_drained && relational_drained;
+        self.wal_flusher.shutdown();
+        let wal_flushed = Instant::now() < deadline && self.flush_wals().is_ok();
+        let frontier_flushed = background_drained
+            && wal_flushed
+            && Instant::now() < deadline
+            && self.checkpoint_common_frontier(deadline).is_ok();
+        let audit_flushed = Instant::now() < deadline
+            && crate::relational::with_sql_deadline(deadline, || {
+                self.audit_writer.flush_and_shutdown()
+            })
+            .is_ok();
+        let deadline_exceeded = Instant::now() >= deadline;
+        let fallback_required = deadline_exceeded
+            || !requests_drained
+            || !background_drained
+            || !wal_flushed
+            || !audit_flushed
+            || !frontier_flushed;
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let report = ShutdownReport {
+            duration_ms,
+            requests_drained,
+            inflight_requests_remaining,
+            background_drained,
+            wal_flushed,
+            audit_flushed,
+            deadline_exceeded,
+            fallback_required,
+        };
+        *self
+            .shutdown_lifecycle
+            .report
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(report.clone());
+        self.shutdown_lifecycle
+            .phase
+            .store(SHUTDOWN_STOPPED, Ordering::Release);
+        metrics::gauge!("chirondb_shutdown_phase").set(f64::from(SHUTDOWN_STOPPED));
+        metrics::gauge!("chirondb_shutdown_inflight_requests").set(self.search_inflight() as f64);
+        metrics::histogram!("chirondb_shutdown_duration_seconds")
+            .record(started.elapsed().as_secs_f64());
+        let outcome = if deadline_exceeded || !requests_drained || !background_drained {
+            "deadline"
+        } else if !wal_flushed || !audit_flushed || !frontier_flushed {
+            "error"
+        } else {
+            "clean"
+        };
+        metrics::counter!(
+            "chirondb_shutdown_total",
+            "outcome" => outcome
+        )
+        .increment(1);
+        report
     }
 
     fn ensure_storage_mutations_available(&self) -> Result<()> {
+        self.ensure_request_admission()?;
         if self.maintenance.load(Ordering::Acquire) {
             return Err(GaussError::WalUnavailable(
                 "storage maintenance is active; mutations are read-only until recovery".to_string(),
             ));
         }
+        if self.durability_degraded.load(Ordering::Acquire) {
+            return Err(GaussError::WalUnavailable(
+                "storage or audit projection is degraded; mutations remain read-only until restart recovery completes"
+                    .to_string(),
+            ));
+        }
         Ok(())
+    }
+
+    fn ensure_request_admission(&self) -> Result<()> {
+        if self.is_shutting_down() {
+            return Err(GaussError::WalUnavailable(
+                "server is shutting down; retry against a ready instance".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn transaction_status(&self, transaction_id: &str) -> Result<TransactionStatus> {
+        Ok(self.transaction_journal.status(transaction_id.parse()?))
+    }
+
+    /// Reconcile a protected transaction without revealing another
+    /// principal's transaction IDs or commit metadata.
+    pub fn transaction_status_authorized(
+        &self,
+        identity: &crate::security::AuthenticatedIdentity,
+        transaction_id: &str,
+    ) -> Result<TransactionStatus> {
+        self.ensure_current_identity(identity)?;
+        let transaction_id = transaction_id.parse()?;
+        self.transaction_journal
+            .status_for_owner(
+                transaction_id,
+                &identity.principal().id,
+                &identity.principal().tenant,
+            )?
+            .ok_or_else(|| crate::security::SecurityError::NotFound.into())
+    }
+
+    /// Stable installation-wide visibility frontier for a multi-model read.
+    /// `None` means a durable transaction is still publishing a storage
+    /// projection and the caller must not publish a cross-engine result.
+    pub fn multimodel_visibility_frontier(&self) -> Result<Option<u64>> {
+        if self.maintenance.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        self.transaction_journal.stable_visibility_frontier()
+    }
+
+    pub fn begin_multimodel_read(&self) -> Result<Option<MultiModelReadSnapshot>> {
+        Ok(self
+            .multimodel_visibility_frontier()?
+            .map(|frontier| MultiModelReadSnapshot {
+                db: self.clone(),
+                frontier,
+            }))
+    }
+
+    pub fn execute_sql(
+        &self,
+        request: crate::SqlExecutionRequest,
+    ) -> Result<crate::SqlExecutionResponse> {
+        self.execute_sql_owned(request)
+            .map(crate::SqlResponse::into_dto)
+    }
+
+    /// Retain typed SQL output memory until consumption or transport encoding.
+    pub fn execute_sql_owned(
+        &self,
+        request: crate::SqlExecutionRequest,
+    ) -> Result<crate::SqlResponse> {
+        self.execute_sql_with_audit_owned(request, &crate::audit::AuditContext::embedded())
+    }
+
+    pub fn execute_sql_with_audit(
+        &self,
+        request: crate::SqlExecutionRequest,
+        audit_context: &crate::audit::AuditContext,
+    ) -> Result<crate::SqlExecutionResponse> {
+        self.execute_sql_with_audit_owned(request, audit_context)
+            .map(crate::SqlResponse::into_dto)
+    }
+
+    /// Retain typed SQL output memory until consumption or transport encoding.
+    pub fn execute_sql_with_audit_owned(
+        &self,
+        request: crate::SqlExecutionRequest,
+        audit_context: &crate::audit::AuditContext,
+    ) -> Result<crate::SqlResponse> {
+        self.ensure_request_admission()?;
+        let _inflight = SearchInflightGuard::new(Arc::clone(&self.search_inflight));
+        if !crate::RelationalEngine::request_is_read_only(&request)? {
+            self.ensure_storage_mutations_available()?;
+        }
+        let _lifecycle = self.lifecycle_gate.read();
+        let execution = self.relational.read().execute_with_audit_cancellable(
+            request,
+            audit_context,
+            Arc::clone(&self.shutdown_lifecycle.cancelled),
+        )?;
+        if let Some(error) = execution.projection_error.as_ref() {
+            self.mark_durability_degraded("relational_storage_projection", error);
+        }
+        if let Some(transaction) = execution.committed.as_ref() {
+            self.project_transaction_audit(transaction);
+        }
+        Ok(execution.into_output())
+    }
+
+    pub fn execute_sql_with_audit_cancellable(
+        &self,
+        request: crate::SqlExecutionRequest,
+        audit_context: &crate::audit::AuditContext,
+        cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<crate::SqlExecutionResponse> {
+        self.execute_sql_with_audit_cancellable_owned(request, audit_context, cancellation)
+            .map(crate::SqlResponse::into_dto)
+    }
+
+    /// Retain typed SQL output memory until consumption or transport encoding.
+    pub fn execute_sql_with_audit_cancellable_owned(
+        &self,
+        request: crate::SqlExecutionRequest,
+        audit_context: &crate::audit::AuditContext,
+        cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<crate::SqlResponse> {
+        self.ensure_request_admission()?;
+        let _inflight = SearchInflightGuard::new(Arc::clone(&self.search_inflight));
+        if !crate::RelationalEngine::request_is_read_only(&request)? {
+            self.ensure_storage_mutations_available()?;
+        }
+        let _lifecycle = self.lifecycle_gate.read();
+        let execution = self.relational.read().execute_with_audit_cancellable(
+            request,
+            audit_context,
+            cancellation,
+        )?;
+        if let Some(error) = execution.projection_error.as_ref() {
+            self.mark_durability_degraded("relational_storage_projection", error);
+        }
+        if let Some(transaction) = execution.committed.as_ref() {
+            self.project_transaction_audit(transaction);
+        }
+        Ok(execution.into_output())
+    }
+
+    /// Execute SQL through the durable protected authority. Authorization,
+    /// tenant resolution, constraint dependencies, and the commit happen
+    /// under one identity publication permit; adapters must still acquire a
+    /// fresh permit when publishing the returned value.
+    pub fn execute_sql_authorized(
+        &self,
+        identity: &crate::security::AuthenticatedIdentity,
+        request: crate::SqlExecutionRequest,
+        transport: &str,
+    ) -> Result<crate::SqlExecutionResponse> {
+        self.execute_sql_authorized_owned(identity, request, transport)
+            .map(crate::SqlResponse::into_dto)
+    }
+
+    /// Retain typed SQL output memory until consumption or transport encoding.
+    pub fn execute_sql_authorized_owned(
+        &self,
+        identity: &crate::security::AuthenticatedIdentity,
+        request: crate::SqlExecutionRequest,
+        transport: &str,
+    ) -> Result<crate::SqlResponse> {
+        self.ensure_request_admission()?;
+        let _inflight = SearchInflightGuard::new(Arc::clone(&self.search_inflight));
+        self.ensure_current_identity(identity)?;
+        if !crate::RelationalEngine::request_is_read_only(&request)? {
+            self.ensure_storage_mutations_available()?;
+        }
+        // Fresh executions authorize each statement against the evolving
+        // private catalog; retries reauthorize their saved receipt scope.
+        let _permit = identity.publication_permit()?;
+        let _lifecycle = self.lifecycle_gate.read();
+        let audit_context = crate::audit::AuditContext {
+            principal_id: identity.principal().id.clone(),
+            tenant_id: Some(identity.principal().tenant.clone()),
+            transport: transport.to_string(),
+            request_id: request.retry_id.clone(),
+        };
+        let execution = self
+            .relational
+            .read()
+            .execute_authorized_with_audit_cancellable(
+                request,
+                &audit_context,
+                Arc::clone(&self.shutdown_lifecycle.cancelled),
+                self,
+                identity,
+            )?;
+        if let Some(error) = execution.projection_error.as_ref() {
+            self.mark_durability_degraded("relational_storage_projection", error);
+        }
+        if let Some(transaction) = execution.committed.as_ref() {
+            self.project_transaction_audit(transaction);
+        }
+        Ok(execution.into_output())
+    }
+
+    /// Add request cancellation while retaining protected authority and shutdown checks.
+    pub fn execute_sql_authorized_cancellable(
+        &self,
+        identity: &crate::security::AuthenticatedIdentity,
+        request: crate::SqlExecutionRequest,
+        transport: &str,
+        cancellation: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<crate::SqlExecutionResponse> {
+        self.execute_sql_authorized_cancellable_owned(identity, request, transport, cancellation)
+            .map(crate::SqlResponse::into_dto)
+    }
+
+    /// Retain typed SQL output memory until consumption or transport encoding.
+    pub fn execute_sql_authorized_cancellable_owned(
+        &self,
+        identity: &crate::security::AuthenticatedIdentity,
+        request: crate::SqlExecutionRequest,
+        transport: &str,
+        cancellation: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<crate::SqlResponse> {
+        crate::relational::with_sql_cancellation(cancellation, || {
+            self.execute_sql_authorized_owned(identity, request, transport)
+        })
+    }
+
+    /// Preflight a protected SQL request without executing it. Multi-model
+    /// planners use this to authorize every resource before any stage reads.
+    pub fn authorize_sql_request(
+        &self,
+        identity: &crate::security::AuthenticatedIdentity,
+        request: &crate::SqlExecutionRequest,
+    ) -> Result<()> {
+        self.ensure_current_identity(identity)?;
+        let _permit = self
+            .relational
+            .read()
+            .authorize_request(identity, request)?;
+        Ok(())
+    }
+
+    fn ensure_current_identity(
+        &self,
+        identity: &crate::security::AuthenticatedIdentity,
+    ) -> Result<()> {
+        if self
+            .identity_authority
+            .as_ref()
+            .is_some_and(|authority| authority.accepts(identity))
+        {
+            Ok(())
+        } else {
+            Err(crate::security::SecurityError::Unauthenticated.into())
+        }
+    }
+
+    /// Embedded DTO handoff; use the owned form to retain the engine budget.
+    pub fn execute_multimodel_transaction(
+        &self,
+        request: MultiModelTransactionRequest,
+        scope: &crate::tenant::TenantScope,
+        audit_context: &crate::audit::AuditContext,
+    ) -> Result<MultiModelTransactionResponse> {
+        self.execute_multimodel_transaction_owned(request, scope, audit_context)
+            .map(MultiModelResponse::into_dto)
+    }
+    pub fn execute_multimodel_transaction_with_sql_rows(
+        &self,
+        request: MultiModelTransactionRequest,
+        scope: &crate::tenant::TenantScope,
+        audit_context: &crate::audit::AuditContext,
+        expected_sql_rows: Option<u64>,
+    ) -> Result<MultiModelTransactionResponse> {
+        self.execute_multimodel_transaction_with_sql_rows_owned(
+            request,
+            scope,
+            audit_context,
+            expected_sql_rows,
+        )
+        .map(MultiModelResponse::into_dto)
+    }
+    pub fn execute_multimodel_transaction_authorized(
+        &self,
+        identity: &crate::security::AuthenticatedIdentity,
+        vector_context: &crate::security::AccessContext,
+        graph_context: &crate::security::AccessContext,
+        request: MultiModelTransactionRequest,
+        transport: &str,
+    ) -> Result<MultiModelTransactionResponse> {
+        self.execute_multimodel_transaction_authorized_owned(
+            identity,
+            vector_context,
+            graph_context,
+            request,
+            transport,
+        )
+        .map(MultiModelResponse::into_dto)
+    }
+    pub fn execute_multimodel_transaction_authorized_with_sql_rows(
+        &self,
+        identity: &crate::security::AuthenticatedIdentity,
+        vector_context: &crate::security::AccessContext,
+        graph_context: &crate::security::AccessContext,
+        request: MultiModelTransactionRequest,
+        transport: &str,
+        expected_sql_rows: Option<u64>,
+    ) -> Result<MultiModelTransactionResponse> {
+        self.execute_multimodel_transaction_authorized_with_sql_rows_owned(
+            identity,
+            vector_context,
+            graph_context,
+            request,
+            transport,
+            expected_sql_rows,
+        )
+        .map(MultiModelResponse::into_dto)
+    }
+
+    pub fn execute_multimodel_transaction_owned(
+        &self,
+        request: MultiModelTransactionRequest,
+        scope: &crate::tenant::TenantScope,
+        audit_context: &crate::audit::AuditContext,
+    ) -> Result<MultiModelResponse> {
+        self.execute_multimodel_transaction_with_sql_rows_owned(request, scope, audit_context, None)
+    }
+
+    /// Require the total directly affected SQL DML row count before the durable
+    /// decision. Vector, graph, and cascading SQL rows are excluded. `None`
+    /// preserves the existing transaction and idempotency fingerprint.
+    pub fn execute_multimodel_transaction_with_sql_rows_owned(
+        &self,
+        request: MultiModelTransactionRequest,
+        scope: &crate::tenant::TenantScope,
+        audit_context: &crate::audit::AuditContext,
+        expected_sql_rows: Option<u64>,
+    ) -> Result<MultiModelResponse> {
+        let _lifecycle = self.lifecycle_gate.read();
+        self.ensure_storage_mutations_available()?;
+        let collection_ref = self.get_coll(&request.collection)?;
+        let claim =
+            match self.admit_multimodel(&request, audit_context, None, None, expected_sql_rows)? {
+                Some(crate::transaction_journal::IdempotencyAdmission::Replay(receipt)) => {
+                    return self.replay_multimodel(receipt, None);
+                }
+                Some(crate::transaction_journal::IdempotencyAdmission::Execute(claim)) => {
+                    Some(claim)
+                }
+                None => None,
+            };
+        let _admission = self.maintenance_barrier.read();
+        let mut collection = collection_ref.write();
+        let result = self.execute_multimodel_transaction_locked(
+            request,
+            scope,
+            audit_context,
+            &mut collection,
+            None,
+            (claim.is_some() || expected_sql_rows.is_some()).then_some(multimodel::CommitOptions {
+                claim: claim.as_ref(),
+                authorization: None,
+                insert: None,
+                decision_started: None,
+                expected_sql_rows,
+                references: None,
+            }),
+        );
+        drop(collection);
+        self.refresh_metrics();
+        result
+    }
+
+    /// Execute an UPDATE or DELETE across relational, vector, and graph state
+    /// under the protected authority's generation/revision commit lease.
+    pub fn execute_multimodel_transaction_authorized_owned(
+        &self,
+        identity: &crate::security::AuthenticatedIdentity,
+        vector_context: &crate::security::AccessContext,
+        graph_context: &crate::security::AccessContext,
+        request: MultiModelTransactionRequest,
+        transport: &str,
+    ) -> Result<MultiModelResponse> {
+        self.execute_multimodel_transaction_authorized_with_sql_rows_owned(
+            identity,
+            vector_context,
+            graph_context,
+            request,
+            transport,
+            None,
+        )
+    }
+
+    /// Protected revision predicates can guard all projections by requiring
+    /// the directly affected SQL row count before the durable decision.
+    pub fn execute_multimodel_transaction_authorized_with_sql_rows_owned(
+        &self,
+        identity: &crate::security::AuthenticatedIdentity,
+        vector_context: &crate::security::AccessContext,
+        graph_context: &crate::security::AccessContext,
+        mut request: MultiModelTransactionRequest,
+        transport: &str,
+        expected_sql_rows: Option<u64>,
+    ) -> Result<MultiModelResponse> {
+        self.ensure_current_identity(identity)?;
+        self.ensure_storage_mutations_available()?;
+        if vector_context.identity().credential_id() != identity.credential_id()
+            || graph_context.identity().credential_id() != identity.credential_id()
+            || vector_context.collection() != request.collection
+            || graph_context.collection() != request.collection
+            || vector_context.tenant() != identity.principal().tenant
+            || graph_context.tenant() != identity.principal().tenant
+            || graph_context.action() != crate::security::Action::GraphWrite
+            || !matches!(
+                vector_context.action(),
+                crate::security::Action::Update | crate::security::Action::Delete
+            )
+        {
+            return Err(crate::security::SecurityError::Forbidden.into());
+        }
+        for statement in &request.sql.statements {
+            let kind = crate::RelationalEngine::analyze_statement(&statement.sql)?.kind;
+            if !matches!(
+                kind,
+                crate::SqlStatementKind::Update | crate::SqlStatementKind::Delete
+            ) {
+                return Err(crate::security::SecurityError::Forbidden.into());
+            }
+        }
+        let audit_context = crate::audit::AuditContext {
+            principal_id: identity.principal().id.clone(),
+            tenant_id: Some(identity.principal().tenant.clone()),
+            transport: transport.into(),
+            request_id: request.sql.retry_id.clone(),
+        };
+        let claim = match self.admit_multimodel(
+            &request,
+            &audit_context,
+            Some(vector_context.action()),
+            Some(identity),
+            expected_sql_rows,
+        )? {
+            Some(crate::transaction_journal::IdempotencyAdmission::Replay(receipt)) => {
+                return self.replay_multimodel(
+                    receipt,
+                    Some((identity, &request.collection, vector_context.action())),
+                );
+            }
+            Some(crate::transaction_journal::IdempotencyAdmission::Execute(claim)) => Some(claim),
+            None => None,
+        };
+        let _sql_permit = self
+            .relational
+            .read()
+            .authorize_request(identity, &request.sql)?;
+        graph_context.publication_permit()?;
+        let _lifecycle = self.lifecycle_gate.read();
+        let _admission = self.maintenance_barrier.read();
+        let collection_ref = self.get_coll_authorized(vector_context)?;
+        let mut collection = collection_ref.write();
+        let authority = collection
+            .security
+            .clone()
+            .ok_or(crate::security::SecurityError::Unavailable)?;
+
+        let authorization =
+            self.authorize_multimodel(&request, &collection, vector_context, graph_context)?;
+        let mut retired = Vec::new();
+        if vector_context.action() == crate::security::Action::Update {
+            if !request.point_deletes.is_empty() {
+                return Err(crate::security::SecurityError::Forbidden.into());
+            }
+            let mut seen = HashSet::new();
+            for point in &mut request.points {
+                if !seen.insert(point.id.clone()) {
+                    return Err(GaussError::InvalidRequest("duplicate update target".into()));
+                }
+                let public_id = point.id.clone();
+                let record = vector_context.authorize(&public_id)?;
+                graph_context.authorize(&public_id)?;
+                let physical = record.storage_id.to_string();
+                let old = collection
+                    .try_resolve(&physical)?
+                    .ok_or(crate::security::SecurityError::Unavailable)?;
+                vector_context.authorize_payload_change(
+                    &public_id,
+                    &old.payload,
+                    &point.payload,
+                )?;
+                if old.vector != point.vector {
+                    vector_context.authorize_representation_write(&public_id, "dense")?;
+                }
+                if old.sparse_vector != point.sparse_vector {
+                    vector_context.authorize_representation_write(&public_id, "sparse")?;
+                }
+                for name in old
+                    .vectors
+                    .keys()
+                    .chain(point.vectors.keys())
+                    .collect::<HashSet<_>>()
+                {
+                    if old.vectors.get(name) != point.vectors.get(name) {
+                        vector_context.authorize_representation_write(&public_id, name)?;
+                    }
+                }
+                point.id = physical;
+                validate_point(&collection.config, point)?;
+            }
+        } else {
+            if !request.points.is_empty() {
+                return Err(crate::security::SecurityError::Forbidden.into());
+            }
+            for point_id in &mut request.point_deletes {
+                let record = vector_context.authorize(point_id)?;
+                graph_context.authorize(point_id)?;
+                retired.push(record.key.clone());
+                *point_id = record.storage_id.to_string();
+            }
+        }
+        for relation in &mut request.relations {
+            relation.source_point_id = graph_context
+                .authorize(&relation.source_point_id)?
+                .storage_id
+                .to_string();
+            relation.target_point_id = graph_context
+                .authorize(&relation.target_point_id)?
+                .storage_id
+                .to_string();
+        }
+        let scope = crate::tenant::TenantScope::system();
+        let incarnation = vector_context.incarnation();
+        let expected_revision = vector_context.policy_revision();
+        let decision_started = AtomicBool::new(false);
+        let run = |security: crate::security::SecurityDelta,
+                   request: MultiModelTransactionRequest,
+                   collection: &mut Collection,
+                   references: &crate::security::DataReferenceAuthorization<'_>|
+         -> Result<MultiModelResponse> {
+            self.execute_multimodel_transaction_locked(
+                request,
+                &scope,
+                &audit_context,
+                collection,
+                Some((security, &identity.principal().tenant)),
+                Some(multimodel::CommitOptions {
+                    claim: claim.as_ref(),
+                    authorization: Some(&authorization),
+                    insert: None,
+                    decision_started: Some(&decision_started),
+                    expected_sql_rows,
+                    references: Some(references),
+                }),
+            )
+        };
+        let result = authority.data_transaction(
+            vector_context,
+            &retired,
+            &decision_started,
+            |bindings, previous, generation, revision, references| {
+                run(
+                    crate::security::SecurityDelta {
+                        incarnation,
+                        expected_revision,
+                        revision,
+                        expected_generation: previous,
+                        generation,
+                        policy: None,
+                        bindings: bindings.to_vec(),
+                    },
+                    request,
+                    &mut collection,
+                    references,
+                )
+            },
+        );
+        let result = result.and_then(|mut response| {
+            response.set_publication(authority.bind(
+                identity,
+                vector_context.tenant(),
+                vector_context.action(),
+            )?);
+            Ok(response)
+        });
+        drop(collection);
+        self.refresh_metrics();
+        result
+    }
+
+    fn execute_multimodel_transaction_locked(
+        &self,
+        request: MultiModelTransactionRequest,
+        scope: &crate::tenant::TenantScope,
+        audit_context: &crate::audit::AuditContext,
+        collection: &mut Collection,
+        protected: Option<(crate::security::SecurityDelta, &str)>,
+        idempotency: Option<multimodel::CommitOptions<'_>>,
+    ) -> Result<MultiModelResponse> {
+        let (security, protected_tenant) = protected.map_or((None, None), |(security, tenant)| {
+            (Some(security), Some(tenant))
+        });
+        let (graph_batch, edge_ids) = self.build_multimodel_graph_batch_locked(
+            collection,
+            graph_runtime::MultiModelGraphMutations {
+                points: request.points,
+                point_deletes: request.point_deletes,
+                relations: request.relations,
+                edge_deletes: request.edge_deletes,
+                edge_updates: request.edge_updates,
+            },
+            scope,
+        )?;
+        let record_lsn = collection.wal.len()?;
+        let prepared_graph = prepare_graph_batch(
+            &collection.config,
+            &collection.streamer,
+            collection.sealing.as_deref(),
+            &collection.searchers,
+            &collection.id_index,
+            record_lsn,
+            collection.graph_lifecycle,
+            &collection.graph_resolver,
+            &collection.graph_mutable,
+            &graph_batch,
+        )?;
+        let graph_epoch = graph_batch.graph_epoch;
+        let projection = crate::wal::MultiModelCollectionBatch {
+            collection: request.collection.clone(),
+            batch: graph_batch,
+            security,
+        };
+        // Reserve and copy response bindings before the durable decision. The
+        // SQL output is adopted separately without releasing its reservation.
+        let metadata = multimodel::ResponseMetadata::prepare(
+            &edge_ids,
+            idempotency
+                .as_ref()
+                .and_then(|options| options.insert)
+                .map(|insert| insert.bindings),
+        )?;
+        let mut operation_lsn = None;
+        let execution = self.relational.read().execute_multimodel_with_projection(
+            request.sql,
+            vec![projection],
+            audit_context,
+            protected_tenant,
+            idempotency.as_ref().map(|options| multimodel::CommitReceipt {
+                claim: options.claim, authorization: options.authorization, graph_epoch,
+                edge_ids: &edge_ids, insert: options.insert,
+                decision_started: options.decision_started,
+                expected_sql_rows: options.expected_sql_rows,
+                references: options.references,
+            }),
+            |transaction_id, projections| {
+                let [projection] = projections else {
+                    return Err(GaussError::WalUnavailable(
+                        "multi-model runtime currently requires one collection projection"
+                            .to_string(),
+                    ));
+                };
+                crate::failpoint::check("multi_model.before_collection_projection")?;
+                let entry = projection
+                    .security
+                    .clone()
+                    .map(|security| WalEntry::ProtectedBatch {
+                        batch: crate::security::ProtectedBatch {
+                            version: crate::security::SECURITY_VERSION,
+                            security,
+                            content: crate::security::ProtectedContent::Graph {
+                                batch: projection.batch.clone(),
+                            },
+                        },
+                    })
+                    .unwrap_or_else(|| WalEntry::GraphBatch {
+                        batch: projection.batch.clone(),
+                    });
+                let lsn = collection.wal.append(&WalEntry::TransactionApply {
+                    transaction_id,
+                    entry: Box::new(entry),
+                })?;
+                operation_lsn = Some(lsn);
+                crate::failpoint::check("multi_model.after_collection_wal")?;
+                let Collection {
+                    streamer,
+                    sealing,
+                    searchers,
+                    id_index,
+                    graph_resolver,
+                    graph_mutable,
+                    sparse_index,
+                    payload_index,
+                    overlays,
+                    ..
+                } = &mut *collection;
+                apply_prepared_graph_batch(
+                    GraphApplyState {
+                        streamer,
+                        sealing: sealing.as_deref(),
+                        searchers,
+                        id_index,
+                        resolver: graph_resolver,
+                        mutable: graph_mutable,
+                        sparse_index: Some(sparse_index),
+                        payload_index,
+                    },
+                    projection.batch.clone(),
+                    prepared_graph,
+                )
+                .map_err(|error| {
+                    GaussError::WalUnavailable(format!(
+                        "committed multi-model graph batch could not publish; restart required: {error}"
+                    ))
+                })?;
+                let mut point_tombstones = crate::ordinal::SegmentOrdinalSet::new();
+                for searcher in searchers.iter() {
+                    point_tombstones
+                        .insert_bitmap(searcher.id.clone(), searcher.tombstone_ordinals.clone());
+                }
+                let edge_tombstones = graph_mutable
+                    .as_ref()
+                    .expect("prepared multi-model batch requires mutable graph state")
+                    .edge_tombstones();
+                if let Err(error) = overlays
+                    .reconcile_points(&point_tombstones)
+                    .and_then(|_| overlays.replace_edges(edge_tombstones))
+                    .and_then(|_| overlays.publish_pending())
+                {
+                    self.mark_durability_degraded("multi_model_overlay", &error);
+                }
+                if let Err(error) = crate::failpoint::check("multi_model.after_collection_apply") {
+                    self.mark_durability_degraded("multi_model_after_collection_apply", &error);
+                }
+                Ok(())
+            },
+        )?;
+        if let Some(error) = execution.projection_error.as_ref() {
+            self.mark_durability_degraded("multi_model_storage_projection", error);
+        }
+        if let Some(transaction) = execution.committed.as_ref() {
+            self.project_transaction_audit(transaction);
+        }
+        Ok(MultiModelResponse::fresh(
+            execution.into_output(),
+            crate::graph::GraphMutationReceipt {
+                graph_epoch,
+                operation_lsn,
+                durable: true,
+                replayed: false,
+            },
+            edge_ids,
+            metadata,
+        ))
+    }
+
+    pub fn sql_request_is_read_only(&self, request: &crate::SqlExecutionRequest) -> Result<bool> {
+        crate::RelationalEngine::request_is_read_only(request)
+    }
+
+    /// PgWire uses the caller-owned private catalog to route statements after
+    /// transactional DDL. The handle lookup also verifies principal, tenant
+    /// and transport before revealing whether a table is in that snapshot.
+    pub fn sql_transaction_has_table_authorized(
+        &self,
+        identity: &crate::security::AuthenticatedIdentity,
+        handle: &str,
+        transport: &str,
+        table: &str,
+    ) -> Result<bool> {
+        self.ensure_current_identity(identity)?;
+        let _permit = identity.publication_permit()?;
+        self.relational.read().interactive_has_table(
+            handle,
+            &crate::audit::AuditContext {
+                principal_id: identity.principal().id.clone(),
+                tenant_id: Some(identity.principal().tenant.clone()),
+                transport: transport.into(),
+                request_id: Some(handle.into()),
+            },
+            table,
+        )
+    }
+
+    pub fn relational_tables(&self) -> Vec<crate::TableDefinition> {
+        self.relational.read().table_definitions()
+    }
+
+    /// Run only in an offline process with exclusive ownership of the data
+    /// directory. The migration is idempotent and preserves SQL commit order.
+    pub fn migrate_relational_reference_indexes_offline(&mut self) -> Result<usize> {
+        self.relational.read().migrate_reference_indexes_offline()
+    }
+
+    pub fn begin_sql_transaction(
+        &self,
+        audit_context: &crate::audit::AuditContext,
+    ) -> Result<crate::SqlTransactionHandleResponse> {
+        self.ensure_request_admission()?;
+        let _lifecycle = self.lifecycle_gate.read();
+        self.relational.read().begin_interactive(audit_context)
+    }
+
+    pub fn begin_sql_transaction_authorized(
+        &self,
+        identity: &crate::security::AuthenticatedIdentity,
+        transport: &str,
+    ) -> Result<crate::SqlTransactionHandleResponse> {
+        self.ensure_request_admission()?;
+        self.ensure_current_identity(identity)?;
+        let _permit = identity.publication_permit()?;
+        let _lifecycle = self.lifecycle_gate.read();
+        self.relational
+            .read()
+            .begin_interactive_authorized(&crate::audit::AuditContext {
+                principal_id: identity.principal().id.clone(),
+                tenant_id: Some(identity.principal().tenant.clone()),
+                transport: transport.into(),
+                request_id: None,
+            })
+    }
+
+    pub fn execute_sql_transaction(
+        &self,
+        handle: &str,
+        request: crate::SqlExecutionRequest,
+        audit_context: &crate::audit::AuditContext,
+    ) -> Result<crate::SqlExecutionResponse> {
+        self.execute_sql_transaction_owned(handle, request, audit_context)
+            .map(crate::SqlResponse::into_dto)
+    }
+
+    /// Retain typed SQL output memory until consumption or transport encoding.
+    pub fn execute_sql_transaction_owned(
+        &self,
+        handle: &str,
+        request: crate::SqlExecutionRequest,
+        audit_context: &crate::audit::AuditContext,
+    ) -> Result<crate::SqlResponse> {
+        self.ensure_request_admission()?;
+        let _inflight = SearchInflightGuard::new(Arc::clone(&self.search_inflight));
+        if !crate::RelationalEngine::request_is_read_only(&request)? {
+            self.ensure_storage_mutations_available()?;
+        }
+        let _lifecycle = self.lifecycle_gate.read();
+        self.relational
+            .read()
+            .execute_interactive_cancellable_owned(
+                handle,
+                request,
+                audit_context,
+                Arc::clone(&self.shutdown_lifecycle.cancelled),
+            )
+    }
+
+    pub fn execute_sql_transaction_cancellable(
+        &self,
+        handle: &str,
+        request: crate::SqlExecutionRequest,
+        audit_context: &crate::audit::AuditContext,
+        cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<crate::SqlExecutionResponse> {
+        self.execute_sql_transaction_cancellable_owned(handle, request, audit_context, cancellation)
+            .map(crate::SqlResponse::into_dto)
+    }
+
+    /// Retain typed SQL output memory until consumption or transport encoding.
+    pub fn execute_sql_transaction_cancellable_owned(
+        &self,
+        handle: &str,
+        request: crate::SqlExecutionRequest,
+        audit_context: &crate::audit::AuditContext,
+        cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<crate::SqlResponse> {
+        self.ensure_request_admission()?;
+        let _inflight = SearchInflightGuard::new(Arc::clone(&self.search_inflight));
+        if !crate::RelationalEngine::request_is_read_only(&request)? {
+            self.ensure_storage_mutations_available()?;
+        }
+        let _lifecycle = self.lifecycle_gate.read();
+        self.relational
+            .read()
+            .execute_interactive_cancellable_owned(handle, request, audit_context, cancellation)
+    }
+
+    pub fn execute_sql_transaction_authorized(
+        &self,
+        identity: &crate::security::AuthenticatedIdentity,
+        handle: &str,
+        request: crate::SqlExecutionRequest,
+        transport: &str,
+    ) -> Result<crate::SqlExecutionResponse> {
+        self.execute_sql_transaction_authorized_owned(identity, handle, request, transport)
+            .map(crate::SqlResponse::into_dto)
+    }
+
+    /// Retain typed SQL output memory until consumption or transport encoding.
+    pub fn execute_sql_transaction_authorized_owned(
+        &self,
+        identity: &crate::security::AuthenticatedIdentity,
+        handle: &str,
+        request: crate::SqlExecutionRequest,
+        transport: &str,
+    ) -> Result<crate::SqlResponse> {
+        self.ensure_request_admission()?;
+        let _inflight = SearchInflightGuard::new(Arc::clone(&self.search_inflight));
+        self.ensure_current_identity(identity)?;
+        if !crate::RelationalEngine::request_is_read_only(&request)? {
+            self.ensure_storage_mutations_available()?;
+        }
+        let _permit = identity.publication_permit()?;
+        let _lifecycle = self.lifecycle_gate.read();
+        let response = self
+            .relational
+            .read()
+            .execute_interactive_authorized_cancellable(
+                handle,
+                request,
+                &crate::audit::AuditContext {
+                    principal_id: identity.principal().id.clone(),
+                    tenant_id: Some(identity.principal().tenant.clone()),
+                    transport: transport.into(),
+                    request_id: Some(handle.to_string()),
+                },
+                Arc::clone(&self.shutdown_lifecycle.cancelled),
+                identity,
+            )?;
+        self.relational
+            .read()
+            .authorize_reference_results(self, identity, &response.results)?;
+        Ok(response)
+    }
+
+    pub fn execute_sql_transaction_authorized_cancellable(
+        &self,
+        identity: &crate::security::AuthenticatedIdentity,
+        handle: &str,
+        request: crate::SqlExecutionRequest,
+        transport: &str,
+        cancellation: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<crate::SqlExecutionResponse> {
+        self.execute_sql_transaction_authorized_cancellable_owned(
+            identity,
+            handle,
+            request,
+            transport,
+            cancellation,
+        )
+        .map(crate::SqlResponse::into_dto)
+    }
+
+    /// Retain typed SQL output memory until consumption or transport encoding.
+    pub fn execute_sql_transaction_authorized_cancellable_owned(
+        &self,
+        identity: &crate::security::AuthenticatedIdentity,
+        handle: &str,
+        request: crate::SqlExecutionRequest,
+        transport: &str,
+        cancellation: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<crate::SqlResponse> {
+        crate::relational::with_sql_cancellation(cancellation, || {
+            self.execute_sql_transaction_authorized_owned(identity, handle, request, transport)
+        })
+    }
+
+    pub fn commit_sql_transaction(
+        &self,
+        handle: &str,
+        audit_context: &crate::audit::AuditContext,
+    ) -> Result<crate::SqlExecutionResponse> {
+        self.commit_sql_transaction_owned(handle, audit_context)
+            .map(crate::SqlResponse::into_dto)
+    }
+
+    /// Retain typed SQL output memory until consumption or transport encoding.
+    pub fn commit_sql_transaction_owned(
+        &self,
+        handle: &str,
+        audit_context: &crate::audit::AuditContext,
+    ) -> Result<crate::SqlResponse> {
+        self.ensure_storage_mutations_available()?;
+        let _inflight = SearchInflightGuard::new(Arc::clone(&self.search_inflight));
+        let _lifecycle = self.lifecycle_gate.read();
+        let execution = self
+            .relational
+            .read()
+            .commit_interactive(handle, audit_context)?;
+        if let Some(error) = execution.projection_error.as_ref() {
+            self.mark_durability_degraded("relational_storage_projection", error);
+        }
+        if let Some(transaction) = execution.committed.as_ref() {
+            self.project_transaction_audit(transaction);
+        }
+        Ok(execution.into_output())
+    }
+
+    pub fn commit_sql_transaction_cancellable(
+        &self,
+        handle: &str,
+        audit_context: &crate::audit::AuditContext,
+        cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<crate::SqlExecutionResponse> {
+        self.commit_sql_transaction_cancellable_owned(handle, audit_context, cancellation)
+            .map(crate::SqlResponse::into_dto)
+    }
+
+    /// Retain typed SQL output memory until consumption or transport encoding.
+    pub fn commit_sql_transaction_cancellable_owned(
+        &self,
+        handle: &str,
+        audit_context: &crate::audit::AuditContext,
+        cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<crate::SqlResponse> {
+        self.ensure_storage_mutations_available()?;
+        let _inflight = SearchInflightGuard::new(Arc::clone(&self.search_inflight));
+        let _lifecycle = self.lifecycle_gate.read();
+        let execution = self.relational.read().commit_interactive_cancellable(
+            handle,
+            audit_context,
+            cancellation,
+        )?;
+        if let Some(error) = execution.projection_error.as_ref() {
+            self.mark_durability_degraded("relational_storage_projection", error);
+        }
+        if let Some(transaction) = execution.committed.as_ref() {
+            self.project_transaction_audit(transaction);
+        }
+        Ok(execution.into_output())
+    }
+
+    pub fn commit_sql_transaction_authorized(
+        &self,
+        identity: &crate::security::AuthenticatedIdentity,
+        handle: &str,
+        transport: &str,
+    ) -> Result<crate::SqlExecutionResponse> {
+        self.commit_sql_transaction_authorized_owned(identity, handle, transport)
+            .map(crate::SqlResponse::into_dto)
+    }
+
+    /// Retain typed SQL output memory until consumption or transport encoding.
+    pub fn commit_sql_transaction_authorized_owned(
+        &self,
+        identity: &crate::security::AuthenticatedIdentity,
+        handle: &str,
+        transport: &str,
+    ) -> Result<crate::SqlResponse> {
+        self.ensure_current_identity(identity)?;
+        self.ensure_storage_mutations_available()?;
+        let _inflight = SearchInflightGuard::new(Arc::clone(&self.search_inflight));
+        let _lifecycle = self.lifecycle_gate.read();
+        let execution = self.relational.read().commit_interactive_authorized(
+            self,
+            identity,
+            handle,
+            &crate::audit::AuditContext {
+                principal_id: identity.principal().id.clone(),
+                tenant_id: Some(identity.principal().tenant.clone()),
+                transport: transport.into(),
+                request_id: Some(handle.to_string()),
+            },
+            Arc::clone(&self.shutdown_lifecycle.cancelled),
+        )?;
+        if let Some(error) = execution.projection_error.as_ref() {
+            self.mark_durability_degraded("relational_storage_projection", error);
+        }
+        if let Some(transaction) = execution.committed.as_ref() {
+            self.project_transaction_audit(transaction);
+        }
+        Ok(execution.into_output())
+    }
+
+    pub fn commit_sql_transaction_authorized_cancellable(
+        &self,
+        identity: &crate::security::AuthenticatedIdentity,
+        handle: &str,
+        transport: &str,
+        cancellation: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<crate::SqlExecutionResponse> {
+        self.commit_sql_transaction_authorized_cancellable_owned(
+            identity,
+            handle,
+            transport,
+            cancellation,
+        )
+        .map(crate::SqlResponse::into_dto)
+    }
+
+    /// Retain typed SQL output memory until consumption or transport encoding.
+    pub fn commit_sql_transaction_authorized_cancellable_owned(
+        &self,
+        identity: &crate::security::AuthenticatedIdentity,
+        handle: &str,
+        transport: &str,
+        cancellation: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<crate::SqlResponse> {
+        crate::relational::with_sql_cancellation(cancellation, || {
+            self.commit_sql_transaction_authorized_owned(identity, handle, transport)
+        })
+    }
+
+    pub fn rollback_sql_transaction(
+        &self,
+        handle: &str,
+        audit_context: &crate::audit::AuditContext,
+    ) -> Result<crate::SqlTransactionHandleResponse> {
+        let _lifecycle = self.lifecycle_gate.read();
+        self.relational
+            .read()
+            .rollback_interactive(handle, audit_context)
+    }
+
+    pub fn rollback_sql_transaction_authorized(
+        &self,
+        identity: &crate::security::AuthenticatedIdentity,
+        handle: &str,
+        transport: &str,
+    ) -> Result<crate::SqlTransactionHandleResponse> {
+        self.ensure_current_identity(identity)?;
+        let _permit = identity.publication_permit()?;
+        let _lifecycle = self.lifecycle_gate.read();
+        self.relational.read().rollback_interactive(
+            handle,
+            &crate::audit::AuditContext {
+                principal_id: identity.principal().id.clone(),
+                tenant_id: Some(identity.principal().tenant.clone()),
+                transport: transport.into(),
+                request_id: Some(handle.to_string()),
+            },
+        )
     }
 
     /// Force every dirty collection WAL (and the root catalog WAL) to stable
@@ -1173,6 +2801,146 @@ impl Db {
         metrics::counter!("chirondb_wal_durability_failures_total", "operation" => operation)
             .increment(1);
         tracing::error!(%error, operation, "durability subsystem entered degraded mode");
+    }
+
+    fn commit_collection_transaction(
+        &self,
+        collection_name: &str,
+        collection: &mut Collection,
+        mutation: WalEntry,
+        audit: TransactionAudit,
+    ) -> Result<(CommittedTransaction, u64)> {
+        self.commit_collection_transaction_with_decision(
+            collection_name,
+            collection,
+            mutation,
+            audit,
+            None,
+        )
+    }
+
+    fn commit_collection_transaction_with_decision(
+        &self,
+        collection_name: &str,
+        collection: &mut Collection,
+        mutation: WalEntry,
+        audit: TransactionAudit,
+        decision_started: Option<&AtomicBool>,
+    ) -> Result<(CommittedTransaction, u64)> {
+        let target = TransactionTarget::Collection {
+            name: collection_name.to_string(),
+        };
+        let transaction = match decision_started {
+            Some(started) => self.transaction_journal.commit_with_decision(
+                target,
+                mutation.clone(),
+                audit,
+                started,
+            ),
+            None => self
+                .transaction_journal
+                .commit(target, mutation.clone(), audit),
+        }
+        .inspect_err(|error| {
+            if matches!(
+                error,
+                GaussError::WalUnavailable(_) | GaussError::CommitOutcomeUnknown { .. }
+            ) {
+                self.mark_durability_degraded("transaction_decision", error);
+            }
+        })?;
+        let transaction_id = transaction.prepare.transaction_id;
+        let projection =
+            crate::failpoint::check("transaction.before_storage_projection").and_then(|()| {
+                collection.wal.append(&WalEntry::TransactionApply {
+                    transaction_id,
+                    entry: Box::new(mutation),
+                })
+            });
+        let operation_lsn = match projection {
+            Ok(lsn) => {
+                self.wal_flusher.request_flush();
+                if let Err(error) = self
+                    .transaction_journal
+                    .mark_projected(transaction_id, ProjectionKind::Storage)
+                {
+                    self.mark_durability_degraded("transaction_storage_marker", &error);
+                }
+                lsn
+            }
+            Err(error) => {
+                self.mark_durability_degraded("transaction_storage_projection", &error);
+                collection.wal.len().unwrap_or_default()
+            }
+        };
+        Ok((transaction, operation_lsn))
+    }
+
+    fn commit_catalog_transaction(
+        &self,
+        inner: &mut DbInner,
+        mutation: WalEntry,
+        audit: TransactionAudit,
+    ) -> Result<(CommittedTransaction, u64, bool)> {
+        let transaction = self
+            .transaction_journal
+            .commit(TransactionTarget::Catalog, mutation.clone(), audit)
+            .inspect_err(|error| {
+                if matches!(
+                    error,
+                    GaussError::WalUnavailable(_) | GaussError::CommitOutcomeUnknown { .. }
+                ) {
+                    self.mark_durability_degraded("transaction_decision", error);
+                }
+            })?;
+        let transaction_id = transaction.prepare.transaction_id;
+        let projection =
+            crate::failpoint::check("transaction.before_storage_projection").and_then(|()| {
+                inner.catalog_wal.append(&WalEntry::TransactionApply {
+                    transaction_id,
+                    entry: Box::new(mutation),
+                })
+            });
+        let (lsn, projected) = match projection {
+            Ok(lsn) => {
+                self.wal_flusher.request_flush();
+                (lsn, true)
+            }
+            Err(error) => {
+                self.mark_durability_degraded("transaction_catalog_projection", &error);
+                (inner.catalog_wal.len().unwrap_or_default(), false)
+            }
+        };
+        Ok((transaction, lsn, projected))
+    }
+
+    fn project_transaction_audit(&self, transaction: &CommittedTransaction) {
+        let transaction_id = transaction.prepare.transaction_id;
+        if let Err(error) =
+            crate::failpoint::check("transaction.before_audit_projection").and_then(|()| {
+                self.audit_writer
+                    .project_committed_transaction(transaction_id, &transaction.prepare.audit)
+            })
+        {
+            self.mark_durability_degraded("transaction_audit_projection", &error);
+            return;
+        }
+        if let Err(error) = self
+            .transaction_journal
+            .mark_projected(transaction_id, ProjectionKind::Audit)
+        {
+            self.mark_durability_degraded("transaction_audit_marker", &error);
+        }
+    }
+
+    fn finish_committed_legacy_audit(
+        &self,
+        audit_operation: audit::AuditOperation,
+        details: Value,
+    ) {
+        if let Err(error) = audit_operation.success(details) {
+            self.mark_durability_degraded("legacy_audit_projection", &error);
+        }
     }
 
     fn checkpoint_catalog_after_commit(&self, inner: &mut DbInner) {
@@ -1333,8 +3101,7 @@ impl Db {
             collection_name,
             ids,
             false,
-            audit::AuditContext::embedded(),
-            MutationOrigin::Client,
+            MutationContext::client(audit::AuditContext::embedded()),
         )
     }
 
@@ -1344,8 +3111,7 @@ impl Db {
             collection_name,
             ids,
             true,
-            audit::AuditContext::embedded(),
-            MutationOrigin::Client,
+            MutationContext::client(audit::AuditContext::embedded()),
         )
     }
 
@@ -1362,8 +3128,7 @@ impl Db {
             id,
             payload,
             merge,
-            audit::AuditContext::embedded(),
-            MutationOrigin::Client,
+            MutationContext::client(audit::AuditContext::embedded()),
         )
     }
 
@@ -1373,7 +3138,7 @@ impl Db {
             collection_name,
             filter,
             false,
-            audit::AuditContext::embedded(),
+            MutationContext::client(audit::AuditContext::embedded()),
         )
     }
 
@@ -1387,7 +3152,7 @@ impl Db {
             collection_name,
             filter,
             true,
-            audit::AuditContext::embedded(),
+            MutationContext::client(audit::AuditContext::embedded()),
         )
     }
 
@@ -1409,6 +3174,12 @@ impl Db {
         self.inner.read().tenant_enforcement
     }
 
+    /// Installation authority is pinned outside every content generation and
+    /// is never replaced by snapshot restore or PITR.
+    pub fn identity_authority(&self) -> Option<&Arc<crate::security::IdentityAuthority>> {
+        self.identity_authority.as_ref()
+    }
+
     /// Refuses a call that arrived through an entry point carrying no tenant
     /// scope, once enforcement is on.
     ///
@@ -1422,6 +3193,19 @@ impl Db {
                 "`{operation}` was called without a tenant scope while tenant enforcement is \
                  on; use the `_scoped` entry point"
             )));
+        }
+        Ok(())
+    }
+
+    /// An initialized installation has one production durability contract:
+    /// acknowledged mutations are synchronous. Keeping the check in the core
+    /// prevents an adapter from accidentally re-enabling `wait=false`.
+    fn require_sync_durability(&self, wait: bool) -> Result<()> {
+        if self.identity_authority.is_some() && !wait {
+            return Err(GaussError::InvalidRequest(
+                "wait=false is unavailable in the protected production profile; retry with wait=true"
+                    .to_string(),
+            ));
         }
         Ok(())
     }
@@ -1441,12 +3225,11 @@ impl Db {
         let enforcement = self.tenant_enforcement();
         request.filter = scope.scope_filter(enforcement, request.filter)?;
         if request.graph.is_some() {
-            let cancelled = AtomicBool::new(false);
             return self.graph_search_scoped_controlled(
                 collection_name,
                 request,
                 scope,
-                &cancelled,
+                self.build_lifecycle.cancellation(),
             );
         }
         self.search_unguarded(collection_name, request)
@@ -1528,7 +3311,7 @@ impl Db {
             collection_name,
             points,
             wait,
-            MutationContext::client(audit_context(scope)),
+            MutationContext::scoped(scope),
             None,
             None,
         )
@@ -1559,7 +3342,7 @@ impl Db {
             collection_name,
             points,
             wait,
-            MutationContext::client(audit_context(scope)),
+            MutationContext::scoped(scope),
             unsafe_audit,
             None,
         )
@@ -1605,17 +3388,20 @@ impl Db {
         let receipt = self.commit_graph_batch_locked(&mut collection, batch, wait)?;
         drop(collection);
 
-        audit_operation.success(serde_json::json!({
-            "graph_epoch": receipt.graph_epoch.raw(),
-            "operation_lsn": receipt.operation_lsn,
-            "wait": wait,
-            "point_mutations": point_mutations,
-            "handle_assignments": handle_assignments,
-            "edge_mutations": edge_mutations,
-            "deferred_creates": deferred_creates,
-            "deferred_binds": deferred_binds,
-            "session_mutations": session_mutations,
-        }))?;
+        self.finish_committed_legacy_audit(
+            audit_operation,
+            serde_json::json!({
+                "graph_epoch": receipt.graph_epoch.raw(),
+                "operation_lsn": receipt.operation_lsn,
+                "wait": wait,
+                "point_mutations": point_mutations,
+                "handle_assignments": handle_assignments,
+                "edge_mutations": edge_mutations,
+                "deferred_creates": deferred_creates,
+                "deferred_binds": deferred_binds,
+                "session_mutations": session_mutations,
+            }),
+        );
         self.refresh_metrics();
         Ok(receipt)
     }
@@ -1626,6 +3412,47 @@ impl Db {
         batch: crate::wal::GraphBatch,
         wait: bool,
     ) -> Result<GraphBatchCommitReceipt> {
+        self.commit_graph_batch_security_locked(collection, batch, wait, None, None)
+    }
+
+    fn commit_graph_batch_security_locked(
+        &self,
+        collection: &mut Collection,
+        batch: crate::wal::GraphBatch,
+        wait: bool,
+        security: Option<crate::security::SecurityDelta>,
+        decision: Option<(&audit::AuditContext, &AtomicBool)>,
+    ) -> Result<GraphBatchCommitReceipt> {
+        match decision {
+            Some((context, started)) => self.commit_graph_batch_audited_locked(
+                collection,
+                batch,
+                wait,
+                security,
+                context,
+                Some(started),
+            ),
+            None => self.commit_graph_batch_audited_locked(
+                collection,
+                batch,
+                wait,
+                security,
+                &audit::AuditContext::embedded(),
+                None,
+            ),
+        }
+    }
+
+    fn commit_graph_batch_audited_locked(
+        &self,
+        collection: &mut Collection,
+        batch: crate::wal::GraphBatch,
+        wait: bool,
+        security: Option<crate::security::SecurityDelta>,
+        context: &audit::AuditContext,
+        decision_started: Option<&AtomicBool>,
+    ) -> Result<GraphBatchCommitReceipt> {
+        self.require_sync_durability(wait)?;
         let record_lsn = collection.wal.len()?;
         let prepared = prepare_graph_batch(
             &collection.config,
@@ -1641,16 +3468,42 @@ impl Db {
         )?;
         crate::failpoint::check("graph_batch.after_prepare")?;
         let graph_epoch = batch.graph_epoch;
-        let operation_lsn = collection.wal.append_no_sync(&WalEntry::GraphBatch {
-            batch: batch.clone(),
-        })?;
-        crate::failpoint::check("graph_batch.after_wal_append")?;
-        if wait && let Err(error) = collection.wal.sync() {
-            self.mark_durability_degraded("graph_batch_sync", &error);
-            return Err(error);
+        let entry = match security {
+            Some(security) => WalEntry::ProtectedBatch {
+                batch: crate::security::ProtectedBatch {
+                    version: crate::security::SECURITY_VERSION,
+                    security,
+                    content: crate::security::ProtectedContent::Graph {
+                        batch: batch.clone(),
+                    },
+                },
+            },
+            None => WalEntry::GraphBatch {
+                batch: batch.clone(),
+            },
+        };
+        let (transaction, operation_lsn) = self.commit_collection_transaction_with_decision(
+            &collection.config.name.clone(),
+            collection,
+            entry,
+            TransactionAudit::mutation(
+                "graph_batch",
+                Some(&collection.config.name),
+                context,
+                serde_json::json!({
+                    "graph_epoch": graph_epoch.raw(),
+                    "wait_requested": wait,
+                    "point_mutations": batch.point_mutations.len(),
+                    "edge_mutations": batch.edge_mutations.len(),
+                }),
+            ),
+            decision_started,
+        )?;
+        if let Err(error) = crate::failpoint::check("graph_batch.after_wal_append") {
+            self.mark_durability_degraded("graph_batch_after_wal_append", &error);
         }
-        if wait {
-            crate::failpoint::check("graph_batch.after_wal_sync")?;
+        if wait && let Err(error) = crate::failpoint::check("graph_batch.after_wal_sync") {
+            self.mark_durability_degraded("graph_batch_after_wal_sync", &error);
         }
 
         let Collection {
@@ -1665,7 +3518,7 @@ impl Db {
             overlays,
             ..
         } = collection;
-        if let Err(error) = apply_prepared_graph_batch(
+        let applied = if let Err(error) = apply_prepared_graph_batch(
             GraphApplyState {
                 streamer,
                 sealing: sealing.as_deref(),
@@ -1683,31 +3536,39 @@ impl Db {
                 "committed GraphBatch could not publish its prevalidated state; restart required: {error}"
             ));
             self.mark_durability_degraded("graph_batch_apply", &error);
-            return Err(error);
+            false
+        } else {
+            true
+        };
+        if let Err(error) = crate::failpoint::check("graph_batch.after_apply") {
+            self.mark_durability_degraded("graph_batch_after_apply", &error);
         }
-        crate::failpoint::check("graph_batch.after_apply")?;
-        let mut point_tombstones = crate::ordinal::SegmentOrdinalSet::new();
-        for searcher in searchers.iter() {
-            point_tombstones
-                .insert_bitmap(searcher.id.clone(), searcher.tombstone_ordinals.clone());
+        if applied {
+            let mut point_tombstones = crate::ordinal::SegmentOrdinalSet::new();
+            for searcher in searchers.iter() {
+                point_tombstones
+                    .insert_bitmap(searcher.id.clone(), searcher.tombstone_ordinals.clone());
+            }
+            let edge_tombstones = graph_mutable
+                .as_ref()
+                .expect("prepared GraphBatch requires mutable graph state")
+                .edge_tombstones();
+            if let Err(error) = overlays
+                .reconcile_points(&point_tombstones)
+                .and_then(|_| overlays.replace_edges(edge_tombstones))
+                .and_then(|_| overlays.publish_pending())
+            {
+                self.mark_durability_degraded("graph_batch_overlay", &error);
+            }
         }
-        let edge_tombstones = graph_mutable
-            .as_ref()
-            .expect("prepared GraphBatch requires mutable graph state")
-            .edge_tombstones();
-        if let Err(error) = overlays
-            .reconcile_points(&point_tombstones)
-            .and_then(|_| overlays.replace_edges(edge_tombstones))
-            .and_then(|_| overlays.publish_pending())
-        {
-            self.mark_durability_degraded("graph_batch_overlay", &error);
-            return Err(error);
+        if let Err(error) = crate::failpoint::check("graph_batch.after_overlay_publish") {
+            self.mark_durability_degraded("graph_batch_after_overlay_publish", &error);
         }
-        crate::failpoint::check("graph_batch.after_overlay_publish")?;
+        self.project_transaction_audit(&transaction);
         Ok(GraphBatchCommitReceipt {
             graph_epoch,
             operation_lsn,
-            durable: wait,
+            durable: true,
         })
     }
 
@@ -1717,34 +3578,7 @@ impl Db {
         ids: &[String],
         scope: &crate::tenant::TenantScope,
     ) -> Result<usize> {
-        let enforcement = self.tenant_enforcement();
-        if !enforcement.blocks() {
-            return self.delete_unguarded(
-                collection_name,
-                ids,
-                false,
-                audit_context(scope),
-                MutationOrigin::Client,
-            );
-        }
-        // Only delete ids this caller can actually see. An id belonging to
-        // another tenant is skipped, not refused, for the same reason
-        // `get_points_scoped` omits rather than reports.
-        let visible: Vec<String> = self
-            .get_points_scoped(collection_name, ids, scope)?
-            .into_iter()
-            .map(|point| point.id)
-            .collect();
-        if visible.is_empty() {
-            return Ok(0);
-        }
-        self.delete_unguarded(
-            collection_name,
-            &visible,
-            false,
-            audit_context(scope),
-            MutationOrigin::Client,
-        )
+        self.delete_unguarded(collection_name, ids, false, MutationContext::scoped(scope))
     }
 
     pub fn delete_with_edges_scoped(
@@ -1753,31 +3587,7 @@ impl Db {
         ids: &[String],
         scope: &crate::tenant::TenantScope,
     ) -> Result<usize> {
-        let enforcement = self.tenant_enforcement();
-        if !enforcement.blocks() {
-            return self.delete_unguarded(
-                collection_name,
-                ids,
-                true,
-                audit_context(scope),
-                MutationOrigin::Client,
-            );
-        }
-        let visible = self
-            .get_points_scoped(collection_name, ids, scope)?
-            .into_iter()
-            .map(|point| point.id)
-            .collect::<Vec<_>>();
-        if visible.is_empty() {
-            return Ok(0);
-        }
-        self.delete_unguarded(
-            collection_name,
-            &visible,
-            true,
-            audit_context(scope),
-            MutationOrigin::Client,
-        )
+        self.delete_unguarded(collection_name, ids, true, MutationContext::scoped(scope))
     }
 
     pub fn set_payload_scoped(
@@ -1788,25 +3598,13 @@ impl Db {
         merge: bool,
         scope: &crate::tenant::TenantScope,
     ) -> Result<Point> {
-        let enforcement = self.tenant_enforcement();
-        if enforcement.blocks() {
-            // The point must already be the caller's before it may be changed.
-            let existing =
-                self.get_points_unguarded(collection_name, std::slice::from_ref(&id.to_string()))?;
-            let Some(existing) = existing.first() else {
-                return Err(GaussError::PointNotFound(id.to_string()));
-            };
-            scope.may_write_payload(enforcement, &existing.payload)?;
-            // A replace must not drop the tenant stamp and orphan the row.
-            scope.stamp_payload(enforcement, &mut payload)?;
-        }
+        scope.stamp_payload(self.tenant_enforcement(), &mut payload)?;
         self.set_payload_unguarded(
             collection_name,
             id,
             payload,
             merge,
-            audit_context(scope),
-            MutationOrigin::Client,
+            MutationContext::scoped(scope),
         )
     }
 
@@ -1816,22 +3614,12 @@ impl Db {
         filter: &Filter,
         scope: &crate::tenant::TenantScope,
     ) -> Result<usize> {
-        let enforcement = self.tenant_enforcement();
-        let scoped = scope.scope_filter(enforcement, Some(filter.clone()))?;
-        match scoped {
-            Some(filter) => self.delete_by_filter_unguarded(
-                collection_name,
-                &filter,
-                false,
-                audit_context(scope),
-            ),
-            None => self.delete_by_filter_unguarded(
-                collection_name,
-                filter,
-                false,
-                audit_context(scope),
-            ),
-        }
+        self.delete_by_filter_unguarded(
+            collection_name,
+            filter,
+            false,
+            MutationContext::scoped(scope),
+        )
     }
 
     pub fn delete_by_filter_with_edges_scoped(
@@ -1840,12 +3628,11 @@ impl Db {
         filter: &Filter,
         scope: &crate::tenant::TenantScope,
     ) -> Result<usize> {
-        let scoped = scope.scope_filter(self.tenant_enforcement(), Some(filter.clone()))?;
         self.delete_by_filter_unguarded(
             collection_name,
-            scoped.as_ref().unwrap_or(filter),
+            filter,
             true,
-            audit_context(scope),
+            MutationContext::scoped(scope),
         )
     }
 
@@ -1857,12 +3644,11 @@ impl Db {
     ) -> Result<SearchResponse> {
         request.filter = scope.scope_filter(self.tenant_enforcement(), request.filter)?;
         if request.graph.is_some() {
-            let cancelled = AtomicBool::new(false);
             return self.graph_hybrid_search_scoped_controlled(
                 collection_name,
                 request,
                 scope,
-                &cancelled,
+                self.build_lifecycle.cancellation(),
             );
         }
         self.hybrid_search_unguarded(collection_name, request)
@@ -1927,12 +3713,17 @@ impl Db {
     }
 
     fn get_coll(&self, name: &str) -> Result<Arc<RwLock<Collection>>> {
-        self.inner
+        let collection = self
+            .inner
             .read()
             .collections
             .get(name)
             .cloned()
-            .ok_or_else(|| GaussError::CollectionNotFound(name.to_string()))
+            .ok_or_else(|| GaussError::CollectionNotFound(name.to_string()))?;
+        if collection.read().security.is_some() {
+            return Err(crate::security::SecurityError::Forbidden.into());
+        }
+        Ok(collection)
     }
 
     fn ensure_collection_cold_materialized(&self, collection_name: &str) -> Result<()> {
@@ -1947,25 +3738,81 @@ impl Db {
         collection_name: &str,
         _scope: ColdMaterializeScope,
     ) -> Result<()> {
-        // Read-first: the common case (no cold/object-store tier configured)
-        // exits here without ever taking `self.inner.write()`. Taking a
-        // write lock on every search -- the previous behavior -- serialized
-        // all concurrent searches across every collection through one
-        // global mutex, since parking_lot write locks block all readers.
-        // Only escalate to the write lock below when there's actually
-        // materialization work to do.
-        let (root, cold_object_store) = {
+        self.get_coll(collection_name)?;
+        self.materialize_collection_cold(collection_name, None)
+    }
+
+    fn ensure_collection_cold_materialized_authorized(
+        &self,
+        context: &crate::security::AccessContext,
+    ) -> Result<()> {
+        self.get_coll_authorized(context)?;
+        self.materialize_collection_cold(context.collection(), Some(context))
+            .map_err(|error| match error {
+                GaussError::Security(_) => error,
+                error => {
+                    tracing::error!(%error, collection = context.collection(), "protected cold storage unavailable");
+                    crate::security::SecurityError::Unavailable.into()
+                }
+            })
+    }
+
+    fn materialize_collection_cold(
+        &self,
+        collection_name: &str,
+        context: Option<&crate::security::AccessContext>,
+    ) -> Result<()> {
+        let (root, cold_object_store, arc_coll) = {
             let inner = self.inner.read();
-            if !inner.collections.contains_key(collection_name) {
-                return Err(GaussError::CollectionNotFound(collection_name.to_string()));
-            }
-            (inner.root.clone(), inner.cold_object_store.clone())
+            let collection = inner
+                .collections
+                .get(collection_name)
+                .cloned()
+                .ok_or_else(|| GaussError::CollectionNotFound(collection_name.to_string()))?;
+            (
+                inner.root.clone(),
+                inner.cold_object_store.clone(),
+                collection,
+            )
         };
         let Some(cold_object_store) = cold_object_store else {
             return Ok(());
         };
         self.ensure_storage_mutations_available()?;
         let collection_dir = collection_dir(&root, collection_name);
+        let validate_access = |collection: &Collection| -> Result<()> {
+            match (context, &collection.security) {
+                (Some(context), Some(authority)) if authority.accepts(context) => {
+                    context.publication_permit()?;
+                    Ok(())
+                }
+                (None, None) => Ok(()),
+                _ => Err(crate::security::SecurityError::Forbidden.into()),
+            }
+        };
+        {
+            let collection = arc_coll.read();
+            validate_access(&collection)?;
+            if !crate::segment::cold_materialization_needed(&collection_dir.join("cold"))? {
+                return Ok(());
+            }
+        }
+        // Materialization and recovery are one per-collection transaction. A
+        // writer must not commit between the WAL scan and state installation;
+        // concurrent fetches must not share/delete each other's staging files.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut col = loop {
+            let collection = arc_coll.write();
+            validate_access(&collection)?;
+            if collection.sealing.is_none() {
+                break collection;
+            }
+            drop(collection);
+            if Instant::now() >= deadline {
+                return Err(crate::security::SecurityError::Unavailable.into());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
         let materialized = materialize_missing_cold_segments_from_object_store(
             &collection_dir.join("cold"),
             &cold_object_store,
@@ -1973,28 +3820,23 @@ impl Db {
         if materialized == 0 {
             return Ok(());
         }
-
-        let arc_coll = self
-            .inner
-            .read()
-            .collections
-            .get(collection_name)
-            .cloned()
-            .ok_or_else(|| GaussError::CollectionNotFound(collection_name.to_string()))?;
-        let (config, schema_epoch, wal_watermark) = {
-            let coll = arc_coll.read();
-            (coll.config.clone(), coll.schema_epoch, coll.wal_watermark)
-        };
-        let state = load_collection_state(
+        let state = load_collection_state_with_journal(
             &collection_dir,
-            config,
-            schema_epoch,
-            wal_watermark,
+            col.config.clone(),
+            col.schema_epoch,
+            col.wal_watermark,
             Some(&cold_object_store),
             crate::overlay::OverlayOpenMode::Recover,
+            self.transaction_journal.storage_projection_authority()?,
         )?;
-
-        let mut col = arc_coll.write();
+        crate::failpoint::check("db.cold_reload_loaded")?;
+        // Keep the live epoch and its cancellation state. Replacing it with
+        // recovered authority can strand contexts or reopen a closed epoch.
+        match (&col.security, &state.security) {
+            (Some(current), Some(recovered)) => current.verify_recovered(recovered)?,
+            (None, None) => {}
+            _ => return Err(crate::security::SecurityError::Unavailable.into()),
+        }
         col.config = state.config;
         col.schema_epoch = state.schema_epoch;
         col.streamer = state.streamer;
@@ -2041,110 +3883,7 @@ impl Db {
     }
 
     pub fn create_collection(&self, config: CollectionConfig) -> Result<CollectionConfig> {
-        let _lifecycle = self.lifecycle_gate.write();
-        self.ensure_storage_mutations_available()?;
-        let _admission = self.maintenance_barrier.read();
-        let audit_operation =
-            self.audit_operation("create_collection", Some(config.name.as_str()))?;
-        let mut operation_metrics = OperationGuard::start("create_collection");
-        let config = config.normalize();
-        validate_config(&config)?;
-
-        let mut inner = self.inner.write();
-        if inner.collections.contains_key(&config.name) {
-            return Err(GaussError::CollectionExists(config.name));
-        }
-
-        let root = inner.root.clone();
-        let collection_dir = collection_dir(&root, &config.name);
-        let staging_dir = collection_create_staging_dir(&root, &config.name);
-        if collection_dir.exists() || staging_dir.exists() {
-            return Err(GaussError::WalUnavailable(format!(
-                "collection '{}' has an unresolved filesystem generation",
-                config.name
-            )));
-        }
-        fs::create_dir_all(staging_dir.join("wal"))?;
-        fs::create_dir_all(staging_dir.join("searchers"))?;
-        let staging_wal = Wal::open(&staging_dir.join("wal"))?;
-        let schema_epoch = 1;
-        let checkpoint = CollectionCheckpoint::new(&config, schema_epoch, 0, 0, None)?;
-        write_checkpoint(&staging_dir, &checkpoint)?;
-        let empty_segments = HashSet::new();
-        drop(crate::overlay::OverlayStore::open(
-            &staging_dir,
-            0,
-            &empty_segments,
-            crate::ordinal::SegmentOrdinalSet::new(),
-            crate::overlay::OverlayOpenMode::Recover,
-        )?);
-        drop(staging_wal);
-        sync_tree(&staging_dir)?;
-        inner.catalog_wal.append(&WalEntry::CreateCollection {
-            config: config.clone(),
-        })?;
-        #[cfg(feature = "fault-injection")]
-        crate::fs_util::fault_injection::crash_hook(
-            crate::fs_util::fault_injection::HOOK_CATALOG_AFTER_DURABLE_COMMIT,
-        )?;
-        if let Err(error) = durable_rename(&staging_dir, &collection_dir) {
-            let error = GaussError::WalUnavailable(format!(
-                "catalog committed collection '{}' but generation install failed: {error}",
-                config.name
-            ));
-            self.mark_durability_degraded("create_collection_install", &error);
-            return Err(error);
-        }
-        let wal = Wal::open(&collection_dir.join("wal"))?;
-        let overlays = crate::overlay::OverlayStore::open(
-            &collection_dir,
-            0,
-            &empty_segments,
-            crate::ordinal::SegmentOrdinalSet::new(),
-            crate::overlay::OverlayOpenMode::Recover,
-        )?;
-        inner.collections.insert(
-            config.name.clone(),
-            Arc::new(RwLock::new(Collection {
-                config: config.clone(),
-                streamer: crate::streamer::Streamer::new(),
-                sealing: None,
-                searchers: Vec::new(),
-                id_index: HashMap::new(),
-                graph_lifecycle: crate::graph_lifecycle::GraphLifecycleState::default(),
-                graph_resolver: None,
-                graph_mutable: None,
-                graph_generation: None,
-                graph_calibration: None,
-                sparse_index: SparseIndex::default(),
-                payload_index: PayloadIndex::default(),
-                overlays,
-                rabitq: None,
-                vamana: None,
-                ivf: None,
-                wal,
-                wal_watermark: 0,
-                schema_epoch,
-                last_segment_id: None,
-                recall_curve: None,
-                hnsw_dirty: true,
-                index_build_in_flight: false,
-                generation_build_in_flight: false,
-                graph_backfill_in_flight: false,
-            })),
-        );
-        self.checkpoint_catalog_after_commit(&mut inner);
-        drop(inner);
-        audit_operation.success(serde_json::json!({
-            "vector_dim": config.vector_dim,
-            "metric": config.metric,
-            "shards": config.shards,
-            "replicas": config.replicas,
-            "recall_sla": config.recall_sla,
-        }))?;
-        self.refresh_metrics();
-        operation_metrics.succeed();
-        Ok(config)
+        self.create_collection_inner(config, None)
     }
 
     pub fn list_collections(&self) -> Vec<CollectionConfig> {
@@ -2153,18 +3892,60 @@ impl Db {
             .read()
             .collections
             .values()
-            .map(|c| c.read().config.clone())
+            .filter_map(|c| {
+                let collection = c.read();
+                collection
+                    .security
+                    .is_none()
+                    .then(|| collection.config.clone())
+            })
             .collect();
         collections.sort_by(|left, right| left.name.cmp(&right.name));
         collections
     }
 
     pub fn delete_collection(&self, collection_name: &str) -> Result<String> {
+        self.delete_collection_inner(collection_name, None)
+    }
+
+    pub fn delete_protected_collection_authorized(
+        &self,
+        identity: &crate::security::AuthenticatedIdentity,
+        collection_name: &str,
+    ) -> Result<String> {
+        self.delete_collection_inner(collection_name, Some(identity))
+    }
+
+    fn delete_collection_inner(
+        &self,
+        collection_name: &str,
+        protected: Option<&crate::security::AuthenticatedIdentity>,
+    ) -> Result<String> {
         let _lifecycle = self.lifecycle_gate.write();
+        let _identity_lease = if let Some(identity) = protected {
+            if !self
+                .identity_authority()
+                .is_some_and(|authority| authority.accepts(identity))
+                || !identity.is_installation_admin()
+            {
+                return Err(crate::security::SecurityError::Forbidden.into());
+            }
+            Some(identity.publication_permit()?)
+        } else {
+            None
+        };
         self.ensure_storage_mutations_available()?;
         let _admission = self.maintenance_barrier.read();
-        let audit_operation = self.audit_operation("delete_collection", Some(collection_name))?;
-        let coll = self.get_coll(collection_name)?;
+        let coll = self
+            .inner
+            .read()
+            .collections
+            .get(collection_name)
+            .cloned()
+            .ok_or(crate::security::SecurityError::NotFound)?;
+        if (coll.read().security.is_some()) != protected.is_some() {
+            return Err(crate::security::SecurityError::NotFound.into());
+        }
         while coll.read().sealing.is_some() {
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -2173,13 +3954,48 @@ impl Db {
             return Err(GaussError::CollectionNotFound(collection_name.to_string()));
         }
         let root = inner.root.clone();
-        inner.catalog_wal.append(&WalEntry::DropCollection {
-            name: collection_name.to_string(),
-        })?;
-        #[cfg(feature = "fault-injection")]
-        crate::fs_util::fault_injection::crash_hook(
-            crate::fs_util::fault_injection::HOOK_CATALOG_AFTER_DURABLE_COMMIT,
+        let mutation = if protected.is_some() {
+            let previous = read_catalog(&root)?.security_revision;
+            WalEntry::DropProtectedCollection {
+                name: collection_name.to_string(),
+                expected_revision: previous,
+                revision: previous
+                    .checked_add(1)
+                    .ok_or(crate::security::SecurityError::Unavailable)?,
+            }
+        } else {
+            WalEntry::DropCollection {
+                name: collection_name.to_string(),
+            }
+        };
+        let (transaction, _, storage_projected) = self.commit_catalog_transaction(
+            &mut inner,
+            mutation,
+            TransactionAudit::mutation(
+                if protected.is_some() {
+                    "collection.delete_protected"
+                } else {
+                    "delete_collection"
+                },
+                Some(collection_name),
+                &protected.map_or_else(audit::AuditContext::embedded, |identity| {
+                    audit::AuditContext {
+                        principal_id: identity.principal().id.clone(),
+                        tenant_id: Some(identity.principal().tenant.clone()),
+                        transport: "protected".into(),
+                        request_id: None,
+                    }
+                }),
+                serde_json::Value::Null,
+            ),
         )?;
+        #[cfg(feature = "fault-injection")]
+        if let Err(error) = crate::fs_util::fault_injection::crash_hook(
+            crate::fs_util::fault_injection::HOOK_CATALOG_AFTER_DURABLE_COMMIT,
+        ) {
+            let error = GaussError::Io(error);
+            self.mark_durability_degraded("drop_collection_publication", &error);
+        }
         let removed = inner.collections.remove(collection_name);
         drop(removed);
         let dir = collection_dir(&root, collection_name);
@@ -2190,6 +4006,7 @@ impl Db {
                 uuid::Uuid::new_v4()
             ));
         }
+        let mut lifecycle_installed = true;
         if dir.exists()
             && let Err(error) = durable_rename(&dir, &trash)
         {
@@ -2197,7 +4014,7 @@ impl Db {
                 "catalog committed drop for '{collection_name}' but trash install failed: {error}"
             ));
             self.mark_durability_degraded("drop_collection_install", &error);
-            return Err(error);
+            lifecycle_installed = false;
         }
         // Checkpoint and prefix pruning happen only after the live generation
         // has moved out of the catalog namespace. If a crash happens earlier,
@@ -2210,7 +4027,15 @@ impl Db {
             self.mark_durability_degraded("drop_collection_cleanup", &error);
             tracing::warn!(%error, collection = collection_name, "drop trash retained for operator cleanup");
         }
-        audit_operation.success(serde_json::json!({}))?;
+        if storage_projected
+            && lifecycle_installed
+            && let Err(error) = self
+                .transaction_journal
+                .mark_projected(transaction.prepare.transaction_id, ProjectionKind::Storage)
+        {
+            self.mark_durability_degraded("transaction_catalog_marker", &error);
+        }
+        self.project_transaction_audit(&transaction);
         self.refresh_metrics();
         Ok(collection_name.to_string())
     }
@@ -2223,8 +4048,9 @@ impl Db {
         let _lifecycle = self.lifecycle_gate.read();
         self.ensure_storage_mutations_available()?;
         let _admission = self.maintenance_barrier.read();
-        let audit_operation =
-            self.audit_operation("update_payload_schema", Some(collection_name))?;
+        // Reject legacy admission before materialization or inspecting payloads:
+        // even a validation error can disclose protected field values/types.
+        self.get_coll(collection_name)?;
         let mut operation_metrics = OperationGuard::start("update_payload_schema");
         self.ensure_collection_cold_materialized(collection_name)?;
         let inner = self.inner.write();
@@ -2234,12 +4060,16 @@ impl Db {
             .get(collection_name)
             .cloned()
             .ok_or_else(|| GaussError::CollectionNotFound(collection_name.to_string()))?;
-        let (updated, checkpoint) = {
+        let (updated, checkpoint, transaction) = {
             let mut collection = arc_coll.write();
+            if collection.security.is_some() {
+                return Err(crate::security::SecurityError::Forbidden.into());
+            }
             let mut candidate = collection.config.clone();
             candidate.payload_schema = payload_schema;
             validate_config(&candidate)?;
             for point in collection.iter_live() {
+                let point = point?;
                 validate_payload_schema(&candidate, &point)?;
             }
             let schema_epoch = collection
@@ -2247,39 +4077,57 @@ impl Db {
                 .checked_add(1)
                 .ok_or_else(|| GaussError::InvalidRequest("schema epoch overflow".to_string()))?;
             let previous_config = collection.config.clone();
-            let last_applied_lsn = collection.wal.append(&WalEntry::Schema {
-                schema_epoch,
-                config: candidate.clone(),
-                previous_config: Some(previous_config),
-            })?;
+            let (transaction, last_applied_lsn) = self.commit_collection_transaction(
+                collection_name,
+                &mut collection,
+                WalEntry::Schema {
+                    schema_epoch,
+                    config: candidate.clone(),
+                    previous_config: Some(previous_config),
+                },
+                TransactionAudit::mutation(
+                    "update_payload_schema",
+                    Some(collection_name),
+                    &audit::AuditContext::embedded(),
+                    serde_json::json!({"fields": candidate.payload_schema.len()}),
+                ),
+            )?;
             // WAL-first: once validation succeeds, make the schema durable
             // before publishing it to readers or advancing the epoch.
             collection.config = candidate.clone();
             collection.schema_epoch = schema_epoch;
-            let checkpoint = collection.checkpoint(
+            let checkpoint = match collection.checkpoint(
                 last_applied_lsn,
                 collection.live_points(),
                 collection.last_segment_id.clone(),
-            )?;
-            (candidate, checkpoint)
+            ) {
+                Ok(checkpoint) => Some(checkpoint),
+                Err(error) => {
+                    self.mark_durability_degraded("schema_checkpoint_build", &error);
+                    None
+                }
+            };
+            (candidate, checkpoint, transaction)
         };
-        if let Err(error) = write_catalog(&inner)
-            .and_then(|()| write_checkpoint(&collection_dir(&root, collection_name), &checkpoint))
-        {
+        if let Err(error) = write_catalog(&inner).and_then(|()| match &checkpoint {
+            Some(checkpoint) => {
+                write_checkpoint(&collection_dir(&root, collection_name), checkpoint)
+            }
+            None => Ok(()),
+        }) {
             // The schema record is already durable and recovery can rebuild
             // both metadata files. Do not report a false rollback to a client;
             // mark readiness degraded until an operator restarts/repairs I/O.
             self.mark_durability_degraded("schema_checkpoint", &error);
         }
         drop(inner);
-        audit_operation.success(serde_json::json!({
-            "fields": updated.payload_schema.len(),
-        }))?;
+        self.project_transaction_audit(&transaction);
         operation_metrics.succeed();
         Ok(updated)
     }
 
     pub fn upsert(&self, collection_name: &str, points: Vec<Point>) -> Result<usize> {
+        self.require_scoped_entry("upsert")?;
         self.upsert_wait_unguarded(
             collection_name,
             points,
@@ -2302,20 +4150,37 @@ impl Db {
         >,
         graph_deferred_session: Option<&crate::graph::GraphDeferredSessionId>,
     ) -> Result<UpsertExecutionReceipt> {
+        self.require_sync_durability(wait)?;
         let MutationContext {
             audit: audit_context,
             origin,
+            scope,
+            protected_create,
+            protected_update,
+            ..
         } = mutation_context;
+        let enforcement = self.tenant_enforcement();
         let _lifecycle = self.lifecycle_gate.read();
         self.ensure_storage_mutations_available()?;
         let _admission = self.maintenance_barrier.read();
         if origin == MutationOrigin::LegacyReplication {
             self.ensure_legacy_replication_available(collection_name)?;
         }
-        let audit_operation =
-            self.audit_operation_with_context("upsert", Some(collection_name), audit_context)?;
+        let transaction_audit_context = audit_context;
+        let audit_operation = self.audit_operation_with_context(
+            "upsert",
+            Some(collection_name),
+            transaction_audit_context.clone(),
+        )?;
         let mut operation_metrics = OperationGuard::start("upsert");
-        self.ensure_collection_cold_materialized(collection_name)?;
+        match protected_create
+            .as_ref()
+            .map(|create| &create.context)
+            .or(protected_update.as_ref())
+        {
+            Some(context) => self.ensure_collection_cold_materialized_authorized(context)?,
+            None => self.ensure_collection_cold_materialized(collection_name)?,
+        }
         let (root, max_points_per_collection, wal_archive_policy) = {
             let inner = self.inner.read();
             (
@@ -2324,7 +4189,13 @@ impl Db {
                 seal_wal_archive_policy(&inner, collection_name),
             )
         };
-        let coll = self.get_coll(collection_name)?;
+        let coll = match &protected_create {
+            Some(create) => self.get_coll_authorized(&create.context)?,
+            None => match &protected_update {
+                Some(context) => self.get_coll_authorized(context)?,
+                None => self.get_coll(collection_name)?,
+            },
+        };
         let mut collection = coll.write();
 
         // A collection has exactly two mutable legs: the frozen streamer being
@@ -2348,274 +4219,551 @@ impl Db {
             return Err(graph_replication_unavailable(collection_name));
         }
 
-        let requested_points = points.len();
-        // PB-2: parallelise typed-payload + dim validation across the batch.
-        // Each `validate_point` call is independent and CPU-bound (dim check,
-        // payload schema walk, regex/text checks). For small batches the rayon
-        // setup cost dominates, so fall back to serial below the threshold.
-        const PARALLEL_VALIDATE_THRESHOLD: usize = 256;
-        let validate_one = |point: &Point| -> Result<()> {
-            validate_point(&collection.config, point).map_err(|e| match e {
-                GaussError::DimensionMismatch { expected, actual } => {
-                    GaussError::InvalidRequest(format!(
-                        "point '{}': expected vector dimension {expected}, got {actual}",
-                        point.id
-                    ))
-                }
-                other => other,
-            })
-        };
-        if points.len() >= PARALLEL_VALIDATE_THRESHOLD {
-            points.par_iter().try_for_each(validate_one)?;
-        } else {
+        if let Some(scope) = scope.as_ref() {
             for point in &points {
-                validate_one(point)?;
-            }
-        }
-        if let Some(max_points) = max_points_per_collection {
-            let new_ids = points
-                .iter()
-                .filter(|point| !collection.id_index.contains_key(&point.id))
-                .count();
-            let projected_points = collection
-                .live_points()
-                .checked_add(new_ids)
-                .ok_or_else(|| GaussError::ResourceExhausted("point count overflow".to_string()))?;
-            if projected_points > max_points {
-                return Err(GaussError::InvalidRequest(format!(
-                    "collection {collection_name} would exceed max_points_per_collection {max_points}: {projected_points}"
-                )));
-            }
-        }
-
-        let graph_enabled = collection.graph_lifecycle.is_enabled();
-        if graph_deferred_session.is_some() && !graph_enabled {
-            return Err(crate::graph::GraphError::new(
-                crate::graph::GraphErrorCode::GraphDisabled,
-                "graph is not enabled for this collection",
-            )
-            .into());
-        }
-        // Persist one frame per request. Graph-enabled collections route point
-        // mutation and any fresh handle assignments through the same
-        // GraphBatch; vector-only collections retain their legacy WAL shape.
-        let mut graph_epoch = None;
-        let mut graph_bound_endpoints = 0;
-        let operation_lsn = if graph_enabled && !points.is_empty() {
-            let (receipt, bound_endpoints) = self.commit_graph_point_upserts_with_session_locked(
-                &mut collection,
-                points.clone(),
-                wait,
-                graph_deferred_session.map(crate::graph::GraphDeferredSessionId::as_str),
-            )?;
-            graph_epoch = Some(receipt.graph_epoch);
-            graph_bound_endpoints = bound_endpoints;
-            receipt.operation_lsn
-        } else if !points.is_empty() {
-            collection.wal.append_no_sync(&WalEntry::UpsertBatch {
-                points: points.clone(),
-            })?;
-            if wait {
-                collection.wal.sync()?;
-            }
-            collection.wal.len()?
-        } else {
-            collection.wal.len()?
-        };
-        // Phase 3a: when an HNSW graph already exists, append each new point
-        // into the live graph alongside sparse/payload updates. Removes the gap
-        // where points upserted between compactions fell through to flat scan.
-        let h2qg_present_before = collection.streamer.hnsw.is_some();
-        let rabitq_present_before = collection.rabitq.is_some();
-        let vamana_present_before = collection.vamana.is_some();
-        let ivf_present_before = collection.ivf.is_some();
-        let collection_vector_dim = collection.config.vector_dim;
-        if !graph_enabled {
-            for point in points {
-                // Route the old copy through the ID authority: an id living in a
-                // sealed searcher is tombstoned there (never mutated in place);
-                // an id already in the streamer is replaced as before.
-                match collection.id_index.get(&point.id).copied() {
-                    Some(crate::searcher::SegLoc::Sealing) => {
-                        if let Some(old_point) = collection
-                            .sealing
-                            .as_ref()
-                            .and_then(|streamer| streamer.points.get(&point.id))
-                            .cloned()
-                        {
-                            remove_sparse_point(&mut collection.sparse_index, &old_point);
-                            remove_payload_point(&mut collection.payload_index, &old_point);
-                        }
-                        collection.streamer.insert(point.clone());
-                    }
-                    Some(crate::searcher::SegLoc::Searcher(i)) => {
-                        let old_point = collection.searchers[i as usize]
-                            .store
-                            .get(&point.id)
-                            .map(Cow::into_owned);
-                        if let Some(old_point) = old_point {
-                            remove_sparse_point(&mut collection.sparse_index, &old_point);
-                            remove_payload_point(&mut collection.payload_index, &old_point);
-                        }
-                        collection.tombstone_searcher(i as usize, &point.id)?;
-                        collection.streamer.insert(point.clone());
-                    }
-                    _ => {
-                        if let Some(old_point) = collection.streamer.insert(point.clone()) {
-                            remove_sparse_point(&mut collection.sparse_index, &old_point);
-                            remove_payload_point(&mut collection.payload_index, &old_point);
-                        }
-                    }
-                }
-                collection
-                    .id_index
-                    .insert(point.id.clone(), crate::searcher::SegLoc::Streamer);
-                insert_sparse_point(&mut collection.sparse_index, &point);
-                insert_payload_point(&mut collection.payload_index, &point);
-                if h2qg_present_before
-                    && let Some(h2qg) = collection.streamer.hnsw.as_mut()
-                    && !h2qg.contains(&point.id)
-                {
-                    let _ = h2qg.insert_point(&point, collection_vector_dim);
-                }
-                // PC-1b: inline insert for RaBitQ too. `IndexBackend::insert_point`
-                // is a trait method so the call shape is identical.
-                if rabitq_present_before && let Some(rb) = collection.rabitq.as_mut() {
-                    use crate::index::IndexBackend;
-                    if !IndexBackend::contains(rb, &point.id) {
-                        let _ = IndexBackend::insert_point(rb, &point, collection_vector_dim);
-                    }
-                }
-                // PC-2: same inline-insert shape for Vamana.
-                if vamana_present_before && let Some(vm) = collection.vamana.as_mut() {
-                    use crate::index::IndexBackend;
-                    if !IndexBackend::contains(vm, &point.id) {
-                        let _ = IndexBackend::insert_point(vm, &point, collection_vector_dim);
-                    }
-                }
-                // B1.1: same inline-insert shape for IVF.
-                if ivf_present_before && let Some(ivf) = collection.ivf.as_mut() {
-                    use crate::index::IndexBackend;
-                    if !IndexBackend::contains(ivf, &point.id) {
-                        let _ = IndexBackend::insert_point(ivf, &point, collection_vector_dim);
-                    }
-                }
-                collection.hnsw_dirty = true;
-            }
-        }
-
-        let mut pending_seal = None;
-        if collection.sealing.is_none()
-            && !collection.generation_build_in_flight
-            && collection
-                .streamer
-                .should_seal(collection.config.streamer_max_bytes)
-        {
-            // The seal marker may cover this WAL prefix only after the prefix
-            // itself is durable, including wait=false batches.
-            collection.wal.sync()?;
-            match collection.overlays.publish_pending() {
-                Ok(()) => {
-                    let end_lsn = collection.wal.len()?;
-                    let graph = capture_graph_seal(
-                        &mut collection,
-                        &collection_dir(&root, collection_name),
-                        end_lsn,
+                if let Some(existing) = collection.try_resolve(&point.id)? {
+                    scope.authorize_replacement(
+                        enforcement,
+                        &point.id,
+                        &existing.payload,
+                        &point.payload,
                     )?;
-                    let wal_archive_cut = if graph.is_some() {
-                        collection.wal.freeze_archive_cut(end_lsn)?
-                    } else {
-                        None
-                    };
-                    let frozen = freeze_streamer_for_seal(&mut collection, end_lsn);
-                    pending_seal = Some(PendingSeal {
-                        coll: Arc::clone(&coll),
-                        data_dir_lock: Arc::clone(&self._data_dir_lock),
-                        lifecycle: Arc::clone(&self.build_lifecycle),
-                        collection_dir: collection_dir(&root, collection_name),
-                        frozen,
-                        end_lsn,
-                        graph,
-                        wal_archive_cut,
-                        wal_archive_policy,
-                        vector_dim: collection.config.vector_dim,
-                        metric: collection.config.metric,
-                        hnsw_m: collection.config.hnsw_m,
-                        hnsw_ef_construction: collection.config.hnsw_ef_construction,
-                        index_kind: crate::seal::SealIndexKind::Algorithm2,
-                        cascade: self.cascade.clone(),
-                        intra_query_parallel: self.intra_query_parallel.clone(),
-                    });
                 }
-                Err(error) => self.mark_durability_degraded("visibility_overlay", &error),
             }
         }
 
-        // Phase 3a: if the collection just crossed the HNSW threshold, stage
-        // the initial graph build to run on a background thread, off the
-        // collection write lock. Building inline (the old behavior) stalls
-        // every read/write against this collection for the entire build --
-        // measured 26s/55s/109s at 768/1536/3072-dim on a 20k-point corpus.
-        // The build functions only need an owned point snapshot + scalar
-        // params, so they don't need the lock held; `spawn_index_build`
-        // reconciles points inserted during the build window on completion.
-        let mut pending_build: Option<PendingIndexBuild> = None;
-        if pending_seal.is_none()
-            && !h2qg_present_before
-            && !rabitq_present_before
-            && !vamana_present_before
-            && !ivf_present_before
-            && !collection.index_build_in_flight
-            && collection.streamer_hnsw_required()
-            && collection.streamer.hnsw.is_none()
-            && collection.rabitq.is_none()
-            && collection.vamana.is_none()
-            && collection.ivf.is_none()
-        {
-            collection.index_build_in_flight = true;
-            let vector_dim = collection.config.vector_dim;
-            let hnsw_m = collection.config.hnsw_m;
-            let hnsw_ef_construction = collection.config.hnsw_ef_construction;
-            let metric = collection.config.metric;
+        if let Some(session) = graph_deferred_session {
+            let scope = scope.as_ref().ok_or_else(|| {
+                GaussError::InvalidRequest(
+                    "deferred mutation requires an authenticated scope".into(),
+                )
+            })?;
+            collection
+                .graph_mutable
+                .as_ref()
+                .ok_or_else(|| GaussError::InvalidRequest("graph is not enabled".into()))?
+                .authorize_deferred_owner(session.as_str(), scope)?;
+        }
 
-            // PC-1b: `CollectionConfig.index_kind = Some("rabitq")` routes the
-            // build to the binary cascade backend. PC-2: `Some("vamana")` routes
-            // to the DiskANN-style single-layer graph. Otherwise fall through
-            // to the internal f32 HNSW dispatch. Collection quantization is
-            // a sealed-tier policy; the mutable Streamer remains the live f32
-            // tier so hot candidates do not pay a second proxy-distance path.
-            let index_kind = collection
-                .config
-                .index_kind
-                .as_deref()
-                .map(str::to_ascii_lowercase);
-            let kind = if index_kind.as_deref() == Some("rabitq") {
-                PendingIndexBuildKind::Rabitq
-            } else if index_kind.as_deref() == Some("vamana") {
-                PendingIndexBuildKind::Vamana
-            } else if index_kind.as_deref() == Some("ivf") {
-                PendingIndexBuildKind::Ivf
-            } else {
-                PendingIndexBuildKind::H2qg
+        let authority = collection.security.clone();
+        let mut points = points;
+        if let Some(context) = &protected_update {
+            let _lease = context.publication_permit()?;
+            let mut seen = HashSet::new();
+            for point in &mut points {
+                if !seen.insert(point.id.clone()) {
+                    return Err(GaussError::InvalidRequest("duplicate update target".into()));
+                }
+                let record = context.authorize(&point.id)?;
+                let physical = record.storage_id.to_string();
+                let old = collection
+                    .try_resolve(&physical)?
+                    .ok_or(crate::security::SecurityError::Unavailable)?;
+                context.authorize_payload_change(&point.id, &old.payload, &point.payload)?;
+                if old.vector != point.vector {
+                    context.authorize_representation_write(&point.id, "dense")?;
+                }
+                if old.sparse_vector != point.sparse_vector {
+                    context.authorize_representation_write(&point.id, "sparse")?;
+                }
+                for name in old
+                    .vectors
+                    .keys()
+                    .chain(point.vectors.keys())
+                    .collect::<HashSet<_>>()
+                {
+                    if old.vectors.get(name) != point.vectors.get(name) {
+                        context.authorize_representation_write(&point.id, name)?;
+                    }
+                }
+                for name in point
+                    .vectors
+                    .keys()
+                    .map(String::as_str)
+                    .chain((!point.vector.is_empty()).then_some("dense"))
+                    .chain(point.sparse_vector.is_some().then_some("sparse"))
+                {
+                    let representation = record
+                        .representations
+                        .get(name)
+                        .ok_or(crate::security::SecurityError::Forbidden)?;
+                    if representation
+                        .source_fields
+                        .iter()
+                        .any(|field| old.payload.pointer(field) != point.payload.pointer(field))
+                    {
+                        context.authorize_representation_write(&point.id, name)?;
+                    }
+                    if representation
+                        .source_fields
+                        .iter()
+                        .any(|field| point.payload.pointer(field).is_none())
+                    {
+                        return Err(crate::security::SecurityError::Invalid(
+                            "representation source is absent from updated content".into(),
+                        )
+                        .into());
+                    }
+                }
+                point.id = physical;
+                validate_point(&collection.config, point)?;
+            }
+            crate::security::storage::serialized_len(
+                &points,
+                crate::wal::MAX_WAL_RECORD_BYTES / 2,
+            )?;
+        }
+        if protected_create.is_some() {
+            // Validate vectors/payload schema before entering a commit callback.
+            // Journal PREPARE admission precedes the decision marker; later failures
+            // close the epoch and require outcome reconciliation.
+            if max_points_per_collection
+                .is_some_and(|limit| collection.live_points().saturating_add(points.len()) > limit)
+            {
+                return Err(GaussError::ResourceExhausted(
+                    "collection point quota exceeded".into(),
+                ));
+            }
+            for point in &points {
+                validate_point(&collection.config, point)?;
+            }
+        }
+        let requested_points = points.len();
+        let decision_started = AtomicBool::new(false);
+        let execute = |points: Vec<Point>,
+                       security_delta: Option<crate::security::SecurityDelta>|
+         -> Result<(
+            UpsertExecutionReceipt,
+            Option<PendingSeal>,
+            Option<PendingIndexBuild>,
+        )> {
+            let requested_points = points.len();
+            // PB-2: parallelise typed-payload + dim validation across the batch.
+            // Each `validate_point` call is independent and CPU-bound (dim check,
+            // payload schema walk, regex/text checks). For small batches the rayon
+            // setup cost dominates, so fall back to serial below the threshold.
+            const PARALLEL_VALIDATE_THRESHOLD: usize = 256;
+            let validate_one = |point: &Point| -> Result<()> {
+                validate_point(&collection.config, point).map_err(|e| match e {
+                    GaussError::DimensionMismatch { expected, actual } => {
+                        GaussError::InvalidRequest(format!(
+                            "point '{}': expected vector dimension {expected}, got {actual}",
+                            point.id
+                        ))
+                    }
+                    other => other,
+                })
             };
-            pending_build = Some(PendingIndexBuild {
-                coll: Arc::clone(&coll),
-                data_dir_lock: Arc::clone(&self._data_dir_lock),
-                lifecycle: Arc::clone(&self.build_lifecycle),
-                streamer_base_lsn: collection.streamer.base_lsn,
-                vector_dim,
-                hnsw_m,
-                hnsw_ef_construction,
-                metric,
-                kind,
-                cascade: self.cascade.clone(),
-            });
-        }
+            if points.len() >= PARALLEL_VALIDATE_THRESHOLD {
+                points.par_iter().try_for_each(validate_one)?;
+            } else {
+                for point in &points {
+                    validate_one(point)?;
+                }
+            }
+            if let Some(max_points) = max_points_per_collection {
+                let new_ids = points
+                    .iter()
+                    .filter(|point| !collection.id_index.contains_key(&point.id))
+                    .count();
+                let projected_points =
+                    collection
+                        .live_points()
+                        .checked_add(new_ids)
+                        .ok_or_else(|| {
+                            GaussError::ResourceExhausted("point count overflow".to_string())
+                        })?;
+                if projected_points > max_points {
+                    return Err(GaussError::InvalidRequest(format!(
+                        "collection {collection_name} would exceed max_points_per_collection {max_points}: {projected_points}"
+                    )));
+                }
+            }
 
-        if wait && let Err(error) = collection.overlays.publish_pending() {
-            self.mark_durability_degraded("visibility_overlay", &error);
-        }
-        let total = collection.live_points();
+            let graph_enabled = collection.graph_lifecycle.is_enabled();
+            if graph_deferred_session.is_some() && !graph_enabled {
+                return Err(crate::graph::GraphError::new(
+                    crate::graph::GraphErrorCode::GraphDisabled,
+                    "graph is not enabled for this collection",
+                )
+                .into());
+            }
+            // Persist one frame per request. Graph-enabled collections route point
+            // mutation and any fresh handle assignments through the same
+            // GraphBatch; vector-only collections retain their legacy WAL shape.
+            let mut sealed_reads = mutation_reads::SealedPoints::prepare(
+                &collection,
+                points.iter().map(|point| point.id.as_str()),
+                self.build_lifecycle.cancellation(),
+            )?;
+            let mut graph_epoch = None;
+            let mut graph_bound_endpoints = 0;
+            let mut committed_transaction = None;
+            let (wal_points, _wal_points_admission) =
+                crate::security::mutation::PointCopies::points(&points)?.into_parts();
+            let operation_lsn = if graph_enabled && !points.is_empty() {
+                let (receipt, bound_endpoints) = self
+                    .commit_graph_point_upserts_with_security_locked(
+                        &mut collection,
+                        wal_points,
+                        wait,
+                        graph_deferred_session.map(crate::graph::GraphDeferredSessionId::as_str),
+                        security_delta,
+                        Some((&transaction_audit_context, &decision_started)),
+                    )?;
+                graph_epoch = Some(receipt.graph_epoch);
+                graph_bound_endpoints = bound_endpoints;
+                receipt.operation_lsn
+            } else if !points.is_empty() {
+                let entry = match security_delta {
+                    Some(security) => WalEntry::ProtectedBatch {
+                        batch: crate::security::ProtectedBatch {
+                            version: crate::security::SECURITY_VERSION,
+                            security,
+                            content: crate::security::ProtectedContent::Upsert {
+                                points: wal_points,
+                            },
+                        },
+                    },
+                    None => WalEntry::UpsertBatch { points: wal_points },
+                };
+                let (transaction, operation_lsn) = self
+                    .commit_collection_transaction_with_decision(
+                        collection_name,
+                        &mut collection,
+                        entry,
+                        TransactionAudit::mutation(
+                            "upsert",
+                            Some(collection_name),
+                            &transaction_audit_context,
+                            serde_json::json!({
+                                "requested_points": requested_points,
+                                "wait": wait,
+                            }),
+                        ),
+                        Some(&decision_started),
+                    )?;
+                committed_transaction = Some(transaction);
+                operation_lsn
+            } else {
+                collection.wal.len()?
+            };
+            // Phase 3a: when an HNSW graph already exists, append each new point
+            // into the live graph alongside sparse/payload updates. Removes the gap
+            // where points upserted between compactions fell through to flat scan.
+            let mut h2qg_present_before = collection.streamer.hnsw.is_some();
+            let mut rabitq_present_before = collection.rabitq.is_some();
+            let mut vamana_present_before = collection.vamana.is_some();
+            let mut ivf_present_before = collection.ivf.is_some();
+            let collection_vector_dim = collection.config.vector_dim;
+            if !graph_enabled {
+                for point in points {
+                    // Route the old copy through the ID authority: an id living in a
+                    // sealed searcher is tombstoned there (never mutated in place);
+                    // an id already in the streamer is replaced as before.
+                    match collection.id_index.get(&point.id).copied() {
+                        Some(crate::searcher::SegLoc::Sealing) => {
+                            if let Some(old_point) = collection
+                                .sealing
+                                .as_ref()
+                                .and_then(|streamer| streamer.points.get(&point.id))
+                                .cloned()
+                            {
+                                remove_sparse_point(&mut collection.sparse_index, &old_point);
+                                remove_payload_point(&mut collection.payload_index, &old_point);
+                            }
+                            collection.streamer.insert(point.clone());
+                        }
+                        Some(crate::searcher::SegLoc::Searcher(i)) => {
+                            let old_point = sealed_reads.take(&point.id);
+                            if let Some(old_point) = old_point {
+                                remove_sparse_point(&mut collection.sparse_index, &old_point);
+                                remove_payload_point(&mut collection.payload_index, &old_point);
+                            }
+                            if let Err(error) = collection.tombstone_searcher(i as usize, &point.id)
+                            {
+                                self.mark_durability_degraded("upsert_visibility", &error);
+                            }
+                            collection.streamer.insert(point.clone());
+                        }
+                        _ => {
+                            if let Some(old_point) = collection.streamer.insert(point.clone()) {
+                                remove_sparse_point(&mut collection.sparse_index, &old_point);
+                                remove_payload_point(&mut collection.payload_index, &old_point);
+                            }
+                        }
+                    }
+                    collection
+                        .id_index
+                        .insert(point.id.clone(), crate::searcher::SegLoc::Streamer);
+                    insert_sparse_point(&mut collection.sparse_index, &point);
+                    insert_payload_point(&mut collection.payload_index, &point);
+                    if h2qg_present_before
+                        && let Some(h2qg) = collection.streamer.hnsw.as_mut()
+                        && !h2qg.contains(&point.id)
+                        && let Err(error) = h2qg.insert_point(&point, collection_vector_dim)
+                    {
+                        collection.streamer.hnsw = None;
+                        h2qg_present_before = false;
+                        tracing::warn!(%error, "discarded failed mutable H2QG projection");
+                    }
+                    // PC-1b: inline insert for RaBitQ too. `IndexBackend::insert_point`
+                    // is a trait method so the call shape is identical.
+                    if rabitq_present_before && let Some(rb) = collection.rabitq.as_mut() {
+                        use crate::index::IndexBackend;
+                        if !IndexBackend::contains(rb, &point.id)
+                            && let Err(error) =
+                                IndexBackend::insert_point(rb, &point, collection_vector_dim)
+                        {
+                            collection.rabitq = None;
+                            rabitq_present_before = false;
+                            tracing::warn!(%error, "discarded failed mutable RaBitQ projection");
+                        }
+                    }
+                    // PC-2: same inline-insert shape for Vamana.
+                    if vamana_present_before && let Some(vm) = collection.vamana.as_mut() {
+                        use crate::index::IndexBackend;
+                        if !IndexBackend::contains(vm, &point.id)
+                            && let Err(error) =
+                                IndexBackend::insert_point(vm, &point, collection_vector_dim)
+                        {
+                            collection.vamana = None;
+                            vamana_present_before = false;
+                            tracing::warn!(%error, "discarded failed mutable Vamana projection");
+                        }
+                    }
+                    // B1.1: same inline-insert shape for IVF.
+                    if ivf_present_before && let Some(ivf) = collection.ivf.as_mut() {
+                        use crate::index::IndexBackend;
+                        if !IndexBackend::contains(ivf, &point.id)
+                            && let Err(error) =
+                                IndexBackend::insert_point(ivf, &point, collection_vector_dim)
+                        {
+                            collection.ivf = None;
+                            ivf_present_before = false;
+                            tracing::warn!(%error, "discarded failed mutable IVF projection");
+                        }
+                    }
+                    collection.hnsw_dirty = true;
+                }
+            }
+
+            let mut pending_seal = None;
+            if collection.sealing.is_none()
+                && !collection.generation_build_in_flight
+                && collection
+                    .streamer
+                    .should_seal(collection.config.streamer_max_bytes)
+            {
+                // The seal marker may cover this WAL prefix only after the prefix
+                // itself is durable, including wait=false batches.
+                collection.wal.sync()?;
+                match collection.overlays.publish_pending() {
+                    Ok(()) => {
+                        let end_lsn = collection.wal.len()?;
+                        let graph = capture_graph_seal(
+                            &mut collection,
+                            &collection_dir(&root, collection_name),
+                            end_lsn,
+                        )?;
+                        let wal_archive_cut = if graph.is_some() {
+                            collection.wal.freeze_archive_cut(end_lsn)?
+                        } else {
+                            None
+                        };
+                        let frozen = freeze_streamer_for_seal(&mut collection, end_lsn);
+                        pending_seal = Some(PendingSeal {
+                            coll: Arc::clone(&coll),
+                            data_dir_lock: Arc::clone(&self._data_dir_lock),
+                            lifecycle: Arc::clone(&self.build_lifecycle),
+                            collection_dir: collection_dir(&root, collection_name),
+                            frozen,
+                            end_lsn,
+                            graph,
+                            wal_archive_cut,
+                            wal_archive_policy,
+                            vector_dim: collection.config.vector_dim,
+                            metric: collection.config.metric,
+                            hnsw_m: collection.config.hnsw_m,
+                            hnsw_ef_construction: collection.config.hnsw_ef_construction,
+                            index_kind: crate::seal::SealIndexKind::Algorithm2,
+                            cascade: self.cascade.clone(),
+                            intra_query_parallel: self.intra_query_parallel.clone(),
+                        });
+                    }
+                    Err(error) => self.mark_durability_degraded("visibility_overlay", &error),
+                }
+            }
+
+            // Phase 3a: if the collection just crossed the HNSW threshold, stage
+            // the initial graph build to run on a background thread, off the
+            // collection write lock. Building inline (the old behavior) stalls
+            // every read/write against this collection for the entire build --
+            // measured 26s/55s/109s at 768/1536/3072-dim on a 20k-point corpus.
+            // The build functions only need an owned point snapshot + scalar
+            // params, so they don't need the lock held; `spawn_index_build`
+            // reconciles points inserted during the build window on completion.
+            let mut pending_build: Option<PendingIndexBuild> = None;
+            if pending_seal.is_none()
+                && !h2qg_present_before
+                && !rabitq_present_before
+                && !vamana_present_before
+                && !ivf_present_before
+                && !collection.index_build_in_flight
+                && collection.streamer_hnsw_required()
+                && collection.streamer.hnsw.is_none()
+                && collection.rabitq.is_none()
+                && collection.vamana.is_none()
+                && collection.ivf.is_none()
+            {
+                collection.index_build_in_flight = true;
+                let vector_dim = collection.config.vector_dim;
+                let hnsw_m = collection.config.hnsw_m;
+                let hnsw_ef_construction = collection.config.hnsw_ef_construction;
+                let metric = collection.config.metric;
+
+                // PC-1b: `CollectionConfig.index_kind = Some("rabitq")` routes the
+                // build to the binary cascade backend. PC-2: `Some("vamana")` routes
+                // to the DiskANN-style single-layer graph. Otherwise fall through
+                // to the internal f32 HNSW dispatch. Collection quantization is
+                // a sealed-tier policy; the mutable Streamer remains the live f32
+                // tier so hot candidates do not pay a second proxy-distance path.
+                let index_kind = collection
+                    .config
+                    .index_kind
+                    .as_deref()
+                    .map(str::to_ascii_lowercase);
+                let kind = if index_kind.as_deref() == Some("rabitq") {
+                    PendingIndexBuildKind::Rabitq
+                } else if index_kind.as_deref() == Some("vamana") {
+                    PendingIndexBuildKind::Vamana
+                } else if index_kind.as_deref() == Some("ivf") {
+                    PendingIndexBuildKind::Ivf
+                } else {
+                    PendingIndexBuildKind::H2qg
+                };
+                pending_build = Some(PendingIndexBuild {
+                    coll: Arc::clone(&coll),
+                    data_dir_lock: Arc::clone(&self._data_dir_lock),
+                    lifecycle: Arc::clone(&self.build_lifecycle),
+                    streamer_base_lsn: collection.streamer.base_lsn,
+                    vector_dim,
+                    hnsw_m,
+                    hnsw_ef_construction,
+                    metric,
+                    kind,
+                    cascade: self.cascade.clone(),
+                });
+            }
+
+            if wait && let Err(error) = collection.overlays.publish_pending() {
+                self.mark_durability_degraded("visibility_overlay", &error);
+            }
+            let total = collection.live_points();
+            let mut audit_details = serde_json::json!({
+                "requested_points": requested_points,
+                "total_points": total,
+                "wait": wait,
+                "operation_lsn": operation_lsn,
+            });
+            if graph_deferred_session.is_some() {
+                audit_details["deferred_graph_session"] = serde_json::json!(true);
+                audit_details["bound_endpoints"] = serde_json::json!(graph_bound_endpoints);
+            }
+            if let Some(unsafe_audit) = &unsafe_structural_audit {
+                audit_details["unsafe_structural_embedding"] = serde_json::json!({
+                    "reason": unsafe_audit.reason,
+                    "point_count": unsafe_audit.point_count,
+                    "zero_vector_points": unsafe_audit.zero_vector_points,
+                    "point_id_sha256": unsafe_audit.point_id_sha256,
+                });
+            }
+            if let Some(transaction) = &committed_transaction {
+                self.project_transaction_audit(transaction);
+            }
+            self.finish_committed_legacy_audit(audit_operation, audit_details);
+            if let Err(error) = crate::failpoint::check("db.after_upsert_durable") {
+                self.mark_durability_degraded("upsert_acknowledgement", &error);
+            }
+            Ok((
+                UpsertExecutionReceipt {
+                    created_ids: crate::search::AdmittedVec::default(),
+                    total,
+                    operation_lsn,
+                    unsafe_override_audited: unsafe_structural_audit.is_some(),
+                    graph_epoch,
+                    graph_bound_endpoints,
+                },
+                pending_seal,
+                pending_build,
+            ))
+        };
+        let (receipt, pending_seal, pending_build) = (if let Some(create) = protected_create {
+            let authority = authority.ok_or(crate::security::SecurityError::Forbidden)?;
+            let mut receipt = None;
+            authority.create_with_options(
+                &create.context,
+                &create.template,
+                &create.points,
+                crate::security::CreateOptions {
+                    ids: create.public_ids.as_deref(),
+                    request: create.request,
+                    decision_started: Some(&decision_started),
+                },
+                |records, generation| {
+                    let created_ids = crate::security::mutation::ids(
+                        records.iter().map(|record| record.key.id.as_str()),
+                    )?;
+                    let (physical, _physical_admission) =
+                        crate::security::mutation::PointCopies::new_points(
+                            &create.points,
+                            Some(records),
+                        )?
+                        .into_parts();
+                    let delta = crate::security::SecurityDelta {
+                        incarnation: create.context.incarnation(),
+                        expected_revision: create.context.policy_revision(),
+                        revision: create.context.policy_revision(),
+                        expected_generation: generation - 1,
+                        generation,
+                        policy: None,
+                        bindings: records.to_vec(),
+                    };
+                    let mut result = execute(physical, Some(delta))?;
+                    result.0.created_ids = created_ids;
+                    receipt = Some(result);
+                    Ok(())
+                },
+            )?;
+            let receipt = receipt.ok_or(crate::security::SecurityError::Unavailable)?;
+            Ok(receipt)
+        } else if let Some(context) = protected_update {
+            authority
+                .ok_or(crate::security::SecurityError::Unavailable)?
+                .data_transaction(
+                    &context,
+                    &[],
+                    &decision_started,
+                    |_, previous, generation, _, _| {
+                        execute(
+                            points,
+                            Some(crate::security::SecurityDelta {
+                                incarnation: context.incarnation(),
+                                expected_revision: context.policy_revision(),
+                                revision: context.policy_revision(),
+                                expected_generation: previous,
+                                generation,
+                                policy: None,
+                                bindings: Vec::new(),
+                            }),
+                        )
+                    },
+                )
+        } else {
+            execute(points, None)
+        })?;
+        // Keep the collection write lock until both content and security
+        // bindings are published. Metrics and workers may reacquire it.
         drop(collection);
         if let Some(seal) = pending_seal {
             spawn_segment_seal(seal);
@@ -2623,36 +4771,10 @@ impl Db {
         if let Some(build) = pending_build {
             spawn_index_build(build);
         }
-        let mut audit_details = serde_json::json!({
-            "requested_points": requested_points,
-            "total_points": total,
-            "wait": wait,
-            "operation_lsn": operation_lsn,
-        });
-        if graph_deferred_session.is_some() {
-            audit_details["deferred_graph_session"] = serde_json::json!(true);
-            audit_details["bound_endpoints"] = serde_json::json!(graph_bound_endpoints);
-        }
-        if let Some(unsafe_audit) = &unsafe_structural_audit {
-            audit_details["unsafe_structural_embedding"] = serde_json::json!({
-                "reason": unsafe_audit.reason,
-                "point_count": unsafe_audit.point_count,
-                "zero_vector_points": unsafe_audit.zero_vector_points,
-                "point_id_sha256": unsafe_audit.point_id_sha256,
-            });
-        }
-        audit_operation.success(audit_details)?;
-        crate::failpoint::check("db.after_upsert_durable")?;
         observe_points_upserted(requested_points);
         self.refresh_metrics();
         operation_metrics.succeed();
-        Ok(UpsertExecutionReceipt {
-            total,
-            operation_lsn,
-            unsafe_override_audited: unsafe_structural_audit.is_some(),
-            graph_epoch,
-            graph_bound_endpoints,
-        })
+        Ok(receipt)
     }
 
     fn delete_unguarded(
@@ -2660,20 +4782,33 @@ impl Db {
         collection_name: &str,
         ids: &[String],
         with_edges_acknowledged: bool,
-        audit_context: audit::AuditContext,
-        origin: MutationOrigin,
+        context: MutationContext,
     ) -> Result<usize> {
+        let MutationContext {
+            audit: audit_context,
+            origin,
+            scope,
+            protected_delete,
+            protected_filter,
+            ..
+        } = context;
+        let enforcement = self.tenant_enforcement();
         let _lifecycle = self.lifecycle_gate.read();
         self.ensure_storage_mutations_available()?;
         let _admission = self.maintenance_barrier.read();
         if origin == MutationOrigin::LegacyReplication {
             self.ensure_legacy_replication_available(collection_name)?;
         }
-        let audit_operation =
-            self.audit_operation_with_context("delete", Some(collection_name), audit_context)?;
+        let transaction_audit_context = audit_context;
         let mut operation_metrics = OperationGuard::start("delete");
-        self.ensure_collection_cold_materialized(collection_name)?;
-        let coll = self.get_coll(collection_name)?;
+        match &protected_delete {
+            Some(context) => self.ensure_collection_cold_materialized_authorized(context)?,
+            None => self.ensure_collection_cold_materialized(collection_name)?,
+        }
+        let coll = match &protected_delete {
+            Some(context) => self.get_coll_authorized(context)?,
+            None => self.get_coll(collection_name)?,
+        };
         let mut collection = coll.write();
         if origin == MutationOrigin::LegacyReplication
             && collection.graph_lifecycle.epoch().is_some()
@@ -2681,96 +4816,244 @@ impl Db {
             return Err(graph_replication_unavailable(collection_name));
         }
 
-        if collection.graph_lifecycle.is_enabled() {
-            let (receipt, deleted, orphaned_edges) = self.commit_graph_point_deletes_locked(
-                &mut collection,
-                ids,
-                with_edges_acknowledged,
-            )?;
-            drop(collection);
-            audit_operation.success(serde_json::json!({
-                "requested_ids": ids.len(),
-                "deleted": deleted,
-                "graph_epoch": receipt.map(|receipt| receipt.graph_epoch.raw()),
-                "operation_lsn": receipt.map(|receipt| receipt.operation_lsn),
-                "with_edges_acknowledged": with_edges_acknowledged,
-            }))?;
-            observe_points_deleted(deleted);
-            observe_graph_edges_orphaned_by_delete(orphaned_edges);
-            self.refresh_metrics();
-            operation_metrics.succeed();
-            return Ok(deleted);
+        if let Some(scope) = scope.as_ref().filter(|_| enforcement.blocks()) {
+            for id in ids {
+                let existing = collection
+                    .try_resolve(id)?
+                    .ok_or_else(|| GaussError::PointNotFound(id.clone()))?;
+                scope
+                    .may_write_payload(enforcement, &existing.payload)
+                    .map_err(|_| GaussError::PointNotFound(id.clone()))?;
+            }
         }
 
-        if !ids.is_empty() {
-            collection
-                .wal
-                .append(&WalEntry::DeleteBatch { ids: ids.to_vec() })?;
+        let authority = collection.security.clone();
+        // Resolve a filtered mutation inside the same write lock as validation
+        // and WAL append. Read grants can never enlarge this Delete domain.
+        let selected_ids = match &protected_filter {
+            Some(filter) => Self::select_delete_ids_locked(
+                &collection,
+                protected_delete
+                    .as_ref()
+                    .ok_or(crate::security::SecurityError::Forbidden)?,
+                filter,
+                self.build_lifecycle.cancellation(),
+            )?,
+            None => crate::search::AdmittedVec::default(),
+        };
+        let ids = if protected_filter.is_some() {
+            &selected_ids[..]
+        } else {
+            ids
+        };
+        if protected_delete.is_some() && ids.is_empty() {
+            self.audit_operation_with_context(
+                "delete",
+                Some(collection_name),
+                transaction_audit_context.clone(),
+            )?
+            .success(serde_json::json!({"deleted":0}))?;
+            operation_metrics.succeed();
+            return Ok(0);
         }
-        let mut deleted = 0;
-        for id in ids {
-            match collection.id_index.get(id).copied() {
-                Some(crate::searcher::SegLoc::Streamer) => {
-                    if let Some(point) = collection.streamer.remove(id) {
-                        remove_sparse_point(&mut collection.sparse_index, &point);
-                        remove_payload_point(&mut collection.payload_index, &point);
-                        if let Some(h2qg) = collection.streamer.hnsw.as_mut() {
-                            h2qg.remove_from_indexed(id);
-                        }
-                        for named in collection.streamer.named_hnsw.values_mut() {
-                            named.remove_from_indexed(id);
-                        }
-                        collection.id_index.remove(id);
-                        collection.hnsw_dirty = true;
-                        deleted += 1;
-                    }
+        let mut physical_ids = Vec::new();
+        let mut retire = Vec::new();
+        if let Some(context) = &protected_delete {
+            let _lease = context.publication_permit()?;
+            let mut seen = HashSet::new();
+            for id in ids {
+                if !seen.insert(id) {
+                    return Err(GaussError::InvalidRequest("duplicate delete target".into()));
                 }
-                Some(crate::searcher::SegLoc::Sealing) => {
-                    if let Some(point) = collection
-                        .sealing
-                        .as_ref()
-                        .and_then(|streamer| streamer.points.get(id))
-                        .cloned()
-                    {
-                        remove_sparse_point(&mut collection.sparse_index, &point);
-                        remove_payload_point(&mut collection.payload_index, &point);
-                    }
-                    collection.id_index.remove(id);
-                    collection.hnsw_dirty = true;
-                    deleted += 1;
+                let record = context.authorize(id)?;
+                let physical = record.storage_id.to_string();
+                if collection.try_resolve(&physical)?.is_none() {
+                    return Err(crate::security::SecurityError::Unavailable.into());
                 }
-                Some(crate::searcher::SegLoc::Searcher(i)) => {
-                    // Sealed point: tombstone in place, never mutate the
-                    // segment. Reclaimed at the next compact.
-                    let point = collection.searchers[i as usize]
-                        .store
-                        .get(id)
-                        .map(Cow::into_owned);
-                    if let Some(point) = point {
-                        remove_sparse_point(&mut collection.sparse_index, &point);
-                        remove_payload_point(&mut collection.payload_index, &point);
-                    }
-                    collection.tombstone_searcher(i as usize, id)?;
-                    collection.id_index.remove(id);
-                    collection.hnsw_dirty = true;
-                    deleted += 1;
-                }
-                None => {}
-            }
-            // DROP GRAPH preserves surviving handles, not deleted incarnations.
-            if let Some(resolver) = &mut collection.graph_resolver {
-                resolver.retire(id);
+                physical_ids.push(physical);
+                retire.push(record.key);
             }
         }
-        if let Err(error) = collection.overlays.publish_pending() {
-            self.mark_durability_degraded("visibility_overlay", &error);
+        let ids = if protected_delete.is_some() {
+            physical_ids.as_slice()
+        } else {
+            ids
+        };
+        if protected_delete.is_some() {
+            Self::validate_graph_delete_ack_locked(&collection, ids, with_edges_acknowledged)?;
         }
+        let decision_started = AtomicBool::new(false);
+        let mut execute =
+            |security_delta: Option<crate::security::SecurityDelta>| -> Result<(usize, usize)> {
+                if collection.graph_lifecycle.is_enabled() {
+                    let audit_operation = self.audit_operation_with_context(
+                        "delete",
+                        Some(collection_name),
+                        transaction_audit_context.clone(),
+                    )?;
+                    let (receipt, deleted, orphaned_edges) = self
+                        .commit_graph_point_deletes_with_security_locked(
+                            &mut collection,
+                            ids,
+                            with_edges_acknowledged,
+                            security_delta,
+                            Some((&transaction_audit_context, &decision_started)),
+                        )?;
+                    self.finish_committed_legacy_audit(
+                        audit_operation,
+                        serde_json::json!({
+                            "requested_ids": ids.len(),
+                            "deleted": deleted,
+                            "graph_epoch": receipt.map(|receipt| receipt.graph_epoch.raw()),
+                            "operation_lsn": receipt.map(|receipt| receipt.operation_lsn),
+                            "with_edges_acknowledged": with_edges_acknowledged,
+                        }),
+                    );
+                    return Ok((deleted, orphaned_edges));
+                }
+
+                let mut committed_transaction = None;
+                let mut sealed_reads = mutation_reads::SealedPoints::prepare(
+                    &collection,
+                    ids.iter().map(String::as_str),
+                    self.build_lifecycle.cancellation(),
+                )?;
+                if !ids.is_empty() {
+                    let entry = match security_delta {
+                        Some(security) => WalEntry::ProtectedBatch {
+                            batch: crate::security::ProtectedBatch {
+                                version: crate::security::SECURITY_VERSION,
+                                security,
+                                content: crate::security::ProtectedContent::Delete {
+                                    ids: ids.to_vec(),
+                                },
+                            },
+                        },
+                        None => WalEntry::DeleteBatch { ids: ids.to_vec() },
+                    };
+                    let (transaction, _) = self.commit_collection_transaction_with_decision(
+                        collection_name,
+                        &mut collection,
+                        entry,
+                        TransactionAudit::mutation(
+                            "delete",
+                            Some(collection_name),
+                            &transaction_audit_context,
+                            serde_json::json!({"requested_ids": ids.len()}),
+                        ),
+                        Some(&decision_started),
+                    )?;
+                    committed_transaction = Some(transaction);
+                }
+                let mut deleted = 0;
+                for id in ids {
+                    match collection.id_index.get(id).copied() {
+                        Some(crate::searcher::SegLoc::Streamer) => {
+                            if let Some(point) = collection.streamer.remove(id) {
+                                remove_sparse_point(&mut collection.sparse_index, &point);
+                                remove_payload_point(&mut collection.payload_index, &point);
+                                if let Some(h2qg) = collection.streamer.hnsw.as_mut() {
+                                    h2qg.remove_from_indexed(id);
+                                }
+                                for named in collection.streamer.named_hnsw.values_mut() {
+                                    named.remove_from_indexed(id);
+                                }
+                                collection.id_index.remove(id);
+                                collection.hnsw_dirty = true;
+                                deleted += 1;
+                            }
+                        }
+                        Some(crate::searcher::SegLoc::Sealing) => {
+                            if let Some(point) = collection
+                                .sealing
+                                .as_ref()
+                                .and_then(|streamer| streamer.points.get(id))
+                                .cloned()
+                            {
+                                remove_sparse_point(&mut collection.sparse_index, &point);
+                                remove_payload_point(&mut collection.payload_index, &point);
+                            }
+                            collection.id_index.remove(id);
+                            collection.hnsw_dirty = true;
+                            deleted += 1;
+                        }
+                        Some(crate::searcher::SegLoc::Searcher(i)) => {
+                            // Sealed point: tombstone in place, never mutate the
+                            // segment. Reclaimed at the next compact.
+                            let point = sealed_reads.take(id);
+                            if let Some(point) = point {
+                                remove_sparse_point(&mut collection.sparse_index, &point);
+                                remove_payload_point(&mut collection.payload_index, &point);
+                            }
+                            if let Err(error) = collection.tombstone_searcher(i as usize, id) {
+                                self.mark_durability_degraded("delete_visibility", &error);
+                            }
+                            collection.id_index.remove(id);
+                            collection.hnsw_dirty = true;
+                            deleted += 1;
+                        }
+                        None => {}
+                    }
+                    // DROP GRAPH preserves surviving handles, not deleted incarnations.
+                    if let Some(resolver) = &mut collection.graph_resolver {
+                        resolver.retire(id);
+                    }
+                }
+                if let Err(error) = collection.overlays.publish_pending() {
+                    self.mark_durability_degraded("visibility_overlay", &error);
+                }
+                if let Some(transaction) = &committed_transaction {
+                    self.project_transaction_audit(transaction);
+                } else {
+                    let audit_operation = self.audit_operation_with_context(
+                        "delete",
+                        Some(collection_name),
+                        transaction_audit_context.clone(),
+                    )?;
+                    self.finish_committed_legacy_audit(
+                        audit_operation,
+                        serde_json::json!({
+                            "requested_ids": ids.len(),
+                            "deleted": deleted,
+                        }),
+                    );
+                }
+                Ok((deleted, 0))
+            };
+        let (deleted, orphaned_edges) = (if let Some(context) = protected_delete {
+            authority
+                .ok_or(crate::security::SecurityError::Unavailable)?
+                .data_transaction(
+                    &context,
+                    &retire,
+                    &decision_started,
+                    |records, previous, generation, revision, _| {
+                        let public_ids = records
+                            .iter()
+                            .map(|record| record.key.id.clone())
+                            .collect::<std::collections::BTreeSet<_>>();
+                        self.relational.read().ensure_no_live_references(
+                            context.tenant(),
+                            collection_name,
+                            &public_ids,
+                        )?;
+                        execute(Some(crate::security::SecurityDelta {
+                            incarnation: context.incarnation(),
+                            expected_revision: context.policy_revision(),
+                            revision,
+                            expected_generation: previous,
+                            generation,
+                            policy: None,
+                            bindings: records.to_vec(),
+                        }))
+                    },
+                )
+        } else {
+            execute(None)
+        })?;
         drop(collection);
-        audit_operation.success(serde_json::json!({
-            "requested_ids": ids.len(),
-            "deleted": deleted,
-        }))?;
         observe_points_deleted(deleted);
+        observe_graph_edges_orphaned_by_delete(orphaned_edges);
         self.refresh_metrics();
         operation_metrics.succeed();
         Ok(deleted)
@@ -2783,8 +5066,9 @@ impl Db {
         let collection = coll.read();
         let points = ids
             .iter()
-            .filter_map(|id| collection.resolve(id).map(Cow::into_owned))
-            .collect();
+            .filter_map(|id| collection.try_resolve(id).transpose())
+            .map(|point| point.map(Cow::into_owned))
+            .collect::<Result<Vec<_>>>()?;
         Ok(points)
     }
 
@@ -2794,17 +5078,22 @@ impl Db {
         id: &str,
         payload: serde_json::Value,
         merge: bool,
-        audit_context: audit::AuditContext,
-        origin: MutationOrigin,
+        context: MutationContext,
     ) -> Result<Point> {
+        let MutationContext {
+            audit: audit_context,
+            origin,
+            scope,
+            ..
+        } = context;
+        let enforcement = self.tenant_enforcement();
         let _lifecycle = self.lifecycle_gate.read();
         self.ensure_storage_mutations_available()?;
         let _admission = self.maintenance_barrier.read();
         if origin == MutationOrigin::LegacyReplication {
             self.ensure_legacy_replication_available(collection_name)?;
         }
-        let audit_operation =
-            self.audit_operation_with_context("set_payload", Some(collection_name), audit_context)?;
+        let transaction_audit_context = audit_context;
         let mut operation_metrics = OperationGuard::start("set_payload");
         self.ensure_collection_cold_materialized(collection_name)?;
         let coll = self.get_coll(collection_name)?;
@@ -2823,7 +5112,7 @@ impl Db {
         // especially important for follower apply: an invalid replicated
         // payload must not become a durable record that fails every restart.
         let mut candidate = collection
-            .resolve(id)
+            .try_resolve(id)?
             .map(Cow::into_owned)
             .ok_or_else(|| GaussError::PointNotFound(id.to_string()))?;
         if merge {
@@ -2839,29 +5128,53 @@ impl Db {
         } else {
             candidate.payload = payload.clone();
         }
+        if let Some(scope) = scope.as_ref() {
+            let existing = collection
+                .try_resolve(id)?
+                .ok_or_else(|| GaussError::PointNotFound(id.to_string()))?;
+            scope.authorize_replacement(enforcement, id, &existing.payload, &candidate.payload)?;
+        }
         validate_payload_schema(&collection.config, &candidate)?;
 
         if collection.graph_lifecycle.is_enabled() {
+            let audit_operation = self.audit_operation_with_context(
+                "set_payload",
+                Some(collection_name),
+                transaction_audit_context.clone(),
+            )?;
             let receipt = self.commit_graph_point_upserts_locked(
                 &mut collection,
                 vec![candidate.clone()],
                 true,
             )?;
             drop(collection);
-            audit_operation.success(serde_json::json!({
-                "merge": merge,
-                "graph_epoch": receipt.graph_epoch.raw(),
-                "operation_lsn": receipt.operation_lsn,
-            }))?;
+            self.finish_committed_legacy_audit(
+                audit_operation,
+                serde_json::json!({
+                    "merge": merge,
+                    "graph_epoch": receipt.graph_epoch.raw(),
+                    "operation_lsn": receipt.operation_lsn,
+                }),
+            );
             operation_metrics.succeed();
             return Ok(candidate);
         }
 
-        collection.wal.append(&WalEntry::SetPayload {
-            id: id.to_string(),
-            payload: payload.clone(),
-            merge,
-        })?;
+        let (transaction, _) = self.commit_collection_transaction(
+            collection_name,
+            &mut collection,
+            WalEntry::SetPayload {
+                id: id.to_string(),
+                payload: payload.clone(),
+                merge,
+            },
+            TransactionAudit::mutation(
+                "set_payload",
+                Some(collection_name),
+                &transaction_audit_context,
+                serde_json::json!({"point_id": id, "merge": merge}),
+            ),
+        )?;
 
         // A payload update on a sealed point is an update: move the point
         // into the streamer and tombstone the old location, then mutate the
@@ -2886,7 +5199,9 @@ impl Db {
                     .get(id)
                     .map(Cow::into_owned);
                 if let Some(point) = point {
-                    collection.tombstone_searcher(i as usize, id)?;
+                    if let Err(error) = collection.tombstone_searcher(i as usize, id) {
+                        self.mark_durability_degraded("payload_visibility", &error);
+                    }
                     collection.streamer.insert(point);
                     collection
                         .id_index
@@ -2924,7 +5239,7 @@ impl Db {
         }
 
         drop(collection);
-        audit_operation.success(serde_json::json!({ "merge": merge }))?;
+        self.project_transaction_audit(&transaction);
         operation_metrics.succeed();
         Ok(updated_point)
     }
@@ -2934,51 +5249,66 @@ impl Db {
         collection_name: &str,
         filter: &crate::Filter,
         with_edges_acknowledged: bool,
-        audit_context: audit::AuditContext,
+        context: MutationContext,
     ) -> Result<usize> {
+        let MutationContext {
+            audit: audit_context,
+            scope,
+            ..
+        } = context;
+        let enforcement = self.tenant_enforcement();
         let _lifecycle = self.lifecycle_gate.read();
         self.ensure_storage_mutations_available()?;
         validate_filter_complexity(Some(filter))?;
         let _admission = self.maintenance_barrier.read();
-        let audit_operation = self.audit_operation_with_context(
-            "delete_by_filter",
-            Some(collection_name),
-            audit_context,
-        )?;
+        let transaction_audit_context = audit_context;
         let mut operation_metrics = OperationGuard::start("delete_by_filter");
         self.ensure_collection_cold_materialized(collection_name)?;
         let coll = self.get_coll(collection_name)?;
         let mut collection = coll.write();
         let visibility = collection.overlay_read_state();
 
-        let matching_ids: Vec<String> =
-            if let Some(candidates) = collection.payload_candidates(&visibility, Some(filter)) {
-                collection
-                    .iter_payload_candidates(&visibility, &candidates)
-                    .filter(|point| filter.matches(&point.payload))
-                    .map(|point| point.id.clone())
-                    .collect()
-            } else {
-                collection
-                    .iter_live_in_read_state(&visibility)
-                    .filter(|point| filter.matches(&point.payload))
-                    .map(|point| point.id.clone())
-                    .collect()
-            };
+        let candidates = collection.payload_candidates(&visibility, Some(filter));
+        let source = match &candidates {
+            Some(candidates) => collection.iter_payload_candidates(&visibility, candidates),
+            None => collection.iter_live_in_read_state(&visibility),
+        };
+        let matching_ids = source
+            .filter_map(|point| {
+                point
+                    .map(|point| {
+                        (filter.matches(&point.payload)
+                            && scope.as_ref().is_none_or(|scope| {
+                                scope.may_write_payload(enforcement, &point.payload).is_ok()
+                            }))
+                        .then(|| point.id.clone())
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<String>>>()?;
+        drop(candidates);
 
         if collection.graph_lifecycle.is_enabled() {
+            let audit_operation = self.audit_operation_with_context(
+                "delete_by_filter",
+                Some(collection_name),
+                transaction_audit_context.clone(),
+            )?;
             let (receipt, deleted, orphaned_edges) = self.commit_graph_point_deletes_locked(
                 &mut collection,
                 &matching_ids,
                 with_edges_acknowledged,
             )?;
             drop(collection);
-            audit_operation.success(serde_json::json!({
-                "deleted": deleted,
-                "graph_epoch": receipt.map(|receipt| receipt.graph_epoch.raw()),
-                "operation_lsn": receipt.map(|receipt| receipt.operation_lsn),
-                "with_edges_acknowledged": with_edges_acknowledged,
-            }))?;
+            self.finish_committed_legacy_audit(
+                audit_operation,
+                serde_json::json!({
+                    "deleted": deleted,
+                    "graph_epoch": receipt.map(|receipt| receipt.graph_epoch.raw()),
+                    "operation_lsn": receipt.map(|receipt| receipt.operation_lsn),
+                    "with_edges_acknowledged": with_edges_acknowledged,
+                }),
+            );
             observe_points_deleted(deleted);
             observe_graph_edges_orphaned_by_delete(orphaned_edges);
             self.refresh_metrics();
@@ -2986,11 +5316,29 @@ impl Db {
             return Ok(deleted);
         }
 
-        if !matching_ids.is_empty() {
-            collection.wal.append(&WalEntry::DeleteBatch {
-                ids: matching_ids.clone(),
-            })?;
-        }
+        let mut sealed_reads = mutation_reads::SealedPoints::prepare(
+            &collection,
+            matching_ids.iter().map(String::as_str),
+            self.build_lifecycle.cancellation(),
+        )?;
+        let committed_transaction = if matching_ids.is_empty() {
+            None
+        } else {
+            let (transaction, _) = self.commit_collection_transaction(
+                collection_name,
+                &mut collection,
+                WalEntry::DeleteBatch {
+                    ids: matching_ids.clone(),
+                },
+                TransactionAudit::mutation(
+                    "delete_by_filter",
+                    Some(collection_name),
+                    &transaction_audit_context,
+                    serde_json::json!({"matched_ids": matching_ids.len()}),
+                ),
+            )?;
+            Some(transaction)
+        };
         let mut deleted = 0;
         for id in &matching_ids {
             match collection.id_index.get(id).copied() {
@@ -3024,15 +5372,14 @@ impl Db {
                     deleted += 1;
                 }
                 Some(crate::searcher::SegLoc::Searcher(i)) => {
-                    let point = collection.searchers[i as usize]
-                        .store
-                        .get(id)
-                        .map(Cow::into_owned);
+                    let point = sealed_reads.take(id);
                     if let Some(point) = point {
                         remove_sparse_point(&mut collection.sparse_index, &point);
                         remove_payload_point(&mut collection.payload_index, &point);
                     }
-                    collection.tombstone_searcher(i as usize, id)?;
+                    if let Err(error) = collection.tombstone_searcher(i as usize, id) {
+                        self.mark_durability_degraded("filter_delete_visibility", &error);
+                    }
                     collection.id_index.remove(id);
                     collection.hnsw_dirty = true;
                     deleted += 1;
@@ -3047,7 +5394,19 @@ impl Db {
             self.mark_durability_degraded("visibility_overlay", &error);
         }
         drop(collection);
-        audit_operation.success(serde_json::json!({ "deleted": deleted }))?;
+        if let Some(transaction) = &committed_transaction {
+            self.project_transaction_audit(transaction);
+        } else {
+            let audit_operation = self.audit_operation_with_context(
+                "delete_by_filter",
+                Some(collection_name),
+                transaction_audit_context,
+            )?;
+            self.finish_committed_legacy_audit(
+                audit_operation,
+                serde_json::json!({ "deleted": deleted }),
+            );
+        }
         observe_points_deleted(deleted);
         self.refresh_metrics();
         operation_metrics.succeed();
@@ -3060,7 +5419,11 @@ impl Db {
         request: SearchRequest,
     ) -> Result<SearchResponse> {
         let _lifecycle = self.lifecycle_gate.read();
-        self.search_controlled_unguarded(collection_name, request, None)
+        self.search_controlled_unguarded(
+            collection_name,
+            request,
+            Some(&self.shutdown_lifecycle.cancelled),
+        )
     }
 
     /// Execute a search that can be cooperatively stopped by an upstream
@@ -3096,16 +5459,27 @@ impl Db {
         request: SearchRequest,
         cancelled: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<SearchResponse> {
+        self.search_controlled_in_collection(collection_name, request, cancelled, None)
+    }
+
+    fn search_controlled_in_collection(
+        &self,
+        collection_name: &str,
+        request: SearchRequest,
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
+        collection: Option<&Collection>,
+    ) -> Result<SearchResponse> {
         debug_assert!(request.graph.is_none());
         let _inflight = SearchInflightGuard::new(self.search_inflight.clone());
         let mut operation_metrics = OperationGuard::start("search");
         #[cfg(feature = "search-metrics")]
         let expected_k = request.k;
-        let response = self.search_excluding(
+        let response = self.search_excluding_in_collection(
             collection_name,
             request,
             &std::collections::HashSet::new(),
             cancelled,
+            collection,
         )?;
         if response.degraded {
             observe_degraded("search");
@@ -3180,22 +5554,25 @@ impl Db {
                 searches = request.searches.len()
             )
             .entered();
-            // PA-5: independent search branches in parallel via rayon. Each
-            // branch takes its own per-collection read lock (multiple readers
-            // allowed) and internally fans out via M4-002 par_iter on its own
-            // candidate set. Nested rayon — handled by rayon's thread pool.
-            // First error short-circuits the batch. Branch dispatch uses its
-            // own pool because each branch can fan out internally on the
-            // dedicated search pool while holding a collection read guard.
-            // See `search_pool` module doc for the writer-preference deadlock
-            // this separation prevents.
+            // Pin one collection before dispatch. A Rayon worker waiting on
+            // inner scoring can steal another branch; acquiring another read
+            // behind a queued writer would deadlock its still-held first read.
+            // Sharing the pin also gives all branches the same content cut.
             if request.searches.len() >= 2 {
+                self.ensure_collection_cold_materialized(collection_name)?;
+                let coll = self.get_coll(collection_name)?;
+                let collection = coll.read();
                 crate::search_pool::MULTI_SEARCH_POOL.install(|| {
                     request
                         .searches
                         .into_par_iter()
                         .map(|search| {
-                            self.search_controlled_unguarded(collection_name, search, None)
+                            self.search_controlled_in_collection(
+                                collection_name,
+                                search,
+                                Some(&self.shutdown_lifecycle.cancelled),
+                                Some(&collection),
+                            )
                         })
                         .collect::<Result<Vec<_>>>()
                 })?
@@ -3205,7 +5582,7 @@ impl Db {
                     results.push(self.search_controlled_unguarded(
                         collection_name,
                         search,
-                        None,
+                        Some(&self.shutdown_lifecycle.cancelled),
                     )?);
                 }
                 results
@@ -3339,7 +5716,7 @@ impl Db {
         };
         let mut searched = 0;
         let mut degraded = false;
-        let mut dense_ranked = Vec::new();
+        let mut dense_ranked = crate::search::Rankings::default();
         if let Some(vector) = &request.vector {
             let _span = tracing::info_span!(
                 "gaussdb.search.hybrid.dense_branch",
@@ -3356,6 +5733,7 @@ impl Db {
             let coll_ef_search = collection
                 .config
                 .hnsw_ef_search
+                .filter(|value| *value != 0)
                 .map(|x| (x as usize).max(branch_limit))
                 .or_else(|| {
                     collection.config.recall_sla.map(|recall_sla| {
@@ -3391,8 +5769,8 @@ impl Db {
                 recall_target,
                 filter_pred,
                 ordinal_filter,
-                None,
-            ) {
+                Some(&self.shutdown_lifecycle.cancelled),
+            )? {
                 if budget.is_some_and(|budget| started.elapsed() >= budget) {
                     degraded = true;
                     break;
@@ -3414,16 +5792,16 @@ impl Db {
                 else {
                     continue;
                 };
-                dense_ranked.push(RankedPoint {
-                    id: point.id.clone(),
-                    score: collection.config.metric.score(vector, point_vector)?,
-                });
+                dense_ranked.copy_push(
+                    &point.id,
+                    collection.config.metric.score(vector, point_vector)?,
+                )?;
             }
-            dense_ranked.sort_by(rank_order);
+            dense_ranked.sort_unstable_by(rank_order);
             dense_ranked.truncate(branch_limit);
         }
 
-        let mut sparse_ranked = Vec::new();
+        let mut sparse_ranked = crate::search::Rankings::default();
         if !degraded && let Some(query_sparse) = &request.sparse_vector {
             let _span = tracing::info_span!(
                 "gaussdb.search.hybrid.sparse_branch",
@@ -3436,12 +5814,15 @@ impl Db {
             // The sparse engine is still ID-keyed. Materialize only at this
             // compatibility boundary; dense and exact sealed paths retain
             // ordinals through candidate exchange.
-            let sparse_payload_candidates = payload_candidates.as_ref().map(|candidates| {
-                collection
-                    .iter_payload_candidates(&visibility, candidates)
-                    .map(|point| point.id.clone())
-                    .collect::<HashSet<_>>()
-            });
+            let sparse_payload_candidates = payload_candidates
+                .as_ref()
+                .map(|candidates| {
+                    collection
+                        .iter_payload_candidates(&visibility, candidates)
+                        .map(|point| point.map(|point| point.id.clone()))
+                        .collect::<Result<HashSet<_>>>()
+                })
+                .transpose()?;
             let sparse = sparse_search_ranked(
                 &collection.sparse_index,
                 &resolver,
@@ -3452,9 +5833,9 @@ impl Db {
                     filter: request.filter.as_ref(),
                     budget,
                     started,
-                    cancelled: None,
+                    cancelled: Some(&self.shutdown_lifecycle.cancelled),
                 },
-            );
+            )?;
             searched += sparse.searched;
             degraded = sparse.degraded;
             sparse_ranked = sparse.ranked;
@@ -3474,11 +5855,11 @@ impl Db {
                 request.fusion,
                 request.dense_weight,
                 request.sparse_weight,
-            )
+            )?
         };
         let mut hits = Vec::with_capacity(request.k.min(fused.len()));
         for ranked in fused.into_iter().take(request.k) {
-            if let Some(point) = collection.resolve(&ranked.id) {
+            if let Some(point) = collection.try_resolve(&ranked.id)? {
                 hits.push(SearchHit {
                     id: point.id.clone(),
                     score: ranked.score,
@@ -3547,7 +5928,7 @@ impl Db {
             .entered();
             for id in &request.positive {
                 let point = collection
-                    .resolve(id)
+                    .try_resolve(id)?
                     .ok_or_else(|| GaussError::PointNotFound(id.clone()))?;
                 add_scaled(
                     &mut vector,
@@ -3557,7 +5938,7 @@ impl Db {
             }
             for id in &request.negative {
                 let point = collection
-                    .resolve(id)
+                    .try_resolve(id)?
                     .ok_or_else(|| GaussError::PointNotFound(id.clone()))?;
                 add_scaled(
                     &mut vector,
@@ -3679,6 +6060,17 @@ impl Db {
         excluded: &std::collections::HashSet<String>,
         cancelled: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<SearchResponse> {
+        self.search_excluding_in_collection(collection_name, request, excluded, cancelled, None)
+    }
+
+    fn search_excluding_in_collection(
+        &self,
+        collection_name: &str,
+        request: SearchRequest,
+        excluded: &std::collections::HashSet<String>,
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
+        pinned: Option<&Collection>,
+    ) -> Result<SearchResponse> {
         validate_k(request.k, "k")?;
         validate_filter_complexity(request.filter.as_ref())?;
         if request.vector.iter().any(|value| !value.is_finite()) {
@@ -3708,17 +6100,22 @@ impl Db {
                 graph: None,
             });
         }
-        {
+        let coll;
+        let guard;
+        let collection = if let Some(collection) = pinned {
+            collection
+        } else {
             let _span = tracing::info_span!(
                 "gaussdb.search.materialize_cold",
                 collection = collection_name
             )
             .entered();
             self.ensure_collection_cold_materialized(collection_name)?;
-        }
+            coll = self.get_coll(collection_name)?;
+            guard = coll.read();
+            &guard
+        };
         let budget = request.budget_ms.map(Duration::from_millis);
-        let coll = self.get_coll(collection_name)?;
-        let collection = coll.read();
         if request.vector.len() != collection.config.vector_dim {
             return Err(GaussError::DimensionMismatch {
                 expected: collection.config.vector_dim,
@@ -3730,7 +6127,7 @@ impl Db {
         }
         let visibility = collection.overlay_read_state();
         let resolver = CollectionReadResolver {
-            collection: &collection,
+            collection,
             state: &visibility,
         };
 
@@ -3803,6 +6200,7 @@ impl Db {
             .entered();
             let candidates_set = payload_candidates.as_ref().unwrap();
             for point in collection.iter_payload_candidates(&visibility, candidates_set) {
+                let point = point?;
                 if excluded.contains(&point.id) {
                     continue;
                 }
@@ -3867,7 +6265,7 @@ impl Db {
                 .unwrap_or(crate::h2qg::DEFAULT_RECALL_TARGET);
             let resolved_ef_search = request
                 .ef_search
-                .or(collection.config.hnsw_ef_search)
+                .or(collection.config.hnsw_ef_search.filter(|value| *value != 0))
                 .map(|x| (x as usize).max(candidate_k))
                 .or_else(|| {
                     let ef = if let Some(curve) = collection.recall_curve.as_ref() {
@@ -3919,7 +6317,7 @@ impl Db {
                     .as_ref()
                     .map(|set| &set.sealed as &dyn crate::index::OrdinalFilterPredicate),
                 cancelled,
-            );
+            )?;
             if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
                 degraded = true;
             }
@@ -4058,26 +6456,21 @@ impl Db {
         let coll = self.get_coll(collection_name)?;
         let collection = coll.read();
         let visibility = collection.overlay_read_state();
-        let count =
-            if let Some(candidates) = collection.payload_candidates(&visibility, filter.as_ref()) {
-                collection
-                    .iter_payload_candidates(&visibility, &candidates)
-                    .filter(|point| {
-                        filter
-                            .as_ref()
-                            .is_none_or(|filter| filter.matches(&point.payload))
-                    })
-                    .count()
-            } else {
-                collection
-                    .iter_live_in_read_state(&visibility)
-                    .filter(|point| {
-                        filter
-                            .as_ref()
-                            .is_none_or(|filter| filter.matches(&point.payload))
-                    })
-                    .count()
-            };
+        let candidates = collection.payload_candidates(&visibility, filter.as_ref());
+        let source = match &candidates {
+            Some(candidates) => collection.iter_payload_candidates(&visibility, candidates),
+            None => collection.iter_live_in_read_state(&visibility),
+        };
+        let mut count = 0;
+        for point in source {
+            let point = point?;
+            if filter
+                .as_ref()
+                .is_none_or(|filter| filter.matches(&point.payload))
+            {
+                count += 1;
+            }
+        }
         operation_metrics.succeed();
         Ok(CountResponse { count })
     }
@@ -4144,28 +6537,23 @@ impl Db {
         let coll = self.get_coll(collection_name)?;
         let collection = coll.read();
         let visibility = collection.overlay_read_state();
-        let mut points: Vec<_> =
-            if let Some(candidates) = collection.payload_candidates(&visibility, filter.as_ref()) {
-                collection
-                    .iter_payload_candidates(&visibility, &candidates)
-                    .filter(|point| {
+        let candidates = collection.payload_candidates(&visibility, filter.as_ref());
+        let source = match &candidates {
+            Some(candidates) => collection.iter_payload_candidates(&visibility, candidates),
+            None => collection.iter_live_in_read_state(&visibility),
+        };
+        let mut points = source
+            .filter_map(|point| {
+                point
+                    .map(|point| {
                         filter
                             .as_ref()
                             .is_none_or(|filter| filter.matches(&point.payload))
+                            .then(|| point.into_owned())
                     })
-                    .map(Cow::into_owned)
-                    .collect()
-            } else {
-                collection
-                    .iter_live_in_read_state(&visibility)
-                    .filter(|point| {
-                        filter
-                            .as_ref()
-                            .is_none_or(|filter| filter.matches(&point.payload))
-                    })
-                    .map(Cow::into_owned)
-                    .collect()
-            };
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
         // Sort by ID for stable, deterministic pagination
         points.sort_by(|left, right| left.id.cmp(&right.id));
 
@@ -4234,8 +6622,8 @@ impl Db {
                 collection.config.clone(),
                 collection
                     .iter_live()
-                    .map(Cow::into_owned)
-                    .collect::<Vec<Point>>(),
+                    .map(|point| point.map(Cow::into_owned))
+                    .collect::<Result<Vec<Point>>>()?,
                 collection.streamer.hnsw.is_some()
                     || collection
                         .searchers
@@ -4351,7 +6739,7 @@ impl Db {
             let collection = coll.read();
             (
                 collection.config.recall_sla,
-                collection.config.hnsw_ef_search,
+                collection.config.hnsw_ef_search.filter(|value| *value != 0),
                 collection.live_points(),
                 collection.config.vector_dim,
             )
@@ -4517,6 +6905,9 @@ impl Db {
                 })?;
             }
         }
+        // The offline encryptor refuses active WAL frames. SQL rows need the
+        // same durable checkpoint cut as the vector and graph collections.
+        self.relational.read().checkpoint()?;
         self.wait_for_storage_idle()?;
         {
             let mut inner = self.inner.write();
@@ -4905,8 +7296,47 @@ impl Db {
                 for raw in plan.overlay.edge_tombstones().iter() {
                     tail_edge_tombstones.remove(raw);
                 }
+                if let crate::searcher::SegmentIndex::LegacyH2qg(h2qg) = &mut index {
+                    h2qg.set_cascade(Arc::clone(&self.cascade));
+                    h2qg.set_intra_query_parallel(Arc::clone(&self.intra_query_parallel));
+                }
+                let compact_h2qg_cells = index
+                    .as_backend()
+                    .map_or(0, crate::index::IndexBackend::cells);
+                let compact_named_h2qg_fields = named_index.len();
+                let compact_sparse_dim = collection.sparse_index.dimensions.len();
+                let compact_sparse_postings = collection
+                    .sparse_index
+                    .dimensions
+                    .values()
+                    .map(|posting| posting.postings.len())
+                    .sum();
+                let compact_payload_fields = collection.payload_index.equality.len();
+                let compact_payload_values = collection
+                    .payload_index
+                    .equality
+                    .values()
+                    .map(HashMap::len)
+                    .sum();
+                let compact_payload_postings = collection
+                    .payload_index
+                    .equality
+                    .values()
+                    .flat_map(HashMap::values)
+                    .map(HashSet::len)
+                    .sum();
+                let mut new_searcher = None;
                 let candidate_manifest = prepared_graph.manifest.as_ref().clone();
                 let commit_result = (|| -> Result<_> {
+                    new_searcher = Some(crate::searcher::SegmentSearcher::new(
+                        segment_id.clone(),
+                        final_dir.clone(),
+                        index,
+                        named_index,
+                        crate::searcher::SegmentStore::V4(Arc::clone(&store)),
+                        tombstones.clone(),
+                        tombstone_ordinals.clone(),
+                    )?);
                     crate::seal::write_tombstones(&final_dir, &store, &tombstones)?;
                     for searcher in &collection.searchers {
                         persist_searcher_tombstones(searcher)?;
@@ -4959,44 +7389,8 @@ impl Db {
                     mutable.install_compaction_tail_tombstones(tail_edge_tombstones);
                     mutable.attach_sealed_adjacency(Arc::clone(&published));
                 }
-                if let crate::searcher::SegmentIndex::LegacyH2qg(h2qg) = &mut index {
-                    h2qg.set_cascade(Arc::clone(&self.cascade));
-                    h2qg.set_intra_query_parallel(Arc::clone(&self.intra_query_parallel));
-                }
-                let compact_h2qg_cells = index
-                    .as_backend()
-                    .map_or(0, crate::index::IndexBackend::cells);
-                let compact_named_h2qg_fields = named_index.len();
-                let compact_sparse_dim = collection.sparse_index.dimensions.len();
-                let compact_sparse_postings = collection
-                    .sparse_index
-                    .dimensions
-                    .values()
-                    .map(|posting| posting.postings.len())
-                    .sum();
-                let compact_payload_fields = collection.payload_index.equality.len();
-                let compact_payload_values = collection
-                    .payload_index
-                    .equality
-                    .values()
-                    .map(HashMap::len)
-                    .sum();
-                let compact_payload_postings = collection
-                    .payload_index
-                    .equality
-                    .values()
-                    .flat_map(HashMap::values)
-                    .map(HashSet::len)
-                    .sum();
-                let new_searcher = crate::searcher::SegmentSearcher::new(
-                    segment_id.clone(),
-                    final_dir,
-                    index,
-                    named_index,
-                    crate::searcher::SegmentStore::V4(store),
-                    tombstones.clone(),
-                    tombstone_ordinals,
-                );
+                let new_searcher =
+                    new_searcher.expect("validated searcher before graph publication");
                 for (id, snapshot_location) in &input.entries {
                     if collection.id_index.get(id) == Some(snapshot_location) {
                         collection
@@ -5005,7 +7399,7 @@ impl Db {
                     }
                 }
                 collection.searchers = vec![new_searcher];
-                collection.rebuild_payload_fallback();
+                collection.rebuild_payload_fallback()?;
                 if input.frozen.is_some() {
                     collection.sealing = None;
                 }
@@ -5181,11 +7575,48 @@ impl Db {
                 });
                 next_point_tombstones.insert_bitmap(segment_id.clone(), tombstone_ordinals.clone());
 
+                let compact_h2qg_cells = index
+                    .as_backend()
+                    .map_or(0, crate::index::IndexBackend::cells);
+                let compact_named_h2qg_fields = named_index.len();
+                let compact_sparse_dim = collection.sparse_index.dimensions.len();
+                let compact_sparse_postings = collection
+                    .sparse_index
+                    .dimensions
+                    .values()
+                    .map(|posting| posting.postings.len())
+                    .sum();
+                let compact_payload_fields = collection.payload_index.equality.len();
+                let compact_payload_values = collection
+                    .payload_index
+                    .equality
+                    .values()
+                    .map(HashMap::len)
+                    .sum();
+                let compact_payload_postings = collection
+                    .payload_index
+                    .equality
+                    .values()
+                    .flat_map(HashMap::values)
+                    .map(HashSet::len)
+                    .sum();
+                let included_frozen = input.frozen.is_some();
+                let compact_tombstones = tombstones.len();
+                let mut merged_searcher = None;
                 // Complete every fallible candidate write before changing the
                 // in-memory generation. If manifest publication fails before
                 // rename, the frozen snapshot is restored and the old
                 // generation remains the sole serveable one.
                 let commit_result = (|| -> Result<u64> {
+                    merged_searcher = Some(crate::searcher::SegmentSearcher::new(
+                        segment_id.clone(),
+                        final_dir.clone(),
+                        index,
+                        named_index,
+                        crate::searcher::SegmentStore::V4(Arc::clone(&store)),
+                        tombstones.clone(),
+                        tombstone_ordinals.clone(),
+                    )?);
                     crate::seal::write_tombstones(&final_dir, &store, &tombstones)?;
                     if selected_segment_ids.is_some() {
                         for searcher in &collection.searchers {
@@ -5246,8 +7677,7 @@ impl Db {
                             collection.overlays.restore_snapshot(&previous_overlay)?;
                             let frozen = input.frozen.as_ref().map(Arc::clone);
                             drop(input);
-                            drop(index);
-                            drop(named_index);
+                            drop(merged_searcher);
                             drop(store);
                             drop(collection);
                             let mut failed = coll.write();
@@ -5262,42 +7692,8 @@ impl Db {
                     }
                 };
 
-                let compact_h2qg_cells = index
-                    .as_backend()
-                    .map_or(0, crate::index::IndexBackend::cells);
-                let compact_named_h2qg_fields = named_index.len();
-                let compact_sparse_dim = collection.sparse_index.dimensions.len();
-                let compact_sparse_postings = collection
-                    .sparse_index
-                    .dimensions
-                    .values()
-                    .map(|posting| posting.postings.len())
-                    .sum();
-                let compact_payload_fields = collection.payload_index.equality.len();
-                let compact_payload_values = collection
-                    .payload_index
-                    .equality
-                    .values()
-                    .map(HashMap::len)
-                    .sum();
-                let compact_payload_postings = collection
-                    .payload_index
-                    .equality
-                    .values()
-                    .flat_map(HashMap::values)
-                    .map(HashSet::len)
-                    .sum();
-                let included_frozen = input.frozen.is_some();
-                let compact_tombstones = tombstones.len();
-                let merged_searcher = crate::searcher::SegmentSearcher::new(
-                    segment_id.clone(),
-                    final_dir,
-                    index,
-                    named_index,
-                    crate::searcher::SegmentStore::V4(store),
-                    tombstones,
-                    tombstone_ordinals,
-                );
+                let merged_searcher =
+                    merged_searcher.expect("validated searcher before vector publication");
                 if let Some(selected) = &selected_segment_ids {
                     let old_searchers = std::mem::take(&mut collection.searchers);
                     let selected_positions = old_searchers
@@ -5358,7 +7754,7 @@ impl Db {
                     }
                     collection.searchers = vec![merged_searcher];
                 }
-                collection.rebuild_payload_fallback();
+                collection.rebuild_payload_fallback()?;
                 if included_frozen {
                     collection.sealing = None;
                 }
@@ -5517,7 +7913,7 @@ impl Db {
                     crate::searcher::SegmentStore::V4(store),
                     HashSet::new(),
                     roaring::RoaringBitmap::new(),
-                );
+                )?;
 
                 // The manifest is the atomic generation switch. Until it
                 // lands, recovery keeps serving the old segment set and
@@ -5617,9 +8013,8 @@ impl Db {
                         }
                         crate::searcher::SegmentStore::V4(store) => {
                             for ordinal in 0..store.len() {
-                                if let Some(point) = store.get_ordinal(ordinal)
-                                    && !tombstones.contains(&point.id)
-                                {
+                                if !store.id(ordinal).is_some_and(|id| tombstones.contains(id)) {
+                                    let point = store.try_get_ordinal(ordinal)?;
                                     union_points.entry(point.id.clone()).or_insert(point);
                                 }
                             }
@@ -5687,7 +8082,7 @@ impl Db {
                     crate::searcher::SegmentStore::Heap(union_points),
                     std::collections::HashSet::new(),
                     roaring::RoaringBitmap::new(),
-                );
+                )?;
                 // W1 bugfix: compaction reloads a fresh H2qgIndex from the
                 // rewritten segment; wire the server-wide cascade flag same
                 // as the other two build/load sites.
@@ -5695,12 +8090,13 @@ impl Db {
                     h2qg.set_cascade(self.cascade.clone());
                 }
                 let mut id_index = HashMap::with_capacity(new_searcher.store.len());
-                for point in new_searcher.store.iter_points() {
+                for point in new_searcher.store.try_iter_points() {
+                    let point = point?;
                     id_index.insert(point.id.clone(), crate::searcher::SegLoc::Searcher(0));
                 }
                 collection.searchers = vec![new_searcher];
                 collection.id_index = id_index;
-                collection.rebuild_payload_fallback();
+                collection.rebuild_payload_fallback()?;
                 let generation = current_manifest_generation.checked_add(1).ok_or_else(|| {
                     GaussError::InvalidRequest("segment manifest generation overflow".into())
                 })?;
@@ -5854,28 +8250,31 @@ impl Db {
                 .map_or(0, |prune| prune.pruned_bytes),
         };
         // PB-1: `collection` write guard already dropped at end of inner block.
-        audit_operation.success(serde_json::json!({
-            "segment_id": &response.segment_id,
-            "points": response.points,
-            "h2qg_cells": response.h2qg_cells,
-            "named_h2qg_fields": response.named_h2qg_fields,
-            "sparse_dimensions": response.sparse_dimensions,
-            "sparse_postings": response.sparse_postings,
-            "payload_fields": response.payload_fields,
-            "payload_values": response.payload_values,
-            "payload_postings": response.payload_postings,
-            "tombstones": response.tombstones,
-            "wal_archived_segments": response.wal_archived_segments,
-            "wal_archived_bytes": response.wal_archived_bytes,
-            "wal_external_archived_segments": response.wal_external_archived_segments,
-            "wal_external_archived_bytes": response.wal_external_archived_bytes,
-            "wal_object_archived_segments": response.wal_object_archived_segments,
-            "wal_object_archived_bytes": response.wal_object_archived_bytes,
-            "wal_archive_command_executed": response.wal_archive_command_executed,
-            "wal_auto_retained_archives": response.wal_auto_retained_archives,
-            "wal_auto_pruned_archives": response.wal_auto_pruned_archives,
-            "wal_auto_pruned_bytes": response.wal_auto_pruned_bytes,
-        }))?;
+        self.finish_committed_legacy_audit(
+            audit_operation,
+            serde_json::json!({
+                "segment_id": &response.segment_id,
+                "points": response.points,
+                "h2qg_cells": response.h2qg_cells,
+                "named_h2qg_fields": response.named_h2qg_fields,
+                "sparse_dimensions": response.sparse_dimensions,
+                "sparse_postings": response.sparse_postings,
+                "payload_fields": response.payload_fields,
+                "payload_values": response.payload_values,
+                "payload_postings": response.payload_postings,
+                "tombstones": response.tombstones,
+                "wal_archived_segments": response.wal_archived_segments,
+                "wal_archived_bytes": response.wal_archived_bytes,
+                "wal_external_archived_segments": response.wal_external_archived_segments,
+                "wal_external_archived_bytes": response.wal_external_archived_bytes,
+                "wal_object_archived_segments": response.wal_object_archived_segments,
+                "wal_object_archived_bytes": response.wal_object_archived_bytes,
+                "wal_archive_command_executed": response.wal_archive_command_executed,
+                "wal_auto_retained_archives": response.wal_auto_retained_archives,
+                "wal_auto_pruned_archives": response.wal_auto_pruned_archives,
+                "wal_auto_pruned_bytes": response.wal_auto_pruned_bytes,
+            }),
+        );
         self.refresh_metrics();
         operation_metrics.succeed();
         Ok(response)
@@ -5963,12 +8362,15 @@ impl Db {
             bytes: write.bytes,
             points: write.points,
         };
-        audit_operation.success(serde_json::json!({
-            "segments": response.segments,
-            "files": response.files,
-            "bytes": response.bytes,
-            "points": response.points,
-        }))?;
+        self.finish_committed_legacy_audit(
+            audit_operation,
+            serde_json::json!({
+                "segments": response.segments,
+                "files": response.files,
+                "bytes": response.bytes,
+                "points": response.points,
+            }),
+        );
         operation_metrics.succeed();
         Ok(response)
     }
@@ -6063,6 +8465,7 @@ impl Db {
                         let (entries, deletes) = match record.entry {
                             WalEntry::Upsert { .. } | WalEntry::SetPayload { .. } => (1, 0),
                             WalEntry::UpsertBatch { points } => (points.len(), 0),
+                            WalEntry::ProtectedBatch { batch } => batch.content.mutation_counts(),
                             WalEntry::Delete { .. } => (1, 1),
                             WalEntry::DeleteBatch { ids } => (ids.len(), ids.len()),
                             WalEntry::GraphBatch { batch } => {
@@ -6080,10 +8483,18 @@ impl Db {
                                 (entries, deletes)
                             }
                             WalEntry::CreateCollection { .. }
+                            | WalEntry::CreateProtectedCollection { .. }
                             | WalEntry::DropCollection { .. }
+                            | WalEntry::DropProtectedCollection { .. }
                             | WalEntry::Schema { .. }
                             | WalEntry::GraphEpochAdvance { .. }
-                            | WalEntry::Compact { .. } => (0, 0),
+                            | WalEntry::Compact { .. }
+                            | WalEntry::TransactionPrepare { .. }
+                            | WalEntry::TransactionCommit { .. }
+                            | WalEntry::TransactionProjection { .. }
+                            | WalEntry::RelationalBatch { .. }
+                            | WalEntry::MultiModelBatch { .. } => (0, 0),
+                            WalEntry::TransactionApply { entry, .. } => wal_mutation_counts(*entry),
                         };
                         wal_entry_count = wal_entry_count.saturating_add(entries);
                         wal_delete_count = wal_delete_count.saturating_add(deletes);
@@ -6153,12 +8564,15 @@ impl Db {
             &collection_dir(&root, collection_name).join("wal/archive"),
             retain_last,
         )?;
-        audit_operation.success(serde_json::json!({
-            "retain_last": retain_last,
-            "retained_archives": prune.retained_archives,
-            "pruned_archives": prune.pruned_archives,
-            "pruned_bytes": prune.pruned_bytes,
-        }))?;
+        self.finish_committed_legacy_audit(
+            audit_operation,
+            serde_json::json!({
+                "retain_last": retain_last,
+                "retained_archives": prune.retained_archives,
+                "pruned_archives": prune.pruned_archives,
+                "pruned_bytes": prune.pruned_bytes,
+            }),
+        );
         operation_metrics.succeed();
         Ok(WalArchivePruneResponse {
             collection: collection_name.to_string(),
@@ -6170,10 +8584,21 @@ impl Db {
 
     pub fn snapshot(&self, destination: impl AsRef<Path>) -> Result<()> {
         let _lifecycle = self.lifecycle_gate.write();
+        if self.identity_authority.is_some()
+            || self
+                .inner
+                .read()
+                .collections
+                .values()
+                .any(|collection| collection.read().security.is_some())
+        {
+            return Err(crate::security::SecurityError::Forbidden.into());
+        }
         self.ensure_storage_mutations_available()?;
         let _admission = self.maintenance_barrier.read();
         let audit_operation = self.audit_operation("snapshot", None)?;
         let mut operation_metrics = OperationGuard::start("snapshot");
+        let _relational_pause = self.relational.read().pause_checkpoints()?;
         self.wait_for_storage_idle()?;
         self.flush_wals()?;
         let inner = self.inner.read();
@@ -6215,6 +8640,7 @@ impl Db {
         )?;
         snapshot_journal::write(parent, &identity, &journal)?;
         snapshot_dir_all(&inner.root, &staging)?;
+        snapshot_control::stage_transactions(&self.data_dir, &inner.root, &staging)?;
         // Check the copied generation and WAL tail, not just in-memory source
         // counters. An incomplete graph snapshot must never publish success.
         let staged = load_db_root(&staging, inner.cold_object_store.as_ref())?;
@@ -6256,10 +8682,13 @@ impl Db {
         )?;
         snapshot_journal::remove(parent, &identity)?;
         drop(inner);
-        audit_operation.success(serde_json::json!({
-            "destination": destination.display().to_string(),
-            "collections": marker.collections.len(),
-        }))?;
+        self.finish_committed_legacy_audit(
+            audit_operation,
+            serde_json::json!({
+                "destination": destination.display().to_string(),
+                "collections": marker.collections.len(),
+            }),
+        );
         operation_metrics.succeed();
         Ok(())
     }
@@ -6314,6 +8743,21 @@ impl Db {
         wal_restore_archive_dir: Option<&Path>,
         wal_restore_object_store: Option<&ColdObjectStoreConfig>,
     ) -> Result<()> {
+        if self.identity_authority.is_some()
+            || self
+                .inner
+                .read()
+                .collections
+                .values()
+                .any(|collection| collection.read().security.is_some())
+        {
+            return Err(crate::security::SecurityError::Forbidden.into());
+        }
+        let source_catalog = read_catalog(source.as_ref())?;
+        if !source_catalog.protected.is_empty() || source_catalog.installation.is_some() {
+            return Err(crate::security::SecurityError::Forbidden.into());
+        }
+        self.relational.read().ensure_restore_idle()?;
         if let Some(previous_generation) = self.active_generation() {
             return self.restore_generation_to_wal_targets_with_archive_sources(
                 source.as_ref(),
@@ -6464,6 +8908,7 @@ impl Db {
                 &catalog_wal,
                 rewrite_restore_metadata,
             )?;
+            activate_transaction_catalog_guard(&staging)?;
             catalog_wal.sync()?;
             for collection in collections.values() {
                 collection.read().wal.sync()?;
@@ -6523,11 +8968,25 @@ impl Db {
         // Declared after the lifecycle guard so ordinary exits clear
         // maintenance before queued operations can acquire the shared gate.
         let mut maintenance_guard = maintenance_guard;
+        let _relational_pause = match self
+            .relational
+            .read()
+            .ensure_restore_idle()
+            .and_then(|()| self.relational.read().pause_checkpoints())
+        {
+            Ok(pause) => pause,
+            Err(error) => {
+                let _ = durable_remove_dir_all(&journal_parent);
+                return Err(error);
+            }
+        };
         self.wal_flusher.quiesce();
         let preinstall = self
             .wait_for_storage_idle()
             .and_then(|()| self.flush_wals())
             .and_then(|()| preserve_audit_log(&root, &staging))
+            .and_then(|()| restore_control::preserve_journal(self, &staging))
+            .and_then(|()| restore_control::validate_staging(self, &staging))
             .and_then(|()| self.graph_identity.preserve_for_root_swap(&staging))
             .and_then(|()| sync_tree(&staging));
         if let Err(error) = preinstall {
@@ -6593,6 +9052,57 @@ impl Db {
             }
         };
 
+        let control_reload = self
+            .transaction_journal
+            .reload_after_root_swap(&self.data_dir)
+            .and_then(|()| self.audit_writer.reload_after_root_swap(&self.data_dir))
+            .and_then(|()| {
+                recover_transaction_audit_projections(&self.transaction_journal, &self.audit_writer)
+            })
+            .and_then(|()| restore_control::open_installed(self, &root));
+        let relational = match control_reload {
+            Ok(relational) => relational,
+            Err(error) => {
+                drop(loaded);
+                if let Err(rollback_error) =
+                    rollback_restore_generation(&root, &staging, &backup, &journal_parent)
+                {
+                    maintenance_guard.latch();
+                    self.mark_durability_degraded(
+                        "restore_control_reload_rollback",
+                        &rollback_error,
+                    );
+                    return Err(GaussError::WalCorruption {
+                        path: journal_parent
+                            .join(restore_journal::RESTORE_JOURNAL_FILE)
+                            .display()
+                            .to_string(),
+                        message: format!(
+                            "restore control reload failed ({error}); rollback also failed ({rollback_error})"
+                        ),
+                    });
+                }
+                let rollback_reload = self
+                    .transaction_journal
+                    .reload_after_root_swap(&self.data_dir)
+                    .and_then(|()| self.audit_writer.reload_after_root_swap(&self.data_dir));
+                if let Err(rollback_reload) = rollback_reload {
+                    maintenance_guard.latch();
+                    self.mark_durability_degraded(
+                        "restore_control_rollback_reload",
+                        &rollback_reload,
+                    );
+                    return Err(GaussError::WalCorruption {
+                        path: self.data_dir.display().to_string(),
+                        message: format!(
+                            "restore control reload failed ({error}); rollback control reload also failed ({rollback_reload})"
+                        ),
+                    });
+                }
+                return Err(error);
+            }
+        };
+
         let LoadedDbRoot {
             catalog_wal,
             collections,
@@ -6604,6 +9114,7 @@ impl Db {
             let old_collections = std::mem::replace(&mut inner.collections, collections);
             (old_catalog_wal, old_collections)
         };
+        restore_control::publish(self, relational);
         drop(old_collections);
         drop(old_catalog_wal);
 
@@ -6617,7 +9128,7 @@ impl Db {
             self.mark_durability_degraded("restore_cleanup", &error);
             tracing::error!(%error, "atomic restore committed but cleanup requires startup recovery");
         }
-        audit_operation.success(serde_json::json!({
+        self.finish_committed_legacy_audit(audit_operation, serde_json::json!({
                 "source": source.display().to_string(),
                 "collections": restored_collection_count,
                 "snapshot_marker": snapshot_marker.is_some(),
@@ -6637,7 +9148,7 @@ impl Db {
                 "wal_replayed_archives": wal_archive_replay.archives,
                 "wal_replayed_archive_records": wal_archive_replay.records,
                 "wal_replayed_archive_schema_records": wal_archive_replay.schema_records,
-            }))?;
+            }));
         self.rebuild_recovered_streamer_indexes();
         self.refresh_metrics();
         operation_metrics.succeed();
@@ -6815,6 +9326,7 @@ impl Db {
                 &catalog_wal,
                 rewrite_restore_metadata,
             )?;
+            activate_transaction_catalog_guard(&staging)?;
             catalog_wal.sync()?;
             for collection in collections.values() {
                 collection.read().wal.sync()?;
@@ -6862,9 +9374,30 @@ impl Db {
         let maintenance_guard = MaintenanceGuard::enter(Arc::clone(&self.maintenance))?;
         let _lifecycle = self.lifecycle_gate.write();
         let mut maintenance_guard = maintenance_guard;
+        let _relational_pause = match self
+            .relational
+            .read()
+            .ensure_restore_idle()
+            .and_then(|()| self.relational.read().pause_checkpoints())
+        {
+            Ok(pause) => pause,
+            Err(error) => {
+                let _ = durable_remove_dir_all(&staging);
+                let _ = restore_journal::remove(&self.data_dir);
+                return Err(error);
+            }
+        };
         self.wal_flusher.quiesce();
         self.wait_for_storage_idle()?;
         self.flush_wals()?;
+
+        if let Err(error) =
+            restore_control::validate_staging(self, &staging).and_then(|()| sync_tree(&staging))
+        {
+            let _ = durable_remove_dir_all(&staging);
+            let _ = restore_journal::remove(&self.data_dir);
+            return Err(error);
+        }
 
         fs::rename(&staging, &destination)?;
         sync_directory(&generations)?;
@@ -6913,6 +9446,31 @@ impl Db {
                 return Err(error);
             }
         };
+        let relational =
+            match restore_control::open_installed(self, &destination).and_then(|engine| {
+                self.transaction_journal.content_root_changed()?;
+                Ok(engine)
+            }) {
+                Ok(engine) => engine,
+                Err(error) => {
+                    drop(loaded);
+                    if let Err(rollback) =
+                        crate::storage_layout::switch_current(&self.data_dir, previous_generation)
+                    {
+                        maintenance_guard.latch();
+                        self.mark_durability_degraded("restore_sql_rollback", &rollback);
+                        return Err(GaussError::WalCorruption {
+                            path: self.data_dir.display().to_string(),
+                            message: format!(
+                                "SQL restore failed ({error}); root rollback failed ({rollback})"
+                            ),
+                        });
+                    }
+                    let _ = durable_remove_dir_all(&destination);
+                    let _ = restore_journal::remove(&self.data_dir);
+                    return Err(error);
+                }
+            };
         let LoadedDbRoot {
             catalog_wal,
             collections,
@@ -6925,6 +9483,7 @@ impl Db {
             let old_collections = std::mem::replace(&mut inner.collections, collections);
             (old_catalog_wal, old_collections)
         };
+        restore_control::publish(self, relational);
         drop(old_collections);
         drop(old_catalog_wal);
 
@@ -6935,7 +9494,7 @@ impl Db {
             tracing::error!(%error, "generation restore committed but old generation cleanup failed");
         }
         sync_directory(&generations)?;
-        audit_operation.success(serde_json::json!({
+        self.finish_committed_legacy_audit(audit_operation, serde_json::json!({
             "source": source.display().to_string(),
             "collections": restored_collection_count,
             "snapshot_marker": snapshot_marker.is_some(),
@@ -6958,7 +9517,7 @@ impl Db {
             "wal_replayed_archives": wal_archive_replay.archives,
             "wal_replayed_archive_records": wal_archive_replay.records,
             "wal_replayed_archive_schema_records": wal_archive_replay.schema_records,
-        }))?;
+        }));
         self.rebuild_recovered_streamer_indexes();
         self.refresh_metrics();
         operation_metrics.succeed();
@@ -6971,7 +9530,11 @@ impl Db {
     pub fn collection_wal_dir(&self, name: &str) -> Option<std::path::PathBuf> {
         let _lifecycle = self.lifecycle_gate.read();
         let inner = self.inner.read();
-        if inner.collections.contains_key(name) {
+        if inner
+            .collections
+            .get(name)
+            .is_some_and(|collection| collection.read().security.is_none())
+        {
             let root = inner.root.clone();
             drop(inner);
             Some(collection_dir(&root, name).join("wal"))
@@ -7019,8 +9582,7 @@ impl Db {
             collection_name,
             ids,
             false,
-            audit::AuditContext::embedded(),
-            MutationOrigin::LegacyReplication,
+            MutationContext::legacy_replication(),
         )?;
         Ok(())
     }
@@ -7039,8 +9601,7 @@ impl Db {
             id,
             payload,
             merge,
-            audit::AuditContext::embedded(),
-            MutationOrigin::LegacyReplication,
+            MutationContext::legacy_replication(),
         )?;
         Ok(())
     }
@@ -7229,17 +9790,34 @@ impl Db {
             ));
         }
         for point in collection.iter_live() {
+            let point = point?;
             validate_payload_schema(&config, &point)?;
         }
 
         let previous_config = collection.config.clone();
-        collection.wal.append(&WalEntry::Schema {
-            schema_epoch,
-            config: config.clone(),
-            previous_config: Some(previous_config),
-        })?;
+        let (transaction, _) = self.commit_collection_transaction(
+            collection_name,
+            &mut collection,
+            WalEntry::Schema {
+                schema_epoch,
+                config: config.clone(),
+                previous_config: Some(previous_config),
+            },
+            TransactionAudit::mutation(
+                "replicated_schema",
+                Some(collection_name),
+                &audit::AuditContext {
+                    principal_id: "legacy-replication".to_string(),
+                    tenant_id: None,
+                    transport: "replication".to_string(),
+                    request_id: None,
+                },
+                serde_json::json!({"schema_epoch": schema_epoch}),
+            ),
+        )?;
         collection.config = config;
         collection.schema_epoch = schema_epoch;
+        self.project_transaction_audit(&transaction);
         Ok(())
     }
 
@@ -7280,6 +9858,17 @@ impl Db {
         )
     }
 
+    /// Finish a protocol-level audit record for an operation whose database
+    /// mutation has already committed. Projection failure degrades write
+    /// admission but never changes the committed client result into an error.
+    pub fn finish_committed_network_audit(
+        &self,
+        audit_operation: audit::AuditOperation,
+        details: Value,
+    ) {
+        self.finish_committed_legacy_audit(audit_operation, details);
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn audit_access_event(
         &self,
@@ -7309,7 +9898,7 @@ impl Db {
                 details: Value::Null,
                 durable: false,
             })
-            .map_err(|error| GaussError::AuditUnavailable(error.to_string()))
+            .map_err(audit::audit_unavailable)
     }
 
     fn audit_success(
@@ -7329,7 +9918,7 @@ impl Db {
                 details,
                 durable: true,
             })
-            .map_err(|error| GaussError::AuditUnavailable(error.to_string()))
+            .map_err(audit::audit_unavailable)
     }
 
     fn audit_operation(
@@ -7348,7 +9937,7 @@ impl Db {
     ) -> Result<audit::AuditOperation> {
         self.audit_writer
             .operation(operation, collection, context)
-            .map_err(|error| GaussError::AuditUnavailable(error.to_string()))
+            .map_err(audit::audit_unavailable)
     }
 
     fn audit_query_operation_with_context(
@@ -7359,7 +9948,7 @@ impl Db {
     ) -> Result<audit::AuditOperation> {
         self.audit_writer
             .operation_in_category("query", operation, collection, context)
-            .map_err(|error| GaussError::AuditUnavailable(error.to_string()))
+            .map_err(audit::audit_unavailable)
     }
 
     /// Encode a text string as a BM25-weighted sparse vector using the current
@@ -7378,13 +9967,46 @@ impl Db {
         let _lifecycle = self.lifecycle_gate.read();
         let coll = self.get_coll(collection_name)?;
         let collection = coll.read();
-        let live: Vec<Point> = collection.iter_live().map(Cow::into_owned).collect();
+        let live: Vec<Point> = collection
+            .iter_live()
+            .map(|point| point.map(Cow::into_owned))
+            .collect::<Result<Vec<_>>>()?;
         let live_refs: Vec<&Point> = live.iter().collect();
         let corpus = crate::sparse_index::build_bm25_corpus_from_points(&live_refs, text_fields);
         Ok(crate::sparse_index::encode_bm25(&corpus, text))
     }
 
     pub fn refresh_metrics(&self) {
+        let profile = crate::resource_profile::current();
+        metrics::gauge!("chirondb_resource_effective_memory_bytes")
+            .set(profile.effective_memory_bytes as f64);
+        metrics::gauge!("chirondb_resource_engine_budget_bytes")
+            .set(profile.engine_budget_bytes as f64);
+        metrics::gauge!("chirondb_resource_sql_pool_bytes").set(profile.sql_pool_bytes as f64);
+        metrics::gauge!("chirondb_resource_effective_cores").set(profile.effective_cores as f64);
+        metrics::gauge!("chirondb_resource_query_workers").set(profile.query_workers as f64);
+        metrics::gauge!("chirondb_resource_background_workers")
+            .set(profile.background_workers as f64);
+        metrics::gauge!("chirondb_query_arena_high_water_bytes")
+            .set(crate::query_arena::high_water_bytes() as f64);
+        let usage = crate::resource_profile::process_usage();
+        if let Some(value) = usage.rss_bytes {
+            metrics::gauge!("chirondb_process_rss_bytes").set(value as f64);
+        }
+        if let Some(value) = usage.pss_bytes {
+            metrics::gauge!("chirondb_process_pss_bytes").set(value as f64);
+        }
+        if let Some(value) = usage.cgroup_memory_bytes {
+            metrics::gauge!("chirondb_cgroup_memory_current_bytes").set(value as f64);
+        }
+        if let Some(value) = usage.thread_count {
+            metrics::gauge!("chirondb_process_threads").set(value as f64);
+        }
+        let (persistent_cache_bytes, persistent_cache_high_water_bytes) =
+            crate::encryption::persistent_cache_usage_bytes();
+        metrics::gauge!("chirondb_persistent_cache_bytes").set(persistent_cache_bytes as f64);
+        metrics::gauge!("chirondb_persistent_cache_high_water_bytes")
+            .set(persistent_cache_high_water_bytes as f64);
         let inner = self.inner.read();
         let collections = inner.collections.len();
         let points = inner
@@ -7415,14 +10037,26 @@ impl Drop for Db {
         // coordinator while the collection files are still alive.
         if Arc::strong_count(&self.inner) == 1 {
             if !self
-                .build_lifecycle
-                .cancel_and_drain(Duration::from_secs(300))
+                .relational
+                .read()
+                .cancel_and_drain_checkpoint(Instant::now() + Duration::from_secs(300))
+            {
+                tracing::error!(
+                    "timed out draining relational checkpoint during Db drop; its worker retains the data-directory lease"
+                );
+            }
+            if !self.is_shutting_down()
+                && !self
+                    .build_lifecycle
+                    .cancel_and_drain(Duration::from_secs(300))
             {
                 tracing::error!(
                     "timed out draining background index builds during Db drop; data-directory lease remains held by unfinished tasks"
                 );
             }
-            if let Err(error) = flush_wals_inner(&self.inner) {
+            if !self.is_shutting_down()
+                && let Err(error) = flush_wals_inner(&self.inner)
+            {
                 tracing::error!(%error, "final WAL flush failed during Db drop");
             }
             self.wal_flusher.shutdown();
@@ -7444,6 +10078,7 @@ fn streamer_admission_wait_required(
 }
 
 fn validate_config(config: &CollectionConfig) -> Result<()> {
+    crate::h2qg::validate_hnsw_params(config.hnsw_m)?;
     if config.name.is_empty()
         || config.name.len() > 255
         || !config
@@ -7638,7 +10273,7 @@ fn apply_restore_wal_targets(
         let wal_dir = directory.join("wal");
         let mut schema_records = Vec::new();
         Wal::scan_from(&wal_dir, *target_lsn, |record| {
-            if matches!(&record.entry, WalEntry::Schema { .. }) {
+            if matches!(projected_wal_entry(&record.entry), WalEntry::Schema { .. }) {
                 schema_records.push(record);
             }
             Ok(())
@@ -7676,7 +10311,7 @@ fn apply_restore_wal_targets(
         )?;
         let mut schema_records = Vec::new();
         Wal::scan_from(&wal_dir, 0, |record| {
-            if matches!(&record.entry, WalEntry::Schema { .. }) {
+            if matches!(projected_wal_entry(&record.entry), WalEntry::Schema { .. }) {
                 schema_records.push(record);
             }
             Ok(())
@@ -7779,6 +10414,7 @@ fn load_restore_collections(
             },
         )?;
         let LoadedCollectionState {
+            security,
             config,
             schema_epoch,
             streamer,
@@ -7799,6 +10435,7 @@ fn load_restore_collections(
         collections.insert(
             collection_name,
             Arc::new(RwLock::new(Collection {
+                security,
                 config,
                 streamer,
                 sealing: None,
@@ -7882,7 +10519,7 @@ fn schema_state_before_wal_target(
             schema_epoch,
             previous_config,
             ..
-        } = &record.entry
+        } = projected_wal_entry(&record.entry)
         {
             let previous_config = previous_config.clone().ok_or_else(|| {
                 GaussError::InvalidRequest(format!(
@@ -8243,13 +10880,16 @@ fn capture_graph_seal(
     .map(Some)
 }
 
-fn spawn_segment_seal(seal: PendingSeal) {
-    let Some(task_guard) = seal.lifecycle.register() else {
-        restore_failed_seal(seal.coll, seal.frozen);
+fn spawn_segment_seal(pending: PendingSeal) {
+    let Some(task_guard) = pending.lifecycle.register() else {
+        restore_failed_seal(pending.coll, pending.frozen);
         return;
     };
     build_admission::BUILD_POOL.spawn(move || {
         let _task_guard = task_guard;
+        // Closure captures drop after locals. Move the inputs into a local so
+        // their root lease is released before the guard reports completion.
+        let seal = pending;
         let estimated =
             build_admission::estimated_build_bytes(seal.frozen.points.len(), seal.vector_dim, 3);
         let _permit = match build_admission::acquire_cancellable(
@@ -8430,7 +11070,7 @@ fn run_segment_seal(seal: &PendingSeal) -> Result<()> {
         crate::searcher::SegmentStore::V4(store),
         tombstones,
         tombstone_ordinals.clone(),
-    );
+    )?;
     let previous_overlay = collection.overlays.current();
     let generation = if let Some(graph) = &seal.graph {
         graph.generation
@@ -8504,7 +11144,7 @@ fn run_segment_seal(seal: &PendingSeal) -> Result<()> {
             );
         }
     }
-    collection.rebuild_payload_fallback();
+    collection.rebuild_payload_fallback()?;
     collection.last_segment_id = Some(segment_id.clone());
     if !retain_graph_wal {
         collection.wal_watermark = seal.end_lsn;
@@ -8877,14 +11517,17 @@ struct PendingIndexBuild {
 /// above) and install the result. Deletes need no special handling here --
 /// `Db::delete` never touches the index synchronously either; both rely on
 /// the next compaction to drop stale entries.
-fn spawn_index_build(build: PendingIndexBuild) {
-    let cleanup_coll = Arc::clone(&build.coll);
-    let Some(task_guard) = build.lifecycle.register() else {
-        cleanup_coll.write().index_build_in_flight = false;
+fn spawn_index_build(pending: PendingIndexBuild) {
+    let cleanup_collection = Arc::clone(&pending.coll);
+    let Some(task_guard) = pending.lifecycle.register() else {
+        cleanup_collection.write().index_build_in_flight = false;
         return;
     };
     build_admission::BUILD_POOL.spawn(move || {
         let _task_guard = task_guard;
+        // Release captured storage owners before notifying the drain waiter.
+        let build = pending;
+        let cleanup_coll = cleanup_collection;
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
             let PendingIndexBuild {
                 coll,
@@ -8938,7 +11581,10 @@ fn spawn_index_build(build: PendingIndexBuild) {
                     PendingIndexBuildKind::H2qg => {
                         collection.streamer.points.values().cloned().collect()
                     }
-                    _ => collection.iter_live().map(Cow::into_owned).collect(),
+                    _ => collection
+                        .iter_live()
+                        .map(|point| point.map(Cow::into_owned))
+                        .collect::<Result<Vec<_>>>()?,
                 }
             };
             if lifecycle.is_cancelled() {
@@ -8957,6 +11603,7 @@ fn spawn_index_build(build: PendingIndexBuild) {
                     }
                     let mut collection = coll.write();
                     for point in collection.iter_live() {
+                        let point = point?;
                         use crate::index::IndexBackend;
                         if !IndexBackend::contains(&backend, &point.id) {
                             IndexBackend::insert_point(&mut backend, &point, vector_dim)?;
@@ -8975,6 +11622,7 @@ fn spawn_index_build(build: PendingIndexBuild) {
                     }
                     let mut collection = coll.write();
                     for point in collection.iter_live() {
+                        let point = point?;
                         use crate::index::IndexBackend;
                         if !IndexBackend::contains(&backend, &point.id) {
                             IndexBackend::insert_point(&mut backend, &point, vector_dim)?;
@@ -8996,6 +11644,7 @@ fn spawn_index_build(build: PendingIndexBuild) {
                     }
                     let mut collection = coll.write();
                     for point in collection.iter_live() {
+                        let point = point?;
                         use crate::index::IndexBackend;
                         if !IndexBackend::contains(&backend, &point.id) {
                             IndexBackend::insert_point(&mut backend, &point, vector_dim)?;
@@ -9319,7 +11968,7 @@ fn apply_wal_upsert(
         }
         Some(SegLoc::Searcher(i)) => {
             let searcher = &mut searchers[*i as usize];
-            if let Some(existing) = searcher.store.get(&point.id) {
+            if let Some(existing) = searcher.store.try_get(&point.id)? {
                 if let Some(sparse_index) = sparse_index.as_deref_mut() {
                     remove_sparse_point(sparse_index, &existing);
                 }
@@ -9348,7 +11997,7 @@ fn apply_wal_delete(
     id: String,
 ) -> Result<()> {
     use crate::searcher::SegLoc;
-    match id_index.remove(&id) {
+    match id_index.get(&id).copied() {
         Some(SegLoc::Streamer) => {
             if let Some(existing) = streamer.remove(&id) {
                 if let Some(sparse_index) = sparse_index.as_deref_mut() {
@@ -9372,7 +12021,7 @@ fn apply_wal_delete(
         }
         Some(SegLoc::Searcher(i)) => {
             let searcher = &mut searchers[i as usize];
-            if let Some(existing) = searcher.store.get(&id) {
+            if let Some(existing) = searcher.store.try_get(&id)? {
                 if let Some(sparse_index) = sparse_index {
                     remove_sparse_point(sparse_index, &existing);
                 }
@@ -9382,6 +12031,7 @@ fn apply_wal_delete(
         }
         None => {}
     }
+    id_index.remove(&id);
     Ok(())
 }
 
@@ -9836,6 +12486,7 @@ fn graph_replication_unavailable(collection: &str) -> GaussError {
 }
 
 struct WalReplayIndexes<'a> {
+    protected: bool,
     id_index: &'a mut HashMap<String, crate::searcher::SegLoc>,
     graph_lifecycle: &'a mut crate::graph_lifecycle::GraphLifecycleState,
     graph_resolver: &'a mut Option<crate::graph_resolver::PointIncarnationResolver>,
@@ -9853,7 +12504,32 @@ fn apply_wal_record(
 ) -> Result<()> {
     use crate::searcher::SegLoc;
     let record_lsn = record.lsn;
-    match record.entry {
+    let entry = match record.entry {
+        WalEntry::TransactionApply { entry, .. } => *entry,
+        entry => entry,
+    };
+    let entry = match entry {
+        WalEntry::ProtectedBatch { batch } => {
+            if !indexes.protected {
+                return Err(crate::security::SecurityError::Unavailable.into());
+            }
+            batch.validate()?;
+            match batch.content.into_wal() {
+                Some(entry) => entry,
+                None => return Ok(()),
+            }
+        }
+        WalEntry::Compact {
+            generation,
+            segments,
+        } => WalEntry::Compact {
+            generation,
+            segments,
+        },
+        _ if indexes.protected => return Err(crate::security::SecurityError::Unavailable.into()),
+        entry => entry,
+    };
+    match entry {
         WalEntry::Upsert { point } => {
             apply_wal_upsert(
                 streamer,
@@ -9919,7 +12595,7 @@ fn apply_wal_record(
                 }
                 Some(SegLoc::Searcher(i)) => {
                     let searcher = &mut searchers[*i as usize];
-                    let taken = searcher.store.get(&id).map(Cow::into_owned);
+                    let taken = searcher.store.try_get(&id)?.map(Cow::into_owned);
                     if taken.is_some() {
                         searcher.tombstone(&id);
                     }
@@ -9969,9 +12645,10 @@ fn apply_wal_record(
             for point in streamer
                 .points
                 .values()
-                .map(Cow::Borrowed)
-                .chain(searchers.iter().flat_map(|s| s.iter_live()))
+                .map(|point| Ok(Cow::Borrowed(point)))
+                .chain(searchers.iter().flat_map(|s| s.try_iter_live()))
             {
+                let point = point?;
                 validate_payload_schema(&next_config, &point)?;
             }
             *config = next_config;
@@ -10007,7 +12684,17 @@ fn apply_wal_record(
                 batch,
             )?;
         }
-        WalEntry::CreateCollection { .. } | WalEntry::DropCollection { .. } => {
+        WalEntry::ProtectedBatch { .. }
+        | WalEntry::CreateProtectedCollection { .. }
+        | WalEntry::CreateCollection { .. }
+        | WalEntry::DropCollection { .. }
+        | WalEntry::DropProtectedCollection { .. }
+        | WalEntry::TransactionPrepare { .. }
+        | WalEntry::TransactionCommit { .. }
+        | WalEntry::TransactionProjection { .. }
+        | WalEntry::RelationalBatch { .. }
+        | WalEntry::MultiModelBatch { .. }
+        | WalEntry::TransactionApply { .. } => {
             return Err(GaussError::WalCorruption {
                 path: config.name.clone(),
                 message: "catalog WAL entry found in collection WAL".to_string(),
@@ -10017,11 +12704,42 @@ fn apply_wal_record(
     Ok(())
 }
 
+fn wal_mutation_counts(entry: WalEntry) -> (usize, usize) {
+    match entry {
+        WalEntry::Upsert { .. } | WalEntry::SetPayload { .. } => (1, 0),
+        WalEntry::UpsertBatch { points } => (points.len(), 0),
+        WalEntry::ProtectedBatch { batch } => batch.content.mutation_counts(),
+        WalEntry::Delete { .. } => (1, 1),
+        WalEntry::DeleteBatch { ids } => (ids.len(), ids.len()),
+        WalEntry::GraphBatch { batch } => {
+            let entries = batch.point_mutations.len();
+            let deletes = batch
+                .point_mutations
+                .iter()
+                .filter(|mutation| {
+                    matches!(mutation, crate::wal::GraphPointMutation::Delete { .. })
+                })
+                .count();
+            (entries, deletes)
+        }
+        WalEntry::TransactionApply { entry, .. } => wal_mutation_counts(*entry),
+        _ => (0, 0),
+    }
+}
+
+fn projected_wal_entry(entry: &WalEntry) -> &WalEntry {
+    match entry {
+        WalEntry::TransactionApply { entry, .. } => projected_wal_entry(entry),
+        entry => entry,
+    }
+}
+
 /// Everything `Db::open` / cold-materialize / restore need to (re)build a
 /// collection's in-memory state from its directory: sealed segments as
 /// independent searchers, WAL tail replayed into the streamer, and the
 /// global indexes over the union.
 struct LoadedCollectionState {
+    security: Option<Arc<crate::security::CollectionAuthority>>,
     config: CollectionConfig,
     schema_epoch: u64,
     streamer: crate::streamer::Streamer,
@@ -10053,13 +12771,23 @@ fn load_db_root(
     root: &Path,
     cold_object_store: Option<&ColdObjectStoreConfig>,
 ) -> Result<LoadedDbRoot> {
+    load_db_root_with_journal(root, cold_object_store, None)
+}
+
+fn load_db_root_with_journal(
+    root: &Path,
+    cold_object_store: Option<&ColdObjectStoreConfig>,
+    journal: Option<&TransactionJournal>,
+) -> Result<LoadedDbRoot> {
     fs::create_dir_all(collections_dir(root))?;
     let mut catalog = read_catalog(root)?;
     let catalog_wal = Wal::open(&root.join(CATALOG_WAL_DIR))?;
-    let catalog_replay = replay_catalog_wal(root, &mut catalog, &catalog_wal)?;
+    let catalog_replay =
+        replay_catalog_wal_with_journal(root, &mut catalog, &catalog_wal, journal)?;
     reconcile_catalog_generations(root, &catalog.collections, &catalog_replay.dropped)?;
     let catalog_replayed = catalog_replay.replayed;
     let mut collections = HashMap::new();
+    let protected_catalog = catalog.protected;
     for config in catalog.collections {
         validate_config(&config)?;
         let collection_name = config.name.clone();
@@ -10075,15 +12803,17 @@ fn load_db_root(
             .as_ref()
             .map(|checkpoint| checkpoint.wal_watermark)
             .unwrap_or(0);
-        let state = load_collection_state(
+        let state = load_collection_state_with_journal(
             &collection_dir,
             config,
             schema_epoch,
             wal_watermark,
             cold_object_store,
             crate::overlay::OverlayOpenMode::Recover,
+            journal,
         )?;
         let LoadedCollectionState {
+            security,
             config,
             schema_epoch,
             streamer,
@@ -10098,12 +12828,21 @@ fn load_db_root(
             sparse_index,
             overlays,
         } = state;
+        if security.as_ref().map(|authority| authority.incarnation())
+            != protected_catalog.get(&collection_name).copied()
+        {
+            return Err(crate::security::SecurityError::Invalid(
+                "protected catalog and collection binding disagree".into(),
+            )
+            .into());
+        }
         let wal = Wal::open(&collection_dir.join("wal"))?;
         let graph_calibration =
             crate::graph_estimator::GraphCalibrationStore::open(&collection_dir)?.map(Arc::new);
         collections.insert(
             collection_name,
             Arc::new(RwLock::new(Collection {
+                security,
                 config,
                 streamer,
                 sealing: None,
@@ -10143,12 +12882,38 @@ fn load_db_root(
 
 fn load_collection_state(
     collection_dir: &Path,
+    config: CollectionConfig,
+    schema_epoch: u64,
+    wal_watermark: u64,
+    cold_object_store: Option<&ColdObjectStoreConfig>,
+    overlay_mode: crate::overlay::OverlayOpenMode,
+) -> Result<LoadedCollectionState> {
+    load_collection_state_with_journal(
+        collection_dir,
+        config,
+        schema_epoch,
+        wal_watermark,
+        cold_object_store,
+        overlay_mode,
+        None,
+    )
+}
+
+fn load_collection_state_with_journal(
+    collection_dir: &Path,
     mut config: CollectionConfig,
     mut schema_epoch: u64,
     wal_watermark: u64,
     cold_object_store: Option<&ColdObjectStoreConfig>,
     overlay_mode: crate::overlay::OverlayOpenMode,
+    journal: Option<&TransactionJournal>,
 ) -> Result<LoadedCollectionState> {
+    let security_checkpoint = crate::security::storage::recover_with_journal(
+        collection_dir,
+        None,
+        journal.map(|journal| (journal, config.name.as_str())),
+    )?;
+    let protected = security_checkpoint.is_some();
     let manifest = read_segments_manifest(collection_dir)?;
     if let Some(manifest) = manifest
         .as_ref()
@@ -10371,19 +13136,34 @@ fn load_collection_state(
     if let (Some(mutable), Some(generation)) = (&mut graph_mutable, &graph_generation) {
         mutable.attach_sealed_adjacency(Arc::clone(generation));
     }
-    let mut payload_index = crate::payload_index::build_payload_index_iter(
+    let mut payload_index = crate::payload_index::try_build_payload_index_iter(
         searchers
             .iter()
             .filter(|searcher| searcher.ordinal_payload_index.is_none())
             .flat_map(|searcher| searcher.store.iter_aux_index_points()),
-    );
+    )?;
     Wal::recover_from(&collection_dir.join("wal"), wal_watermark, |record| {
+        if let (
+            Some(journal),
+            WalEntry::TransactionApply {
+                transaction_id,
+                entry,
+            },
+        ) = (journal, &record.entry)
+        {
+            journal.validate_storage_projection(
+                *transaction_id,
+                crate::transaction_journal::StorageTarget::Collection(&config.name),
+                entry,
+            )?;
+        }
         apply_wal_record(
             &mut config,
             &mut schema_epoch,
             &mut streamer,
             &mut searchers,
             WalReplayIndexes {
+                protected,
                 id_index: &mut id_index,
                 graph_lifecycle: &mut graph_lifecycle,
                 graph_resolver: &mut graph_resolver,
@@ -10411,7 +13191,7 @@ fn load_collection_state(
         for id in hidden_ids {
             if id_index.get(&id) == Some(&crate::searcher::SegLoc::Searcher(searcher_index as u32))
             {
-                if let Some(point) = searcher.store.get(&id) {
+                if let Some(point) = searcher.store.try_get(&id)? {
                     remove_payload_point(&mut payload_index, &point);
                 }
                 id_index.remove(&id);
@@ -10431,11 +13211,11 @@ fn load_collection_state(
             .map_or(&empty_edge_tombstones, |graph| graph.edge_tombstones()),
     )?;
     overlays.publish_pending()?;
-    let sparse_index = crate::sparse_index::build_sparse_index_iter(
+    let sparse_index = crate::sparse_index::try_build_sparse_index_iter(
         streamer
             .points
             .values()
-            .map(Cow::Borrowed)
+            .map(|point| Ok(Cow::Borrowed(point)))
             .chain(searchers.iter().flat_map(|searcher| {
                 searcher.iter_visible_aux_index_points(
                     overlays
@@ -10444,8 +13224,33 @@ fn load_collection_state(
                         .bitmap(&searcher.id),
                 )
             })),
-    );
+    )?;
+    let security = security_checkpoint
+        .map(|stored| -> Result<_> {
+            if stored.authority.collection != config.name {
+                return Err(crate::security::SecurityError::Unavailable.into());
+            }
+            let bindings: HashSet<_> = stored
+                .authority
+                .resources
+                .iter()
+                .filter(|record| !record.retired)
+                .map(|record| record.storage_id.to_string())
+                .collect();
+            if bindings.len() != id_index.len() || id_index.keys().any(|id| !bindings.contains(id))
+            {
+                return Err(crate::security::SecurityError::Invalid(
+                    "recovered content and security identities disagree".into(),
+                )
+                .into());
+            }
+            Ok(Arc::new(
+                crate::security::CollectionAuthority::from_verified_checkpoint(stored.authority)?,
+            ))
+        })
+        .transpose()?;
     Ok(LoadedCollectionState {
+        security,
         config,
         schema_epoch,
         streamer,
@@ -10690,9 +13495,34 @@ fn read_catalog(root: &Path) -> Result<Catalog> {
     if !path.exists() {
         return Ok(Catalog::default());
     }
-    Ok(serde_json::from_slice(
-        &crate::encryption::read_persistent(&path)?,
-    )?)
+    let bytes = crate::encryption::read_persistent(&path)?;
+    let guarded = bytes.starts_with(TRANSACTION_CATALOG_MAGIC);
+    let bytes = if guarded {
+        crate::security::storage::decode_metadata(TRANSACTION_CATALOG_MAGIC, &bytes)?
+    } else {
+        bytes.as_slice()
+    };
+    let installed = bytes.starts_with(INSTALLATION_CATALOG_MAGIC);
+    let marked = installed || bytes.starts_with(PROTECTED_CATALOG_MAGIC);
+    let catalog: Catalog = serde_json::from_slice(if marked {
+        crate::security::storage::decode_metadata(
+            if installed {
+                INSTALLATION_CATALOG_MAGIC
+            } else {
+                PROTECTED_CATALOG_MAGIC
+            },
+            bytes,
+        )?
+    } else {
+        bytes
+    })?;
+    if !marked && !catalog.protected.is_empty() {
+        return Err(crate::security::SecurityError::Unavailable.into());
+    }
+    if installed != catalog.installation.is_some() || installed && catalog.security_revision == 0 {
+        return Err(crate::security::SecurityError::Unavailable.into());
+    }
+    Ok(catalog)
 }
 
 fn replay_catalog_wal(
@@ -10700,14 +13530,67 @@ fn replay_catalog_wal(
     catalog: &mut Catalog,
     wal: &Wal,
 ) -> Result<CatalogReplayResult> {
+    replay_catalog_wal_with_journal(root, catalog, wal, None)
+}
+
+fn replay_catalog_wal_with_journal(
+    root: &Path,
+    catalog: &mut Catalog,
+    wal: &Wal,
+    journal: Option<&TransactionJournal>,
+) -> Result<CatalogReplayResult> {
     let mut replay = CatalogReplayResult::default();
     Wal::recover_from(
         &root.join(CATALOG_WAL_DIR),
         catalog.wal_watermark,
         |record| {
             replay.replayed = true;
-            match record.entry {
+            let entry = match record.entry {
+                WalEntry::TransactionApply {
+                    transaction_id,
+                    entry,
+                } => {
+                    if let Some(journal) = journal {
+                        journal.validate_storage_projection(
+                            transaction_id,
+                            crate::transaction_journal::StorageTarget::Catalog,
+                            &entry,
+                        )?;
+                    }
+                    *entry
+                }
+                entry => entry,
+            };
+            match entry {
+                WalEntry::CreateProtectedCollection {
+                    config,
+                    security,
+                    expected_revision,
+                    revision,
+                } => {
+                    validate_config(&config)?;
+                    if catalog.installation.is_none()
+                        || expected_revision != catalog.security_revision
+                        || expected_revision.checked_add(1) != Some(revision)
+                        || security.collection != config.name
+                        || catalog.collections.iter().any(|c| c.name == config.name)
+                    {
+                        return Err(crate::security::SecurityError::Unavailable.into());
+                    }
+                    crate::security::CollectionAuthority::from_verified_checkpoint(
+                        security.clone(),
+                    )?;
+                    replay.dropped.remove(&config.name);
+                    catalog.security_revision = revision;
+                    catalog
+                        .protected
+                        .insert(config.name.clone(), security.incarnation);
+                    catalog.collections.push(config);
+                }
                 WalEntry::CreateCollection { config } => {
+                    if catalog.installation.is_some() {
+                        return Err(crate::security::SecurityError::Forbidden.into());
+                    }
                     validate_config(&config)?;
                     replay.dropped.remove(&config.name);
                     catalog
@@ -10716,8 +13599,37 @@ fn replay_catalog_wal(
                     catalog.collections.push(config);
                 }
                 WalEntry::DropCollection { name } => {
+                    if catalog.installation.is_some() {
+                        return Err(crate::security::SecurityError::Forbidden.into());
+                    }
                     catalog.collections.retain(|config| config.name != name);
                     replay.dropped.insert(name);
+                }
+                WalEntry::DropProtectedCollection {
+                    name,
+                    expected_revision,
+                    revision,
+                } => {
+                    if catalog.installation.is_none()
+                        || catalog.security_revision != expected_revision
+                        || expected_revision.checked_add(1) != Some(revision)
+                        || catalog.protected.remove(&name).is_none()
+                    {
+                        return Err(crate::security::SecurityError::Unavailable.into());
+                    }
+                    catalog.security_revision = revision;
+                    catalog.collections.retain(|config| config.name != name);
+                    replay.dropped.insert(name);
+                }
+                WalEntry::TransactionPrepare { .. }
+                | WalEntry::TransactionCommit { .. }
+                | WalEntry::TransactionProjection { .. }
+                | WalEntry::TransactionApply { .. } => {
+                    return Err(GaussError::WalCorruption {
+                        path: root.join(CATALOG_WAL_DIR).display().to_string(),
+                        message: "transaction control record found in catalog projection"
+                            .to_string(),
+                    });
                 }
                 _ => {
                     return Err(GaussError::WalCorruption {
@@ -10753,13 +13665,83 @@ fn write_catalog_state(
         .map(|collection| collection.read().config.clone())
         .collect();
     collection_configs.sort_by(|left, right| left.name.cmp(&right.name));
+    let protected = collections
+        .iter()
+        .filter_map(|(name, collection)| {
+            collection
+                .read()
+                .security
+                .as_ref()
+                .map(|authority| (name.clone(), authority.incarnation()))
+        })
+        .collect();
+    let mut previous = read_catalog(root)?;
+    replay_catalog_wal(root, &mut previous, catalog_wal)?;
     let catalog = Catalog {
+        installation: previous.installation,
+        security_revision: previous.security_revision,
+        protected,
         collections: collection_configs,
         wal_watermark: catalog_wal.len()?,
     };
     let path = root.join(CATALOG_FILE);
-    let bytes = serde_json::to_vec_pretty(&catalog)?;
+    let payload = serde_json::to_vec_pretty(&catalog)?;
+    let bytes = if catalog.installation.is_some() {
+        crate::security::storage::encode_metadata(INSTALLATION_CATALOG_MAGIC, &payload)
+    } else if catalog.protected.is_empty() {
+        payload
+    } else {
+        crate::security::storage::encode_metadata(PROTECTED_CATALOG_MAGIC, &payload)
+    };
+    let bytes = crate::security::storage::encode_metadata(TRANSACTION_CATALOG_MAGIC, &bytes);
     crate::encryption::atomic_write_persistent(&path, crate::encryption::FileType::Metadata, &bytes)
+}
+
+fn activate_transaction_catalog_guard(root: &Path) -> Result<()> {
+    let path = root.join(CATALOG_FILE);
+    let current = if path.exists() {
+        crate::encryption::read_persistent(&path)?
+    } else {
+        serde_json::to_vec(&Catalog::default())?
+    };
+    if current.starts_with(TRANSACTION_CATALOG_MAGIC) {
+        return Ok(());
+    }
+    let guarded = crate::security::storage::encode_metadata(TRANSACTION_CATALOG_MAGIC, &current);
+    crate::encryption::atomic_write_persistent(
+        &path,
+        crate::encryption::FileType::Metadata,
+        &guarded,
+    )
+}
+
+pub(crate) fn initialize_installation_catalog(root: &Path, installation: uuid::Uuid) -> Result<()> {
+    let catalog = Catalog {
+        installation: Some(installation),
+        security_revision: 1,
+        ..Catalog::default()
+    };
+    let bytes = crate::security::storage::encode_metadata(
+        INSTALLATION_CATALOG_MAGIC,
+        &serde_json::to_vec(&catalog)?,
+    );
+    crate::encryption::atomic_write_persistent(
+        &root.join(CATALOG_FILE),
+        crate::encryption::FileType::Metadata,
+        &bytes,
+    )
+}
+
+pub(crate) fn verify_installation_catalog(data: &Path, installation: uuid::Uuid) -> Result<()> {
+    let layout = crate::storage_layout::resolve(data)?;
+    let catalog = read_catalog(&layout.active_root)?;
+    if layout.generation.is_none()
+        || catalog.installation != Some(installation)
+        || catalog.collections.len() != catalog.protected.len()
+    {
+        return Err(crate::security::SecurityError::Unavailable.into());
+    }
+    Ok(())
 }
 
 fn collections_dir(root: &Path) -> PathBuf {
@@ -11066,28 +14048,7 @@ fn sibling_file_name(path: &Path) -> Result<String> {
 }
 
 fn preserve_audit_log(live_root: &Path, staged_root: &Path) -> Result<()> {
-    let live_path = audit::audit_log_path(live_root);
-    let staged_path = audit::audit_log_path(staged_root);
-    let current = match fs::read(&live_path) {
-        Ok(bytes) => Some(bytes),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
-    match current {
-        Some(bytes) => {
-            let parent = staged_path.parent().ok_or_else(|| {
-                GaussError::InvalidRequest("staged audit log has no parent directory".to_string())
-            })?;
-            fs::create_dir_all(parent)?;
-            let mut file = File::create(&staged_path)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            sync_directory(parent)?;
-        }
-        None if staged_path.exists() => durable_remove_file(&staged_path)?,
-        None => {}
-    }
-    Ok(())
+    audit::preserve_durable_log(live_root, staged_root)
 }
 
 fn rollback_restore_generation(
@@ -11157,6 +14118,17 @@ fn snapshot_dir_contents(root: &Path, source: &Path, destination: &Path) -> Resu
         {
             continue;
         }
+        if source.strip_prefix(root).ok() == Some(Path::new("relational"))
+            && entry.file_name() == "query-spill"
+        {
+            continue;
+        }
+        if file_type.is_dir()
+            && (crate::relational::disk_map::DiskMap::is_journal_scratch(&source_path)
+                || Wal::is_snapshot_scratch(&source_path))
+        {
+            continue;
+        }
         let target = destination.join(entry.file_name());
         if file_type.is_dir() {
             fs::create_dir_all(&target)?;
@@ -11198,6 +14170,8 @@ mod tests {
     mod graph_retrieval;
     mod graph_snapshot;
     mod partitioned_delta;
+    mod projection_binding;
+    mod wal_pin_leases;
 
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
@@ -11226,12 +14200,89 @@ mod tests {
     use crate::{
         CollectionConfig, DistanceMetric, Filter, GaussError, HybridSearchRequest,
         MultiSearchRequest, PayloadType, Point, RecommendRequest, RerankRequest, ScoreBoost,
-        SearchRequest, SparseVector, audit, checkpoint,
+        SearchRequest, SparseVector, SqlExecutionRequest, SqlStatementRequest, audit, checkpoint,
         graph_identity::GRAPH_IDENTITY_FILE,
+        relational::{RelationalBatch, RelationalMutation},
         segment::ColdObjectStoreConfig,
         snapshot,
-        wal::{GraphBatch, GraphPointMutation, Wal, WalEntry},
+        transaction_journal::{TransactionAudit, TransactionJournal, TransactionTarget},
+        wal::{
+            GraphBatch, GraphPointMutation, MULTI_MODEL_BATCH_VERSION, MultiModelBatch,
+            MultiModelCollectionBatch, Wal, WalEntry,
+        },
     };
+
+    #[test]
+    fn snapshot_excludes_query_spill_without_losing_relational_wal() {
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("source");
+        let relational = source.join("relational");
+        fs::create_dir_all(relational.join("query-spill/.chiron-query-spill-active")).unwrap();
+        fs::write(
+            relational.join("query-spill/.chiron-query-spill-active/0.run"),
+            b"scratch",
+        )
+        .unwrap();
+        fs::create_dir_all(relational.join("wal")).unwrap();
+        fs::write(relational.join("wal/0.log"), b"durable").unwrap();
+        let journal = source.join(crate::transaction_journal::TRANSACTION_JOURNAL_DIR);
+        fs::create_dir_all(journal.join(".chiron-decisions-active")).unwrap();
+        fs::write(
+            journal.join(".chiron-decisions-active/index.rseg"),
+            b"scratch",
+        )
+        .unwrap();
+        fs::write(journal.join("0.gdwal"), b"durable-decision").unwrap();
+        fs::create_dir_all(journal.join(".chiron-decision-checkpoint/generation-active")).unwrap();
+        fs::write(
+            journal.join(".chiron-decision-checkpoint/CURRENT"),
+            b"derived-cache",
+        )
+        .unwrap();
+        for directory in ["audit", "transactions/authority"] {
+            let checkpoint = source.join(directory).join(".chiron-decision-checkpoint");
+            fs::create_dir_all(&checkpoint).unwrap();
+            fs::write(checkpoint.join("CURRENT"), b"checkpoint").unwrap();
+        }
+        fs::write(source.join("audit/audit.jsonl"), b"durable-audit").unwrap();
+        let destination = root.path().join("snapshot");
+        super::snapshot_dir_all(&source, &destination).unwrap();
+        assert!(!destination.join("relational/query-spill").exists());
+        assert!(
+            !destination
+                .join("audit/.chiron-decision-checkpoint")
+                .exists()
+        );
+        assert!(!destination.join("audit").exists());
+        assert!(crate::relational::disk_map::DiskMap::is_journal_scratch(
+            &source.join("audit/.chiron-decision-checkpoint")
+        ));
+        assert_eq!(
+            fs::read(
+                destination.join("transactions/authority/.chiron-decision-checkpoint/CURRENT")
+            )
+            .unwrap(),
+            b"checkpoint"
+        );
+        assert!(
+            !destination
+                .join("transactions/journal/.chiron-decisions-active")
+                .exists()
+        );
+        assert_eq!(
+            fs::read(destination.join("transactions/journal/0.gdwal")).unwrap(),
+            b"durable-decision"
+        );
+        assert!(
+            !destination
+                .join("transactions/journal/.chiron-decision-checkpoint")
+                .exists()
+        );
+        assert_eq!(
+            fs::read(destination.join("relational/wal/0.log")).unwrap(),
+            b"durable"
+        );
+    }
 
     #[test]
     fn memory_pressure_rejects_only_when_both_streamers_are_full() {
@@ -11241,6 +14292,264 @@ mod tests {
             super::streamer_admission_wait_required(true, true, true),
             Err(GaussError::ResourceExhausted(_))
         ));
+    }
+
+    #[test]
+    fn wal_flusher_dirty_notification_serializes_with_wait_registration() {
+        wal_flusher_notification_serializes_with_wait_registration(false);
+    }
+
+    #[test]
+    fn wal_flusher_stop_notification_serializes_with_wait_registration() {
+        wal_flusher_notification_serializes_with_wait_registration(true);
+    }
+
+    fn wal_flusher_notification_serializes_with_wait_registration(shutdown: bool) {
+        let coordinator = Arc::new(super::WalFlushCoordinator {
+            stop: Arc::new(AtomicBool::new(false)),
+            dirty: Arc::new(AtomicBool::new(false)),
+            wake: Arc::new((super::StdMutex::new(()), super::Condvar::new())),
+            flush_gate: Arc::new(super::StdMutex::new(())),
+            handle: super::StdMutex::new(None),
+            wakeups: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        // Hold the worker's predicate lock in the check-to-wait window.
+        let guard = coordinator.wake.0.lock().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let publisher = Arc::clone(&coordinator);
+        let worker = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            if shutdown {
+                publisher.shutdown();
+            } else {
+                publisher.request_flush();
+            }
+            finished_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            finished_rx.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        let predicate = if shutdown {
+            &coordinator.stop
+        } else {
+            &coordinator.dirty
+        };
+        let (guard, wait) = coordinator
+            .wake
+            .1
+            .wait_timeout_while(guard, Duration::from_secs(1), |_| {
+                !predicate.load(Ordering::Acquire)
+            })
+            .unwrap();
+        assert!(!wait.timed_out(), "predicate notification was lost");
+        assert!(predicate.load(Ordering::Acquire));
+        drop(guard);
+        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn maintenance_quiesce_waits_for_inflight_wal_flush() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open(temp.path()).unwrap();
+        // Hold the metadata lock after the flusher has entered storage I/O.
+        let inner = db.inner.write();
+        let baseline = db.wal_flusher.wakeups();
+        db.wal_flusher.request_flush();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while db.wal_flusher.wakeups() == baseline && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(db.wal_flusher.wakeups(), baseline + 1);
+        thread::sleep(Duration::from_millis(20));
+        db.maintenance.store(true, Ordering::Release);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let flusher = Arc::clone(&db.wal_flusher);
+        let waiter = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            flusher.quiesce();
+            finished_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            finished_rx.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(inner);
+        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn wal_flusher_has_no_idle_timer_wakeups() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open(temp.path()).unwrap();
+        let baseline = db.wal_flusher.wakeups();
+        thread::sleep(Duration::from_millis(250));
+        assert_eq!(db.wal_flusher.wakeups(), baseline);
+    }
+
+    #[test]
+    fn wal_flusher_flushes_after_dirty_notification() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open(temp.path()).unwrap();
+        let baseline = db.wal_flusher.wakeups();
+        db.create_collection(ls_vec_config("dirty_notification"))
+            .unwrap();
+
+        // The 200 ms coalescing interval is not a scheduling deadline on a
+        // loaded CI host. Observe the worker, then drain its in-flight sync.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while db.wal_flusher.wakeups() == baseline {
+            assert!(Instant::now() < deadline, "WAL flush worker did not wake");
+            thread::sleep(Duration::from_millis(5));
+        }
+        db.wal_flusher.quiesce();
+        assert!(!db.inner.read().catalog_wal.is_dirty());
+        assert_eq!(db.wal_flusher.wakeups(), baseline + 1);
+    }
+
+    #[test]
+    fn shutdown_is_bounded_idempotent_and_closes_mutation_admission() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open(temp.path()).unwrap();
+        assert!(db.durability_ready());
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let first = db.shutdown(deadline);
+        assert!(!first.fallback_required, "{first:?}");
+        assert!(first.requests_drained, "{first:?}");
+        assert!(db.build_lifecycle.register().is_none());
+        assert!(!db.durability_ready());
+        assert_eq!(db.shutdown(deadline), first);
+
+        let error = db
+            .create_collection(ls_vec_config("after_shutdown"))
+            .unwrap_err();
+        assert!(matches!(error, GaussError::WalUnavailable(_)));
+        let error = db
+            .execute_sql(SqlExecutionRequest {
+                statements: vec![SqlStatementRequest {
+                    sql: "SELECT 1".to_string(),
+                    parameters: Vec::new(),
+                }],
+                idempotency_key: None,
+                retry_id: None,
+            })
+            .unwrap_err();
+        assert!(matches!(error, GaussError::WalUnavailable(_)));
+    }
+
+    #[test]
+    fn shutdown_draining_grants_work_a_grace_window_before_cancellation() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open(temp.path()).unwrap();
+
+        assert!(db.begin_shutdown());
+        assert!(!db.shutdown_lifecycle.cancelled.load(Ordering::Acquire));
+        assert!(matches!(
+            db.execute_sql(SqlExecutionRequest {
+                statements: vec![SqlStatementRequest {
+                    sql: "SELECT 1".to_string(),
+                    parameters: Vec::new(),
+                }],
+                idempotency_key: None,
+                retry_id: None,
+            }),
+            Err(GaussError::WalUnavailable(_))
+        ));
+
+        db.cancel_shutdown_work();
+        assert!(db.shutdown_lifecycle.cancelled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn shutdown_waits_for_cooperatively_cancelled_inflight_work() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open(temp.path()).unwrap();
+        db.search_inflight.fetch_add(1, Ordering::AcqRel);
+        let inflight = Arc::clone(&db.search_inflight);
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            inflight.fetch_sub(1, Ordering::AcqRel);
+        });
+
+        let report = db.shutdown(Instant::now() + Duration::from_secs(1));
+
+        worker.join().unwrap();
+        assert!(report.requests_drained, "{report:?}");
+        assert_eq!(report.inflight_requests_remaining, 0);
+        assert!(!report.fallback_required, "{report:?}");
+    }
+
+    #[test]
+    fn shutdown_waits_for_active_compaction_publication() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open(temp.path()).unwrap();
+        db.compactions_in_flight
+            .lock()
+            .unwrap()
+            .insert("fixture".to_string());
+        let compactions = Arc::clone(&db.compactions_in_flight);
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            compactions.lock().unwrap().remove("fixture");
+        });
+
+        let report = db.shutdown(Instant::now() + Duration::from_secs(1));
+
+        worker.join().unwrap();
+        assert!(report.background_drained, "{report:?}");
+        assert!(!report.fallback_required, "{report:?}");
+    }
+
+    #[test]
+    fn shutdown_reports_fallback_when_background_work_misses_deadline() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open(temp.path()).unwrap();
+        let task = db.build_lifecycle.register().unwrap();
+        let started = Instant::now();
+
+        let report = db.shutdown(Instant::now() + Duration::from_millis(25));
+
+        assert!(!report.background_drained, "{report:?}");
+        assert!(report.fallback_required, "{report:?}");
+        assert!(started.elapsed() < Duration::from_millis(250));
+        drop(task);
+    }
+
+    #[test]
+    fn shutdown_reports_fallback_when_final_wal_sync_fails() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open(temp.path()).unwrap();
+        db.create_collection(ls_vec_config("sync_failure")).unwrap();
+        let collection = db
+            .inner
+            .read()
+            .collections
+            .get("sync_failure")
+            .unwrap()
+            .clone();
+        {
+            let mut collection = collection.write();
+            collection
+                .wal
+                .append_no_sync(&WalEntry::Delete {
+                    id: "missing".to_string(),
+                })
+                .unwrap();
+            collection.wal.inject_sync_failure();
+        }
+
+        let report = db.shutdown(Instant::now() + Duration::from_secs(1));
+
+        assert!(!report.wal_flushed, "{report:?}");
+        assert!(report.fallback_required, "{report:?}");
     }
 
     #[test]
@@ -11464,6 +14773,119 @@ mod tests {
             index_kind: None,
             streamer_max_bytes: 0,
         }
+    }
+
+    #[test]
+    #[ignore = "requires CHIRONDB_OLD_BINARY built from commit 25b63b4"]
+    fn old_binary_rejects_transaction_catalog_format() {
+        use std::{
+            collections::{BTreeMap, BTreeSet},
+            process::{Command, Stdio},
+        };
+
+        fn files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+            let mut pending = vec![root.to_path_buf()];
+            let mut contents = BTreeMap::new();
+            while let Some(directory) = pending.pop() {
+                for entry in fs::read_dir(directory).unwrap() {
+                    let entry = entry.unwrap();
+                    let path = entry.path();
+                    let kind = fs::symlink_metadata(&path).unwrap().file_type();
+                    assert!(!kind.is_symlink(), "protected fixture contains a symlink");
+                    if kind.is_dir() {
+                        pending.push(path);
+                    } else if kind.is_file() {
+                        contents.insert(
+                            path.strip_prefix(root).unwrap().to_path_buf(),
+                            fs::read(path).unwrap(),
+                        );
+                    }
+                }
+            }
+            contents
+        }
+
+        let binary = std::env::var_os("CHIRONDB_OLD_BINARY")
+            .expect("provide the verified pre-transaction-journal server executable");
+        let directory = TempDir::new().unwrap();
+        let db = Db::open(directory.path()).unwrap();
+        db.create_collection(ls_vec_config("guarded")).unwrap();
+        db.upsert(
+            "guarded",
+            vec![Point {
+                id: "record-1".to_string(),
+                vector: vec![0.25, 0.75],
+                vectors: Default::default(),
+                sparse_vector: None,
+                payload: serde_json::json!({"format": "transaction-journal-v1"}),
+            }],
+        )
+        .unwrap();
+        let generation = db.inner.read().root.clone();
+        drop(db);
+
+        for path in [directory.path(), generation.as_path()] {
+            let before = files(directory.path());
+            let mut child = Command::new(&binary)
+                .env_clear()
+                .current_dir(directory.path())
+                .args([
+                    "--listen-http",
+                    "127.0.0.1:0",
+                    "--listen-grpc",
+                    "127.0.0.1:0",
+                    "--listen-wire",
+                    "127.0.0.1:0",
+                    "--data-dir",
+                ])
+                .arg(path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let completed = loop {
+                if child.try_wait().unwrap().is_some() {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    break false;
+                }
+                thread::sleep(Duration::from_millis(20));
+            };
+            let output = child.wait_with_output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(completed, "old server remained alive against upgraded data");
+            assert!(
+                !output.status.success(),
+                "old server admitted upgraded data"
+            );
+            assert!(
+                stderr.contains("failed to open data dir"),
+                "old server must fail while opening upgraded storage: {stderr}"
+            );
+            let after = files(directory.path());
+            let changed = before
+                .keys()
+                .chain(after.keys())
+                .filter(|path| before.get(*path) != after.get(*path))
+                .collect::<BTreeSet<_>>();
+            assert!(
+                changed.is_empty(),
+                "old server changed upgraded data files: {changed:?}"
+            );
+        }
+
+        let reopened = Db::open(directory.path()).unwrap();
+        assert_eq!(
+            reopened
+                .get_points("guarded", &["record-1".to_string()])
+                .unwrap()[0]
+                .id,
+            "record-1"
+        );
     }
 
     #[test]
@@ -12520,16 +15942,15 @@ mod tests {
     }
 
     #[test]
-    fn wait_true_wal_failures_do_not_publish_batch_state_and_poison_collection() {
+    fn precommit_journal_failures_do_not_publish_batch_state() {
         for failure in ["write", "sync"] {
             let temp = TempDir::new().unwrap();
             let db = Db::open(temp.path()).unwrap();
             db.create_collection(ls_vec_config("docs")).unwrap();
-            let coll = db.get_coll("docs").unwrap();
             if failure == "write" {
-                coll.read().wal.inject_write_failure();
+                db.transaction_journal.inject_write_failure();
             } else {
-                coll.read().wal.inject_sync_failure();
+                db.transaction_journal.inject_sync_failure();
             }
 
             let error = db
@@ -12544,11 +15965,1123 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(error, GaussError::WalUnavailable(_)));
             assert_eq!(db.count("docs", None).unwrap().count, 0);
+            assert!(!db.durability_ready());
             assert!(matches!(
-                db.upsert("docs", vec![ls_vec_point("later", 3.0, "failed")]),
+                db.upsert("docs", vec![ls_vec_point("later", 3.0, "blocked")]),
                 Err(GaussError::WalUnavailable(_))
             ));
         }
+    }
+
+    #[test]
+    fn multi_model_recovery_projects_each_wal_exactly_once() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let relational_wal = root.join("relational/wal");
+        let collection_wal = super::collection_dir(root, "chunks").join("wal");
+        fs::create_dir_all(&relational_wal).unwrap();
+        fs::create_dir_all(&collection_wal).unwrap();
+        let journal = TransactionJournal::open(root).unwrap();
+        let batch = MultiModelBatch {
+            version: MULTI_MODEL_BATCH_VERSION,
+            relational: RelationalBatch {
+                sequence: 1,
+                mutations: vec![RelationalMutation::DropTable {
+                    name: "documents".into(),
+                }],
+            },
+            collections: vec![MultiModelCollectionBatch {
+                collection: "chunks".into(),
+                batch: GraphBatch {
+                    point_mutations: vec![GraphPointMutation::Upsert {
+                        point: ls_vec_point("chunk-1", 1.0, "multi-model"),
+                    }],
+                    ..GraphBatch::default()
+                },
+                security: None,
+            }],
+        };
+        let committed = journal
+            .commit(
+                TransactionTarget::MultiModel {
+                    collections: vec!["chunks".into()],
+                },
+                WalEntry::MultiModelBatch {
+                    batch: batch.clone(),
+                },
+                TransactionAudit::mutation(
+                    "multi_model_transaction",
+                    None,
+                    &audit::AuditContext::embedded(),
+                    json!({"domains": ["relational", "vector", "graph"]}),
+                ),
+            )
+            .unwrap();
+        let transaction_id = committed.prepare.transaction_id;
+
+        // Crash boundary: the relational projection reached its WAL while
+        // the collection projection and journal marker did not.
+        let mut relational_projection = Wal::open(&relational_wal).unwrap();
+        relational_projection
+            .append(&WalEntry::TransactionApply {
+                transaction_id,
+                entry: Box::new(WalEntry::RelationalBatch {
+                    batch: batch.relational.clone(),
+                }),
+            })
+            .unwrap();
+        drop(relational_projection);
+
+        for _ in 0..2 {
+            super::recover_transaction_storage_projections(&journal, root).unwrap();
+        }
+        let mut relational_entries = 0;
+        Wal::recover_from(&relational_wal, 0, |record| {
+            if matches!(
+                record.entry,
+                WalEntry::TransactionApply {
+                    transaction_id: found,
+                    entry,
+                } if found == transaction_id && matches!(*entry, WalEntry::RelationalBatch { .. })
+            ) {
+                relational_entries += 1;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let mut collection_entries = 0;
+        Wal::recover_from(&collection_wal, 0, |record| {
+            if matches!(
+                record.entry,
+                WalEntry::TransactionApply {
+                    transaction_id: found,
+                    entry,
+                } if found == transaction_id && matches!(*entry, WalEntry::GraphBatch { .. })
+            ) {
+                collection_entries += 1;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(relational_entries, 1);
+        assert_eq!(collection_entries, 1);
+        let status = journal.status(transaction_id);
+        assert!(status.storage_projected);
+        assert!(!status.audit_projected);
+        assert!(journal.stable_visibility_frontier().unwrap().is_some());
+    }
+
+    #[test]
+    fn multi_model_transaction_commits_row_points_and_edge_and_recovers() {
+        use crate::{
+            MultiModelTransactionRequest, RelationalValue, SqlExecutionRequest, SqlResult,
+            SqlStatementRequest,
+            graph::{
+                ConfigureEdgeTypeRequest, GraphDirection, GraphRelationScope, GraphTraverseRequest,
+                RelateRequest, TraversalBudget,
+            },
+            tenant::TenantScope,
+        };
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let scope = TenantScope::tenant("multi-model-writer", "acme");
+        let transaction_id = {
+            let db = Db::open(root).unwrap();
+            db.create_collection(ls_vec_config("chunks")).unwrap();
+            db.set_graph_lifecycle_scoped("chunks", true, true, &scope)
+                .unwrap();
+            db.configure_edge_type_scoped(
+                "chunks",
+                ConfigureEdgeTypeRequest {
+                    name: "cites".into(),
+                    weight_property: None,
+                },
+                true,
+                &scope,
+            )
+            .unwrap();
+            db.execute_sql(SqlExecutionRequest {
+                statements: vec![SqlStatementRequest {
+                    sql: "CREATE TABLE documents (id TEXT PRIMARY KEY, title TEXT NOT NULL)".into(),
+                    parameters: vec![],
+                }],
+                idempotency_key: None,
+                retry_id: Some("create-documents".into()),
+            })
+            .unwrap();
+
+            let response = db
+                .execute_multimodel_transaction(
+                    MultiModelTransactionRequest {
+                        sql: SqlExecutionRequest {
+                            statements: vec![SqlStatementRequest {
+                                sql: "INSERT INTO documents (id, title) VALUES ($1, $2)".into(),
+                                parameters: vec![
+                                    RelationalValue::Text("doc-1".into()),
+                                    RelationalValue::Text("Atomic knowledge".into()),
+                                ],
+                            }],
+                            idempotency_key: None,
+                            retry_id: Some("multi-model-doc-1".into()),
+                        },
+                        collection: "chunks".into(),
+                        points: vec![
+                            graph_point("chunk-1", 1.0, "acme"),
+                            graph_point("source-1", 2.0, "acme"),
+                        ],
+                        point_deletes: vec![],
+                        relations: vec![RelateRequest {
+                            source_point_id: "chunk-1".into(),
+                            target_point_id: "source-1".into(),
+                            edge_type: "cites".into(),
+                            properties: json!({"kind": "source"}),
+                            scope: GraphRelationScope::Local,
+                            idempotency_key: None,
+                        }],
+                        edge_deletes: vec![],
+                        edge_updates: vec![],
+                    },
+                    &scope,
+                    &audit::AuditContext::embedded(),
+                )
+                .unwrap();
+            assert!(response.sql.committed);
+            assert_eq!(response.edge_ids.len(), 1);
+            assert!(response.graph.durable);
+            let transaction_id = response.sql.transaction_id.unwrap();
+            let status = db.transaction_status(&transaction_id).unwrap();
+            assert!(status.storage_projected);
+            assert!(status.audit_projected);
+
+            let selected = db
+                .execute_sql(SqlExecutionRequest {
+                    statements: vec![SqlStatementRequest {
+                        sql: "SELECT id, title FROM documents WHERE id = 'doc-1'".into(),
+                        parameters: vec![],
+                    }],
+                    idempotency_key: None,
+                    retry_id: None,
+                })
+                .unwrap();
+            assert!(matches!(
+                &selected.results[0],
+                SqlResult::Rows { rows, .. }
+                    if rows == &vec![vec![
+                        RelationalValue::Text("doc-1".into()),
+                        RelationalValue::Text("Atomic knowledge".into()),
+                    ]]
+            ));
+            assert_eq!(
+                db.get_points_scoped("chunks", &["chunk-1".into(), "source-1".into()], &scope,)
+                    .unwrap()
+                    .len(),
+                2
+            );
+            let traversal = db
+                .traverse_scoped(
+                    "chunks",
+                    GraphTraverseRequest {
+                        anchors: vec!["chunk-1".into()],
+                        edge_types: vec!["cites".into()],
+                        direction: GraphDirection::Outgoing,
+                        node_filter: None,
+                        edge_filter: None,
+                        budget: TraversalBudget {
+                            max_depth: 1,
+                            ..TraversalBudget::default()
+                        },
+                    },
+                    &scope,
+                )
+                .unwrap();
+            assert_eq!(
+                traversal
+                    .nodes
+                    .iter()
+                    .map(|node| node.point_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["source-1"]
+            );
+            transaction_id
+        };
+
+        let reopened = Db::open(root).unwrap();
+        assert!(
+            reopened
+                .transaction_status(&transaction_id)
+                .unwrap()
+                .storage_projected
+        );
+        let selected = reopened
+            .execute_sql(SqlExecutionRequest {
+                statements: vec![SqlStatementRequest {
+                    sql: "SELECT title FROM documents WHERE id = 'doc-1'".into(),
+                    parameters: vec![],
+                }],
+                idempotency_key: None,
+                retry_id: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            &selected.results[0],
+            SqlResult::Rows { rows, .. }
+                if rows == &vec![vec![RelationalValue::Text("Atomic knowledge".into())]]
+        ));
+        assert_eq!(
+            reopened
+                .get_points_scoped("chunks", &["chunk-1".into(), "source-1".into()], &scope,)
+                .unwrap()
+                .len(),
+            2
+        );
+        let recovered = reopened
+            .traverse_scoped(
+                "chunks",
+                GraphTraverseRequest {
+                    anchors: vec!["chunk-1".into()],
+                    edge_types: vec!["cites".into()],
+                    direction: GraphDirection::Outgoing,
+                    node_filter: None,
+                    edge_filter: None,
+                    budget: TraversalBudget {
+                        max_depth: 1,
+                        ..TraversalBudget::default()
+                    },
+                },
+                &scope,
+            )
+            .unwrap();
+        assert_eq!(recovered.nodes[0].point_id, "source-1");
+    }
+
+    #[test]
+    fn multi_model_update_and_delete_share_one_commit_decision() {
+        use crate::{
+            MultiModelTransactionRequest, RelationalValue, SqlExecutionRequest, SqlResult,
+            SqlStatementRequest,
+            graph::{
+                ConfigureEdgeTypeRequest, EdgePropertyMode, GraphRelationScope, RelateRequest,
+                UpdateEdgeRequest,
+            },
+            tenant::TenantScope,
+        };
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let scope = TenantScope::tenant("multi-model-writer", "acme");
+        let db = Db::open(root).unwrap();
+        db.create_collection(ls_vec_config("chunks")).unwrap();
+        db.set_graph_lifecycle_scoped("chunks", true, true, &scope)
+            .unwrap();
+        db.configure_edge_type_scoped(
+            "chunks",
+            ConfigureEdgeTypeRequest {
+                name: "cites".into(),
+                weight_property: None,
+            },
+            true,
+            &scope,
+        )
+        .unwrap();
+        db.execute_sql(SqlExecutionRequest {
+            statements: vec![SqlStatementRequest {
+                sql: "CREATE TABLE documents (id TEXT PRIMARY KEY, title TEXT NOT NULL)".into(),
+                parameters: vec![],
+            }],
+            idempotency_key: None,
+            retry_id: None,
+        })
+        .unwrap();
+        let created = db
+            .execute_multimodel_transaction(
+                MultiModelTransactionRequest {
+                    sql: SqlExecutionRequest {
+                        statements: vec![SqlStatementRequest {
+                            sql: "INSERT INTO documents VALUES ('doc-1', 'before')".into(),
+                            parameters: vec![],
+                        }],
+                        idempotency_key: None,
+                        retry_id: Some("create-before-update".into()),
+                    },
+                    collection: "chunks".into(),
+                    points: vec![
+                        graph_point("chunk-1", 1.0, "acme"),
+                        graph_point("source-1", 2.0, "acme"),
+                    ],
+                    point_deletes: vec![],
+                    relations: vec![RelateRequest {
+                        source_point_id: "chunk-1".into(),
+                        target_point_id: "source-1".into(),
+                        edge_type: "cites".into(),
+                        properties: json!({"state":"before"}),
+                        scope: GraphRelationScope::Local,
+                        idempotency_key: None,
+                    }],
+                    edge_deletes: vec![],
+                    edge_updates: vec![],
+                },
+                &scope,
+                &audit::AuditContext::embedded(),
+            )
+            .unwrap();
+        let edge = created.edge_ids[0].clone();
+
+        let updated = db
+            .execute_multimodel_transaction(
+                MultiModelTransactionRequest {
+                    sql: SqlExecutionRequest {
+                        statements: vec![SqlStatementRequest {
+                            sql: "UPDATE documents SET title = 'after' WHERE id = 'doc-1'".into(),
+                            parameters: vec![],
+                        }],
+                        idempotency_key: None,
+                        retry_id: Some("update-all-domains".into()),
+                    },
+                    collection: "chunks".into(),
+                    points: vec![graph_point("chunk-1", 9.0, "acme")],
+                    point_deletes: vec![],
+                    relations: vec![],
+                    edge_deletes: vec![],
+                    edge_updates: vec![(
+                        edge.clone(),
+                        UpdateEdgeRequest {
+                            mode: EdgePropertyMode::Replace,
+                            properties: json!({"state":"after"}),
+                        },
+                    )],
+                },
+                &scope,
+                &audit::AuditContext::embedded(),
+            )
+            .unwrap();
+        assert!(updated.sql.committed);
+        let update_transaction = updated.sql.transaction_id.unwrap();
+        assert!(
+            db.transaction_status(&update_transaction)
+                .unwrap()
+                .storage_projected
+        );
+        let selected = db
+            .execute_sql(SqlExecutionRequest {
+                statements: vec![SqlStatementRequest {
+                    sql: "SELECT title FROM documents WHERE id = 'doc-1'".into(),
+                    parameters: vec![],
+                }],
+                idempotency_key: None,
+                retry_id: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            &selected.results[0],
+            SqlResult::Rows { rows, .. }
+                if rows == &vec![vec![RelationalValue::Text("after".into())]]
+        ));
+        assert_eq!(
+            db.get_points_scoped("chunks", &["chunk-1".into()], &scope)
+                .unwrap()[0]
+                .vector[0],
+            9.0
+        );
+        let edge_id = crate::edge_token::decode(db.graph_database_id(), &edge).unwrap();
+        assert_eq!(
+            db.inner.read().collections["chunks"]
+                .read()
+                .graph_mutable
+                .as_ref()
+                .unwrap()
+                .edge_properties(edge_id)
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            &json!({"state":"after"})
+        );
+
+        let deleted = db
+            .execute_multimodel_transaction(
+                MultiModelTransactionRequest {
+                    sql: SqlExecutionRequest {
+                        statements: vec![SqlStatementRequest {
+                            sql: "DELETE FROM documents WHERE id = 'doc-1'".into(),
+                            parameters: vec![],
+                        }],
+                        idempotency_key: None,
+                        retry_id: Some("delete-all-domains".into()),
+                    },
+                    collection: "chunks".into(),
+                    points: vec![],
+                    point_deletes: vec!["chunk-1".into()],
+                    relations: vec![],
+                    edge_deletes: vec![edge.clone()],
+                    edge_updates: vec![],
+                },
+                &scope,
+                &audit::AuditContext::embedded(),
+            )
+            .unwrap();
+        assert!(deleted.sql.committed);
+        let delete_transaction = deleted.sql.transaction_id.unwrap();
+        assert!(
+            db.transaction_status(&delete_transaction)
+                .unwrap()
+                .storage_projected
+        );
+        assert!(
+            db.get_points_scoped("chunks", &["chunk-1".into()], &scope)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !db.inner.read().collections["chunks"]
+                .read()
+                .graph_mutable
+                .as_ref()
+                .unwrap()
+                .edge_visible(edge_id)
+        );
+        let selected = db
+            .execute_sql(SqlExecutionRequest {
+                statements: vec![SqlStatementRequest {
+                    sql: "SELECT id FROM documents WHERE id = 'doc-1'".into(),
+                    parameters: vec![],
+                }],
+                idempotency_key: None,
+                retry_id: None,
+            })
+            .unwrap();
+        assert!(matches!(&selected.results[0], SqlResult::Rows { rows, .. } if rows.is_empty()));
+        drop(db);
+
+        let reopened = Db::open(root).unwrap();
+        assert!(
+            reopened
+                .get_points_scoped("chunks", &["chunk-1".into()], &scope)
+                .unwrap()
+                .is_empty()
+        );
+        let selected = reopened
+            .execute_sql(SqlExecutionRequest {
+                statements: vec![SqlStatementRequest {
+                    sql: "SELECT id FROM documents WHERE id = 'doc-1'".into(),
+                    parameters: vec![],
+                }],
+                idempotency_key: None,
+                retry_id: None,
+            })
+            .unwrap();
+        assert!(matches!(&selected.results[0], SqlResult::Rows { rows, .. } if rows.is_empty()));
+    }
+
+    #[test]
+    fn rejected_multi_model_transaction_publishes_no_domain() {
+        use crate::{
+            MultiModelTransactionRequest, SqlExecutionRequest, SqlResult, SqlStatementRequest,
+            graph::{GraphRelationScope, RelateRequest},
+            tenant::TenantScope,
+        };
+
+        let temp = TempDir::new().unwrap();
+        let db = Db::open(temp.path()).unwrap();
+        let scope = TenantScope::tenant("multi-model-writer", "acme");
+        db.create_collection(ls_vec_config("chunks")).unwrap();
+        db.set_graph_lifecycle_scoped("chunks", true, true, &scope)
+            .unwrap();
+        db.execute_sql(SqlExecutionRequest {
+            statements: vec![SqlStatementRequest {
+                sql: "CREATE TABLE documents (id TEXT PRIMARY KEY)".into(),
+                parameters: vec![],
+            }],
+            idempotency_key: None,
+            retry_id: None,
+        })
+        .unwrap();
+
+        let error = db
+            .execute_multimodel_transaction(
+                MultiModelTransactionRequest {
+                    sql: SqlExecutionRequest {
+                        statements: vec![SqlStatementRequest {
+                            sql: "INSERT INTO documents (id) VALUES ('doc-rejected')".into(),
+                            parameters: vec![],
+                        }],
+                        idempotency_key: None,
+                        retry_id: Some("multi-model-rejected".into()),
+                    },
+                    collection: "chunks".into(),
+                    points: vec![
+                        graph_point("chunk-rejected", 1.0, "acme"),
+                        graph_point("source-rejected", 2.0, "acme"),
+                    ],
+                    point_deletes: vec![],
+                    relations: vec![RelateRequest {
+                        source_point_id: "chunk-rejected".into(),
+                        target_point_id: "source-rejected".into(),
+                        edge_type: "missing-type".into(),
+                        properties: json!({}),
+                        scope: GraphRelationScope::Local,
+                        idempotency_key: None,
+                    }],
+                    edge_deletes: vec![],
+                    edge_updates: vec![],
+                },
+                &scope,
+                &audit::AuditContext::embedded(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("not configured"));
+        assert!(
+            db.get_points_scoped(
+                "chunks",
+                &["chunk-rejected".into(), "source-rejected".into()],
+                &scope,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let selected = db
+            .execute_sql(SqlExecutionRequest {
+                statements: vec![SqlStatementRequest {
+                    sql: "SELECT id FROM documents".into(),
+                    parameters: vec![],
+                }],
+                idempotency_key: None,
+                retry_id: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            &selected.results[0],
+            SqlResult::Rows { rows, .. } if rows.is_empty()
+        ));
+    }
+
+    // Failpoints are process-wide. Separate children keep a fault in one
+    // boundary test from firing while another test builds its fixture.
+    #[cfg(feature = "fault-injection")]
+    fn run_multimodel_boundary_in_child(name: &str) -> bool {
+        const CHILD: &str = "CHIRONDB_MULTIMODEL_BOUNDARY_CHILD";
+        if std::env::var(CHILD).as_deref() == Ok(name) {
+            return false;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("db::tests::{name}"), "--nocapture"])
+            .env(CHILD, name)
+            .env_remove("CHIRONDB_FAILPOINT")
+            .env_remove("CHIRONDB_FAILPOINT_MARKER")
+            .env_remove("CHIRONDB_FAILPOINT_RELEASE")
+            .status()
+            .unwrap();
+        assert!(status.success(), "isolated boundary test failed: {name}");
+        true
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn committed_multi_model_projection_boundaries_recover_all_domains() {
+        if run_multimodel_boundary_in_child(
+            "committed_multi_model_projection_boundaries_recover_all_domains",
+        ) {
+            return;
+        }
+        use crate::{
+            MultiModelTransactionRequest, RelationalValue, SqlExecutionRequest, SqlResult,
+            SqlStatementRequest,
+            graph::{
+                ConfigureEdgeTypeRequest, GraphDirection, GraphRelationScope, GraphTraverseRequest,
+                RelateRequest, TraversalBudget,
+            },
+            tenant::TenantScope,
+        };
+
+        for (failpoint, visible_before_restart, degraded, storage_projected) in [
+            ("transaction.after_commit", true, false, true),
+            (
+                "multi_model.before_relational_projection",
+                false,
+                true,
+                false,
+            ),
+            ("multi_model.after_relational_wal", false, true, false),
+            (
+                "multi_model.before_collection_projection",
+                false,
+                true,
+                false,
+            ),
+            ("multi_model.after_collection_wal", false, true, false),
+            ("multi_model.after_collection_apply", true, true, true),
+            ("multi_model.before_storage_marker", true, true, false),
+            ("multi_model.after_storage_marker", true, true, true),
+            ("transaction.before_audit_projection", true, true, true),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let scope = TenantScope::tenant("multi-model-fault", "acme");
+            let db = Db::open(temp.path()).unwrap();
+            db.create_collection(ls_vec_config("chunks")).unwrap();
+            db.set_graph_lifecycle_scoped("chunks", true, true, &scope)
+                .unwrap();
+            db.configure_edge_type_scoped(
+                "chunks",
+                ConfigureEdgeTypeRequest {
+                    name: "cites".into(),
+                    weight_property: None,
+                },
+                true,
+                &scope,
+            )
+            .unwrap();
+            db.execute_sql(SqlExecutionRequest {
+                statements: vec![SqlStatementRequest {
+                    sql: "CREATE TABLE documents (id TEXT PRIMARY KEY)".into(),
+                    parameters: vec![],
+                }],
+                idempotency_key: None,
+                retry_id: None,
+            })
+            .unwrap();
+            let marker = temp.path().join("unused-marker");
+            let release = temp.path().join("unused-release");
+            let response = {
+                let _env =
+                    crate::failpoint::test_env(&format!("error:{failpoint}"), &marker, &release);
+                db.execute_multimodel_transaction(
+                    MultiModelTransactionRequest {
+                        sql: SqlExecutionRequest {
+                            statements: vec![SqlStatementRequest {
+                                sql: "INSERT INTO documents VALUES ($1)".into(),
+                                parameters: vec![RelationalValue::Text("doc-fault".into())],
+                            }],
+                            idempotency_key: None,
+                            retry_id: Some(format!("fault-{failpoint}")),
+                        },
+                        collection: "chunks".into(),
+                        points: vec![
+                            graph_point("chunk-fault", 1.0, "acme"),
+                            graph_point("source-fault", 2.0, "acme"),
+                        ],
+                        point_deletes: vec![],
+                        relations: vec![RelateRequest {
+                            source_point_id: "chunk-fault".into(),
+                            target_point_id: "source-fault".into(),
+                            edge_type: "cites".into(),
+                            properties: json!({}),
+                            scope: GraphRelationScope::Local,
+                            idempotency_key: None,
+                        }],
+                        edge_deletes: vec![],
+                        edge_updates: vec![],
+                    },
+                    &scope,
+                    &audit::AuditContext::embedded(),
+                )
+                .unwrap()
+            };
+            assert!(response.sql.committed, "{failpoint}");
+            let transaction_id = response.sql.transaction_id.unwrap();
+            assert_eq!(
+                db.transaction_status(&transaction_id)
+                    .unwrap()
+                    .storage_projected,
+                storage_projected,
+                "{failpoint}"
+            );
+            assert_eq!(db.durability_ready(), !degraded, "{failpoint}");
+            let selected = db
+                .execute_sql(SqlExecutionRequest {
+                    statements: vec![SqlStatementRequest {
+                        sql: "SELECT id FROM documents WHERE id = 'doc-fault'".into(),
+                        parameters: vec![],
+                    }],
+                    idempotency_key: None,
+                    retry_id: None,
+                })
+                .unwrap();
+            let visible_rows = match &selected.results[0] {
+                SqlResult::Rows { rows, .. } => rows.len(),
+                other => panic!("unexpected result: {other:?}"),
+            };
+            assert_eq!(
+                visible_rows,
+                usize::from(visible_before_restart),
+                "{failpoint}"
+            );
+            assert_eq!(
+                db.get_points_scoped(
+                    "chunks",
+                    &["chunk-fault".into(), "source-fault".into()],
+                    &scope,
+                )
+                .unwrap()
+                .len(),
+                if visible_before_restart { 2 } else { 0 },
+                "{failpoint}"
+            );
+            drop(db);
+
+            let reopened = Db::open(temp.path()).unwrap();
+            assert!(reopened.durability_ready(), "{failpoint}");
+            assert!(
+                reopened
+                    .transaction_status(&transaction_id)
+                    .unwrap()
+                    .storage_projected,
+                "{failpoint}"
+            );
+            assert!(
+                reopened
+                    .transaction_status(&transaction_id)
+                    .unwrap()
+                    .audit_projected,
+                "{failpoint}"
+            );
+            let selected = reopened
+                .execute_sql(SqlExecutionRequest {
+                    statements: vec![SqlStatementRequest {
+                        sql: "SELECT id FROM documents WHERE id = 'doc-fault'".into(),
+                        parameters: vec![],
+                    }],
+                    idempotency_key: None,
+                    retry_id: None,
+                })
+                .unwrap();
+            assert!(matches!(
+                &selected.results[0],
+                SqlResult::Rows { rows, .. } if rows.len() == 1
+            ));
+            assert_eq!(
+                reopened
+                    .get_points_scoped(
+                        "chunks",
+                        &["chunk-fault".into(), "source-fault".into()],
+                        &scope,
+                    )
+                    .unwrap()
+                    .len(),
+                2,
+                "{failpoint}"
+            );
+            let traversal = reopened
+                .traverse_scoped(
+                    "chunks",
+                    GraphTraverseRequest {
+                        anchors: vec!["chunk-fault".into()],
+                        edge_types: vec!["cites".into()],
+                        direction: GraphDirection::Outgoing,
+                        node_filter: None,
+                        edge_filter: None,
+                        budget: TraversalBudget {
+                            max_depth: 1,
+                            ..TraversalBudget::default()
+                        },
+                    },
+                    &scope,
+                )
+                .unwrap();
+            assert_eq!(traversal.nodes[0].point_id, "source-fault", "{failpoint}");
+        }
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn precommit_multi_model_boundaries_never_leave_partial_state() {
+        if run_multimodel_boundary_in_child(
+            "precommit_multi_model_boundaries_never_leave_partial_state",
+        ) {
+            return;
+        }
+        use crate::{
+            MultiModelTransactionRequest, RelationalValue, SqlExecutionRequest, SqlResult,
+            SqlStatementRequest,
+            graph::{ConfigureEdgeTypeRequest, GraphRelationScope, RelateRequest},
+            tenant::TenantScope,
+        };
+
+        for failpoint in [
+            "transaction.before_prepare",
+            "transaction.after_prepare",
+            "transaction.before_commit",
+            "transaction.before_commit_fsync",
+        ] {
+            let temp = TempDir::new().unwrap();
+            let scope = TenantScope::tenant("multi-model-precommit", "acme");
+            let db = Db::open(temp.path()).unwrap();
+            db.create_collection(ls_vec_config("chunks")).unwrap();
+            db.set_graph_lifecycle_scoped("chunks", true, true, &scope)
+                .unwrap();
+            db.configure_edge_type_scoped(
+                "chunks",
+                ConfigureEdgeTypeRequest {
+                    name: "cites".into(),
+                    weight_property: None,
+                },
+                true,
+                &scope,
+            )
+            .unwrap();
+            db.execute_sql(SqlExecutionRequest {
+                statements: vec![SqlStatementRequest {
+                    sql: "CREATE TABLE documents (id TEXT PRIMARY KEY)".into(),
+                    parameters: vec![],
+                }],
+                idempotency_key: None,
+                retry_id: None,
+            })
+            .unwrap();
+            let marker = temp.path().join("unused-marker");
+            let release = temp.path().join("unused-release");
+            let error = {
+                let _env =
+                    crate::failpoint::test_env(&format!("error:{failpoint}"), &marker, &release);
+                db.execute_multimodel_transaction(
+                    MultiModelTransactionRequest {
+                        sql: SqlExecutionRequest {
+                            statements: vec![SqlStatementRequest {
+                                sql: "INSERT INTO documents VALUES ($1)".into(),
+                                parameters: vec![RelationalValue::Text("doc-fault".into())],
+                            }],
+                            idempotency_key: None,
+                            retry_id: Some(format!("precommit-{failpoint}")),
+                        },
+                        collection: "chunks".into(),
+                        points: vec![
+                            graph_point("chunk-fault", 1.0, "acme"),
+                            graph_point("source-fault", 2.0, "acme"),
+                        ],
+                        point_deletes: vec![],
+                        relations: vec![RelateRequest {
+                            source_point_id: "chunk-fault".into(),
+                            target_point_id: "source-fault".into(),
+                            edge_type: "cites".into(),
+                            properties: json!({}),
+                            scope: GraphRelationScope::Local,
+                            idempotency_key: None,
+                        }],
+                        edge_deletes: vec![],
+                        edge_updates: vec![],
+                    },
+                    &scope,
+                    &audit::AuditContext::embedded(),
+                )
+                .unwrap_err()
+            };
+            if failpoint == "transaction.before_commit_fsync" {
+                assert!(matches!(error, GaussError::CommitOutcomeUnknown { .. }));
+            }
+            assert!(
+                db.get_points_scoped(
+                    "chunks",
+                    &["chunk-fault".into(), "source-fault".into()],
+                    &scope,
+                )
+                .unwrap()
+                .is_empty(),
+                "{failpoint}"
+            );
+            drop(db);
+            let reopened = Db::open(temp.path()).unwrap();
+            let selected = reopened
+                .execute_sql(SqlExecutionRequest {
+                    statements: vec![SqlStatementRequest {
+                        sql: "SELECT id FROM documents WHERE id = 'doc-fault'".into(),
+                        parameters: vec![],
+                    }],
+                    idempotency_key: None,
+                    retry_id: None,
+                })
+                .unwrap();
+            let row_visible = matches!(
+                &selected.results[0],
+                SqlResult::Rows { rows, .. } if rows.len() == 1
+            );
+            let point_count = reopened
+                .get_points_scoped(
+                    "chunks",
+                    &["chunk-fault".into(), "source-fault".into()],
+                    &scope,
+                )
+                .unwrap()
+                .len();
+            assert_eq!(point_count, if row_visible { 2 } else { 0 }, "{failpoint}");
+            if failpoint != "transaction.before_commit_fsync" {
+                assert!(!row_visible, "{failpoint}");
+            }
+        }
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn error_after_durable_commit_still_returns_committed() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open(temp.path()).unwrap();
+        db.create_collection(ls_vec_config("docs")).unwrap();
+        let marker = temp.path().join("unused-marker");
+        let release = temp.path().join("unused-release");
+        {
+            let _env =
+                crate::failpoint::test_env("error:transaction.after_commit", &marker, &release);
+            db.upsert("docs", vec![ls_vec_point("committed", 1.0, "durable")])
+                .unwrap();
+        }
+        assert_eq!(db.count("docs", None).unwrap().count, 1);
+        drop(db);
+
+        let reopened = Db::open(temp.path()).unwrap();
+        assert_eq!(reopened.count("docs", None).unwrap().count, 1);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn unknown_commit_outcome_reconciles_by_transaction_id_after_reopen() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open(temp.path()).unwrap();
+        db.create_collection(ls_vec_config("docs")).unwrap();
+        let marker = temp.path().join("unused-marker");
+        let release = temp.path().join("unused-release");
+        let transaction_id = {
+            let _env = crate::failpoint::test_env(
+                "error:transaction.before_commit_fsync",
+                &marker,
+                &release,
+            );
+            match db.upsert("docs", vec![ls_vec_point("unknown", 1.0, "ambiguous")]) {
+                Err(GaussError::CommitOutcomeUnknown { transaction_id }) => transaction_id,
+                other => panic!("expected outcome_unknown, got {other:?}"),
+            }
+        };
+        assert_eq!(db.count("docs", None).unwrap().count, 0);
+        assert_eq!(
+            db.transaction_status(&transaction_id).unwrap().state,
+            crate::transaction_journal::TransactionState::OutcomeUnknown
+        );
+        assert!(!db.durability_ready());
+        drop(db);
+
+        let reopened = Db::open(temp.path()).unwrap();
+        assert_eq!(reopened.count("docs", None).unwrap().count, 1);
+        let status = reopened.transaction_status(&transaction_id).unwrap();
+        assert_eq!(
+            status.state,
+            crate::transaction_journal::TransactionState::Committed
+        );
+        assert!(status.storage_projected);
+        assert!(status.audit_projected);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn committed_storage_projection_failure_publishes_then_recovers() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open(temp.path()).unwrap();
+        db.create_collection(ls_vec_config("docs")).unwrap();
+        let marker = temp.path().join("unused-marker");
+        let release = temp.path().join("unused-release");
+        {
+            let _env = crate::failpoint::test_env(
+                "error:transaction.before_storage_projection",
+                &marker,
+                &release,
+            );
+            db.upsert("docs", vec![ls_vec_point("committed", 1.0, "wal-full")])
+                .unwrap();
+        }
+        assert_eq!(db.count("docs", None).unwrap().count, 1);
+        assert!(!db.durability_ready());
+        assert!(matches!(
+            db.upsert("docs", vec![ls_vec_point("blocked", 2.0, "degraded")]),
+            Err(GaussError::WalUnavailable(_))
+        ));
+        drop(db);
+
+        let reopened = Db::open(temp.path()).unwrap();
+        assert!(reopened.durability_ready());
+        assert_eq!(reopened.count("docs", None).unwrap().count, 1);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn committed_audit_projection_failure_is_successful_degraded_and_repaired_once() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open(temp.path()).unwrap();
+        db.create_collection(ls_vec_config("docs")).unwrap();
+        let marker = temp.path().join("unused-marker");
+        let release = temp.path().join("unused-release");
+        {
+            let _env = crate::failpoint::test_env(
+                "error:transaction.before_audit_projection",
+                &marker,
+                &release,
+            );
+            db.upsert("docs", vec![ls_vec_point("committed", 1.0, "audit-full")])
+                .unwrap();
+        }
+        assert_eq!(db.count("docs", None).unwrap().count, 1);
+        assert!(!db.durability_ready());
+        assert!(matches!(
+            db.upsert("docs", vec![ls_vec_point("blocked", 2.0, "degraded")]),
+            Err(GaussError::WalUnavailable(_))
+        ));
+        let transaction_id = db
+            .transaction_journal
+            .committed()
+            .unwrap()
+            .last()
+            .unwrap()
+            .prepare
+            .transaction_id;
+        let transaction_id_string = transaction_id.to_string();
+        let status = db.transaction_status(&transaction_id_string).unwrap();
+        assert_eq!(
+            status.state,
+            crate::transaction_journal::TransactionState::Committed
+        );
+        assert!(status.storage_projected);
+        assert!(!status.audit_projected);
+        drop(db);
+
+        let reopened = Db::open(temp.path()).unwrap();
+        assert!(reopened.durability_ready());
+        assert_eq!(reopened.count("docs", None).unwrap().count, 1);
+        let repaired = reopened.transaction_status(&transaction_id_string).unwrap();
+        assert!(repaired.storage_projected);
+        assert!(repaired.audit_projected);
+        audit::verify_hash_chain(temp.path()).unwrap();
+        assert_eq!(
+            audit::records_for_test(temp.path())
+                .unwrap()
+                .iter()
+                .filter(|record| {
+                    record
+                        .get("operation_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(transaction_id_string.as_str())
+                })
+                .count(),
+            1,
+            "recovery must project the committed audit record exactly once"
+        );
+        drop(reopened);
+
+        let reopened_again = Db::open(temp.path()).unwrap();
+        assert!(
+            reopened_again
+                .transaction_status(&transaction_id_string)
+                .unwrap()
+                .audit_projected
+        );
+        audit::verify_hash_chain(temp.path()).unwrap();
+        assert_eq!(
+            audit::records_for_test(temp.path())
+                .unwrap()
+                .iter()
+                .filter(|record| {
+                    record
+                        .get("operation_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(transaction_id_string.as_str())
+                })
+                .count(),
+            1,
+            "a second recovery must not duplicate the audit projection"
+        );
     }
 
     #[test]
@@ -12568,7 +17101,8 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert!(matches!(
             &records[0].entry,
-            WalEntry::UpsertBatch { points } if points.len() == 2
+            WalEntry::TransactionApply { entry, .. }
+                if matches!(entry.as_ref(), WalEntry::UpsertBatch { points } if points.len() == 2)
         ));
         drop(db);
 
@@ -13040,6 +17574,7 @@ mod tests {
             .append(&WalEntry::GraphBatch {
                 batch: GraphBatch {
                     deferred_sessions: vec![GraphDeferredSessionMutation::Open {
+                        owner: None,
                         session_id: "load-1".to_string(),
                     }],
                     ..GraphBatch::default()
@@ -13186,6 +17721,7 @@ mod tests {
             .append(&WalEntry::GraphBatch {
                 batch: GraphBatch {
                     deferred_sessions: vec![GraphDeferredSessionMutation::Open {
+                        owner: None,
                         session_id: "load-3".to_string(),
                     }],
                     deferred_binds: vec![GraphDeferredBind {
@@ -13208,6 +17744,7 @@ mod tests {
             .append(&WalEntry::GraphBatch {
                 batch: GraphBatch {
                     deferred_sessions: vec![GraphDeferredSessionMutation::Open {
+                        owner: None,
                         session_id: "load-2".to_string(),
                     }],
                     ..GraphBatch::default()
@@ -13624,7 +18161,7 @@ mod tests {
         assert!(enabled.transitioned);
         assert_eq!(enabled.graph_epoch, Some(crate::graph::GraphEpoch::INITIAL));
         assert!(enabled.operation_lsn.is_some());
-        assert!(!enabled.durable);
+        assert!(enabled.durable);
         assert!(enabled.backfill_in_progress);
         wait_for_graph_backfill(&db, "docs");
 
@@ -13687,7 +18224,7 @@ mod tests {
         let wal_dir = super::collection_dir(&root, "docs").join("wal");
         let mut assignment_batches = Vec::new();
         Wal::scan_from(&wal_dir, 0, |record| {
-            if let WalEntry::GraphBatch { batch } = record.entry
+            if let WalEntry::GraphBatch { batch } = super::projected_wal_entry(&record.entry)
                 && !batch.handle_assignments.is_empty()
             {
                 assignment_batches.push(batch.handle_assignments.len());
@@ -13877,7 +18414,7 @@ mod tests {
         let mut assignments = 0_usize;
         let mut legacy_point_mutations = 0_usize;
         Wal::scan_from(&wal_dir, 0, |record| {
-            match record.entry {
+            match super::projected_wal_entry(&record.entry) {
                 WalEntry::GraphBatch { batch } => {
                     graph_batches += 1;
                     assignments += batch.handle_assignments.len();
@@ -14789,7 +19326,7 @@ mod tests {
         );
         let before = coll.read().wal.len().unwrap();
         assert!(
-            db.upsert("docs", vec![graph_point("a", 4.0, "globex")])
+            db.upsert_scoped("docs", vec![graph_point("a", 4.0, "globex")], true, &scope)
                 .is_err()
         );
         assert_eq!(
@@ -14797,7 +19334,7 @@ mod tests {
             before,
             "disk incident-edge check precedes WAL"
         );
-        db.upsert("docs", vec![graph_point("a", 4.0, "acme")])
+        db.upsert_scoped("docs", vec![graph_point("a", 4.0, "acme")], true, &scope)
             .unwrap();
         let second = prepare_forced_graph_vector_seal(&db, data, "docs");
         db.update_edge_scoped(
@@ -15705,358 +20242,365 @@ mod tests {
 
     #[test]
     fn c1_million_randomized_mutations_interleaved_with_forced_seals_match_oracle() {
-        use crate::{
-            graph::{
-                ConfigureEdgeTypeRequest, EdgeMutation, EdgePropertyMode, EdgePropertyMutation,
-                GraphNamespace, RelateMutation, TypeId, UnrelateMutation,
-            },
-            wal::GraphBatch,
-        };
-
-        const POINT_COUNT: usize = 64;
-        const EDGE_BATCH_SIZE: usize = 4_096;
-        const EDGE_BATCHES: usize = 245;
-        const EDGE_MUTATION_COUNT: usize = EDGE_BATCH_SIZE * EDGE_BATCHES;
-        const SEAL_EVERY_BATCHES: usize = 32;
-
-        let temp = TempDir::new().unwrap();
-        let db = Db::open(temp.path()).unwrap();
-        let mut config = ls_vec_config("docs");
-        config.streamer_max_bytes = usize::MAX;
-        db.create_collection(config).unwrap();
-        let scope = crate::tenant::TenantScope::tenant("c1-writer", "acme");
-        db.set_graph_lifecycle_scoped("docs", true, true, &scope)
-            .unwrap();
-        db.configure_edge_type_scoped(
-            "docs",
-            ConfigureEdgeTypeRequest {
-                name: "CITES".to_string(),
-                weight_property: None,
-            },
-            true,
-            &scope,
-        )
-        .unwrap();
-
-        let point_ids = (0..POINT_COUNT)
-            .map(|index| format!("node-{index:03}"))
-            .collect::<Vec<_>>();
-        db.upsert(
-            "docs",
-            point_ids
-                .iter()
-                .enumerate()
-                .map(|(index, point_id)| graph_point(point_id, index as f32, "acme"))
-                .collect(),
-        )
-        .unwrap();
-        let mut live_nids = {
-            let collection = db.get_coll("docs").unwrap();
-            let collection = collection.read();
-            let resolver = collection.graph_resolver.as_ref().unwrap();
-            point_ids
-                .iter()
-                .map(|point_id| resolver.live_nid(point_id))
-                .collect::<Vec<_>>()
-        };
-        let mut retired_nids = HashSet::new();
-        let mut edges = HashMap::new();
-        let mut slots = vec![None; EDGE_BATCH_SIZE];
-        let mut edge_ids = db
-            .graph_identity
-            .allocate_edge_ids(std::num::NonZeroU64::new((EDGE_MUTATION_COUNT + 1) as u64).unwrap())
-            .unwrap()
-            .edge_ids();
-
-        let initial_seal = prepare_forced_graph_vector_seal(&db, temp.path(), "docs");
-        run_segment_seal(&initial_seal).unwrap();
-        assert_c1_mutation_oracle(
-            &initial_seal.coll.read(),
-            &point_ids,
-            &live_nids,
-            &retired_nids,
-            &edges,
-        );
-        drop(initial_seal);
-        let mut forced_seals = 1_usize;
-
-        // Named opposite outcomes required by C1: UPSERT supersession keeps
-        // the Nid and relation, while delete-then-recreate changes the Nid and
-        // must never reconnect the old relation.
-        let named_edge_id = edge_ids.next().unwrap();
-        let named_source = live_nids[0].unwrap();
-        let retired_target = live_nids[1].unwrap();
-        {
-            let coll = db.get_coll("docs").unwrap();
-            db.commit_graph_batch_locked(
-                &mut coll.write(),
-                GraphBatch {
-                    graph_epoch: crate::graph::GraphEpoch::INITIAL,
-                    edge_mutations: vec![EdgeMutation::Relate(RelateMutation {
-                        edge_id: named_edge_id,
-                        source: named_source,
-                        target: retired_target,
-                        type_id: TypeId::from_raw(1),
-                        namespace: GraphNamespace::Tenant("acme".to_string()),
-                        properties: json!({"revision": 0}),
-                    })],
-                    ..GraphBatch::default()
+        crate::relational::wal_decode::with_isolated_test_storage(|| {
+            use crate::{
+                graph::{
+                    ConfigureEdgeTypeRequest, EdgeMutation, EdgePropertyMode, EdgePropertyMutation,
+                    GraphNamespace, RelateMutation, TypeId, UnrelateMutation,
                 },
-                false,
+                wal::GraphBatch,
+            };
+
+            const POINT_COUNT: usize = 64;
+            const EDGE_BATCH_SIZE: usize = 4_096;
+            const EDGE_BATCHES: usize = 245;
+            const EDGE_MUTATION_COUNT: usize = EDGE_BATCH_SIZE * EDGE_BATCHES;
+            const SEAL_EVERY_BATCHES: usize = 32;
+
+            let temp = TempDir::new().unwrap();
+            let db = Db::open(temp.path()).unwrap();
+            let mut config = ls_vec_config("docs");
+            config.streamer_max_bytes = usize::MAX;
+            db.create_collection(config).unwrap();
+            let scope = crate::tenant::TenantScope::tenant("c1-writer", "acme");
+            db.set_graph_lifecycle_scoped("docs", true, true, &scope)
+                .unwrap();
+            db.configure_edge_type_scoped(
+                "docs",
+                ConfigureEdgeTypeRequest {
+                    name: "CITES".to_string(),
+                    weight_property: None,
+                },
+                true,
+                &scope,
             )
             .unwrap();
-        }
-        edges.insert(
-            named_edge_id,
-            C1EdgeOracle {
-                source: named_source,
-                target: retired_target,
-                revision: 0,
-                live: true,
-            },
-        );
 
-        let mut superseded = graph_point(&point_ids[0], 10_000.0, "acme");
-        superseded.payload["revision"] = json!("superseded");
-        db.upsert("docs", vec![superseded]).unwrap();
-        assert_eq!(
-            db.get_coll("docs")
+            let point_ids = (0..POINT_COUNT)
+                .map(|index| format!("node-{index:03}"))
+                .collect::<Vec<_>>();
+            db.upsert(
+                "docs",
+                point_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(index, point_id)| graph_point(point_id, index as f32, "acme"))
+                    .collect(),
+            )
+            .unwrap();
+            let mut live_nids = {
+                let collection = db.get_coll("docs").unwrap();
+                let collection = collection.read();
+                let resolver = collection.graph_resolver.as_ref().unwrap();
+                point_ids
+                    .iter()
+                    .map(|point_id| resolver.live_nid(point_id))
+                    .collect::<Vec<_>>()
+            };
+            let mut retired_nids = HashSet::new();
+            let mut edges = HashMap::new();
+            let mut slots = vec![None; EDGE_BATCH_SIZE];
+            let mut edge_ids = db
+                .graph_identity
+                .allocate_edge_ids(
+                    std::num::NonZeroU64::new((EDGE_MUTATION_COUNT + 1) as u64).unwrap(),
+                )
+                .unwrap()
+                .edge_ids();
+
+            let initial_seal = prepare_forced_graph_vector_seal(&db, temp.path(), "docs");
+            run_segment_seal(&initial_seal).unwrap();
+            assert_c1_mutation_oracle(
+                &initial_seal.coll.read(),
+                &point_ids,
+                &live_nids,
+                &retired_nids,
+                &edges,
+            );
+            drop(initial_seal);
+            let mut forced_seals = 1_usize;
+
+            // Named opposite outcomes required by C1: UPSERT supersession keeps
+            // the Nid and relation, while delete-then-recreate changes the Nid and
+            // must never reconnect the old relation.
+            let named_edge_id = edge_ids.next().unwrap();
+            let named_source = live_nids[0].unwrap();
+            let retired_target = live_nids[1].unwrap();
+            {
+                let coll = db.get_coll("docs").unwrap();
+                db.commit_graph_batch_locked(
+                    &mut coll.write(),
+                    GraphBatch {
+                        graph_epoch: crate::graph::GraphEpoch::INITIAL,
+                        edge_mutations: vec![EdgeMutation::Relate(RelateMutation {
+                            edge_id: named_edge_id,
+                            source: named_source,
+                            target: retired_target,
+                            type_id: TypeId::from_raw(1),
+                            namespace: GraphNamespace::Tenant("acme".to_string()),
+                            properties: json!({"revision": 0}),
+                        })],
+                        ..GraphBatch::default()
+                    },
+                    false,
+                )
+                .unwrap();
+            }
+            edges.insert(
+                named_edge_id,
+                C1EdgeOracle {
+                    source: named_source,
+                    target: retired_target,
+                    revision: 0,
+                    live: true,
+                },
+            );
+
+            let mut superseded = graph_point(&point_ids[0], 10_000.0, "acme");
+            superseded.payload["revision"] = json!("superseded");
+            db.upsert("docs", vec![superseded]).unwrap();
+            assert_eq!(
+                db.get_coll("docs")
+                    .unwrap()
+                    .read()
+                    .graph_resolver
+                    .as_ref()
+                    .unwrap()
+                    .live_nid(&point_ids[0]),
+                Some(named_source)
+            );
+            let named_seal = prepare_forced_graph_vector_seal(&db, temp.path(), "docs");
+            run_segment_seal(&named_seal).unwrap();
+            assert_c1_mutation_oracle(
+                &named_seal.coll.read(),
+                &point_ids,
+                &live_nids,
+                &retired_nids,
+                &edges,
+            );
+            drop(named_seal);
+            forced_seals += 1;
+
+            assert_eq!(
+                db.delete_with_edges_scoped("docs", &[point_ids[1].clone()], &scope)
+                    .unwrap(),
+                1
+            );
+            live_nids[1] = None;
+            retired_nids.insert(retired_target);
+            assert_c1_mutation_oracle(
+                &db.get_coll("docs").unwrap().read(),
+                &point_ids,
+                &live_nids,
+                &retired_nids,
+                &edges,
+            );
+            db.upsert("docs", vec![graph_point(&point_ids[1], 20_000.0, "acme")])
+                .unwrap();
+            let replacement_target = db
+                .get_coll("docs")
                 .unwrap()
                 .read()
                 .graph_resolver
                 .as_ref()
                 .unwrap()
-                .live_nid(&point_ids[0]),
-            Some(named_source)
-        );
-        let named_seal = prepare_forced_graph_vector_seal(&db, temp.path(), "docs");
-        run_segment_seal(&named_seal).unwrap();
-        assert_c1_mutation_oracle(
-            &named_seal.coll.read(),
-            &point_ids,
-            &live_nids,
-            &retired_nids,
-            &edges,
-        );
-        drop(named_seal);
-        forced_seals += 1;
+                .live_nid(&point_ids[1])
+                .unwrap();
+            assert_ne!(replacement_target, retired_target);
+            assert!(retired_nids.contains(&retired_target));
+            live_nids[1] = Some(replacement_target);
+            assert_c1_mutation_oracle(
+                &db.get_coll("docs").unwrap().read(),
+                &point_ids,
+                &live_nids,
+                &retired_nids,
+                &edges,
+            );
 
-        assert_eq!(
-            db.delete_with_edges_scoped("docs", &[point_ids[1].clone()], &scope)
-                .unwrap(),
-            1
-        );
-        live_nids[1] = None;
-        retired_nids.insert(retired_target);
-        assert_c1_mutation_oracle(
-            &db.get_coll("docs").unwrap().read(),
-            &point_ids,
-            &live_nids,
-            &retired_nids,
-            &edges,
-        );
-        db.upsert("docs", vec![graph_point(&point_ids[1], 20_000.0, "acme")])
-            .unwrap();
-        let replacement_target = db
-            .get_coll("docs")
-            .unwrap()
-            .read()
-            .graph_resolver
-            .as_ref()
-            .unwrap()
-            .live_nid(&point_ids[1])
-            .unwrap();
-        assert_ne!(replacement_target, retired_target);
-        assert!(retired_nids.contains(&retired_target));
-        live_nids[1] = Some(replacement_target);
-        assert_c1_mutation_oracle(
-            &db.get_coll("docs").unwrap().read(),
-            &point_ids,
-            &live_nids,
-            &retired_nids,
-            &edges,
-        );
+            let mut random_state = 0xc1c1_5ea1_5eed_2026_u64;
+            let mut relates = 0_usize;
+            let mut unrelates = 0_usize;
+            let mut property_updates = 0_usize;
+            let mut point_supersessions = 1_usize;
+            let mut point_deletes = 1_usize;
+            let mut point_recreates = 1_usize;
 
-        let mut random_state = 0xc1c1_5ea1_5eed_2026_u64;
-        let mut relates = 0_usize;
-        let mut unrelates = 0_usize;
-        let mut property_updates = 0_usize;
-        let mut point_supersessions = 1_usize;
-        let mut point_deletes = 1_usize;
-        let mut point_recreates = 1_usize;
-
-        for batch_index in 0..EDGE_BATCHES {
-            let seal_boundary = (batch_index + 1).is_multiple_of(SEAL_EVERY_BATCHES);
-            let point_index = (c1_next_random(&mut random_state) as usize) % point_ids.len();
-            let point_random = c1_next_random(&mut random_state);
-            match live_nids[point_index] {
-                Some(current_nid) if !seal_boundary && point_random.is_multiple_of(8) => {
-                    assert_eq!(
-                        db.delete_with_edges_scoped(
-                            "docs",
-                            &[point_ids[point_index].clone()],
-                            &scope,
-                        )
-                        .unwrap(),
-                        1
-                    );
-                    live_nids[point_index] = None;
-                    assert!(retired_nids.insert(current_nid));
-                    point_deletes += 1;
-                }
-                Some(current_nid) => {
-                    let mut point =
-                        graph_point(&point_ids[point_index], batch_index as f32, "acme");
-                    point.payload["revision"] = json!(batch_index);
-                    db.upsert("docs", vec![point]).unwrap();
-                    assert_eq!(
-                        db.get_coll("docs")
+            for batch_index in 0..EDGE_BATCHES {
+                let seal_boundary = (batch_index + 1).is_multiple_of(SEAL_EVERY_BATCHES);
+                let point_index = (c1_next_random(&mut random_state) as usize) % point_ids.len();
+                let point_random = c1_next_random(&mut random_state);
+                match live_nids[point_index] {
+                    Some(current_nid) if !seal_boundary && point_random.is_multiple_of(8) => {
+                        assert_eq!(
+                            db.delete_with_edges_scoped(
+                                "docs",
+                                &[point_ids[point_index].clone()],
+                                &scope,
+                            )
+                            .unwrap(),
+                            1
+                        );
+                        live_nids[point_index] = None;
+                        assert!(retired_nids.insert(current_nid));
+                        point_deletes += 1;
+                    }
+                    Some(current_nid) => {
+                        let mut point =
+                            graph_point(&point_ids[point_index], batch_index as f32, "acme");
+                        point.payload["revision"] = json!(batch_index);
+                        db.upsert("docs", vec![point]).unwrap();
+                        assert_eq!(
+                            db.get_coll("docs")
+                                .unwrap()
+                                .read()
+                                .graph_resolver
+                                .as_ref()
+                                .unwrap()
+                                .live_nid(&point_ids[point_index]),
+                            Some(current_nid)
+                        );
+                        point_supersessions += 1;
+                    }
+                    None => {
+                        let mut point =
+                            graph_point(&point_ids[point_index], batch_index as f32, "acme");
+                        point.payload["revision"] = json!(batch_index);
+                        db.upsert("docs", vec![point]).unwrap();
+                        let replacement = db
+                            .get_coll("docs")
                             .unwrap()
                             .read()
                             .graph_resolver
                             .as_ref()
                             .unwrap()
-                            .live_nid(&point_ids[point_index]),
-                        Some(current_nid)
-                    );
-                    point_supersessions += 1;
+                            .live_nid(&point_ids[point_index])
+                            .unwrap();
+                        assert!(!retired_nids.contains(&replacement));
+                        live_nids[point_index] = Some(replacement);
+                        point_recreates += 1;
+                    }
                 }
-                None => {
-                    let mut point =
-                        graph_point(&point_ids[point_index], batch_index as f32, "acme");
-                    point.payload["revision"] = json!(batch_index);
-                    db.upsert("docs", vec![point]).unwrap();
-                    let replacement = db
-                        .get_coll("docs")
-                        .unwrap()
-                        .read()
-                        .graph_resolver
-                        .as_ref()
-                        .unwrap()
-                        .live_nid(&point_ids[point_index])
-                        .unwrap();
-                    assert!(!retired_nids.contains(&replacement));
-                    live_nids[point_index] = Some(replacement);
-                    point_recreates += 1;
-                }
-            }
 
-            let current_nids = live_nids.iter().flatten().copied().collect::<Vec<_>>();
-            assert!(!current_nids.is_empty());
-            let mut mutations = Vec::with_capacity(EDGE_BATCH_SIZE);
-            for slot in &mut slots {
-                let choice = c1_next_random(&mut random_state);
-                match *slot {
-                    Some(edge_id) if !choice.is_multiple_of(8) => {
-                        let revision = (batch_index * EDGE_BATCH_SIZE + mutations.len() + 1) as u64;
-                        mutations.push(EdgeMutation::Properties(EdgePropertyMutation {
-                            edge_id,
-                            mode: EdgePropertyMode::Replace,
-                            properties: json!({"revision": revision}),
-                        }));
-                        edges.get_mut(&edge_id).unwrap().revision = revision;
-                        property_updates += 1;
-                    }
-                    Some(edge_id) => {
-                        mutations.push(EdgeMutation::Unrelate(UnrelateMutation { edge_id }));
-                        edges.get_mut(&edge_id).unwrap().live = false;
-                        *slot = None;
-                        unrelates += 1;
-                    }
-                    None => {
-                        let edge_id = edge_ids.next().unwrap();
-                        let source = current_nids[(choice as usize) % current_nids.len()];
-                        let target_random = c1_next_random(&mut random_state);
-                        let target = current_nids[(target_random as usize) % current_nids.len()];
-                        let revision = (batch_index * EDGE_BATCH_SIZE + mutations.len() + 1) as u64;
-                        mutations.push(EdgeMutation::Relate(RelateMutation {
-                            edge_id,
-                            source,
-                            target,
-                            type_id: TypeId::from_raw(1),
-                            namespace: GraphNamespace::Tenant("acme".to_string()),
-                            properties: json!({"revision": revision}),
-                        }));
-                        edges.insert(
-                            edge_id,
-                            C1EdgeOracle {
+                let current_nids = live_nids.iter().flatten().copied().collect::<Vec<_>>();
+                assert!(!current_nids.is_empty());
+                let mut mutations = Vec::with_capacity(EDGE_BATCH_SIZE);
+                for slot in &mut slots {
+                    let choice = c1_next_random(&mut random_state);
+                    match *slot {
+                        Some(edge_id) if !choice.is_multiple_of(8) => {
+                            let revision =
+                                (batch_index * EDGE_BATCH_SIZE + mutations.len() + 1) as u64;
+                            mutations.push(EdgeMutation::Properties(EdgePropertyMutation {
+                                edge_id,
+                                mode: EdgePropertyMode::Replace,
+                                properties: json!({"revision": revision}),
+                            }));
+                            edges.get_mut(&edge_id).unwrap().revision = revision;
+                            property_updates += 1;
+                        }
+                        Some(edge_id) => {
+                            mutations.push(EdgeMutation::Unrelate(UnrelateMutation { edge_id }));
+                            edges.get_mut(&edge_id).unwrap().live = false;
+                            *slot = None;
+                            unrelates += 1;
+                        }
+                        None => {
+                            let edge_id = edge_ids.next().unwrap();
+                            let source = current_nids[(choice as usize) % current_nids.len()];
+                            let target_random = c1_next_random(&mut random_state);
+                            let target =
+                                current_nids[(target_random as usize) % current_nids.len()];
+                            let revision =
+                                (batch_index * EDGE_BATCH_SIZE + mutations.len() + 1) as u64;
+                            mutations.push(EdgeMutation::Relate(RelateMutation {
+                                edge_id,
                                 source,
                                 target,
-                                revision,
-                                live: true,
-                            },
-                        );
-                        *slot = Some(edge_id);
-                        relates += 1;
+                                type_id: TypeId::from_raw(1),
+                                namespace: GraphNamespace::Tenant("acme".to_string()),
+                                properties: json!({"revision": revision}),
+                            }));
+                            edges.insert(
+                                edge_id,
+                                C1EdgeOracle {
+                                    source,
+                                    target,
+                                    revision,
+                                    live: true,
+                                },
+                            );
+                            *slot = Some(edge_id);
+                            relates += 1;
+                        }
                     }
                 }
+                assert_eq!(mutations.len(), EDGE_BATCH_SIZE);
+                let coll = db.get_coll("docs").unwrap();
+                db.commit_graph_batch_locked(
+                    &mut coll.write(),
+                    GraphBatch {
+                        graph_epoch: crate::graph::GraphEpoch::INITIAL,
+                        edge_mutations: mutations,
+                        ..GraphBatch::default()
+                    },
+                    false,
+                )
+                .unwrap();
+
+                if seal_boundary {
+                    let seal = prepare_forced_graph_vector_seal(&db, temp.path(), "docs");
+                    run_segment_seal(&seal).unwrap();
+                    assert_c1_mutation_oracle(
+                        &seal.coll.read(),
+                        &point_ids,
+                        &live_nids,
+                        &retired_nids,
+                        &edges,
+                    );
+                    drop(seal);
+                    forced_seals += 1;
+                }
             }
-            assert_eq!(mutations.len(), EDGE_BATCH_SIZE);
-            let coll = db.get_coll("docs").unwrap();
-            db.commit_graph_batch_locked(
-                &mut coll.write(),
-                GraphBatch {
-                    graph_epoch: crate::graph::GraphEpoch::INITIAL,
-                    edge_mutations: mutations,
-                    ..GraphBatch::default()
-                },
-                false,
-            )
-            .unwrap();
 
-            if seal_boundary {
-                let seal = prepare_forced_graph_vector_seal(&db, temp.path(), "docs");
-                run_segment_seal(&seal).unwrap();
-                assert_c1_mutation_oracle(
-                    &seal.coll.read(),
-                    &point_ids,
-                    &live_nids,
-                    &retired_nids,
-                    &edges,
-                );
-                drop(seal);
-                forced_seals += 1;
-            }
-        }
+            let final_seal = prepare_forced_graph_vector_seal(&db, temp.path(), "docs");
+            run_segment_seal(&final_seal).unwrap();
+            assert_c1_mutation_oracle(
+                &final_seal.coll.read(),
+                &point_ids,
+                &live_nids,
+                &retired_nids,
+                &edges,
+            );
+            // Prefix retirement preserves absolute LSNs, including after restart.
+            let final_cut = final_seal.end_lsn;
+            assert!(final_cut > 0);
+            assert_eq!(final_seal.coll.read().wal_watermark, final_cut);
+            assert_eq!(
+                Wal::retained_base_lsn(&temp.path().join("collections/docs/wal")).unwrap(),
+                final_cut
+            );
+            drop(final_seal);
+            forced_seals += 1;
 
-        let final_seal = prepare_forced_graph_vector_seal(&db, temp.path(), "docs");
-        run_segment_seal(&final_seal).unwrap();
-        assert_c1_mutation_oracle(
-            &final_seal.coll.read(),
-            &point_ids,
-            &live_nids,
-            &retired_nids,
-            &edges,
-        );
-        // Prefix retirement preserves absolute LSNs, including after restart.
-        let final_cut = final_seal.end_lsn;
-        assert!(final_cut > 0);
-        assert_eq!(final_seal.coll.read().wal_watermark, final_cut);
-        assert_eq!(
-            Wal::retained_base_lsn(&temp.path().join("collections/docs/wal")).unwrap(),
-            final_cut
-        );
-        drop(final_seal);
-        forced_seals += 1;
+            assert_eq!(EDGE_MUTATION_COUNT, 1_003_520);
+            assert_eq!(relates + unrelates + property_updates, EDGE_MUTATION_COUNT);
+            assert_eq!(point_supersessions + point_deletes + point_recreates, 248);
+            assert_eq!(edges.len(), relates + 1);
+            assert!(relates > 0);
+            assert!(unrelates > 0);
+            assert!(property_updates > 0);
+            assert!(point_supersessions > 1);
+            assert!(point_deletes > 1);
+            assert!(point_recreates > 1);
+            assert_eq!(forced_seals, 10);
+            drop(db);
 
-        assert_eq!(EDGE_MUTATION_COUNT, 1_003_520);
-        assert_eq!(relates + unrelates + property_updates, EDGE_MUTATION_COUNT);
-        assert_eq!(point_supersessions + point_deletes + point_recreates, 248);
-        assert_eq!(edges.len(), relates + 1);
-        assert!(relates > 0);
-        assert!(unrelates > 0);
-        assert!(property_updates > 0);
-        assert!(point_supersessions > 1);
-        assert!(point_deletes > 1);
-        assert!(point_recreates > 1);
-        assert_eq!(forced_seals, 10);
-        drop(db);
-
-        let reopened = Db::open(temp.path()).unwrap();
-        let collection = reopened.get_coll("docs").unwrap();
-        let collection = collection.read();
-        assert_c1_mutation_oracle(&collection, &point_ids, &live_nids, &retired_nids, &edges);
-        assert_eq!(collection.wal_watermark, final_cut);
+            let reopened = Db::open(temp.path()).unwrap();
+            let collection = reopened.get_coll("docs").unwrap();
+            let collection = collection.read();
+            assert_c1_mutation_oracle(&collection, &point_ids, &live_nids, &retired_nids, &edges);
+            assert_eq!(collection.wal_watermark, final_cut);
+        });
     }
 
     #[test]
@@ -16138,10 +20682,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(receipt.graph_epoch, crate::graph::GraphEpoch::INITIAL);
-        assert!(!receipt.durable);
+        assert!(receipt.durable);
         let coll = db.get_coll("docs").unwrap();
         let collection = coll.read();
-        assert!(collection.wal.is_dirty());
+        assert!(!collection.wal.is_dirty());
         assert_eq!(
             collection.graph_mutable.as_ref().unwrap().live_edge_count(),
             1
@@ -16303,7 +20847,7 @@ mod tests {
             .unwrap();
         assert_eq!(related.edge_id.as_str().len(), 39);
         assert!(!related.edge_id.as_str().contains('='));
-        assert!(!related.receipt.durable);
+        assert!(related.receipt.durable);
         assert!(!related.receipt.replayed);
         let relate_lsn = related.receipt.operation_lsn.unwrap();
         let public_result = serde_json::to_value(&related).unwrap();
@@ -16407,10 +20951,10 @@ mod tests {
         let wal_before_replay = reopened.get_coll("docs").unwrap().read().wal.len().unwrap();
         let recovered = reopened
             .relate_scoped("docs", request, true, &scope)
-            .unwrap();
-        assert_eq!(recovered.edge_id, related.edge_id);
-        assert!(recovered.receipt.replayed);
-        assert_eq!(recovered.receipt.operation_lsn, None);
+            .unwrap_err();
+        assert!(
+            matches!(recovered, GaussError::Graph(error) if error.code == crate::graph::GraphErrorCode::EdgeNotFound)
+        );
         assert_eq!(
             reopened.get_coll("docs").unwrap().read().wal.len().unwrap(),
             wal_before_replay
@@ -17044,9 +21588,10 @@ mod tests {
 
         let replayed_relate = db
             .relate_deferred_scoped("docs", &opened.session_id, request, true, &scope)
-            .unwrap();
-        assert_eq!(replayed_relate.edge_id, related.edge_id);
-        assert!(replayed_relate.receipt.replayed);
+            .unwrap_err();
+        assert!(
+            matches!(replayed_relate, GaussError::Graph(error) if error.code == crate::graph::GraphErrorCode::EdgeNotFound)
+        );
         assert_eq!(coll.read().wal.len().unwrap(), wal_after_abort);
 
         let invalid = GraphDeferredSessionId::from_encoded("not-a-session");
@@ -17602,7 +22147,7 @@ mod tests {
 
         for (boundary, expected_new) in [
             ("graph_batch.after_prepare", Some(false)),
-            ("graph_batch.after_wal_append", None),
+            ("graph_batch.after_wal_append", Some(true)),
             ("graph_batch.after_wal_sync", Some(true)),
             ("graph_batch.after_apply", Some(true)),
             ("graph_batch.after_overlay_publish", Some(true)),
@@ -17791,6 +22336,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dropped_collection_transaction_history_does_not_break_reopen() {
+        let root = TempDir::new().unwrap();
+        let db = Db::open(root.path()).unwrap();
+        db.create_collection(ls_vec_config("docs")).unwrap();
+        db.upsert("docs", vec![ls_vec_point("retired", 1.0, "retired")])
+            .unwrap();
+        db.delete_collection("docs").unwrap();
+        drop(db);
+
+        let reopened = Db::open(root.path()).unwrap();
+        assert!(reopened.list_collections().is_empty());
+        reopened.create_collection(ls_vec_config("docs")).unwrap();
+        reopened
+            .upsert("docs", vec![ls_vec_point("active", 2.0, "active")])
+            .unwrap();
+        drop(reopened);
+
+        let recreated = Db::open(root.path()).unwrap();
+        assert!(
+            recreated
+                .get_points("docs", &["retired".into()])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            recreated
+                .get_points("docs", &["active".into()])
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     fn ls_vec_search(x: f32, k: usize) -> SearchRequest {
         SearchRequest {
             graph: None,
@@ -17889,6 +22468,9 @@ mod tests {
                 .as_ref()
                 .is_some_and(|segments| segments.iter().any(|id| id.starts_with("sg-v6-")))
         );
+        // A published segment can still have a worker holding the root lease.
+        let report = db.shutdown(Instant::now() + Duration::from_secs(20));
+        assert!(!report.fallback_required, "{report:?}");
         drop(db);
 
         let reopened = Db::open(temp.path()).unwrap();
@@ -17962,6 +22544,10 @@ mod tests {
             db.search("docs", named_search.clone()).unwrap().hits[0].id,
             "p238"
         );
+        // Publishing the sealed index precedes the worker releasing its data-dir
+        // lease. Drain background work before reopening the embedded database.
+        let report = db.shutdown(Instant::now() + Duration::from_secs(20));
+        assert!(!report.fallback_required, "{report:?}");
         drop(db);
 
         let reopened = Db::open(temp.path()).unwrap();
@@ -18268,6 +22854,12 @@ mod tests {
 
     #[test]
     fn sealed_lsvec_filters_keep_exact_k_at_50_10_and_1_percent() {
+        if run_background_index_fixture_in_child(stringify!(
+            sealed_lsvec_filters_keep_exact_k_at_50_10_and_1_percent
+        )) {
+            return;
+        }
+
         fn assert_filtered_exact_k(db: &Db, filter: Filter, allowed: &HashSet<String>) {
             let response = db
                 .search(
@@ -18361,6 +22953,13 @@ mod tests {
             BACKGROUND_INDEX_TEST_TIMEOUT,
         );
         db.compact_collection("filtered").unwrap();
+        {
+            let coll = db.get_coll("filtered").unwrap();
+            let collection = coll.read();
+            assert_eq!(collection.live_points(), 12_000);
+            assert!(collection.streamer.points.is_empty());
+            assert_eq!(collection.searchers.len(), 1);
+        }
 
         {
             let filters = [
@@ -19024,168 +23623,170 @@ mod tests {
 
     #[test]
     fn lsvec_offlock_compaction_preserves_concurrent_wal_tail_across_restart() {
-        let temp = TempDir::new().unwrap();
-        let db = Db::open(temp.path()).unwrap();
-        let mut config = ls_vec_config("docs");
-        config.index_kind = Some("lsvec".to_string());
-        config.vector_dim = 8;
-        config.streamer_max_bytes = 1;
-        db.create_collection(config).unwrap();
-        db.upsert(
-            "docs",
-            (0..12_000)
-                .map(|i| Point {
-                    id: format!("p{i:05}"),
-                    vector: vec![i as f32; 8],
-                    vectors: HashMap::new(),
-                    sparse_vector: None,
-                    payload: json!({"version": "snapshot"}),
-                })
-                .collect(),
-        )
-        .unwrap();
-        // A full workspace test can run several graph builders concurrently.
-        // Keep this as a liveness bound, but do not turn host contention into
-        // a correctness failure for the off-lock lifecycle assertion below.
-        let deadline = Instant::now() + Duration::from_secs(120);
-        loop {
-            let coll = db.get_coll("docs").unwrap();
-            if coll.read().sealing.is_none() {
-                break;
+        crate::relational::wal_decode::with_isolated_test_storage(|| {
+            let temp = TempDir::new().unwrap();
+            let db = Db::open(temp.path()).unwrap();
+            let mut config = ls_vec_config("docs");
+            config.index_kind = Some("lsvec".to_string());
+            config.vector_dim = 8;
+            config.streamer_max_bytes = 1;
+            db.create_collection(config).unwrap();
+            db.upsert(
+                "docs",
+                (0..12_000)
+                    .map(|i| Point {
+                        id: format!("p{i:05}"),
+                        vector: vec![i as f32; 8],
+                        vectors: HashMap::new(),
+                        sparse_vector: None,
+                        payload: json!({"version": "snapshot"}),
+                    })
+                    .collect(),
+            )
+            .unwrap();
+            // A full workspace test can run several graph builders concurrently.
+            // Keep this as a liveness bound, but do not turn host contention into
+            // a correctness failure for the off-lock lifecycle assertion below.
+            let deadline = Instant::now() + Duration::from_secs(120);
+            loop {
+                let coll = db.get_coll("docs").unwrap();
+                if coll.read().sealing.is_none() {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "initial LS-VEC seal timed out");
+                thread::sleep(Duration::from_millis(5));
             }
-            assert!(Instant::now() < deadline, "initial LS-VEC seal timed out");
-            thread::sleep(Duration::from_millis(5));
-        }
-        db.get_coll("docs")
-            .unwrap()
-            .write()
-            .config
-            .streamer_max_bytes = usize::MAX;
-        db.upsert(
-            "docs",
-            (0..12_000)
-                .map(|i| Point {
-                    id: format!("p{i:05}"),
-                    vector: vec![i as f32; 8],
-                    vectors: HashMap::new(),
-                    sparse_vector: None,
-                    payload: json!({"version": "precompact"}),
-                })
-                .collect(),
-        )
-        .unwrap();
-
-        let compact_db = db.clone();
-        let compact = thread::spawn(move || compact_db.compact_collection("docs"));
-        // Match the initial-seal liveness allowance above: under the full
-        // workspace suite, build admission can queue this compaction behind
-        // several other graph builders before it freezes the streamer.
-        let deadline = Instant::now() + Duration::from_secs(120);
-        loop {
-            let coll = db.get_coll("docs").unwrap();
-            if coll.read().sealing.is_some() {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "off-lock compaction snapshot was not observed"
-            );
-            thread::sleep(Duration::from_millis(1));
-        }
-
-        // The frozen snapshot remains a serveable generation while the new
-        // global graph is built off-lock. Queries must neither wait for the
-        // build nor fall back to degraded/underfilled output.
-        for query_index in 0..16 {
-            let response = db
-                .search(
+            db.get_coll("docs")
+                .unwrap()
+                .write()
+                .config
+                .streamer_max_bytes = usize::MAX;
+            // Load the complete replacement through bounded atomic requests;
+            // the concurrent tail below still races the frozen compaction.
+            for start in (0..12_000).step_by(1024) {
+                db.upsert(
                     "docs",
-                    SearchRequest {
-                        graph: None,
-                        vector: vec![(6_000 + query_index) as f32; 8],
-                        vector_name: None,
-                        k: 10,
-                        filter: None,
-                        budget_ms: None,
-                        consistency: None,
-                        ef_search: None,
-                        recall_target: Some(0.95),
-                        with_payload: Some(false),
-                    },
+                    (start..(start + 1024).min(12_000))
+                        .map(|i| Point {
+                            id: format!("p{i:05}"),
+                            vector: vec![i as f32; 8],
+                            vectors: HashMap::new(),
+                            sparse_vector: None,
+                            payload: json!({"version": "precompact"}),
+                        })
+                        .collect(),
                 )
                 .unwrap();
-            assert_eq!(response.hits.len(), 10);
-            assert!(!response.degraded);
-        }
+            }
 
-        db.upsert(
-            "docs",
-            vec![
-                Point {
-                    id: "p00000".to_string(),
-                    vector: vec![-1.0; 8],
-                    vectors: HashMap::new(),
-                    sparse_vector: None,
-                    payload: json!({"version": "tail"}),
-                },
-                Point {
-                    id: "tail-new".to_string(),
-                    vector: vec![-2.0; 8],
-                    vectors: HashMap::new(),
-                    sparse_vector: None,
-                    payload: json!({"version": "tail"}),
-                },
-            ],
-        )
-        .unwrap();
-        db.delete("docs", &["p00001".to_string()]).unwrap();
-        compact.join().unwrap().unwrap();
+            let compact_db = db.clone();
+            let compact = thread::spawn(move || compact_db.compact_collection("docs"));
+            // Match the initial-seal liveness allowance above: under the full
+            // workspace suite, build admission can queue this compaction behind
+            // several other graph builders before it freezes the streamer.
+            let deadline = Instant::now() + Duration::from_secs(120);
+            loop {
+                let coll = db.get_coll("docs").unwrap();
+                if coll.read().sealing.is_some() {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "off-lock compaction snapshot was not observed"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
 
-        assert_eq!(db.count("docs", None).unwrap().count, 12_000);
-        let points = db
-            .get_points(
+            // The frozen snapshot remains a serveable generation while the new
+            // global graph is built off-lock. Queries must neither wait for the
+            // build nor fall back to degraded/underfilled output.
+            for query_index in 0..16 {
+                let response = db
+                    .search(
+                        "docs",
+                        SearchRequest {
+                            graph: None,
+                            vector: vec![(6_000 + query_index) as f32; 8],
+                            vector_name: None,
+                            k: 10,
+                            filter: None,
+                            budget_ms: None,
+                            consistency: None,
+                            ef_search: None,
+                            recall_target: Some(0.95),
+                            with_payload: Some(false),
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(response.hits.len(), 10);
+                assert!(!response.degraded);
+            }
+
+            db.upsert(
                 "docs",
-                &[
-                    "p00000".to_string(),
-                    "p00001".to_string(),
-                    "tail-new".to_string(),
+                vec![
+                    Point {
+                        id: "p00000".to_string(),
+                        vector: vec![-1.0; 8],
+                        vectors: HashMap::new(),
+                        sparse_vector: None,
+                        payload: json!({"version": "tail"}),
+                    },
+                    Point {
+                        id: "tail-new".to_string(),
+                        vector: vec![-2.0; 8],
+                        vectors: HashMap::new(),
+                        sparse_vector: None,
+                        payload: json!({"version": "tail"}),
+                    },
                 ],
             )
             .unwrap();
-        assert_eq!(points.len(), 2);
-        assert!(
-            points
-                .iter()
-                .any(|point| { point.id == "p00000" && point.payload["version"] == json!("tail") })
-        );
-        assert!(points.iter().any(|point| point.id == "tail-new"));
-        {
-            let coll = db.get_coll("docs").unwrap();
-            let collection = coll.read();
-            assert!(collection.wal_watermark > 0);
-            assert!(!collection.streamer.points.is_empty());
-        }
-        drop(db);
+            db.delete("docs", &["p00001".to_string()]).unwrap();
+            compact.join().unwrap().unwrap();
 
-        let reopened = Db::open(temp.path()).unwrap();
-        assert_eq!(reopened.count("docs", None).unwrap().count, 12_000);
-        let points = reopened
-            .get_points(
-                "docs",
-                &[
-                    "p00000".to_string(),
-                    "p00001".to_string(),
-                    "tail-new".to_string(),
-                ],
-            )
-            .unwrap();
-        assert_eq!(points.len(), 2);
-        assert!(
-            points
-                .iter()
-                .any(|point| { point.id == "p00000" && point.payload["version"] == json!("tail") })
-        );
-        assert!(points.iter().any(|point| point.id == "tail-new"));
+            assert_eq!(db.count("docs", None).unwrap().count, 12_000);
+            let points = db
+                .get_points(
+                    "docs",
+                    &[
+                        "p00000".to_string(),
+                        "p00001".to_string(),
+                        "tail-new".to_string(),
+                    ],
+                )
+                .unwrap();
+            assert_eq!(points.len(), 2);
+            assert!(points.iter().any(|point| {
+                point.id == "p00000" && point.payload["version"] == json!("tail")
+            }));
+            assert!(points.iter().any(|point| point.id == "tail-new"));
+            {
+                let coll = db.get_coll("docs").unwrap();
+                let collection = coll.read();
+                assert!(collection.wal_watermark > 0);
+                assert!(!collection.streamer.points.is_empty());
+            }
+            drop(db);
+
+            let reopened = Db::open(temp.path()).unwrap();
+            assert_eq!(reopened.count("docs", None).unwrap().count, 12_000);
+            let points = reopened
+                .get_points(
+                    "docs",
+                    &[
+                        "p00000".to_string(),
+                        "p00001".to_string(),
+                        "tail-new".to_string(),
+                    ],
+                )
+                .unwrap();
+            assert_eq!(points.len(), 2);
+            assert!(points.iter().any(|point| {
+                point.id == "p00000" && point.payload["version"] == json!("tail")
+            }));
+            assert!(points.iter().any(|point| point.id == "tail-new"));
+        });
     }
 
     #[test]
@@ -20050,6 +24651,10 @@ mod tests {
 
     #[test]
     fn compact_writes_mmap_lsvec_artifacts() {
+        if run_background_index_fixture_in_child(stringify!(compact_writes_mmap_lsvec_artifacts)) {
+            return;
+        }
+
         let temp = TempDir::new().unwrap();
         let db = Db::open(temp.path()).unwrap();
         db.create_collection(CollectionConfig {
@@ -20921,8 +25526,17 @@ mod tests {
         assert!(response.files >= 5);
         assert!(response.bytes > 0);
         assert_eq!(response.points, 1);
+        let hot = temp.path().join("collections/docs/searchers");
+        let remaining = std::fs::read_dir(&hot)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
         assert_eq!(
-            std::fs::read_dir(temp.path().join("collections/docs/searchers"))
+            remaining,
+            vec![std::ffi::OsString::from(crate::build_progress::BUILDS_DIR)]
+        );
+        assert_eq!(
+            std::fs::read_dir(hot.join(crate::build_progress::BUILDS_DIR))
                 .unwrap()
                 .count(),
             0
@@ -21708,7 +26322,7 @@ mod tests {
         let records = Wal::load(&archives[0].path()).unwrap();
         assert_eq!(records.len(), 2);
         assert!(matches!(
-            &records[0].entry,
+            super::projected_wal_entry(&records[0].entry),
             WalEntry::UpsertBatch { points }
                 if points.len() == 1 && points[0].id == "archived"
         ));
@@ -21956,7 +26570,7 @@ mod tests {
         let records = Wal::load(&archives[0].path()).unwrap();
         assert_eq!(records.len(), 2);
         assert!(matches!(
-            &records[0].entry,
+            super::projected_wal_entry(&records[0].entry),
             WalEntry::UpsertBatch { points }
                 if points.len() == 1 && points[0].id == "object-archived"
         ));
@@ -22440,6 +27054,36 @@ mod tests {
         db.restore(snapshot.path()).unwrap();
         assert_eq!(db.count("docs", None).unwrap().count, 2);
         assert!(temp.path().exists());
+
+        db.upsert(
+            "docs",
+            vec![Point {
+                id: "after-restore".to_string(),
+                vector: vec![0.5, 0.5],
+                vectors: HashMap::new(),
+                sparse_vector: None,
+                payload: json!({}),
+            }],
+        )
+        .unwrap();
+        let transaction_id = db
+            .transaction_journal
+            .committed()
+            .unwrap()
+            .last()
+            .unwrap()
+            .prepare
+            .transaction_id
+            .to_string();
+        drop(db);
+
+        let reopened = Db::open(temp.path()).unwrap();
+        assert_eq!(reopened.count("docs", None).unwrap().count, 3);
+        assert_eq!(
+            reopened.transaction_status(&transaction_id).unwrap().state,
+            crate::transaction_journal::TransactionState::Committed
+        );
+        audit::verify_hash_chain(temp.path()).unwrap();
     }
 
     #[test]
@@ -23729,7 +28373,7 @@ mod tests {
             assert_eq!(
                 collection
                     .iter_payload_candidates(&visibility, &candidates)
-                    .map(|point| point.id.clone())
+                    .map(|point| point.unwrap().id.clone())
                     .collect::<Vec<_>>(),
                 vec!["sealed-acme".to_string()]
             );
@@ -24700,11 +29344,9 @@ mod tests {
         assert!(checkpoint.last_applied_lsn > 0);
         let records = crate::wal::Wal::load(&temp.path().join("collections/docs/wal")).unwrap();
         assert!(records.iter().any(|record| matches!(
-            record.entry,
-            WalEntry::Schema {
-                schema_epoch: 2,
-                ..
-            }
+            &record.entry,
+            WalEntry::TransactionApply { entry, .. }
+                if matches!(entry.as_ref(), WalEntry::Schema { schema_epoch: 2, .. })
         )));
 
         let rejected = db.update_payload_schema(
@@ -25422,6 +30064,12 @@ mod tests {
     /// `DbInner.cascade` doc comment for why).
     #[test]
     fn cascade_default_wires_into_fresh_h2qg_after_threshold_crossing() {
+        if run_background_index_fixture_in_child(stringify!(
+            cascade_default_wires_into_fresh_h2qg_after_threshold_crossing
+        )) {
+            return;
+        }
+
         let temp = TempDir::new().unwrap();
         let db = Db::open(temp.path()).unwrap();
         assert!(!db.cascade(), "DbInner.cascade must default false (W1)");
@@ -25478,6 +30126,30 @@ mod tests {
 
     const BACKGROUND_INDEX_TEST_TIMEOUT: Duration = Duration::from_secs(90);
 
+    fn run_background_index_fixture_in_child(name: &str) -> bool {
+        const CHILD: &str = "CHIRONDB_BACKGROUND_INDEX_TEST_CHILD";
+        if std::env::var(CHILD).as_deref() == Ok(name) {
+            return false;
+        }
+        // Independent Db fixtures share build admission and worker queues.
+        // Give timed fixtures a fresh queue, one at a time; their own
+        // background/foreground concurrency and deadlines remain unchanged.
+        static TIMED_FIXTURES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _serial = TIMED_FIXTURES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("db::tests::{name}"), "--nocapture"])
+            .env(CHILD, name)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "isolated background index fixture failed: {name}"
+        );
+        true
+    }
+
     fn wait_for_h2qg(coll: &Arc<RwLock<Collection>>, timeout: Duration) {
         let started = Instant::now();
         loop {
@@ -25496,6 +30168,12 @@ mod tests {
 
     #[test]
     fn reopen_rebuilds_internal_streamer_hnsw_after_wal_replay() {
+        if run_background_index_fixture_in_child(stringify!(
+            reopen_rebuilds_internal_streamer_hnsw_after_wal_replay
+        )) {
+            return;
+        }
+
         let temp = TempDir::new().unwrap();
         let db = Db::open(temp.path()).unwrap();
         db.create_collection(ls_vec_config("hot")).unwrap();
@@ -25510,6 +30188,21 @@ mod tests {
         wait_for_h2qg(&coll, BACKGROUND_INDEX_TEST_TIMEOUT);
         drop(db);
 
+        let maintenance = Db::open_for_offline_maintenance(temp.path()).unwrap();
+        let coll = maintenance.get_coll("hot").unwrap();
+        {
+            let collection = coll.read();
+            assert!(collection.streamer_hnsw_required());
+            assert_eq!(
+                collection.streamer.points.len(),
+                crate::h2qg::HNSW_THRESHOLD + 5
+            );
+            assert!(collection.streamer.hnsw.is_none());
+            assert!(!collection.index_build_in_flight);
+        }
+        maintenance.wait_for_storage_idle().unwrap();
+        drop(maintenance);
+
         let reopened = Db::open(temp.path()).unwrap();
         let coll = reopened.get_coll("hot").unwrap();
         wait_for_h2qg(&coll, BACKGROUND_INDEX_TEST_TIMEOUT);
@@ -25520,6 +30213,12 @@ mod tests {
 
     #[test]
     fn reopen_rebuilds_subthreshold_streamer_hnsw_for_ann_sized_collection() {
+        if run_background_index_fixture_in_child(stringify!(
+            reopen_rebuilds_subthreshold_streamer_hnsw_for_ann_sized_collection
+        )) {
+            return;
+        }
+
         let temp = TempDir::new().unwrap();
         let db = Db::open(temp.path()).unwrap();
         let mut config = ls_vec_config("tiered");
@@ -25644,6 +30343,12 @@ mod tests {
     /// point inserted during the build window.
     #[test]
     fn threshold_crossing_build_runs_off_lock_and_concurrent_writes_succeed() {
+        if run_background_index_fixture_in_child(stringify!(
+            threshold_crossing_build_runs_off_lock_and_concurrent_writes_succeed
+        )) {
+            return;
+        }
+
         let temp = TempDir::new().unwrap();
         let db = Db::open(temp.path()).unwrap();
         db.create_collection(CollectionConfig {
@@ -25712,6 +30417,12 @@ mod tests {
 
     #[test]
     fn streamer_freeze_restarts_background_hnsw_for_the_new_generation() {
+        if run_background_index_fixture_in_child(stringify!(
+            streamer_freeze_restarts_background_hnsw_for_the_new_generation
+        )) {
+            return;
+        }
+
         let temp = TempDir::new().unwrap();
         let db = Db::open(temp.path()).unwrap();
         let mut config = ls_vec_config("generation");
@@ -25770,6 +30481,12 @@ mod tests {
 
     #[test]
     fn ann_sized_frozen_points_trigger_a_subthreshold_replacement_hnsw() {
+        if run_background_index_fixture_in_child(stringify!(
+            ann_sized_frozen_points_trigger_a_subthreshold_replacement_hnsw
+        )) {
+            return;
+        }
+
         let temp = TempDir::new().unwrap();
         let db = Db::open(temp.path()).unwrap();
         let mut config = ls_vec_config("threshold-tail");
@@ -25848,6 +30565,12 @@ mod tests {
 
     #[test]
     fn completed_seal_starts_hnsw_for_ann_sized_replacement_streamer() {
+        if run_background_index_fixture_in_child(stringify!(
+            completed_seal_starts_hnsw_for_ann_sized_replacement_streamer
+        )) {
+            return;
+        }
+
         let temp = TempDir::new().unwrap();
         let db = Db::open(temp.path()).unwrap();
         let mut config = ls_vec_config("post-seal-tail");

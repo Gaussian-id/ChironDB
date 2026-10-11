@@ -1,0 +1,28 @@
+[Unit]
+Description=ChironDB protected single-node server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=chirondb
+Group=chirondb
+UMask=0077
+ExecStart=/usr/local/bin/chirondb --config /etc/chirondb/chirondb.toml --tenant-enforcement enforced
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/chirondb
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

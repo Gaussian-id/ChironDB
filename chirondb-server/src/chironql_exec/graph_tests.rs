@@ -87,6 +87,9 @@ fn candidate(
         allowed_collections: None,
         want_trace: true,
         confirm: false,
+        parameters: Vec::new(),
+        idempotency_key: None,
+        retry_id: None,
         tenant,
     };
     execute(&mut ctx, query)
@@ -539,6 +542,9 @@ fn deferred_relate_requires_and_uses_bound_session_in_v1_1() {
         allowed_collections: None,
         want_trace: true,
         confirm: false,
+        parameters: Vec::new(),
+        idempotency_key: None,
+        retry_id: None,
         tenant: TenantScope::system(),
     };
     let related = execute(&mut production_ctx, "RELATE docs root -> CITES -> child;")

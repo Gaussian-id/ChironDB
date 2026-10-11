@@ -34,7 +34,7 @@ impl Db {
             collection,
             request,
             scope,
-            &AtomicBool::new(false),
+            self.build_lifecycle.cancellation(),
         )
     }
 
@@ -77,7 +77,7 @@ impl Db {
         )?;
         let coll = self.get_coll(collection_name)?;
         let collection = coll.read();
-        if request.vector.len() != collection.config.vector_dim {
+        if !request.vector.is_empty() && request.vector.len() != collection.config.vector_dim {
             return Err(GaussError::DimensionMismatch {
                 expected: collection.config.vector_dim,
                 actual: request.vector.len(),
@@ -90,7 +90,10 @@ impl Db {
         };
         let payload_candidates =
             collection.payload_candidates(&visibility, request.filter.as_ref());
-        let eligible = |id: &str| {
+        // ANN predicates use only the pinned membership/posting domain. Payload
+        // predicates run after fallible hydration, so their errors are not lost
+        // in the backend's boolean predicate contract.
+        let admitted = |id: &str| {
             !stopped()
                 && collection
                     .sparse_index
@@ -99,15 +102,21 @@ impl Db {
                 && payload_candidates
                     .as_ref()
                     .is_none_or(|set| collection.payload_candidate_contains(set, id))
-                && request.filter.as_ref().is_none_or(|filter| {
-                    collection
-                        .resolve(id)
-                        .is_some_and(|point| filter.matches(&point.payload))
-                })
+        };
+        let eligible = |id: &str| -> Result<bool> {
+            if !admitted(id) {
+                return Ok(false);
+            }
+            let Some(filter) = &request.filter else {
+                return Ok(true);
+            };
+            Ok(collection
+                .try_resolve_in_read_state(&visibility, id)?
+                .is_some_and(|point| filter.matches(&point.payload)))
         };
         let ordinal_filter = TextOrdinalFilter {
             collection: &collection,
-            eligible: &eligible,
+            eligible: &admitted,
         };
         let branch_limit = request.k.saturating_mul(4).max(request.k);
         let recall_target = collection
@@ -128,9 +137,9 @@ impl Db {
                     )
                 })
             });
-        let mut dense = Vec::new();
+        let mut dense = crate::search::Rankings::default();
         let mut searched = 0;
-        if request.k > 0 && !stopped() {
+        if !request.vector.is_empty() && request.k > 0 && !stopped() {
             for point in crate::search::fan_out_candidates(
                 collection.global_backend(),
                 &collection.streamer,
@@ -144,53 +153,67 @@ impl Db {
                 None,
                 ef,
                 recall_target,
-                Some(&eligible),
+                Some(&admitted),
                 Some(&ordinal_filter),
                 Some(cancelled),
-            ) {
+            )? {
                 if stopped() {
                     break;
                 }
-                if eligible(&point.id) {
+                if admitted(&point.id)
+                    && request
+                        .filter
+                        .as_ref()
+                        .is_none_or(|filter| filter.matches(&point.payload))
+                {
                     searched += 1;
-                    dense.push(RankedPoint {
-                        id: point.id.clone(),
-                        score: collection
+                    dense.copy_push(
+                        &point.id,
+                        collection
                             .config
                             .metric
                             .score(&request.vector, &point.vector)?,
-                    });
+                    )?;
                 }
             }
         }
-        dense.sort_by(rank_order);
+        dense.sort_unstable_by(rank_order);
         dense.truncate(branch_limit);
         let tenant = if enforcement.blocks() && !scope.is_system() && !scope.can_cross_read() {
             scope.tenant_id()
         } else {
             None
         };
-        let lexical = collection.sparse_index.text.search(
+        let lexical = collection.sparse_index.text.try_search(
             &request.text_field,
             &request.query,
             tenant,
             branch_limit,
             &eligible,
             &stopped,
-        );
+        )?;
         searched += lexical.searched;
-        let fused = crate::search::fuse_text_rankings(&dense, &lexical.ranked);
+        let fused = if request.vector.is_empty() {
+            lexical.ranked
+        } else {
+            crate::search::fuse_text_rankings(&dense, &lexical.ranked)?
+        };
         let hits = fused
             .into_iter()
             .take(request.k)
             .filter_map(|ranked| {
-                collection.resolve(&ranked.id).map(|point| SearchHit {
-                    id: point.id.clone(),
-                    score: ranked.score,
-                    payload: point.payload.clone(),
-                })
+                collection
+                    .try_resolve_in_read_state(&visibility, &ranked.id)
+                    .map(|point| {
+                        point.map(|point| SearchHit {
+                            id: point.id.clone(),
+                            score: ranked.score,
+                            payload: point.payload.clone(),
+                        })
+                    })
+                    .transpose()
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let degraded = lexical.degraded || stopped();
         if degraded {
             observe_degraded("text_hybrid_search");

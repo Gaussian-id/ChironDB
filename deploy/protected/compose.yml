@@ -1,0 +1,58 @@
+name: chirondb-protected
+
+services:
+  init:
+    image: ${CHIRONDB_IMAGE:?Set CHIRONDB_IMAGE to the tested security image digest or local image ID}
+    profiles: [setup]
+    user: "10001:10001"
+    entrypoint: [chironctl]
+    command:
+      - security
+      - init
+      - --data-dir
+      - /var/lib/chirondb/data
+      - --tenant
+      - ${CHIRONDB_TENANT:-default}
+      - --admin
+      - ${CHIRONDB_ADMIN:-admin}
+      - --keyring-out
+      - /etc/chirondb/secrets/storage-keyring.json
+      - --admin-key-out
+      - /run/chirondb-bootstrap/admin.key
+    volumes:
+      - data:/var/lib/chirondb
+      - storage-secrets:/etc/chirondb/secrets
+      - admin-delivery:/run/chirondb-bootstrap
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+
+  server:
+    image: ${CHIRONDB_IMAGE:?Set CHIRONDB_IMAGE to the tested security image digest or local image ID}
+    user: "10001:10001"
+    restart: unless-stopped
+    stop_grace_period: 15s
+    command: [--config, /etc/chirondb/chirondb.toml, --tenant-enforcement, enforced]
+    ports:
+      - "${CHIRONDB_BIND_IP:-127.0.0.1}:${CHIRONDB_HTTP_PORT:-7401}:7401"
+      - "${CHIRONDB_BIND_IP:-127.0.0.1}:${CHIRONDB_GRPC_PORT:-7402}:7402"
+      - "${CHIRONDB_BIND_IP:-127.0.0.1}:${CHIRONDB_WIRE_PORT:-7403}:7403"
+    volumes:
+      - data:/var/lib/chirondb
+      - storage-secrets:/etc/chirondb/secrets:ro
+      - ./chirondb.toml:/etc/chirondb/chirondb.toml:ro
+      - ${CHIRONDB_TLS_DIR:?Provide a directory with server.pem, server.key and ca.pem}:/etc/chirondb/tls:ro
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    healthcheck:
+      test: [CMD, chironctl, --endpoint, "https://localhost:7401", --ca-cert, /etc/chirondb/tls/ca.pem, health]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 6
+
+volumes:
+  data:
+  storage-secrets:
+  admin-delivery:

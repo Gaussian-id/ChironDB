@@ -159,7 +159,11 @@ impl WalReplicationManager {
     /// Strictly scan retained WAL records from a record boundary. The visitor
     /// is invoked as records are decoded, so callers can feed a bounded
     /// channel without first materialising the suffix in a `Vec`.
-    pub fn scan_wal_entries<F>(wal_dir: &Path, from_lsn: u64, visitor: F) -> Result<WalScanStats>
+    pub fn scan_wal_entries<F>(
+        wal_dir: &Path,
+        from_lsn: u64,
+        mut visitor: F,
+    ) -> Result<WalScanStats>
     where
         F: FnMut(WalRecord) -> Result<()>,
     {
@@ -169,7 +173,17 @@ impl WalReplicationManager {
                 "requested WAL LSN {from_lsn} precedes retained base {retained_base}; snapshot required"
             )));
         }
-        Wal::scan_from(wal_dir, from_lsn, visitor)
+        Wal::scan_from(wal_dir, from_lsn, |mut record| {
+            // Legacy replication carries the logical mutation and preserves
+            // the leader LSN used for acknowledgement. The follower creates
+            // its own canonical transaction decision instead of copying a
+            // leader-local projection transaction ID.
+            record.entry = match record.entry {
+                WalEntry::TransactionApply { entry, .. } => *entry,
+                entry => entry,
+            };
+            visitor(record)
+        })
     }
 }
 
@@ -218,6 +232,11 @@ pub async fn apply_replicated_wal_entry(
                     .to_string(),
             ));
         }
+        WalEntry::ProtectedBatch { .. } => {
+            return Err(GaussError::InvalidRequest(
+                "protected collections require single-node operation".into(),
+            ));
+        }
         WalEntry::GraphBatch { .. } => {
             return Err(GaussError::InvalidRequest(
                 "GraphBatch replication is not supported until follower graph state is activated"
@@ -230,9 +249,23 @@ pub async fn apply_replicated_wal_entry(
                     .to_string(),
             ));
         }
-        WalEntry::CreateCollection { .. } | WalEntry::DropCollection { .. } => {
+        WalEntry::CreateProtectedCollection { .. }
+        | WalEntry::CreateCollection { .. }
+        | WalEntry::DropCollection { .. }
+        | WalEntry::DropProtectedCollection { .. }
+        | WalEntry::RelationalBatch { .. }
+        | WalEntry::MultiModelBatch { .. } => {
             return Err(GaussError::InvalidRequest(
                 "catalog WAL entries are not supported by experimental collection replication"
+                    .to_string(),
+            ));
+        }
+        WalEntry::TransactionPrepare { .. }
+        | WalEntry::TransactionCommit { .. }
+        | WalEntry::TransactionProjection { .. }
+        | WalEntry::TransactionApply { .. } => {
+            return Err(GaussError::InvalidRequest(
+                "transaction journal records cannot be applied through legacy replication"
                     .to_string(),
             ));
         }
@@ -335,6 +368,13 @@ mod tests {
             id: "b".to_string(),
         })
         .unwrap();
+        wal.append(&WalEntry::TransactionApply {
+            transaction_id: crate::transaction_journal::TransactionId::new(),
+            entry: Box::new(WalEntry::Delete {
+                id: "c".to_string(),
+            }),
+        })
+        .unwrap();
 
         let mut all = Vec::new();
         WalReplicationManager::scan_wal_entries(tmp.path(), 0, |record| {
@@ -342,7 +382,8 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert_eq!(all.len(), 2);
+        assert_eq!(all.len(), 3);
+        assert!(matches!(all[2].entry, WalEntry::Delete { ref id } if id == "c"));
 
         let mut tail = Vec::new();
         WalReplicationManager::scan_wal_entries(tmp.path(), lsn0, |record| {
@@ -350,7 +391,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert_eq!(tail.len(), 1);
+        assert_eq!(tail.len(), 2);
         assert!(matches!(tail[0].entry, WalEntry::Delete { ref id } if id == "b"));
     }
 
@@ -432,8 +473,16 @@ mod tests {
 
         let records = Wal::load(&tmp.path().join("collections/docs/wal")).unwrap();
         assert_eq!(records.len(), 2);
-        assert!(matches!(records[0].entry, WalEntry::UpsertBatch { .. }));
-        assert!(matches!(records[1].entry, WalEntry::SetPayload { .. }));
+        assert!(matches!(
+            &records[0].entry,
+            WalEntry::TransactionApply { entry, .. }
+                if matches!(entry.as_ref(), WalEntry::UpsertBatch { .. })
+        ));
+        assert!(matches!(
+            &records[1].entry,
+            WalEntry::TransactionApply { entry, .. }
+                if matches!(entry.as_ref(), WalEntry::SetPayload { .. })
+        ));
         drop(db);
 
         let reopened = Db::open(tmp.path()).unwrap();

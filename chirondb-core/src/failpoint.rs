@@ -73,14 +73,26 @@ fn pause_for_parent(name: &str) -> Result<()> {
         GaussError::InvalidRequest("failpoint marker has no parent directory".to_string())
     })?;
     std::fs::create_dir_all(parent)?;
-    let mut file = OpenOptions::new()
+    let contents = format!("pid={} failpoint={name}\n", std::process::id());
+    match OpenOptions::new()
         .create_new(true)
         .write(true)
-        .open(&marker)?;
-    writeln!(file, "pid={} failpoint={name}", std::process::id())?;
-    file.sync_all()?;
-    #[cfg(unix)]
-    std::fs::File::open(parent)?.sync_all()?;
+        .open(&marker)
+    {
+        Ok(mut file) => {
+            file.write_all(contents.as_bytes())?;
+            file.sync_all()?;
+            #[cfg(unix)]
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        // A loop may hit this boundary again after the parent releases it.
+        // Reuse only this process's marker for this exact failpoint, without
+        // rewriting the parent's evidence or accepting a stale foreign marker.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::AlreadyExists
+                && std::fs::read_to_string(&marker).is_ok_and(|value| value == contents) => {}
+        Err(error) => return Err(error.into()),
+    }
 
     let release = std::env::var_os("CHIRONDB_FAILPOINT_RELEASE").map(PathBuf::from);
 
@@ -109,4 +121,42 @@ pub fn check(name: &str) -> Result<()> {
     }
     let _ = name;
     Ok(())
+}
+
+#[cfg(all(test, feature = "fault-injection"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn released_pause_can_be_hit_again_without_rewriting_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("marker");
+        let release = temp.path().join("release");
+        let _env = test_env("pause:seal.after_vamana_cell", &marker, &release);
+        std::fs::write(&release, b"continue").unwrap();
+        check("seal.after_vamana_cell").unwrap();
+        let bytes = std::fs::read(&marker).unwrap();
+        let modified = std::fs::metadata(&marker).unwrap().modified().unwrap();
+        check("seal.after_vamana_cell").unwrap();
+        assert_eq!(std::fs::read(&marker).unwrap(), bytes);
+        assert_eq!(
+            std::fs::metadata(&marker).unwrap().modified().unwrap(),
+            modified
+        );
+    }
+
+    #[test]
+    fn pause_rejects_foreign_marker_even_when_released() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("marker");
+        let release = temp.path().join("release");
+        let _env = test_env("pause:seal.after_vamana_cell", &marker, &release);
+        std::fs::write(&marker, b"foreign marker").unwrap();
+        std::fs::write(&release, b"continue").unwrap();
+        assert!(matches!(
+            check("seal.after_vamana_cell"),
+            Err(GaussError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(std::fs::read(&marker).unwrap(), b"foreign marker");
+    }
 }

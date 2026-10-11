@@ -178,6 +178,7 @@ enum DeferredSessionStatus {
 struct DeferredSession {
     opening_lsn: u64,
     status: DeferredSessionStatus,
+    owner: Option<crate::wal::GraphSessionOwner>,
 }
 
 #[derive(Clone, Debug)]
@@ -392,6 +393,38 @@ impl MutableGraphState {
             .map(|session| session.opening_lsn)
     }
 
+    pub(crate) fn authorize_deferred_owner(
+        &self,
+        session_id: &str,
+        scope: &crate::tenant::TenantScope,
+    ) -> Result<()> {
+        let expected = scope.session_owner();
+        if self
+            .deferred_sessions
+            .get(session_id)
+            .is_some_and(|session| session.owner.as_ref() == Some(&expected))
+        {
+            Ok(())
+        } else {
+            Err(GraphError::new(
+                GraphErrorCode::DeferredSessionNotFound,
+                "deferred graph session does not exist or is not visible",
+            )
+            .into())
+        }
+    }
+
+    pub(crate) fn pending_edge_namespace(
+        &self,
+        edge_id: EdgeId,
+        session_id: &str,
+    ) -> Option<&GraphNamespace> {
+        self.pending_edges
+            .get(&edge_id)
+            .filter(|pending| pending.session_id == session_id)
+            .map(|pending| &pending.namespace)
+    }
+
     pub(crate) fn deferred_session_is_committed(&self, session_id: &str) -> bool {
         self.deferred_sessions
             .get(session_id)
@@ -486,7 +519,7 @@ impl MutableGraphState {
 
         for mutation in session_mutations {
             match mutation {
-                GraphDeferredSessionMutation::Open { session_id } => {
+                GraphDeferredSessionMutation::Open { session_id, owner } => {
                     if self.deferred_sessions.contains_key(session_id) {
                         return Err(invalid_deferred(format!(
                             "deferred session '{session_id}' already exists"
@@ -497,6 +530,7 @@ impl MutableGraphState {
                         DeferredSession {
                             opening_lsn: record_lsn,
                             status: DeferredSessionStatus::Open,
+                            owner: owner.clone(),
                         },
                     );
                 }
@@ -727,6 +761,10 @@ impl MutableGraphState {
                 DeferredSession {
                     opening_lsn,
                     status: next_status,
+                    owner: self
+                        .deferred_sessions
+                        .get(session_id)
+                        .and_then(|session| session.owner.clone()),
                 },
             );
         }

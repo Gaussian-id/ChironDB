@@ -4,7 +4,7 @@
 //! shared little-endian header/table, deterministic encoding, bounded
 //! `PersistentFile` reads, and fail-closed structural validation.
 
-use std::{borrow::Cow, collections::BTreeMap, ops::Range, path::Path};
+use std::{collections::BTreeMap, ops::Range, path::Path};
 
 use crate::{
     GaussError, Result,
@@ -54,14 +54,18 @@ impl CheckedArtifact {
         self.sections.get(&id).copied()
     }
 
-    pub(crate) fn read_section(&self, id: u32) -> Result<Cow<'_, [u8]>> {
+    pub(crate) fn read_section(&self, id: u32) -> Result<crate::encryption::AdmittedRange<'_>> {
         let section = self
             .section(id)
             .ok_or_else(|| invalid(format!("graph artifact section {id} is absent")))?;
         self.read_section_range(id, 0..section.length)
     }
 
-    pub(crate) fn read_section_range(&self, id: u32, range: Range<usize>) -> Result<Cow<'_, [u8]>> {
+    pub(crate) fn read_section_range(
+        &self,
+        id: u32,
+        range: Range<usize>,
+    ) -> Result<crate::encryption::AdmittedRange<'_>> {
         let section = self
             .section(id)
             .ok_or_else(|| invalid(format!("graph artifact section {id} is absent")))?;
@@ -78,7 +82,7 @@ impl CheckedArtifact {
             .offset
             .checked_add(range.end)
             .ok_or_else(|| invalid("graph artifact section range overflow"))?;
-        self.file.read_range(start..end)
+        self.file.read_range_admitted(start..end)
     }
 }
 
@@ -114,7 +118,7 @@ pub(crate) fn open(path: &Path, spec: ArtifactSpec) -> Result<CheckedArtifact> {
         ));
     }
 
-    let fixed = file.read_range(0..COMMON_HEADER_BYTES)?;
+    let fixed = file.read_range_admitted(0..COMMON_HEADER_BYTES)?;
     if &fixed[0..8] != spec.magic {
         return Err(corruption(path, "bad graph artifact magic"));
     }
@@ -145,7 +149,7 @@ pub(crate) fn open(path: &Path, spec: ArtifactSpec) -> Result<CheckedArtifact> {
     if header_bytes > file.len() {
         return Err(corruption(path, "truncated graph artifact section table"));
     }
-    let table = file.read_range(COMMON_HEADER_BYTES..header_bytes)?;
+    let table = file.read_range_admitted(COMMON_HEADER_BYTES..header_bytes)?;
     let expected_crc = read_u32(&fixed, 28, "header CRC32C");
     let mut crc_input = Vec::with_capacity(28 + table.len());
     crc_input.extend_from_slice(&fixed[..28]);

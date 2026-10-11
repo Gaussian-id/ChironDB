@@ -1,0 +1,28 @@
+# Native Linux ARM qualification on the Apple Silicon runner's Docker VM.
+# Test Python/protoc dependencies must live here, where subprocesses execute.
+FROM rust:1.92.0@sha256:f58923369ba295ae1f60bc49d03f2c955a5c93a0b7d49acfb2b2a65bebaf350d AS source
+WORKDIR /app
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends protobuf-compiler python3-requests python3-protobuf \
+    && rm -rf /var/lib/apt/lists/*
+RUN rustup component add clippy rustfmt
+COPY . .
+RUN test "$(uname -m)" = aarch64 \
+    && test "$(rustc --version)" = "rustc 1.92.0 (ded5c06cf 2025-12-08)" \
+    && python3 -c "import requests; from google import protobuf" \
+    && cargo fmt --all -- --check
+
+FROM source AS lint
+RUN --mount=type=cache,id=frontier-registry-arm64,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=frontier-target-arm64,target=/app/target,sharing=locked \
+    cargo --config profile.dev.debug=0 --config profile.test.debug=0 clippy --workspace --all-targets --locked -j 2 -- -D warnings
+
+FROM lint AS tests
+RUN --mount=type=cache,id=frontier-registry-arm64,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=frontier-target-arm64,target=/app/target,sharing=locked \
+    cargo --config profile.dev.debug=0 --config profile.test.debug=0 test --workspace --locked -j 2
+
+FROM tests AS release
+RUN --mount=type=cache,id=frontier-registry-arm64,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=frontier-target-arm64,target=/app/target,sharing=locked \
+    cargo build --release --locked --bins -j 2

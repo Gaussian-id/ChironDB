@@ -115,7 +115,7 @@ impl RabitqArtifact {
         if file.len() < 12 {
             return Ok(false);
         }
-        let header = file.read_range(0..12)?;
+        let header = file.read_range_admitted(0..12)?;
         Ok(&header[..8] == RABITQ_V1_MAGIC
             && u32::from_le_bytes(header[8..12].try_into().expect("fixed header")) == 1)
     }
@@ -125,7 +125,7 @@ impl RabitqArtifact {
         if file.len() < RABITQ_HEADER_BYTES {
             return Err(rabitq_corrupt(path, "bad or truncated RaBitQ header"));
         }
-        let header = file.read_range(0..RABITQ_HEADER_BYTES)?;
+        let header = file.read_range_admitted(0..RABITQ_HEADER_BYTES)?;
         let version = rq_u32(&header, 8).ok_or_else(|| rabitq_corrupt(path, "missing version"))?;
         let (cell_major, query_basis) = match (&header[..8], version) {
             (magic, 2) if magic == RABITQ_V2_MAGIC => (false, RabitqQueryBasis::Residual),
@@ -165,20 +165,14 @@ impl RabitqArtifact {
         }
         let mut ordinal_to_record = cell_major.then(|| vec![u32::MAX; count]);
         let mut expected_cell = 0usize;
-        let mut expected_cell_end = ivf
-            .posting_range(expected_cell)
-            .expect("validated IVF cell")
-            .end;
+        let mut expected_cell_end = ivf.try_posting_range(expected_cell)?.end;
         for record in 0..count {
             while record >= expected_cell_end {
                 expected_cell += 1;
-                expected_cell_end = ivf
-                    .posting_range(expected_cell)
-                    .expect("validated IVF cell")
-                    .end;
+                expected_cell_end = ivf.try_posting_range(expected_cell)?.end;
             }
             let start = RABITQ_HEADER_BYTES + record * record_bytes;
-            let row = file.read_range(start..start + record_bytes)?;
+            let row = file.read_range_admitted(start..start + record_bytes)?;
             let cell = rq_u32(&row, 0)
                 .ok_or_else(|| rabitq_corrupt(path, "truncated RaBitQ cell"))?
                 as usize;
@@ -209,10 +203,7 @@ impl RabitqArtifact {
                 return Err(rabitq_corrupt(path, "invalid RaBitQ cell or factors"));
             }
             if let Some(inverse) = &mut ordinal_to_record {
-                let ordinal = ivf
-                    .posting_ordinal(record)
-                    .ok_or_else(|| rabitq_corrupt(path, "missing IVF posting ordinal"))?
-                    as usize;
+                let ordinal = ivf.try_posting_ordinal(record)? as usize;
                 inverse[ordinal] = u32::try_from(record)
                     .map_err(|_| rabitq_corrupt(path, "RaBitQ record exceeds u32"))?;
             }
@@ -242,9 +233,16 @@ impl RabitqArtifact {
         self.nlist
     }
 
+    /// Compatibility reader; use `try_cell` to retain storage errors.
     pub fn cell(&self, ordinal: usize) -> Option<usize> {
-        let record = self.record_for_ordinal(ordinal)?;
-        rq_u32(&self.record(record)?, 0).map(|cell| cell as usize)
+        self.try_cell(ordinal).ok()
+    }
+
+    pub fn try_cell(&self, ordinal: usize) -> Result<usize> {
+        let record = self
+            .record_for_ordinal(ordinal)
+            .ok_or_else(|| GaussError::InvalidRequest("RaBitQ ordinal out of bounds".into()))?;
+        self.try_record_cell(RabitqRecord(record))
     }
 
     fn record_for_ordinal(&self, ordinal: usize) -> Option<usize> {
@@ -262,14 +260,52 @@ impl RabitqArtifact {
             })
     }
 
-    fn record(&self, record: usize) -> Option<std::borrow::Cow<'_, [u8]>> {
+    fn try_record(&self, record: usize) -> Result<crate::encryption::AdmittedRange<'_>> {
         if record >= self.count {
-            return None;
+            return Err(GaussError::InvalidRequest(
+                "RaBitQ record out of bounds".into(),
+            ));
         }
-        let start = RABITQ_HEADER_BYTES.checked_add(record.checked_mul(self.record_bytes)?)?;
-        self.file
-            .read_range(start..start.checked_add(self.record_bytes)?)
-            .ok()
+        let start = RABITQ_HEADER_BYTES
+            .checked_add(
+                record
+                    .checked_mul(self.record_bytes)
+                    .ok_or_else(|| rabitq_corrupt(self.file.path(), "record offset overflow"))?,
+            )
+            .ok_or_else(|| rabitq_corrupt(self.file.path(), "record offset overflow"))?;
+        let end = start
+            .checked_add(self.record_bytes)
+            .ok_or_else(|| rabitq_corrupt(self.file.path(), "record offset overflow"))?;
+        let row = self.file.read_range_admitted(start..end)?;
+        let cell = rq_u32(&row, 0)
+            .ok_or_else(|| rabitq_corrupt(self.file.path(), "truncated RaBitQ cell"))?
+            as usize;
+        let f_add = f32::from_bits(
+            rq_u32(&row, 4)
+                .ok_or_else(|| rabitq_corrupt(self.file.path(), "truncated RaBitQ f_add"))?,
+        );
+        let f_rescale = f32::from_bits(
+            rq_u32(&row, 8)
+                .ok_or_else(|| rabitq_corrupt(self.file.path(), "truncated RaBitQ f_rescale"))?,
+        );
+        let f_error = f32::from_bits(
+            rq_u32(&row, 12)
+                .ok_or_else(|| rabitq_corrupt(self.file.path(), "truncated RaBitQ f_error"))?,
+        );
+        if cell >= self.nlist
+            || !f_add.is_finite()
+            || (self.query_basis == RabitqQueryBasis::Residual && f_add < 0.0)
+            || !f_rescale.is_finite()
+            || f_rescale > 0.0
+            || !f_error.is_finite()
+            || f_error < 0.0
+        {
+            return Err(rabitq_corrupt(
+                self.file.path(),
+                "invalid RaBitQ cell or factors",
+            ));
+        }
+        Ok(row)
     }
 
     pub(crate) fn record_for_ordinal_key(&self, ordinal: usize) -> Option<RabitqRecord> {
@@ -284,18 +320,40 @@ impl RabitqArtifact {
         record.0
     }
 
-    pub(crate) fn record_cell(&self, record: RabitqRecord) -> Option<usize> {
-        rq_u32(&self.record(record.0)?, 0).map(|cell| cell as usize)
+    pub(crate) fn try_record_cell(&self, record: RabitqRecord) -> Result<usize> {
+        rq_u32(&self.try_record(record.0)?, 0)
+            .map(|cell| cell as usize)
+            .ok_or_else(|| rabitq_corrupt(self.file.path(), "truncated RaBitQ cell"))
     }
 
+    #[cfg(test)]
     pub(crate) fn record_for_ordinal_in_cell(
         &self,
         ordinal: usize,
         expected_cell: usize,
     ) -> Option<RabitqRecord> {
-        let record = self.record_for_ordinal(ordinal)?;
-        (rq_u32(&self.record(record)?, 0)? as usize == expected_cell)
-            .then_some(RabitqRecord(record))
+        self.try_record_for_ordinal_in_cell(ordinal, expected_cell)
+            .ok()
+            .flatten()
+    }
+
+    pub(crate) fn try_record_for_ordinal_in_cell(
+        &self,
+        ordinal: usize,
+        expected_cell: usize,
+    ) -> Result<Option<RabitqRecord>> {
+        if expected_cell >= self.nlist {
+            return Err(GaussError::InvalidRequest(
+                "RaBitQ cell out of bounds".into(),
+            ));
+        }
+        let record = self
+            .record_for_ordinal(ordinal)
+            .ok_or_else(|| GaussError::InvalidRequest("RaBitQ ordinal out of bounds".into()))?;
+        Ok(
+            (self.try_record_cell(RabitqRecord(record))? == expected_cell)
+                .then_some(RabitqRecord(record)),
+        )
     }
 
     /// Estimate squared L2 from a query residual to one persisted residual.
@@ -305,26 +363,57 @@ impl RabitqArtifact {
     /// orthogonal cascade rotation preserves L2; the estimator never
     /// reconstructs or touches the full vector mmap.
     pub fn estimate_squared_l2(&self, ordinal: usize, query_residual: &[f32]) -> Option<f32> {
-        if ordinal >= self.count || query_residual.len() != self.vector_dim {
-            return None;
-        }
-        let query = rotate_for_cascade(query_residual);
-        self.estimate_rotated_squared_l2(ordinal, &query)
+        self.try_estimate_squared_l2(ordinal, query_residual)
+            .ok()
+            .flatten()
     }
 
-    /// Hot-path twin for residual-basis v2/v3 callers that rotate one query
-    /// residual per IVF cell and reuse it across every posting and graph hop
-    /// in that cell. Returns `None` for global-query-basis v4 artifacts.
-    pub fn estimate_rotated_squared_l2(
+    pub fn try_estimate_squared_l2(
         &self,
         ordinal: usize,
-        rotated_query_residual: &[f32],
-    ) -> Option<f32> {
-        if ordinal >= self.count || rotated_query_residual.len() != self.padded_dim {
-            return None;
+        query_residual: &[f32],
+    ) -> Result<Option<f32>> {
+        if ordinal >= self.count || query_residual.len() != self.vector_dim {
+            return Err(GaussError::InvalidRequest(
+                "invalid RaBitQ ordinal or query dimension".into(),
+            ));
         }
-        let table = self.prepare_distance_table(rotated_query_residual)?;
-        self.estimate_squared_l2_with_table(ordinal, &table)
+        let query = rotate_for_cascade(query_residual);
+        self.try_estimate_rotated_squared_l2(ordinal, &query)
+    }
+
+    /// Compatibility estimator for residual-basis v2/v3 artifacts.
+    pub fn estimate_rotated_squared_l2(&self, ordinal: usize, query: &[f32]) -> Option<f32> {
+        self.try_estimate_rotated_squared_l2(ordinal, query)
+            .ok()
+            .flatten()
+    }
+
+    /// None denotes global-basis v4, which requires a cell query table.
+    pub fn try_estimate_rotated_squared_l2(
+        &self,
+        ordinal: usize,
+        query: &[f32],
+    ) -> Result<Option<f32>> {
+        if ordinal >= self.count || query.len() != self.padded_dim {
+            return Err(GaussError::InvalidRequest(
+                "invalid RaBitQ ordinal or rotated query dimension".into(),
+            ));
+        }
+        if self.uses_global_query_table() {
+            return Ok(None);
+        }
+        let table = self
+            .prepare_distance_table(query)
+            .ok_or_else(|| GaussError::InvalidRequest("invalid RaBitQ residual query".into()))?;
+        let record = self
+            .record_for_ordinal(ordinal)
+            .ok_or_else(|| rabitq_corrupt(self.file.path(), "missing RaBitQ ordinal mapping"))?;
+        self.try_estimate_squared_l2_for_record_with_table_for_basis::<false>(
+            RabitqRecord(record),
+            &table,
+        )
+        .map(Some)
     }
 
     pub(crate) fn prepare_distance_table(
@@ -397,11 +486,21 @@ impl RabitqArtifact {
         self.query_basis == RabitqQueryBasis::Global
     }
 
+    #[cfg(test)]
     fn distance_estimate_for_record_with_basis<const GLOBAL: bool>(
         &self,
         record: usize,
         table: &RabitqDistanceTable,
     ) -> Option<RabitqDistanceEstimate> {
+        self.try_distance_estimate_for_record_with_basis::<GLOBAL>(record, table)
+            .ok()
+    }
+
+    pub(crate) fn try_distance_estimate_for_record_with_basis<const GLOBAL: bool>(
+        &self,
+        record: usize,
+        table: &RabitqDistanceTable,
+    ) -> Result<RabitqDistanceEstimate> {
         debug_assert_eq!(GLOBAL, self.query_basis == RabitqQueryBasis::Global);
         let table_len = if GLOBAL {
             table.combined_dot.len()
@@ -409,12 +508,26 @@ impl RabitqArtifact {
             table.split_dot.len()
         };
         if record >= self.count || table_len != self.code_bytes {
-            return None;
+            return Err(GaussError::InvalidRequest(
+                "invalid RaBitQ query table or output shape".into(),
+            ));
         }
-        let row = self.record(record)?;
-        let f_add = f32::from_le_bytes(row[4..8].try_into().ok()?);
-        let f_rescale = f32::from_le_bytes(row[8..12].try_into().ok()?);
-        let f_error = f32::from_le_bytes(row[12..16].try_into().ok()?);
+        let row = self.try_record(record)?;
+        let f_add = f32::from_le_bytes(
+            row[4..8]
+                .try_into()
+                .map_err(|_| rabitq_corrupt(self.file.path(), "truncated RaBitQ factor"))?,
+        );
+        let f_rescale = f32::from_le_bytes(
+            row[8..12]
+                .try_into()
+                .map_err(|_| rabitq_corrupt(self.file.path(), "truncated RaBitQ factor"))?,
+        );
+        let f_error = f32::from_le_bytes(
+            row[12..16]
+                .try_into()
+                .map_err(|_| rabitq_corrupt(self.file.path(), "truncated RaBitQ factor"))?,
+        );
         if !f_add.is_finite()
             || (!GLOBAL && f_add < 0.0)
             || !f_rescale.is_finite()
@@ -425,16 +538,19 @@ impl RabitqArtifact {
             || !table.error_norm_sq.is_finite()
             || table.error_norm_sq < 0.0
         {
-            return None;
+            return Err(GaussError::InvalidRequest(
+                "invalid RaBitQ query table or output shape".into(),
+            ));
         }
-        let codes =
-            row.get(RABITQ_RECORD_META_BYTES..RABITQ_RECORD_META_BYTES + self.code_bytes)?;
+        let codes = row
+            .get(RABITQ_RECORD_META_BYTES..RABITQ_RECORD_META_BYTES + self.code_bytes)
+            .ok_or_else(|| rabitq_corrupt(self.file.path(), "truncated RaBitQ code"))?;
         let dot = if GLOBAL {
             lookup_combined_code_dot(codes, &table.combined_dot)
         } else {
             lookup_split_code_dot(codes, &table.split_dot)
         };
-        Some(distance_estimate_from_dot(
+        Ok(distance_estimate_from_dot(
             f_add,
             f_rescale,
             f_error,
@@ -444,6 +560,51 @@ impl RabitqArtifact {
         ))
     }
 
+    pub(crate) fn try_estimate_squared_l2_with_table_for_basis<const GLOBAL: bool>(
+        &self,
+        ordinal: usize,
+        table: &RabitqDistanceTable,
+    ) -> Result<f32> {
+        let record = self
+            .record_for_ordinal_key(ordinal)
+            .ok_or_else(|| GaussError::InvalidRequest("RaBitQ ordinal out of bounds".into()))?;
+        self.try_estimate_squared_l2_for_record_with_table_for_basis::<GLOBAL>(record, table)
+    }
+
+    pub(crate) fn try_distance_estimate_with_table_for_basis<const GLOBAL: bool>(
+        &self,
+        ordinal: usize,
+        table: &RabitqDistanceTable,
+    ) -> Result<RabitqDistanceEstimate> {
+        let record = self
+            .record_for_ordinal(ordinal)
+            .ok_or_else(|| GaussError::InvalidRequest("RaBitQ ordinal out of bounds".into()))?;
+        self.try_distance_estimate_for_record_with_basis::<GLOBAL>(record, table)
+    }
+
+    pub(crate) fn try_distance_estimate_for_record_with_table_for_basis<const GLOBAL: bool>(
+        &self,
+        record: RabitqRecord,
+        table: &RabitqDistanceTable,
+    ) -> Result<RabitqDistanceEstimate> {
+        self.try_distance_estimate_for_record_with_basis::<GLOBAL>(record.0, table)
+    }
+
+    pub(crate) fn try_distance_estimate_for_posting_with_table_for_basis<const GLOBAL: bool>(
+        &self,
+        posting: usize,
+        ordinal: usize,
+        table: &RabitqDistanceTable,
+    ) -> Result<RabitqDistanceEstimate> {
+        let record = if self.ordinal_to_record.is_some() {
+            posting
+        } else {
+            ordinal
+        };
+        self.try_distance_estimate_for_record_with_basis::<GLOBAL>(record, table)
+    }
+
+    #[cfg(test)]
     pub(crate) fn estimate_squared_l2_with_table(
         &self,
         ordinal: usize,
@@ -459,6 +620,7 @@ impl RabitqArtifact {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn estimate_squared_l2_with_table_for_basis<const GLOBAL: bool>(
         &self,
         ordinal: usize,
@@ -471,11 +633,21 @@ impl RabitqArtifact {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn estimate_squared_l2_for_record_with_table_for_basis<const GLOBAL: bool>(
         &self,
         record: RabitqRecord,
         table: &RabitqDistanceTable,
     ) -> Option<f32> {
+        self.try_estimate_squared_l2_for_record_with_table_for_basis::<GLOBAL>(record, table)
+            .ok()
+    }
+
+    pub(crate) fn try_estimate_squared_l2_for_record_with_table_for_basis<const GLOBAL: bool>(
+        &self,
+        record: RabitqRecord,
+        table: &RabitqDistanceTable,
+    ) -> Result<f32> {
         debug_assert_eq!(GLOBAL, self.query_basis == RabitqQueryBasis::Global);
         let record = record.0;
         let table_len = if GLOBAL {
@@ -484,69 +656,118 @@ impl RabitqArtifact {
             table.split_dot.len()
         };
         if table_len != self.code_bytes {
-            return None;
+            return Err(GaussError::InvalidRequest(
+                "invalid RaBitQ query table or output shape".into(),
+            ));
         }
-        let row = self.record(record)?;
-        let f_add = f32::from_le_bytes(row[4..8].try_into().ok()?);
-        let f_rescale = f32::from_le_bytes(row[8..12].try_into().ok()?);
+        let row = self.try_record(record)?;
+        let f_add = f32::from_le_bytes(
+            row[4..8]
+                .try_into()
+                .map_err(|_| rabitq_corrupt(self.file.path(), "truncated RaBitQ factor"))?,
+        );
+        let f_rescale = f32::from_le_bytes(
+            row[8..12]
+                .try_into()
+                .map_err(|_| rabitq_corrupt(self.file.path(), "truncated RaBitQ factor"))?,
+        );
         if !f_add.is_finite()
             || (!GLOBAL && f_add < 0.0)
             || !f_rescale.is_finite()
             || f_rescale > 0.0
             || !table.estimate_offset.is_finite()
         {
-            return None;
+            return Err(GaussError::InvalidRequest(
+                "invalid RaBitQ query table or output shape".into(),
+            ));
         }
-        let codes =
-            row.get(RABITQ_RECORD_META_BYTES..RABITQ_RECORD_META_BYTES + self.code_bytes)?;
+        let codes = row
+            .get(RABITQ_RECORD_META_BYTES..RABITQ_RECORD_META_BYTES + self.code_bytes)
+            .ok_or_else(|| rabitq_corrupt(self.file.path(), "truncated RaBitQ code"))?;
         let dot = if GLOBAL {
             lookup_combined_code_dot(codes, &table.combined_dot)
         } else {
             lookup_split_code_dot(codes, &table.split_dot)
         };
-        Some((f_add + table.estimate_offset + f_rescale * dot).max(0.0))
+        Ok((f_add + table.estimate_offset + f_rescale * dot).max(0.0))
     }
 
     /// Scores graph-adjacent records in a four-lane stack batch while
     /// preserving each record's scalar code-index accumulation order.
+    #[cfg(test)]
     pub(crate) fn estimate_squared_l2_for_records_with_table_for_basis<const GLOBAL: bool>(
         &self,
         records: &[RabitqRecord],
         table: &RabitqDistanceTable,
         distances: &mut [f32],
     ) -> Option<()> {
+        self.try_estimate_squared_l2_for_records_with_table_for_basis::<GLOBAL>(
+            records, table, distances,
+        )
+        .ok()
+    }
+
+    /// Callers must discard the output buffer on error; earlier chunks may be scored.
+    pub(crate) fn try_estimate_squared_l2_for_records_with_table_for_basis<const GLOBAL: bool>(
+        &self,
+        records: &[RabitqRecord],
+        table: &RabitqDistanceTable,
+        distances: &mut [f32],
+    ) -> Result<()> {
         debug_assert_eq!(GLOBAL, self.query_basis == RabitqQueryBasis::Global);
         let table_len = if GLOBAL {
             table.combined_dot.len()
         } else {
             table.split_dot.len()
         };
-        if table_len != self.code_bytes || distances.len() < records.len() {
-            return None;
+        if table_len != self.code_bytes
+            || distances.len() < records.len()
+            || !table.estimate_offset.is_finite()
+        {
+            return Err(GaussError::InvalidRequest(
+                "invalid RaBitQ query table or output shape".into(),
+            ));
         }
         for (record_chunk, output_chunk) in records.chunks(4).zip(distances.chunks_mut(4)) {
-            let mut rows: [Option<std::borrow::Cow<'_, [u8]>>; 4] = std::array::from_fn(|_| None);
+            let mut rows: [Option<crate::encryption::AdmittedRange<'_>>; 4] =
+                std::array::from_fn(|_| None);
             let mut f_add = [0.0f32; 4];
             let mut f_rescale = [0.0f32; 4];
             let mut dot = [0.0f32; 4];
             for (lane, record) in record_chunk.iter().enumerate() {
-                let row = self.record(record.0)?;
-                f_add[lane] = f32::from_le_bytes(row.get(4..8)?.try_into().ok()?);
-                f_rescale[lane] = f32::from_le_bytes(row.get(8..12)?.try_into().ok()?);
+                let row = self.try_record(record.0)?;
+                f_add[lane] = f32::from_le_bytes(
+                    row.get(4..8)
+                        .ok_or_else(|| rabitq_corrupt(self.file.path(), "truncated RaBitQ factor"))?
+                        .try_into()
+                        .map_err(|_| rabitq_corrupt(self.file.path(), "truncated RaBitQ factor"))?,
+                );
+                f_rescale[lane] = f32::from_le_bytes(
+                    row.get(8..12)
+                        .ok_or_else(|| rabitq_corrupt(self.file.path(), "truncated RaBitQ factor"))?
+                        .try_into()
+                        .map_err(|_| rabitq_corrupt(self.file.path(), "truncated RaBitQ factor"))?,
+                );
                 if !f_add[lane].is_finite()
                     || (!GLOBAL && f_add[lane] < 0.0)
                     || !f_rescale[lane].is_finite()
                     || f_rescale[lane] > 0.0
                 {
-                    return None;
+                    return Err(GaussError::InvalidRequest(
+                        "invalid RaBitQ query table or output shape".into(),
+                    ));
                 }
                 rows[lane] = Some(row);
             }
             for code_index in 0..self.code_bytes {
                 for lane in 0..record_chunk.len() {
                     let packed = *rows[lane]
-                        .as_deref()?
-                        .get(RABITQ_RECORD_META_BYTES + code_index)?;
+                        .as_deref()
+                        .ok_or_else(|| {
+                            rabitq_corrupt(self.file.path(), "missing RaBitQ batch row")
+                        })?
+                        .get(RABITQ_RECORD_META_BYTES + code_index)
+                        .ok_or_else(|| rabitq_corrupt(self.file.path(), "truncated RaBitQ code"))?;
                     dot[lane] += if GLOBAL {
                         table.combined_dot[code_index].packed[packed as usize]
                     } else {
@@ -560,7 +781,7 @@ impl RabitqArtifact {
                     (f_add[lane] + table.estimate_offset + f_rescale[lane] * dot[lane]).max(0.0);
             }
         }
-        Some(())
+        Ok(())
     }
 
     #[cfg(test)]
@@ -579,6 +800,7 @@ impl RabitqArtifact {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn distance_estimate_with_table_for_basis<const GLOBAL: bool>(
         &self,
         ordinal: usize,
@@ -591,6 +813,7 @@ impl RabitqArtifact {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn distance_estimate_for_record_with_table_for_basis<const GLOBAL: bool>(
         &self,
         record: RabitqRecord,
@@ -618,6 +841,7 @@ impl RabitqArtifact {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn distance_estimate_for_posting_with_table_for_basis<const GLOBAL: bool>(
         &self,
         posting: usize,
@@ -746,7 +970,7 @@ fn write_rabitq_artifact_with_layout<S: VectorSource + ?Sized>(
     let padded_dim = next_pow2(vector_dim);
     let code_bytes = padded_dim.div_ceil(4);
     let record_bytes = code_bytes + RABITQ_RECORD_META_BYTES;
-    let centroids = ivf.centroids();
+    let centroids = ivf.try_centroids()?;
 
     let file_bytes =
         RABITQ_HEADER_BYTES
@@ -781,9 +1005,9 @@ fn write_rabitq_artifact_with_layout<S: VectorSource + ?Sized>(
         let centroid_norm_sq = norm_sq(&rotated_centroid);
         let centroid_dot_table = (matches!(layout, RabitqLayout::CellMajorGlobal))
             .then(|| prepare_dot_table(&rotated_centroid));
-        for posting in ivf.posting_range(cell).expect("validated IVF cell") {
-            let ordinal = ivf.posting_ordinal(posting).expect("validated IVF posting") as usize;
-            let vector = source.vector(ordinal)?;
+        for posting in ivf.try_posting_range(cell)? {
+            let ordinal = ivf.try_posting_ordinal(posting)? as usize;
+            let vector = source.read_vector(ordinal)?;
             if vector.len() != vector_dim {
                 return Err(GaussError::DimensionMismatch {
                     expected: vector_dim,
@@ -1224,6 +1448,120 @@ fn pad_or_trim(v: &[f32], dim: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallible_rabitq_readers_reject_late_factors_in_all_supported_layouts() {
+        let dir = tempfile::tempdir().unwrap();
+        let vectors = [
+            vec![0.0, 1.0],
+            vec![1.0, 0.0],
+            vec![2.0, 1.0],
+            vec![3.0, 2.0],
+        ];
+        let ivf_path = dir.path().join("ivf.gdx");
+        crate::index::ivf::write_ivf_artifact(vectors.as_slice(), 2, 1, &ivf_path).unwrap();
+        let ivf = IvfArtifact::open(&ivf_path).unwrap();
+        for layout in [
+            RabitqLayout::OrdinalResidual,
+            RabitqLayout::CellMajorResidual,
+            RabitqLayout::CellMajorGlobal,
+        ] {
+            let path = dir.path().join("rabitq.gdx");
+            write_rabitq_artifact_with_layout(vectors.as_slice(), &ivf, layout, &path).unwrap();
+            let artifact = RabitqArtifact::open(&path, &ivf).unwrap();
+            let record = artifact.record_for_ordinal_key(0).unwrap();
+            let original = fs::read(&path).unwrap();
+            let patch = |offset: usize, bytes: &[u8]| {
+                let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+                file.seek(SeekFrom::Start(offset as u64)).unwrap();
+                file.write_all(bytes).unwrap();
+                file.sync_all().unwrap();
+            };
+            let query = rotate_for_cascade(&[0.5, 0.25]);
+            let table = if artifact.uses_global_query_table() {
+                let global = artifact.prepare_global_query_table(&query).unwrap();
+                artifact
+                    .prepare_global_cell_distance_table(
+                        &query,
+                        &rotate_for_cascade(&ivf.try_centroids().unwrap()[0]),
+                        &global,
+                    )
+                    .unwrap()
+            } else {
+                artifact.prepare_distance_table(&query).unwrap()
+            };
+            let offset = RABITQ_HEADER_BYTES + record.0 * artifact.record_bytes;
+            for (field, bits) in [
+                (0, artifact.cells() as u32),
+                (4, f32::NAN.to_bits()),
+                (8, 1.0f32.to_bits()),
+                (12, (-1.0f32).to_bits()),
+            ] {
+                patch(offset + field, &bits.to_le_bytes());
+                assert!(matches!(
+                    artifact.try_cell(0),
+                    Err(GaussError::SegmentCorruption { .. })
+                ));
+                assert!(matches!(
+                    artifact.try_record_for_ordinal_in_cell(0, 0),
+                    Err(GaussError::SegmentCorruption { .. })
+                ));
+                let (scalar, estimate, batch) = if artifact.uses_global_query_table() {
+                    let mut output = [f32::NAN];
+                    (
+                        artifact
+                            .try_estimate_squared_l2_for_record_with_table_for_basis::<true>(
+                                record, &table,
+                            )
+                            .map(|_| ()),
+                        artifact
+                            .try_distance_estimate_for_record_with_basis::<true>(record.0, &table)
+                            .map(|_| ()),
+                        artifact.try_estimate_squared_l2_for_records_with_table_for_basis::<true>(
+                            &[record],
+                            &table,
+                            &mut output,
+                        ),
+                    )
+                } else {
+                    let mut output = [f32::NAN];
+                    assert!(matches!(
+                        artifact.try_estimate_squared_l2(0, &[0.5, 0.25]),
+                        Err(GaussError::SegmentCorruption { .. })
+                    ));
+                    (
+                        artifact
+                            .try_estimate_squared_l2_for_record_with_table_for_basis::<false>(
+                                record, &table,
+                            )
+                            .map(|_| ()),
+                        artifact
+                            .try_distance_estimate_for_record_with_basis::<false>(record.0, &table)
+                            .map(|_| ()),
+                        artifact.try_estimate_squared_l2_for_records_with_table_for_basis::<false>(
+                            &[record],
+                            &table,
+                            &mut output,
+                        ),
+                    )
+                };
+                for result in [scalar, estimate, batch] {
+                    assert!(matches!(result, Err(GaussError::SegmentCorruption { .. })));
+                }
+                patch(0, &original);
+                assert_eq!(artifact.try_cell(0).unwrap(), 0);
+            }
+            assert!(artifact.try_cell(artifact.len()).is_err());
+            if artifact.uses_global_query_table() {
+                assert_eq!(
+                    artifact.try_estimate_squared_l2(0, &[0.5, 0.25]).unwrap(),
+                    None
+                );
+            }
+            drop(artifact);
+            assert!(RabitqArtifact::open(&path, &ivf).is_ok());
+        }
+    }
 
     fn p(id: &str, v: Vec<f32>) -> Point {
         Point {

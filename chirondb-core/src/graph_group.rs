@@ -1,6 +1,6 @@
 //! Shared namespace/group and tagged-neighbour codecs for graph artifacts.
 
-use std::{borrow::Cow, cmp::Ordering, ops::Range, path::Path};
+use std::{cmp::Ordering, ops::Range, path::Path};
 
 use crate::{
     GaussError, Result,
@@ -415,7 +415,7 @@ pub(crate) fn read_group<'a>(
     section_id: u32,
     layout: &GroupedSectionLayout,
     group_index: usize,
-) -> Result<std::borrow::Cow<'a, [u8]>> {
+) -> Result<crate::encryption::AdmittedRange<'a>> {
     let frame = layout
         .frames
         .get(group_index)
@@ -499,7 +499,7 @@ pub(crate) struct EdgeIdCursor<'a> {
     section: u32,
     next: usize,
     end: usize,
-    buffer: Cow<'a, [u8]>,
+    buffer: crate::encryption::AdmittedRange<'a>,
     position: usize,
     failed: bool,
 }
@@ -527,7 +527,7 @@ impl<'a> EdgeIdCursor<'a> {
             section,
             next: offset(range.start)?,
             end: offset(range.end)?,
-            buffer: Cow::Borrowed(&[]),
+            buffer: crate::encryption::AdmittedRange::borrowed(&[]),
             position: 0,
             failed: false,
         })
@@ -542,7 +542,7 @@ impl<'a> EdgeIdCursor<'a> {
                 .next
                 .saturating_add(AUTHENTICATED_CHUNK_BYTES)
                 .min(self.end);
-            self.buffer = Cow::Borrowed(&[]);
+            self.buffer = crate::encryption::AdmittedRange::borrowed(&[]);
             self.buffer = self
                 .artifact
                 .read_section_range(self.section, self.next..end)?;

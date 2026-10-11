@@ -32,6 +32,17 @@ async fn rust_sdk_matches_embedded_native_text_retrieval() {
             &TenantScope::system(),
         )
         .unwrap();
+    let bm25_query: TextHybridQuery = serde_json::from_value(
+        json!({"query":"refund","text_field":"text","k":2,"filter":null,"budget_ms":null}),
+    )
+    .unwrap();
+    let bm25_expected = db
+        .text_hybrid_search_scoped(
+            "docs",
+            serde_json::from_value(serde_json::to_value(&bm25_query).unwrap()).unwrap(),
+            &TenantScope::system(),
+        )
+        .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, api::router(db)).await.unwrap() });
@@ -55,6 +66,11 @@ async fn rust_sdk_matches_embedded_native_text_retrieval() {
         assert_eq!(actual.id, expected.id);
         assert_eq!(actual.score, expected.score);
     }
+    let bm25 = client.text_hybrid_search("docs", bm25_query).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&bm25.hits).unwrap(),
+        serde_json::to_value(&bm25_expected.hits).unwrap()
+    );
     server.abort();
     let _ = server.await;
 }

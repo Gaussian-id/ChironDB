@@ -234,6 +234,13 @@ impl TenantScope {
         &self.actor
     }
 
+    pub(crate) fn session_owner(&self) -> crate::wal::GraphSessionOwner {
+        crate::wal::GraphSessionOwner {
+            principal: self.actor.clone(),
+            tenant: self.tenant_id.clone(),
+        }
+    }
+
     pub fn is_system(&self) -> bool {
         self.system
     }
@@ -404,6 +411,25 @@ impl TenantScope {
                 Ok(())
             }
         }
+    }
+
+    /// Whether this caller may modify or delete a point that already exists.
+    /// Called with the collection write lock held, before the WAL append.
+    pub(crate) fn authorize_replacement(
+        &self,
+        enforcement: TenantEnforcement,
+        id: &str,
+        old: &Value,
+        new: &Value,
+    ) -> Result<()> {
+        self.may_write_payload(enforcement, old)
+            .map_err(|_| GaussError::PointNotFound(id.to_string()))?;
+        if enforcement.blocks() && !self.system && old.get(TENANT_FIELD) != new.get(TENANT_FIELD) {
+            return Err(GaussError::InvalidRequest(
+                "point ownership cannot be changed by a content mutation".to_string(),
+            ));
+        }
+        self.may_write_payload(enforcement, new)
     }
 
     /// Whether this caller may modify or delete a point that already exists.

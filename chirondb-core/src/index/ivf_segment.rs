@@ -182,7 +182,7 @@ impl IvfVectorStore {
         }
     }
 
-    fn vector_cow(&self, ordinal: usize) -> Option<Cow<'_, [f32]>> {
+    fn vector_cow(&self, ordinal: usize) -> Result<crate::index::VectorRead<'_>> {
         match self {
             Self::Primary(store) => store.vector_cow(ordinal),
             Self::Named(store) => store.vector_cow(ordinal),
@@ -197,7 +197,11 @@ impl VectorSource for IvfVectorStore {
 
     fn vector(&self, ordinal: usize) -> Result<Cow<'_, [f32]>> {
         self.vector_cow(ordinal)
-            .ok_or_else(|| GaussError::InvalidRequest("vector ordinal out of range".to_string()))
+            .map(crate::index::VectorRead::into_compat)
+    }
+
+    fn read_vector(&self, ordinal: usize) -> Result<crate::index::VectorRead<'_>> {
+        self.vector_cow(ordinal)
     }
 }
 
@@ -277,7 +281,7 @@ impl IvfSegmentIndex {
         } else {
             (Some(VamanaArtifact::open(vamana_path, &ivf)?), None)
         };
-        let centroids = ivf.centroids();
+        let centroids = ivf.try_centroids()?;
         let rotated_centroids = centroids
             .iter()
             .map(|centroid| rotate_for_cascade(centroid))
@@ -302,7 +306,7 @@ impl IvfSegmentIndex {
         ef_search: Option<usize>,
         recall_target: f32,
         filter: Option<&dyn FilterPredicate>,
-    ) -> Vec<String> {
+    ) -> Result<Vec<String>> {
         self.search_controlled(query, k, ef_search, recall_target, filter, None, None)
     }
 
@@ -316,12 +320,23 @@ impl IvfSegmentIndex {
         filter: Option<&dyn FilterPredicate>,
         ordinal_filter: Option<&dyn OrdinalFilterPredicate>,
         cancelled: Option<&AtomicBool>,
-    ) -> Vec<String> {
-        if k == 0 || query.len() != self.vector_dim() || self.store.is_empty() {
-            return Vec::new();
+    ) -> Result<Vec<String>> {
+        if query.len() != self.vector_dim() {
+            return Err(GaussError::DimensionMismatch {
+                expected: self.vector_dim(),
+                actual: query.len(),
+            });
+        }
+        if !query.iter().all(|value| value.is_finite()) {
+            return Err(GaussError::InvalidRequest(
+                "query vector must be finite".into(),
+            ));
+        }
+        if k == 0 || self.store.is_empty() {
+            return Ok(Vec::new());
         }
         if cancellation_requested(cancelled) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let mut prepared = query.to_vec();
         if self.metric == DistanceMetric::Cosine {
@@ -353,7 +368,7 @@ impl IvfSegmentIndex {
                 filter,
                 cancelled,
             )
-            .0
+            .map(|result| result.0)
         } else {
             self.search_compressed_controlled::<true>(
                 query,
@@ -364,7 +379,7 @@ impl IvfSegmentIndex {
                 filter,
                 cancelled,
             )
-            .0
+            .map(|result| result.0)
         }
     }
 
@@ -384,6 +399,7 @@ impl IvfSegmentIndex {
         } else {
             self.search_exact_controlled::<false>(query, k, filter, None)
         }
+        .unwrap()
     }
 
     fn search_exact_controlled<const FILTERED: bool>(
@@ -392,7 +408,7 @@ impl IvfSegmentIndex {
         k: usize,
         filter: CandidateFilter<'_>,
         cancelled: Option<&AtomicBool>,
-    ) -> Vec<String> {
+    ) -> Result<Vec<String>> {
         let mut exact = Vec::new();
         for ordinal in 0..self.store.len() {
             if cancellation_requested(cancelled) {
@@ -402,19 +418,17 @@ impl IvfSegmentIndex {
                 record_search_metric!(FilterRejections, 1);
                 continue;
             }
-            if let Some(distance) = self.exact_distance(query, ordinal) {
-                exact.push((distance, ordinal));
-            }
+            exact.push((self.exact_distance(query, ordinal)?, ordinal));
         }
         keep_nearest(&mut exact, k);
-        exact
+        Ok(exact
             .into_iter()
             .filter_map(|(_, ordinal)| self.store.id(ordinal).map(str::to_string))
-            .collect()
+            .collect())
     }
 
     #[cfg(test)]
-    fn search_compressed(
+    pub(crate) fn try_search_compressed(
         &self,
         query: &[f32],
         prepared: &[f32],
@@ -422,7 +436,7 @@ impl IvfSegmentIndex {
         ef_search: Option<usize>,
         rescore_inflation: usize,
         filter: Option<&dyn FilterPredicate>,
-    ) -> (Vec<String>, usize) {
+    ) -> Result<(Vec<String>, usize)> {
         let filter = CandidateFilter {
             string: filter,
             ordinal: None,
@@ -450,6 +464,20 @@ impl IvfSegmentIndex {
         }
     }
 
+    #[cfg(test)]
+    fn search_compressed(
+        &self,
+        query: &[f32],
+        prepared: &[f32],
+        k: usize,
+        ef_search: Option<usize>,
+        rescore_inflation: usize,
+        filter: Option<&dyn FilterPredicate>,
+    ) -> (Vec<String>, usize) {
+        self.try_search_compressed(query, prepared, k, ef_search, rescore_inflation, filter)
+            .unwrap()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn search_compressed_controlled<const FILTERED: bool>(
         &self,
@@ -460,7 +488,7 @@ impl IvfSegmentIndex {
         rescore_inflation: usize,
         filter: CandidateFilter<'_>,
         cancelled: Option<&AtomicBool>,
-    ) -> (Vec<String>, usize) {
+    ) -> Result<(Vec<String>, usize)> {
         if self.rabitq.uses_global_query_table() {
             self.search_compressed_controlled_for_basis::<true, FILTERED>(
                 query,
@@ -494,10 +522,10 @@ impl IvfSegmentIndex {
         rescore_inflation: usize,
         filter: CandidateFilter<'_>,
         cancelled: Option<&AtomicBool>,
-    ) -> (Vec<String>, usize) {
+    ) -> Result<(Vec<String>, usize)> {
         debug_assert_eq!(GLOBAL, self.rabitq.uses_global_query_table());
         if cancellation_requested(cancelled) {
-            return (Vec::new(), 0);
+            return Ok((Vec::new(), 0));
         }
         let ef = ef_search
             .unwrap_or_else(|| self.default_ef_search(k))
@@ -518,9 +546,9 @@ impl IvfSegmentIndex {
         let mut posting_count = 0usize;
         for &(_, cell) in &cells {
             if cancellation_requested(cancelled) {
-                return (Vec::new(), 0);
+                return Ok((Vec::new(), 0));
             }
-            posting_count += self.ivf.posting_range(cell).map_or(0, |range| range.len());
+            posting_count += self.ivf.try_posting_range(cell)?.len();
             selected_cells.push(cell);
             if selected_cells.len() >= min_probe && posting_count >= posting_target {
                 break;
@@ -560,11 +588,9 @@ impl IvfSegmentIndex {
                 Vec::with_capacity(selected_cells.len().saturating_mul(cell_width));
             for &cell in &selected_cells {
                 if cancellation_requested(cancelled) {
-                    return (Vec::new(), 0);
+                    return Ok((Vec::new(), 0));
                 }
-                let Some(entry) = vamana.entry(cell).map(|ordinal| ordinal as usize) else {
-                    continue;
-                };
+                let entry = vamana.try_entry(cell)? as usize;
                 candidates.extend(self.score_cell_graph::<GLOBAL, FILTERED>(
                     entry,
                     cell,
@@ -574,7 +600,7 @@ impl IvfSegmentIndex {
                     &mut tables,
                     &mut visited,
                     cancelled,
-                ));
+                )?);
             }
             candidates
         } else {
@@ -584,10 +610,10 @@ impl IvfSegmentIndex {
                 filter,
                 &mut tables,
                 cancelled,
-            )
+            )?
         };
         if cancellation_requested(cancelled) {
-            return (Vec::new(), 0);
+            return Ok((Vec::new(), 0));
         }
         let uses_cosine_cell_graph = self.metric == DistanceMetric::Cosine
             && self.vamana.is_some()
@@ -604,9 +630,7 @@ impl IvfSegmentIndex {
                 if selected[cell] {
                     continue;
                 }
-                let Some(entry) = vamana.entry(cell).map(|ordinal| ordinal as usize) else {
-                    continue;
-                };
+                let entry = vamana.try_entry(cell)? as usize;
                 l1.extend(self.score_cell_graph::<GLOBAL, FILTERED>(
                     entry,
                     cell,
@@ -616,9 +640,9 @@ impl IvfSegmentIndex {
                     &mut tables,
                     &mut local_visited,
                     cancelled,
-                ));
+                )?);
                 if cancellation_requested(cancelled) {
-                    return (Vec::new(), 0);
+                    return Ok((Vec::new(), 0));
                 }
             }
         }
@@ -631,7 +655,7 @@ impl IvfSegmentIndex {
             ef.max(k)
         };
         if l1.is_empty() {
-            return (Vec::new(), 0);
+            return Ok((Vec::new(), 0));
         }
 
         // The first candidates' RaBitQ upper confidence bounds give an upper
@@ -647,7 +671,7 @@ impl IvfSegmentIndex {
         if !uses_cosine_cell_graph
             && radius_routing_enabled(
                 self.metric,
-                self.ivf.cell_radius(0).is_some(),
+                self.ivf.try_cell_radius(0)?.is_some(),
                 rescore_inflation,
             )
         {
@@ -665,18 +689,20 @@ impl IvfSegmentIndex {
             for &cell in &selected_cells {
                 already_selected[cell] = true;
             }
-            let extra_cells = cells
-                .iter()
-                .filter_map(|&(centroid_distance, cell)| {
-                    if already_selected[cell] {
-                        return None;
-                    }
-                    let radius = self.ivf.cell_radius(cell)?;
-                    let gap = (centroid_distance.sqrt() - radius).max(0.0);
-                    let lower_bound = gap * gap;
-                    (lower_bound <= upper_bound * (1.0 + 8.0 * f32::EPSILON)).then_some(cell)
-                })
-                .collect::<Vec<_>>();
+            let mut extra_cells = Vec::new();
+            for &(centroid_distance, cell) in &cells {
+                if already_selected[cell] {
+                    continue;
+                }
+                let Some(radius) = self.ivf.try_cell_radius(cell)? else {
+                    continue;
+                };
+                let gap = (centroid_distance.sqrt() - radius).max(0.0);
+                let lower_bound = gap * gap;
+                if lower_bound <= upper_bound * (1.0 + 8.0 * f32::EPSILON) {
+                    extra_cells.push(cell);
+                }
+            }
             if !extra_cells.is_empty() {
                 l1.extend(self.score_cells_controlled::<GLOBAL, FILTERED>(
                     &extra_cells,
@@ -684,9 +710,9 @@ impl IvfSegmentIndex {
                     filter,
                     &mut tables,
                     cancelled,
-                ));
+                )?);
                 if cancellation_requested(cancelled) {
-                    return (Vec::new(), 0);
+                    return Ok((Vec::new(), 0));
                 }
                 keep_quantized_by_lower_bound(&mut l1, ef.max(k));
             }
@@ -711,7 +737,7 @@ impl IvfSegmentIndex {
                 filter,
                 &mut tables,
                 cancelled,
-            )
+            )?
         } else {
             // Every graph hop is scored from the resident 2-bit code and
             // per-vector factors; f32 vector pages remain untouched. Resident
@@ -745,7 +771,7 @@ impl IvfSegmentIndex {
             }
             while let Some(Reverse((OrdF32(candidate_distance), ordinal))) = candidates.pop() {
                 if cancellation_requested(cancelled) {
-                    return (Vec::new(), 0);
+                    return Ok((Vec::new(), 0));
                 }
                 let worst = navigation.peek().map_or(f32::INFINITY, |entry| entry.0.0);
                 if navigation.len() >= navigation_width && candidate_distance > worst {
@@ -753,18 +779,21 @@ impl IvfSegmentIndex {
                 }
                 self.visit_neighbors(ordinal, |neighbor| {
                     if cancellation_requested(cancelled) {
-                        return;
+                        return Ok(());
                     }
                     let neighbor = neighbor as usize;
                     if self.store.id(neighbor).is_none() {
-                        return;
+                        return Ok(());
                     }
                     if !filter.navigable::<FILTERED>(self, neighbor) || !visited.insert(neighbor) {
-                        return;
+                        return Ok(());
                     }
-                    if let Some(distance) =
-                        self.quantized_distance::<GLOBAL>(neighbor, &rotated_query, &mut tables)
                     {
+                        let distance = self.quantized_distance::<GLOBAL>(
+                            neighbor,
+                            &rotated_query,
+                            &mut tables,
+                        )?;
                         let worst = navigation.peek().map_or(f32::INFINITY, |entry| entry.0.0);
                         if navigation.len() < navigation_width || distance < worst {
                             candidates.push(Reverse((OrdF32(distance), neighbor)));
@@ -784,16 +813,17 @@ impl IvfSegmentIndex {
                             }
                         }
                     }
-                });
+                    Ok(())
+                })?;
             }
 
             results
                 .into_iter()
-                .filter_map(|(_, ordinal)| {
+                .map(|(_, ordinal)| {
                     self.quantized_distance_estimate::<GLOBAL>(ordinal, &rotated_query, &mut tables)
                         .map(|distance| QuantizedCandidate { distance, ordinal })
                 })
-                .collect::<Vec<_>>()
+                .collect::<Result<Vec<_>>>()?
         };
 
         // L3: rho*k is the analytical floor, not a hard truncation. Preserve
@@ -807,27 +837,26 @@ impl IvfSegmentIndex {
             .map(|candidate| candidate.ordinal)
             .collect::<Vec<_>>();
         if cancellation_requested(cancelled) {
-            return (Vec::new(), 0);
+            return Ok((Vec::new(), 0));
         }
         let mut rescored: Vec<(f32, usize)> = if let Some(diskann) = &self.diskann {
-            diskann
-                .vectors(&rerank_ordinals)
-                .into_iter()
+            let vectors = diskann.try_vectors_admitted(&rerank_ordinals)?;
+            vectors
+                .iter()
                 .zip(rerank_ordinals)
-                .filter_map(|(vector, ordinal)| {
-                    vector
-                        .and_then(|vector| self.distance_to_vector(query, &vector))
+                .map(|(vector, ordinal)| {
+                    self.distance_to_vector(query, vector)
                         .map(|distance| (distance, ordinal))
                 })
-                .collect()
+                .collect::<Result<_>>()?
         } else {
             rerank_ordinals
                 .into_iter()
-                .filter_map(|ordinal| {
+                .map(|ordinal| {
                     self.exact_distance(query, ordinal)
                         .map(|distance| (distance, ordinal))
                 })
-                .collect()
+                .collect::<Result<_>>()?
         };
         let exact_distance_calls = rescored.len();
         keep_nearest(&mut rescored, k);
@@ -835,27 +864,25 @@ impl IvfSegmentIndex {
             .into_iter()
             .filter_map(|(_, ordinal)| self.store.id(ordinal).map(str::to_string))
             .collect();
-        (ids, exact_distance_calls)
+        Ok((ids, exact_distance_calls))
     }
 
-    fn exact_distance(&self, query: &[f32], ordinal: usize) -> Option<f32> {
+    fn exact_distance(&self, query: &[f32], ordinal: usize) -> Result<f32> {
         if let Some(diskann) = &self.diskann {
-            return diskann
-                .vector(ordinal)
-                .and_then(|vector| self.distance_to_vector(query, &vector));
+            let vectors = diskann.try_vectors_admitted(&[ordinal])?;
+            return self.distance_to_vector(query, &vectors[0]);
         }
         let vector = self.store.vector_cow(ordinal)?;
         self.distance_to_vector(query, &vector)
     }
 
-    fn distance_to_vector(&self, query: &[f32], vector: &[f32]) -> Option<f32> {
-        match self.metric {
-            DistanceMetric::L2 => Some(squared_l2(query, vector)),
-            metric => metric.score(query, vector).ok().map(|score| -score),
-        }
-        .inspect(|_| {
-            record_search_metric!(ExactReranks, 1);
-        })
+    fn distance_to_vector(&self, query: &[f32], vector: &[f32]) -> Result<f32> {
+        let distance = match self.metric {
+            DistanceMetric::L2 => squared_l2(query, vector),
+            metric => -metric.score(query, vector)?,
+        };
+        record_search_metric!(ExactReranks, 1);
+        Ok(distance)
     }
 
     #[cfg(test)]
@@ -867,14 +894,19 @@ impl IvfSegmentIndex {
         }
     }
 
-    fn visit_neighbors(&self, ordinal: usize, mut visit: impl FnMut(u32)) {
+    fn visit_neighbors(
+        &self,
+        ordinal: usize,
+        mut visit: impl FnMut(u32) -> Result<()>,
+    ) -> Result<()> {
         if let Some(diskann) = &self.diskann {
-            for neighbor in diskann.neighbors(ordinal).unwrap_or_default() {
-                visit(neighbor);
+            for neighbor in diskann.try_neighbors(ordinal)? {
+                visit(neighbor)?;
             }
         } else if let Some(vamana) = &self.vamana {
-            let _ = vamana.visit_neighbors(ordinal, visit);
+            vamana.try_visit_neighbors(ordinal, visit)?;
         }
+        Ok(())
     }
 
     pub fn diskann_io_stats(&self) -> DiskAnnIoStats {
@@ -889,8 +921,11 @@ impl IvfSegmentIndex {
         }
     }
 
-    pub(crate) fn diskann_vector(&self, ordinal: usize) -> Option<Vec<f32>> {
-        self.diskann.as_ref()?.vector(ordinal)
+    pub(crate) fn diskann_vector(&self, ordinal: usize) -> Result<Vec<f32>> {
+        self.diskann
+            .as_ref()
+            .ok_or_else(|| GaussError::InvalidRequest("segment has no DiskANN artifact".into()))?
+            .try_vector(ordinal)
     }
 
     pub(crate) fn uses_diskann(&self) -> bool {
@@ -902,12 +937,12 @@ impl IvfSegmentIndex {
         ordinal: usize,
         rotated_query: &[f32],
         tables: &mut RabitqQueryTables,
-    ) -> Option<f32> {
-        let cell = self.rabitq.cell(ordinal)?;
+    ) -> Result<f32> {
+        let cell = self.rabitq.try_cell(ordinal)?;
         let table = self.query_distance_table::<GLOBAL>(cell, rotated_query, tables)?;
         record_search_metric!(EstimatorCalls, 1);
         self.rabitq
-            .estimate_squared_l2_with_table_for_basis::<GLOBAL>(ordinal, table)
+            .try_estimate_squared_l2_with_table_for_basis::<GLOBAL>(ordinal, table)
     }
 
     fn quantized_distance_estimate<const GLOBAL: bool>(
@@ -915,12 +950,12 @@ impl IvfSegmentIndex {
         ordinal: usize,
         rotated_query: &[f32],
         tables: &mut RabitqQueryTables,
-    ) -> Option<RabitqDistanceEstimate> {
-        let cell = self.rabitq.cell(ordinal)?;
+    ) -> Result<RabitqDistanceEstimate> {
+        let cell = self.rabitq.try_cell(ordinal)?;
         let table = self.query_distance_table::<GLOBAL>(cell, rotated_query, tables)?;
         record_search_metric!(EstimatorCalls, 1);
         self.rabitq
-            .distance_estimate_with_table_for_basis::<GLOBAL>(ordinal, table)
+            .try_distance_estimate_with_table_for_basis::<GLOBAL>(ordinal, table)
     }
 
     fn query_distance_table<'a, const GLOBAL: bool>(
@@ -928,22 +963,38 @@ impl IvfSegmentIndex {
         cell: usize,
         rotated_query: &[f32],
         tables: &'a mut RabitqQueryTables,
-    ) -> Option<&'a RabitqDistanceTable> {
-        if tables.cells.get(cell)?.is_none() {
-            let rotated_centroid = self.rotated_centroids.get(cell)?;
+    ) -> Result<&'a RabitqDistanceTable> {
+        if tables
+            .cells
+            .get(cell)
+            .ok_or_else(invalid_candidate)?
+            .is_none()
+        {
+            let rotated_centroid = self
+                .rotated_centroids
+                .get(cell)
+                .ok_or_else(invalid_candidate)?;
             let prepared = if GLOBAL {
-                self.rabitq.prepare_global_cell_distance_table(
-                    rotated_query,
-                    rotated_centroid,
-                    tables.global.as_ref()?,
-                )?
+                self.rabitq
+                    .prepare_global_cell_distance_table(
+                        rotated_query,
+                        rotated_centroid,
+                        tables.global.as_ref().ok_or_else(invalid_candidate)?,
+                    )
+                    .ok_or_else(invalid_candidate)?
             } else {
                 let residual = rotated_residual(rotated_query, rotated_centroid);
-                self.rabitq.prepare_distance_table(&residual)?
+                self.rabitq
+                    .prepare_distance_table(&residual)
+                    .ok_or_else(invalid_candidate)?
             };
-            *tables.cells.get_mut(cell)? = Some(prepared);
+            *tables.cells.get_mut(cell).ok_or_else(invalid_candidate)? = Some(prepared);
         }
-        tables.cells.get(cell)?.as_ref()
+        tables
+            .cells
+            .get(cell)
+            .and_then(Option::as_ref)
+            .ok_or_else(invalid_candidate)
     }
 
     #[cfg(test)]
@@ -963,6 +1014,7 @@ impl IvfSegmentIndex {
         } else {
             self.score_cells_controlled::<false, true>(cells, rotated_query, filter, tables, None)
         }
+        .unwrap()
     }
 
     fn score_cells_controlled<const GLOBAL: bool, const FILTERED: bool>(
@@ -972,110 +1024,85 @@ impl IvfSegmentIndex {
         filter: CandidateFilter<'_>,
         tables: &mut RabitqQueryTables,
         cancelled: Option<&AtomicBool>,
-    ) -> Vec<QuantizedCandidate> {
+    ) -> Result<Vec<QuantizedCandidate>> {
         use rayon::prelude::*;
-
         #[cfg(feature = "search-metrics")]
-        let posting_records = cells
-            .iter()
-            .map(|&cell| self.ivf.posting_range(cell).map_or(0, |range| range.len()))
-            .sum::<usize>();
+        let mut posting_records = 0usize;
+        for &cell in cells {
+            if cancellation_requested(cancelled) {
+                return Ok(Vec::new());
+            }
+            #[cfg(feature = "search-metrics")]
+            {
+                posting_records += self.ivf.try_posting_range(cell)?.len();
+            }
+            self.query_distance_table::<GLOBAL>(cell, rotated_query, tables)?;
+        }
         record_search_metric!(PostingScanCalls, 1);
         record_search_metric!(CellsTouched, cells.len());
         record_search_metric!(PostingRecordsScanned, posting_records);
-
-        for &cell in cells {
-            if cancellation_requested(cancelled) {
-                return Vec::new();
-            }
-            if self
-                .query_distance_table::<GLOBAL>(cell, rotated_query, tables)
-                .is_none()
-            {
-                continue;
-            }
-        }
         let cell_tables = &tables.cells;
         #[cfg(feature = "search-metrics")]
         let metric_collector = crate::index::search_metrics::current();
-        // The binding inside this closure is consumed by feature-gated metric
-        // flushes. In the default build those macros disappear, leaving the
-        // binding as a deliberate return-only staging value.
-        #[allow(clippy::let_and_return)]
-        let score_cell = |&cell: &usize| {
+        let score_cell = |&cell: &usize| -> Result<Vec<QuantizedCandidate>> {
             #[cfg(feature = "search-metrics")]
             let _metric_attachment = crate::index::search_metrics::attach(metric_collector.clone());
             if cancellation_requested(cancelled) {
-                return Vec::new();
+                return Ok(Vec::new());
             }
-            let Some(table) = cell_tables.get(cell).and_then(Option::as_ref) else {
-                return Vec::new();
-            };
+            let table = cell_tables
+                .get(cell)
+                .and_then(Option::as_ref)
+                .ok_or_else(invalid_candidate)?;
             #[cfg(feature = "search-metrics")]
             let mut estimator_calls = 0usize;
             #[cfg(feature = "search-metrics")]
-            let mut valid_admissions = 0usize;
-            #[cfg(feature = "search-metrics")]
-            let mut invalid_admissions = 0usize;
-            #[cfg(feature = "search-metrics")]
             let mut filter_rejections = 0usize;
-            let candidates = self
-                .ivf
-                .posting_range(cell)
-                .expect("validated IVF cell")
-                .filter_map(|posting| {
-                    let ordinal = self
-                        .ivf
-                        .posting_ordinal(posting)
-                        .expect("validated IVF posting") as usize;
-                    if !filter.allows::<FILTERED>(self, ordinal) {
-                        #[cfg(feature = "search-metrics")]
-                        {
-                            filter_rejections += 1;
-                        }
-                        return None;
-                    }
+            let mut candidates = Vec::new();
+            for posting in self.ivf.try_posting_range(cell)? {
+                let ordinal = self.ivf.try_posting_ordinal(posting)? as usize;
+                if !filter.allows::<FILTERED>(self, ordinal) {
                     #[cfg(feature = "search-metrics")]
                     {
-                        estimator_calls += 1;
+                        filter_rejections += 1;
                     }
-                    let distance = self
-                        .rabitq
-                        .distance_estimate_for_posting_with_table_for_basis::<GLOBAL>(
-                            posting, ordinal, table,
-                        );
-                    if distance.is_some() {
-                        #[cfg(feature = "search-metrics")]
-                        {
-                            valid_admissions += 1;
-                        }
-                    } else {
-                        #[cfg(feature = "search-metrics")]
-                        {
-                            invalid_admissions += 1;
-                        }
-                    }
-                    distance.map(|distance| QuantizedCandidate { distance, ordinal })
-                })
-                .collect::<Vec<_>>();
+                    continue;
+                }
+                #[cfg(feature = "search-metrics")]
+                {
+                    estimator_calls += 1;
+                }
+                let distance = self
+                    .rabitq
+                    .try_distance_estimate_for_posting_with_table_for_basis::<GLOBAL>(
+                        posting, ordinal, table,
+                    )
+                    .inspect_err(|_| {
+                        record_search_metric!(InvalidRecordAdmissions, 1);
+                    })?;
+                candidates.push(QuantizedCandidate { distance, ordinal });
+            }
             record_search_metric!(EstimatorCalls, estimator_calls);
             record_search_metric!(PostingScanEstimatorCalls, estimator_calls);
-            record_search_metric!(ValidRecordAdmissions, valid_admissions);
-            record_search_metric!(InvalidRecordAdmissions, invalid_admissions);
+            record_search_metric!(ValidRecordAdmissions, candidates.len());
             record_search_metric!(FilterRejections, filter_rejections);
-            candidates
+            Ok(candidates)
         };
         let cell_candidates = if rayon::current_thread_index().is_some() {
-            cells.iter().map(&score_cell).collect::<Vec<_>>()
+            cells.iter().map(&score_cell).collect::<Result<Vec<_>>>()
         } else {
-            crate::search_pool::SEARCH_POOL
-                .install(|| cells.par_iter().map(&score_cell).collect::<Vec<_>>())
-        };
+            crate::search_pool::SEARCH_POOL.install(|| {
+                cells
+                    .par_iter()
+                    .map(&score_cell)
+                    .collect::<Result<Vec<_>>>()
+            })
+        }?;
         let mut candidates = Vec::new();
         for cell in cell_candidates {
             candidates.extend(cell);
         }
-        candidates
+        Ok(candidates)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1087,9 +1114,9 @@ impl IvfSegmentIndex {
         filter: CandidateFilter<'_>,
         tables: &mut RabitqQueryTables,
         cancelled: Option<&AtomicBool>,
-    ) -> Vec<QuantizedCandidate> {
+    ) -> Result<Vec<QuantizedCandidate>> {
         let Some(vamana) = self.vamana.as_ref() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         record_search_metric!(GraphTraversals, 1);
         let mut visited = VisitedOrdinals::Dense(vec![false; self.store.len()]);
@@ -1126,58 +1153,42 @@ impl IvfSegmentIndex {
         while let Some(Reverse((OrdF32(candidate_distance), record_index))) = candidates.pop() {
             record_search_metric!(HeapPops, 1);
             if cancellation_requested(cancelled) {
-                return Vec::new();
+                return Ok(Vec::new());
             }
             let worst = navigation.peek().map_or(f32::INFINITY, |entry| entry.0.0);
             if navigation.len() >= width && candidate_distance > worst {
                 break;
             }
-            let _ = vamana.visit_neighbor_keys(record_index, |neighbor| {
+            vamana.try_visit_neighbor_keys(record_index, |neighbor| {
                 record_search_metric!(GraphHops, 1);
                 if cancellation_requested(cancelled) {
-                    return;
+                    return Ok(());
                 }
                 let neighbor = neighbor as usize;
                 let Some(record) = self.rabitq.record_at(neighbor) else {
                     record_search_metric!(InvalidRecordAdmissions, 1);
-                    return;
+                    return Ok(());
                 };
-                let Some(ordinal) = self
-                    .ivf
-                    .posting_ordinal(neighbor)
-                    .map(|value| value as usize)
-                else {
-                    record_search_metric!(InvalidRecordAdmissions, 1);
-                    return;
-                };
+                let ordinal = self.ivf.try_posting_ordinal(neighbor)? as usize;
                 if self.store.id(ordinal).is_none() {
                     record_search_metric!(InvalidRecordAdmissions, 1);
-                    return;
+                    return Ok(());
                 }
                 if !filter.navigable::<FILTERED>(self, ordinal) {
                     record_search_metric!(InvalidRecordAdmissions, 1);
-                    return;
+                    return Ok(());
                 }
                 if !visited.insert(neighbor) {
-                    return;
+                    return Ok(());
                 }
-                let Some(cell) = self.rabitq.record_cell(record) else {
-                    record_search_metric!(InvalidRecordAdmissions, 1);
-                    return;
-                };
-                let Some(table) = self.query_distance_table::<GLOBAL>(cell, rotated_query, tables)
-                else {
-                    record_search_metric!(InvalidRecordAdmissions, 1);
-                    return;
-                };
+                let cell = self.rabitq.try_record_cell(record)?;
+                let table = self.query_distance_table::<GLOBAL>(cell, rotated_query, tables)?;
                 record_search_metric!(EstimatorCalls, 1);
-                let Some(distance) = self
+                let distance = self
                     .rabitq
-                    .estimate_squared_l2_for_record_with_table_for_basis::<GLOBAL>(record, table)
-                else {
-                    record_search_metric!(InvalidRecordAdmissions, 1);
-                    return;
-                };
+                    .try_estimate_squared_l2_for_record_with_table_for_basis::<GLOBAL>(
+                        record, table,
+                    )?;
                 record_search_metric!(ValidRecordAdmissions, 1);
                 let worst = navigation.peek().map_or(f32::INFINITY, |entry| entry.0.0);
                 if navigation.len() < width || distance < worst {
@@ -1202,19 +1213,26 @@ impl IvfSegmentIndex {
                 } else {
                     record_search_metric!(FilterRejections, 1);
                 }
-            });
+                Ok(())
+            })?;
         }
         results
             .into_iter()
-            .filter_map(|(_, record_index)| {
-                let record = self.rabitq.record_at(record_index)?;
-                let ordinal = self.ivf.posting_ordinal(record_index)? as usize;
-                let cell = self.rabitq.record_cell(record)?;
+            .map(|(_, record_index)| {
+                let record = self
+                    .rabitq
+                    .record_at(record_index)
+                    .ok_or_else(invalid_candidate)?;
+                let ordinal = self.ivf.try_posting_ordinal(record_index)? as usize;
+                let cell = self.rabitq.try_record_cell(record)?;
                 let table = self.query_distance_table::<GLOBAL>(cell, rotated_query, tables)?;
                 record_search_metric!(EstimatorCalls, 1);
-                self.rabitq
-                    .distance_estimate_for_record_with_table_for_basis::<GLOBAL>(record, table)
-                    .map(|distance| QuantizedCandidate { distance, ordinal })
+                let distance = self
+                    .rabitq
+                    .try_distance_estimate_for_record_with_table_for_basis::<GLOBAL>(
+                        record, table,
+                    )?;
+                Ok(QuantizedCandidate { distance, ordinal })
             })
             .collect()
     }
@@ -1230,7 +1248,7 @@ impl IvfSegmentIndex {
         tables: &mut RabitqQueryTables,
         visited: &mut VisitedOrdinals,
         cancelled: Option<&AtomicBool>,
-    ) -> Vec<QuantizedCandidate> {
+    ) -> Result<Vec<QuantizedCandidate>> {
         record_search_metric!(GraphTraversals, 1);
         record_search_metric!(CellsTouched, 1);
         record_search_metric!(EntriesTouched, 1);
@@ -1273,33 +1291,27 @@ impl IvfSegmentIndex {
         tables: &mut RabitqQueryTables,
         visited: &mut VisitedOrdinals,
         cancelled: Option<&AtomicBool>,
-    ) -> Vec<QuantizedCandidate> {
+    ) -> Result<Vec<QuantizedCandidate>> {
         // Search the cell-local mini-Vamana to the caller's bounded width,
         // then let the persisted RaBitQ confidence bounds choose the
         // cross-cell navigation and exact-rerank frontier.
         let width = width.max(1);
-        let Some(table) = self.query_distance_table::<GLOBAL>(cell, rotated_query, tables) else {
-            return Vec::new();
-        };
-        let Some(entry_record) = self.rabitq.record_for_ordinal_in_cell(entry, cell) else {
-            return Vec::new();
+        let table = self.query_distance_table::<GLOBAL>(cell, rotated_query, tables)?;
+        let Some(entry_record) = self.rabitq.try_record_for_ordinal_in_cell(entry, cell)? else {
+            return Ok(Vec::new());
         };
         if self.store.id(entry).is_none() {
             record_search_metric!(InvalidRecordAdmissions, 1);
-            return Vec::new();
+            return Ok(Vec::new());
         }
         if !filter.navigable::<FILTERED>(self, entry) {
             record_search_metric!(InvalidRecordAdmissions, 1);
-            return Vec::new();
+            return Ok(Vec::new());
         }
         record_search_metric!(EstimatorCalls, 1);
-        let Some(entry_distance) = self
+        let entry_distance = self
             .rabitq
-            .distance_estimate_for_record_with_table_for_basis::<GLOBAL>(entry_record, table)
-        else {
-            record_search_metric!(InvalidRecordAdmissions, 1);
-            return Vec::new();
-        };
+            .try_distance_estimate_for_record_with_table_for_basis::<GLOBAL>(entry_record, table)?;
         record_search_metric!(ValidRecordAdmissions, 1);
         let mut candidates = BinaryHeap::<Reverse<(OrdF32, usize)>>::new();
         let mut navigation = BinaryHeap::<(OrdF32, usize)>::new();
@@ -1317,7 +1329,7 @@ impl IvfSegmentIndex {
         while let Some(Reverse((OrdF32(candidate_distance), ordinal))) = candidates.pop() {
             record_search_metric!(HeapPops, 1);
             if cancellation_requested(cancelled) {
-                return Vec::new();
+                return Ok(Vec::new());
             }
             let worst = navigation
                 .peek()
@@ -1328,29 +1340,32 @@ impl IvfSegmentIndex {
             self.visit_neighbors(ordinal, |neighbor| {
                 record_search_metric!(GraphHops, 1);
                 if cancellation_requested(cancelled) {
-                    return;
+                    return Ok(());
                 }
                 let neighbor = neighbor as usize;
-                let Some(record) = self.rabitq.record_for_ordinal_in_cell(neighbor, cell) else {
+                let Some(record) = self.rabitq.try_record_for_ordinal_in_cell(neighbor, cell)?
+                else {
                     record_search_metric!(InvalidRecordAdmissions, 1);
-                    return;
+                    return Ok(());
                 };
                 if self.store.id(neighbor).is_none() {
                     record_search_metric!(InvalidRecordAdmissions, 1);
-                    return;
+                    return Ok(());
                 }
                 if !filter.navigable::<FILTERED>(self, neighbor) {
                     record_search_metric!(InvalidRecordAdmissions, 1);
-                    return;
+                    return Ok(());
                 }
                 if !visited.insert(neighbor) {
-                    return;
+                    return Ok(());
                 }
                 record_search_metric!(EstimatorCalls, 1);
-                if let Some(distance) = self
-                    .rabitq
-                    .estimate_squared_l2_for_record_with_table_for_basis::<GLOBAL>(record, table)
                 {
+                    let distance = self
+                        .rabitq
+                        .try_estimate_squared_l2_for_record_with_table_for_basis::<GLOBAL>(
+                            record, table,
+                        )?;
                     record_search_metric!(ValidRecordAdmissions, 1);
                     let worst = navigation
                         .peek()
@@ -1380,19 +1395,24 @@ impl IvfSegmentIndex {
                         record_search_metric!(FilterRejections, 1);
                     }
                 }
-            });
+                Ok(())
+            })?;
         }
         results
             .into_iter()
-            .filter_map(|(_, ordinal)| {
-                if !filter.allows::<FILTERED>(self, ordinal) {
-                    return None;
-                }
-                let record = self.rabitq.record_for_ordinal_in_cell(ordinal, cell)?;
+            .filter(|(_, ordinal)| filter.allows::<FILTERED>(self, *ordinal))
+            .map(|(_, ordinal)| {
+                let record = self
+                    .rabitq
+                    .try_record_for_ordinal_in_cell(ordinal, cell)?
+                    .ok_or_else(invalid_candidate)?;
                 record_search_metric!(EstimatorCalls, 1);
-                self.rabitq
-                    .distance_estimate_for_record_with_table_for_basis::<GLOBAL>(record, table)
-                    .map(|distance| QuantizedCandidate { distance, ordinal })
+                let distance = self
+                    .rabitq
+                    .try_distance_estimate_for_record_with_table_for_basis::<GLOBAL>(
+                        record, table,
+                    )?;
+                Ok(QuantizedCandidate { distance, ordinal })
             })
             .collect()
     }
@@ -1408,7 +1428,7 @@ impl IvfSegmentIndex {
         tables: &mut RabitqQueryTables,
         visited: &mut VisitedOrdinals,
         cancelled: Option<&AtomicBool>,
-    ) -> Vec<QuantizedCandidate> {
+    ) -> Result<Vec<QuantizedCandidate>> {
         let _span = tracing::info_span!(
             "gaussdb.search.lsvec.score_cell_graph",
             cell,
@@ -1418,40 +1438,30 @@ impl IvfSegmentIndex {
         .entered();
         let width = width.max(1);
         let Some(vamana) = self.vamana.as_ref() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        let Some(table) = self.query_distance_table::<GLOBAL>(cell, rotated_query, tables) else {
-            return Vec::new();
-        };
+        let table = self.query_distance_table::<GLOBAL>(cell, rotated_query, tables)?;
         let Some(entry_record) = self.rabitq.record_at(entry) else {
             record_search_metric!(InvalidRecordAdmissions, 1);
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        if self.rabitq.record_cell(entry_record) != Some(cell) {
+        if self.rabitq.try_record_cell(entry_record)? != cell {
             record_search_metric!(InvalidRecordAdmissions, 1);
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        let Some(entry_ordinal) = self.ivf.posting_ordinal(entry).map(|value| value as usize)
-        else {
-            record_search_metric!(InvalidRecordAdmissions, 1);
-            return Vec::new();
-        };
+        let entry_ordinal = self.ivf.try_posting_ordinal(entry)? as usize;
         if self.store.id(entry_ordinal).is_none() {
             record_search_metric!(InvalidRecordAdmissions, 1);
-            return Vec::new();
+            return Ok(Vec::new());
         }
         if !filter.navigable::<FILTERED>(self, entry_ordinal) {
             record_search_metric!(InvalidRecordAdmissions, 1);
-            return Vec::new();
+            return Ok(Vec::new());
         }
         record_search_metric!(EstimatorCalls, 1);
-        let Some(entry_distance) = self
+        let entry_distance = self
             .rabitq
-            .distance_estimate_for_record_with_table_for_basis::<GLOBAL>(entry_record, table)
-        else {
-            record_search_metric!(InvalidRecordAdmissions, 1);
-            return Vec::new();
-        };
+            .try_distance_estimate_for_record_with_table_for_basis::<GLOBAL>(entry_record, table)?;
         record_search_metric!(ValidRecordAdmissions, 1);
         let mut candidates = BinaryHeap::<Reverse<u64>>::new();
         let mut navigation = BinaryHeap::<u64>::new();
@@ -1471,7 +1481,7 @@ impl IvfSegmentIndex {
             record_search_metric!(HeapPops, 1);
             let (candidate_distance, record_index) = unpack_graph_key(candidate);
             if cancellation_requested(cancelled) {
-                return Vec::new();
+                return Ok(Vec::new());
             }
             let worst = navigation
                 .peek()
@@ -1481,56 +1491,45 @@ impl IvfSegmentIndex {
             }
             let mut records = [RabitqRecord::default(); DEFAULT_R];
             let mut record_count = 0usize;
-            let _ = vamana.visit_neighbor_keys(record_index, |neighbor| {
+            vamana.try_visit_neighbor_keys(record_index, |neighbor| {
                 record_search_metric!(GraphHops, 1);
                 if cancellation_requested(cancelled) || record_count == DEFAULT_R {
-                    return;
+                    return Ok(());
                 }
                 let neighbor = neighbor as usize;
                 let Some(record) = self.rabitq.record_at(neighbor) else {
                     record_search_metric!(InvalidRecordAdmissions, 1);
-                    return;
+                    return Ok(());
                 };
-                if self.rabitq.record_cell(record) != Some(cell) {
+                if self.rabitq.try_record_cell(record)? != cell {
                     record_search_metric!(InvalidRecordAdmissions, 1);
-                    return;
+                    return Ok(());
                 }
-                let Some(ordinal) = self
-                    .ivf
-                    .posting_ordinal(neighbor)
-                    .map(|value| value as usize)
-                else {
-                    record_search_metric!(InvalidRecordAdmissions, 1);
-                    return;
-                };
+                let ordinal = self.ivf.try_posting_ordinal(neighbor)? as usize;
                 if self.store.id(ordinal).is_none() {
                     record_search_metric!(InvalidRecordAdmissions, 1);
-                    return;
+                    return Ok(());
                 }
                 if !filter.navigable::<FILTERED>(self, ordinal) {
                     record_search_metric!(InvalidRecordAdmissions, 1);
-                    return;
+                    return Ok(());
                 }
                 if !visited.insert(neighbor) {
-                    return;
+                    return Ok(());
                 }
                 records[record_count] = record;
                 record_count += 1;
                 record_search_metric!(ValidRecordAdmissions, 1);
-            });
+                Ok(())
+            })?;
             let mut distances = [0.0f32; DEFAULT_R];
             record_search_metric!(EstimatorCalls, record_count);
-            if self
-                .rabitq
-                .estimate_squared_l2_for_records_with_table_for_basis::<GLOBAL>(
+            self.rabitq
+                .try_estimate_squared_l2_for_records_with_table_for_basis::<GLOBAL>(
                     &records[..record_count],
                     table,
                     &mut distances[..record_count],
-                )
-                .is_none()
-            {
-                return Vec::new();
-            }
+                )?;
             for (&record, &distance) in records[..record_count]
                 .iter()
                 .zip(&distances[..record_count])
@@ -1549,14 +1548,7 @@ impl IvfSegmentIndex {
                         record_search_metric!(HeapPops, 1);
                     }
                 }
-                let Some(ordinal) = self
-                    .ivf
-                    .posting_ordinal(record_index)
-                    .map(|value| value as usize)
-                else {
-                    record_search_metric!(InvalidRecordAdmissions, 1);
-                    continue;
-                };
+                let ordinal = self.ivf.try_posting_ordinal(record_index)? as usize;
                 if self.store.id(ordinal).is_none() {
                     record_search_metric!(InvalidRecordAdmissions, 1);
                     continue;
@@ -1580,14 +1572,20 @@ impl IvfSegmentIndex {
         }
         results
             .into_iter()
-            .filter_map(|key| {
+            .map(|key| {
                 let (_, record_index) = unpack_graph_key(key);
-                let record = self.rabitq.record_at(record_index)?;
-                let ordinal = self.ivf.posting_ordinal(record_index)? as usize;
+                let record = self
+                    .rabitq
+                    .record_at(record_index)
+                    .ok_or_else(invalid_candidate)?;
+                let ordinal = self.ivf.try_posting_ordinal(record_index)? as usize;
                 record_search_metric!(EstimatorCalls, 1);
-                self.rabitq
-                    .distance_estimate_for_record_with_table_for_basis::<GLOBAL>(record, table)
-                    .map(|distance| QuantizedCandidate { distance, ordinal })
+                let distance = self
+                    .rabitq
+                    .try_distance_estimate_for_record_with_table_for_basis::<GLOBAL>(
+                        record, table,
+                    )?;
+                Ok(QuantizedCandidate { distance, ordinal })
             })
             .collect()
     }
@@ -1621,7 +1619,7 @@ impl IvfSegmentIndex {
                 .vamana
                 .as_ref()
                 .is_some_and(VamanaArtifact::uses_rabitq_record_keys)
-            || self.ivf.cell_radius(0).is_none()
+            || self.ivf.try_cell_radius(0)?.is_none()
         {
             return Err(GaussError::InvalidRequest(
                 "upper-layer oracle requires a resident cosine LS-VEC segment with radii and record-key Vamana"
@@ -1660,9 +1658,9 @@ impl IvfSegmentIndex {
             });
             cells
                 .into_iter()
-                .filter_map(|(_, cell)| vamana.entry(cell).map(|entry| entry as usize))
                 .take(seed_count)
-                .collect::<Vec<_>>()
+                .map(|(_, cell)| vamana.try_entry(cell).map(|entry| entry as usize))
+                .collect::<Result<Vec<_>>>()?
         };
         if seed_records.len() != seed_count {
             return Err(GaussError::InvalidRequest(format!(
@@ -1681,35 +1679,17 @@ impl IvfSegmentIndex {
                 record_search_metric!(InvalidRecordAdmissions, 1);
                 continue;
             };
-            let Some(ordinal) = self
-                .ivf
-                .posting_ordinal(record_index)
-                .map(|ordinal| ordinal as usize)
-            else {
-                record_search_metric!(InvalidRecordAdmissions, 1);
-                continue;
-            };
+            let ordinal = self.ivf.try_posting_ordinal(record_index)? as usize;
             if self.store.id(ordinal).is_none() || !visited.insert(record_index) {
                 record_search_metric!(InvalidRecordAdmissions, 1);
                 continue;
             }
-            let Some(cell) = self.rabitq.record_cell(record) else {
-                record_search_metric!(InvalidRecordAdmissions, 1);
-                continue;
-            };
-            let Some(table) = self.query_distance_table::<true>(cell, &rotated_query, &mut tables)
-            else {
-                record_search_metric!(InvalidRecordAdmissions, 1);
-                continue;
-            };
+            let cell = self.rabitq.try_record_cell(record)?;
+            let table = self.query_distance_table::<true>(cell, &rotated_query, &mut tables)?;
             record_search_metric!(EstimatorCalls, 1);
-            let Some(distance) = self
+            let distance = self
                 .rabitq
-                .estimate_squared_l2_for_record_with_table_for_basis::<true>(record, table)
-            else {
-                record_search_metric!(InvalidRecordAdmissions, 1);
-                continue;
-            };
+                .try_estimate_squared_l2_for_record_with_table_for_basis::<true>(record, table)?;
             record_search_metric!(ValidRecordAdmissions, 1);
             let key = pack_graph_key(distance, record_index);
             candidates.push(Reverse(key));
@@ -1726,44 +1706,27 @@ impl IvfSegmentIndex {
             if found.len() >= width && candidate_distance > worst {
                 break;
             }
-            let _ = vamana.visit_neighbor_keys(record_index, |neighbor| {
+            vamana.try_visit_neighbor_keys(record_index, |neighbor| {
                 record_search_metric!(GraphHops, 1);
                 let neighbor = neighbor as usize;
                 let Some(record) = self.rabitq.record_at(neighbor) else {
                     record_search_metric!(InvalidRecordAdmissions, 1);
-                    return;
+                    return Ok(());
                 };
-                let Some(ordinal) = self
-                    .ivf
-                    .posting_ordinal(neighbor)
-                    .map(|ordinal| ordinal as usize)
-                else {
-                    record_search_metric!(InvalidRecordAdmissions, 1);
-                    return;
-                };
+                let ordinal = self.ivf.try_posting_ordinal(neighbor)? as usize;
                 // Validate before visitation: invalid/orphan records never
                 // consume the bounded frontier or result capacity.
                 if self.store.id(ordinal).is_none() || !visited.insert(neighbor) {
-                    return;
+                    return Ok(());
                 }
-                let Some(cell) = self.rabitq.record_cell(record) else {
-                    record_search_metric!(InvalidRecordAdmissions, 1);
-                    return;
-                };
-                let Some(table) =
-                    self.query_distance_table::<true>(cell, &rotated_query, &mut tables)
-                else {
-                    record_search_metric!(InvalidRecordAdmissions, 1);
-                    return;
-                };
+                let cell = self.rabitq.try_record_cell(record)?;
+                let table = self.query_distance_table::<true>(cell, &rotated_query, &mut tables)?;
                 record_search_metric!(EstimatorCalls, 1);
-                let Some(distance) = self
+                let distance = self
                     .rabitq
-                    .estimate_squared_l2_for_record_with_table_for_basis::<true>(record, table)
-                else {
-                    record_search_metric!(InvalidRecordAdmissions, 1);
-                    return;
-                };
+                    .try_estimate_squared_l2_for_record_with_table_for_basis::<true>(
+                        record, table,
+                    )?;
                 record_search_metric!(ValidRecordAdmissions, 1);
                 let worst = found
                     .peek()
@@ -1778,34 +1741,36 @@ impl IvfSegmentIndex {
                         record_search_metric!(HeapPops, 1);
                     }
                 }
-            });
+                Ok(())
+            })?;
         }
 
         let mut graph_candidates = found
             .into_iter()
-            .filter_map(|key| {
+            .map(|key| {
                 let (_, record_index) = unpack_graph_key(key);
-                let record = self.rabitq.record_at(record_index)?;
-                let ordinal = self.ivf.posting_ordinal(record_index)? as usize;
-                self.store.id(ordinal)?;
-                let cell = self.rabitq.record_cell(record)?;
+                let record = self
+                    .rabitq
+                    .record_at(record_index)
+                    .ok_or_else(invalid_candidate)?;
+                let ordinal = self.ivf.try_posting_ordinal(record_index)? as usize;
+                self.store.id(ordinal).ok_or_else(invalid_candidate)?;
+                let cell = self.rabitq.try_record_cell(record)?;
                 let table = self.query_distance_table::<true>(cell, &rotated_query, &mut tables)?;
                 record_search_metric!(EstimatorCalls, 1);
                 self.rabitq
-                    .distance_estimate_for_record_with_table_for_basis::<true>(record, table)
+                    .try_distance_estimate_for_record_with_table_for_basis::<true>(record, table)
                     .map(|distance| QuantizedCandidate { distance, ordinal })
             })
-            .collect::<Vec<_>>();
-
+            .collect::<Result<Vec<_>>>()?;
         // Exact-score the bounded graph frontier before radius admission.
-        // This is an offline diagnostic cost, not a new production stage.
         let mut graph_exact = graph_candidates
             .iter()
-            .filter_map(|candidate| {
+            .map(|candidate| {
                 self.exact_distance(query, candidate.ordinal)
                     .map(|distance| (distance, candidate.ordinal))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         graph_exact.sort_unstable_by(|left, right| {
             left.0
                 .total_cmp(&right.0)
@@ -1817,15 +1782,19 @@ impl IvfSegmentIndex {
             // centroid bounds use squared L2 on normalized vectors:
             // `||q-x||² = 2 * (1-cos(q,x))`.
             .map_or(f32::INFINITY, |candidate| 2.0 * (candidate.0 + 1.0));
-        let radius_cells = (0..self.cells())
-            .filter(|&cell| {
-                let centroid_distance = squared_l2(&prepared, &self.centroids[cell]);
-                let radius = self.ivf.cell_radius(cell).expect("validated IVF radius");
-                let gap = (centroid_distance.sqrt() - radius).max(0.0);
-                let lower_bound = gap * gap;
-                lower_bound <= routing_upper_bound * (1.0 + 8.0 * f32::EPSILON)
-            })
-            .collect::<Vec<_>>();
+        let mut radius_cells = Vec::new();
+        for cell in 0..self.cells() {
+            let centroid_distance = squared_l2(&prepared, &self.centroids[cell]);
+            let radius = self
+                .ivf
+                .try_cell_radius(cell)?
+                .ok_or_else(invalid_candidate)?;
+            let gap = (centroid_distance.sqrt() - radius).max(0.0);
+            let lower_bound = gap * gap;
+            if lower_bound <= routing_upper_bound * (1.0 + 8.0 * f32::EPSILON) {
+                radius_cells.push(cell);
+            }
+        }
 
         let mut bounded = self.score_cells_controlled::<true, false>(
             &radius_cells,
@@ -1836,7 +1805,7 @@ impl IvfSegmentIndex {
             },
             &mut tables,
             None,
-        );
+        )?;
         bounded.append(&mut graph_candidates);
         bounded.sort_unstable_by(|left, right| {
             left.ordinal.cmp(&right.ordinal).then_with(|| {
@@ -1861,9 +1830,10 @@ impl IvfSegmentIndex {
             if !exact_ordinals.insert(candidate.ordinal) {
                 continue;
             }
-            if let Some(distance) = self.exact_distance(query, candidate.ordinal) {
-                rescored.push((distance, candidate.ordinal));
-            }
+            rescored.push((
+                self.exact_distance(query, candidate.ordinal)?,
+                candidate.ordinal,
+            ));
         }
         keep_nearest(&mut rescored, k);
         let result = rescored
@@ -1880,6 +1850,10 @@ impl IvfSegmentIndex {
         }
         Ok(result)
     }
+}
+
+fn invalid_candidate() -> GaussError {
+    GaussError::InvalidRequest("invalid LS-VEC candidate metadata or query table".into())
 }
 
 fn cancellation_requested(cancelled: Option<&AtomicBool>) -> bool {
@@ -2009,6 +1983,7 @@ impl IndexBackend for IvfSegmentIndex {
             crate::h2qg::DEFAULT_RECALL_TARGET,
             None,
         )
+        .unwrap_or_default()
     }
 
     fn candidate_ids_with_ef_filter(
@@ -2025,6 +2000,7 @@ impl IndexBackend for IvfSegmentIndex {
             crate::h2qg::DEFAULT_RECALL_TARGET,
             filter,
         )
+        .unwrap_or_default()
     }
 
     fn candidate_ids_with_recall_target(
@@ -2036,6 +2012,7 @@ impl IndexBackend for IvfSegmentIndex {
         filter: Option<&dyn FilterPredicate>,
     ) -> Vec<String> {
         self.search(query, k, ef_search, recall_target, filter)
+            .unwrap_or_default()
     }
 
     fn candidate_ids_with_recall_target_cancellable(
@@ -2056,6 +2033,7 @@ impl IndexBackend for IvfSegmentIndex {
             None,
             Some(cancelled),
         )
+        .unwrap_or_default()
     }
 
     fn candidate_ids_with_recall_target_ordinal_filter(
@@ -2076,6 +2054,7 @@ impl IndexBackend for IvfSegmentIndex {
             ordinal_filter,
             None,
         )
+        .unwrap_or_default()
     }
 
     fn candidate_ids_with_recall_target_ordinal_filter_cancellable(
@@ -2088,6 +2067,110 @@ impl IndexBackend for IvfSegmentIndex {
         ordinal_filter: Option<&dyn OrdinalFilterPredicate>,
         cancelled: &AtomicBool,
     ) -> Vec<String> {
+        self.search_controlled(
+            query,
+            k,
+            ef_search,
+            recall_target,
+            filter,
+            ordinal_filter,
+            Some(cancelled),
+        )
+        .unwrap_or_default()
+    }
+
+    fn try_candidate_ids_with_ef(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: Option<usize>,
+    ) -> Result<Vec<String>> {
+        self.search(
+            query,
+            k,
+            ef_search,
+            crate::h2qg::DEFAULT_RECALL_TARGET,
+            None,
+        )
+    }
+
+    fn try_candidate_ids_with_ef_filter(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: Option<usize>,
+        filter: Option<&dyn FilterPredicate>,
+    ) -> Result<Vec<String>> {
+        self.search(
+            query,
+            k,
+            ef_search,
+            crate::h2qg::DEFAULT_RECALL_TARGET,
+            filter,
+        )
+    }
+
+    fn try_candidate_ids_with_recall_target(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: Option<usize>,
+        recall_target: f32,
+        filter: Option<&dyn FilterPredicate>,
+    ) -> Result<Vec<String>> {
+        self.search(query, k, ef_search, recall_target, filter)
+    }
+
+    fn try_candidate_ids_with_recall_target_cancellable(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: Option<usize>,
+        recall_target: f32,
+        filter: Option<&dyn FilterPredicate>,
+        cancelled: &AtomicBool,
+    ) -> Result<Vec<String>> {
+        self.search_controlled(
+            query,
+            k,
+            ef_search,
+            recall_target,
+            filter,
+            None,
+            Some(cancelled),
+        )
+    }
+
+    fn try_candidate_ids_with_recall_target_ordinal_filter(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: Option<usize>,
+        recall_target: f32,
+        filter: Option<&dyn FilterPredicate>,
+        ordinal_filter: Option<&dyn OrdinalFilterPredicate>,
+    ) -> Result<Vec<String>> {
+        self.search_controlled(
+            query,
+            k,
+            ef_search,
+            recall_target,
+            filter,
+            ordinal_filter,
+            None,
+        )
+    }
+
+    fn try_candidate_ids_with_recall_target_ordinal_filter_cancellable(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: Option<usize>,
+        recall_target: f32,
+        filter: Option<&dyn FilterPredicate>,
+        ordinal_filter: Option<&dyn OrdinalFilterPredicate>,
+        cancelled: &AtomicBool,
+    ) -> Result<Vec<String>> {
         self.search_controlled(
             query,
             k,
@@ -3073,7 +3156,7 @@ mod tests {
         let mut found = BinaryHeap::<(OrdF32, usize)>::new();
         for candidate in l1.iter().take(ef) {
             if visited.insert(candidate.ordinal)
-                && let Some(distance) = index.exact_distance(query, candidate.ordinal)
+                && let Some(distance) = index.exact_distance(query, candidate.ordinal).ok()
             {
                 candidates.push(Reverse((OrdF32(distance), candidate.ordinal)));
                 found.push((OrdF32(distance), candidate.ordinal));
@@ -3089,7 +3172,7 @@ mod tests {
                 if !visited.insert(neighbor) {
                     continue;
                 }
-                let Some(distance) = index.exact_distance(query, neighbor) else {
+                let Some(distance) = index.exact_distance(query, neighbor).ok() else {
                     continue;
                 };
                 let worst = found.peek().map_or(f32::INFINITY, |entry| entry.0.0);

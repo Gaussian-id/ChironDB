@@ -114,6 +114,11 @@ impl EdgeToken {
         &self.0
     }
 
+    /// Retained token allocation for receiving-memory accounting.
+    pub fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
+
     pub fn into_encoded(self) -> String {
         self.0
     }
