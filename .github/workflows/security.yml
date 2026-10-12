@@ -205,13 +205,6 @@ jobs:
       - name: Verify complete ChironQL reference and executable examples
         run: |
           "$RUNNER_TEMP/install-python/bin/python" chirondb-server/tests/security_documentation_examples.py --bin-dir target/debug --output "$RUNNER_TEMP/documentation-reference"
-      - name: Compose and actual Linux systemd integration
-        run: |
-          docker build -t chirondb-installation-ci:local .
-          image_id="$(docker image inspect chirondb-installation-ci:local --format '{{.Id}}')"
-          docker build -f chirondb-server/tests/deployment/Dockerfile.systemd --build-arg BASE_IMAGE=chirondb-installation-ci:local -t chirondb-installation-systemd-ci:local .
-          "$RUNNER_TEMP/install-python/bin/python" chirondb-server/tests/security_installation_deployments.py --mode compose --image "$image_id" --project installation-compose-ci --bin-dir target/debug --output "$RUNNER_TEMP/installation-compose"
-          "$RUNNER_TEMP/install-python/bin/python" chirondb-server/tests/security_installation_deployments.py --mode systemd --image "$image_id" --systemd-image chirondb-installation-systemd-ci:local --project installation-systemd-ci --bin-dir target/debug --port 17531 --output "$RUNNER_TEMP/installation-systemd"
       - name: Interrupted initialization, catalog activation and recovery
         run: |
           cargo build -p chirondb --bin chirondb --bin chironql --bin chironctl --features fault-injection --locked
@@ -225,10 +218,44 @@ jobs:
             ${{ runner.temp }}/installation-native/report.json
             ${{ runner.temp }}/documentation-reference/report.json
             ${{ runner.temp }}/documentation-reference/executed-examples.json
-            ${{ runner.temp }}/installation-compose/report.json
-            ${{ runner.temp }}/installation-systemd/report.json
             ${{ runner.temp }}/installation-faults/*/report.json
             ${{ runner.temp }}/installation-faults/summary.json
+          if-no-files-found: error
+
+  protected-deployment:
+    needs: trust-boundary
+    runs-on: ubuntu-24.04
+    # Cold release-image builds exceeded 55 minutes in the combined job.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@87eb139fed4b08a67bd1fa429a21d1f5d523e03e # 1.92.0
+        with:
+          toolchain: 1.92.0
+          components: clippy, rustfmt
+      - name: Install E2E dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler openssl python3-venv ripgrep
+          python3 -m venv "$RUNNER_TEMP/install-python"
+          "$RUNNER_TEMP/install-python/bin/pip" install -r chirondb-server/tests/security_chironql_requirements.txt
+      - name: Build clients for deployment verification
+        run: cargo build -p chirondb --bin chirondb --bin chironql --bin chironctl --locked
+      - name: Compose and actual Linux systemd integration
+        run: |
+          docker build -t chirondb-installation-ci:local .
+          image_id="$(docker image inspect chirondb-installation-ci:local --format '{{.Id}}')"
+          docker build -f chirondb-server/tests/deployment/Dockerfile.systemd --build-arg BASE_IMAGE=chirondb-installation-ci:local -t chirondb-installation-systemd-ci:local .
+          "$RUNNER_TEMP/install-python/bin/python" chirondb-server/tests/security_installation_deployments.py --mode compose --image "$image_id" --project installation-compose-ci --bin-dir target/debug --output "$RUNNER_TEMP/installation-compose"
+          "$RUNNER_TEMP/install-python/bin/python" chirondb-server/tests/security_installation_deployments.py --mode systemd --image "$image_id" --systemd-image chirondb-installation-systemd-ci:local --project installation-systemd-ci --bin-dir target/debug --port 17531 --output "$RUNNER_TEMP/installation-systemd"
+      - name: Upload sanitized deployment reports only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: protected-deployment-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/installation-compose/report.json
+            ${{ runner.temp }}/installation-systemd/report.json
           if-no-files-found: error
 
   fuzz-corpus:
@@ -309,7 +336,7 @@ jobs:
   required:
     name: security-required
     if: always()
-    needs: [trust-boundary, dependency-policy, protected-format-downgrade, protected-http-five-roles, protected-chironql-five-roles, protected-installation, fuzz-corpus, real-disk-full]
+    needs: [trust-boundary, dependency-policy, protected-format-downgrade, protected-http-five-roles, protected-chironql-five-roles, protected-installation, protected-deployment, fuzz-corpus, real-disk-full]
     runs-on: ubuntu-24.04
     steps:
       - name: Require security gates
@@ -319,15 +346,19 @@ jobs:
           CHIRONQL_RESULT: ${{ needs.protected-chironql-five-roles.result }}
           HTTP_ROLES_RESULT: ${{ needs.protected-http-five-roles.result }}
           INSTALLATION_RESULT: ${{ needs.protected-installation.result }}
+          DEPLOYMENT_RESULT: ${{ needs.protected-deployment.result }}
           FUZZ_RESULT: ${{ needs.fuzz-corpus.result }}
           DISK_RESULT: ${{ needs.real-disk-full.result }}
           TRUST_RESULT: ${{ needs.trust-boundary.result }}
-        run: >-
-          test "$TRUST_RESULT" = success &&
-          test "$DEPENDENCY_RESULT" = success &&
-          test "$DOWNGRADE_RESULT" = success &&
-          test "$HTTP_ROLES_RESULT" = success &&
-          test "$CHIRONQL_RESULT" = success &&
-          test "$INSTALLATION_RESULT" = success &&
-          test "$FUZZ_RESULT" = success &&
-          test "$DISK_RESULT" = success
+        run: |
+          result=0
+          for gate in TRUST_RESULT DEPENDENCY_RESULT DOWNGRADE_RESULT HTTP_ROLES_RESULT \
+            CHIRONQL_RESULT INSTALLATION_RESULT DEPLOYMENT_RESULT FUZZ_RESULT DISK_RESULT; do
+            if [[ "${!gate}" != success ]]; then
+              printf '::error::%s expected success, got %q\n' "$gate" "${!gate}"
+              result=1
+            else
+              printf '%s=success\n' "$gate"
+            fi
+          done
+          exit "$result"
