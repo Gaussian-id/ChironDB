@@ -16,6 +16,7 @@ use tokio::{
     task::JoinSet,
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio_util::sync::CancellationToken;
 use tonic::{Code, Status};
 
 use crate::{
@@ -30,6 +31,59 @@ use crate::{
     security_paths::StoragePolicy,
     wire_postgres,
 };
+
+struct Outbound {
+    response: pb::WireResponse,
+    _output_admission: Option<crate::response_output::SharedAdmission>,
+    guard: Option<crate::chironql_protected::PublicationGuard>,
+    _work: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+}
+impl From<pb::WireResponse> for Outbound {
+    fn from(response: pb::WireResponse) -> Self {
+        Self {
+            response,
+            _output_admission: None,
+            guard: None,
+            _work: None,
+        }
+    }
+}
+
+struct GuardedWriter<'a, W> {
+    writer: &'a mut W,
+    guard: &'a crate::chironql_protected::PublicationGuard,
+}
+impl<W: AsyncWrite + Unpin> AsyncWrite for GuardedWriter<'_, W> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        this.guard
+            .publish(|| Pin::new(&mut *this.writer).poll_write(cx, bytes))
+            .unwrap_or_else(|_| {
+                Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "authorization revoked",
+                )))
+            })
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        this.guard
+            .publish(|| Pin::new(&mut *this.writer).poll_flush(cx))
+            .unwrap_or_else(|_| {
+                Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "authorization revoked",
+                )))
+            })
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.get_mut().writer).poll_shutdown(cx)
+    }
+}
 
 const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 
@@ -49,6 +103,17 @@ pub async fn serve_with_auth_and_policy(
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     serve_listener_with_policy(db, auth, listener, storage_policy).await
+}
+
+pub async fn serve_with_auth_and_policy_until(
+    db: Db,
+    auth: AuthConfig,
+    addr: SocketAddr,
+    storage_policy: StoragePolicy,
+    shutdown: CancellationToken,
+) -> std::io::Result<()> {
+    let listener = TcpListener::bind(addr).await?;
+    serve_listener_with_policy_until(db, auth, listener, storage_policy, shutdown).await
 }
 
 pub async fn serve_tls_with_auth(
@@ -103,16 +168,68 @@ pub async fn serve_listener_with_policy(
     listener: TcpListener,
     storage_policy: StoragePolicy,
 ) -> std::io::Result<()> {
+    serve_listener_with_policy_until(db, auth, listener, storage_policy, CancellationToken::new())
+        .await
+}
+
+pub async fn serve_listener_with_policy_until(
+    db: Db,
+    auth: AuthConfig,
+    listener: TcpListener,
+    storage_policy: StoragePolicy,
+    shutdown: CancellationToken,
+) -> std::io::Result<()> {
+    let mut connections = JoinSet::new();
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let accepted = tokio::select! {
+            _ = shutdown.cancelled() => break,
+            accepted = listener.accept() => accepted,
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    tracing::warn!(%error, "ChironWire connection task panicked");
+                }
+                continue;
+            }
+        };
+        let (stream, peer) = accepted?;
+        let connection = if let Some(authority) = db.identity_authority() {
+            let Ok(permit) = authority.wire_connection_pool().try_acquire_owned() else {
+                continue;
+            };
+            Some(permit)
+        } else {
+            None
+        };
         let db = db.clone();
         let auth = auth.clone();
         let storage_policy = storage_policy.clone();
-        tokio::spawn(async move {
-            if let Err(error) = dispatch_by_first_bytes(db, auth, storage_policy, stream).await {
+        connections.spawn(async move {
+            let _connection = connection;
+            if let Err(error) =
+                dispatch_by_first_bytes(db, auth, storage_policy, stream, false).await
+            {
                 tracing::warn!(%error, %peer, "GaussWire connection failed");
             }
         });
+    }
+    drain_connection_tasks(&mut connections).await;
+    Ok(())
+}
+
+async fn drain_connection_tasks(connections: &mut JoinSet<()>) {
+    let drain = async {
+        while let Some(result) = connections.join_next().await {
+            if let Err(error) = result {
+                tracing::warn!(%error, "ChironWire connection task panicked during shutdown");
+            }
+        }
+    };
+    if tokio::time::timeout(Duration::from_secs(5), drain)
+        .await
+        .is_err()
+    {
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
     }
 }
 
@@ -125,17 +242,36 @@ async fn dispatch_by_first_bytes<S>(
     auth: AuthConfig,
     storage_policy: StoragePolicy,
     mut stream: S,
+    tls_verified: bool,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut prefix = [0_u8; 8];
-    match stream.read_exact(&mut prefix).await {
+    let read = if db.identity_authority().is_some() {
+        tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut prefix))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "protocol preface timed out")
+            })?
+    } else {
+        stream.read_exact(&mut prefix).await
+    };
+    match read {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
         Err(error) => return Err(error),
     }
     if wire_postgres::is_postgres_prefix(&prefix) {
+        if db.identity_authority().is_some() {
+            if !tls_verified {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "protected PostgreSQL wire requires TLS",
+                ));
+            }
+            return wire_postgres::handle_protected_connection(db, stream, prefix).await;
+        }
         return wire_postgres::handle_connection(db, auth, stream, prefix).await;
     }
     let replay = PrefixedStream::new(prefix.to_vec(), stream);
@@ -229,6 +365,26 @@ pub async fn serve_tls_config_with_auth_and_policy(
     serve_tls_listener_with_config(db, auth, listener, tls, storage_policy).await
 }
 
+pub async fn serve_tls_config_with_auth_and_policy_until(
+    db: Db,
+    auth: AuthConfig,
+    addr: SocketAddr,
+    tls: crate::tls::ReloadingTlsConfig,
+    storage_policy: StoragePolicy,
+    shutdown: CancellationToken,
+) -> std::io::Result<()> {
+    let listener = TcpListener::bind(addr).await?;
+    serve_tls_listener_with_acceptor_until(
+        db,
+        auth,
+        listener,
+        TlsAcceptor::from(tls.server_config()),
+        storage_policy,
+        shutdown,
+    )
+    .await
+}
+
 pub async fn serve_tls_listener_with_config(
     db: Db,
     auth: AuthConfig,
@@ -270,13 +426,55 @@ async fn serve_tls_listener_with_acceptor(
     acceptor: TlsAcceptor,
     storage_policy: StoragePolicy,
 ) -> std::io::Result<()> {
+    serve_tls_listener_with_acceptor_until(
+        db,
+        auth,
+        listener,
+        acceptor,
+        storage_policy,
+        CancellationToken::new(),
+    )
+    .await
+}
+
+async fn serve_tls_listener_with_acceptor_until(
+    db: Db,
+    auth: AuthConfig,
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    storage_policy: StoragePolicy,
+    shutdown: CancellationToken,
+) -> std::io::Result<()> {
+    let mut connections = JoinSet::new();
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let accepted = tokio::select! {
+            _ = shutdown.cancelled() => break,
+            accepted = listener.accept() => accepted,
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    tracing::warn!(%error, "ChironWire TLS connection task panicked");
+                }
+                continue;
+            }
+        };
+        let (stream, peer) = accepted?;
+        let (connection, control_only) = if let Some(authority) = db.identity_authority() {
+            match authority.wire_connection_pool().try_acquire_owned() {
+                Ok(permit) => (Some(permit), false),
+                Err(_) => match authority.wire_control_pool().try_acquire_owned() {
+                    Ok(permit) => (Some(permit), true),
+                    Err(_) => continue,
+                },
+            }
+        } else {
+            (None, false)
+        };
         let db = db.clone();
         let auth = auth.clone();
         let acceptor = acceptor.clone();
         let storage_policy = storage_policy.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
+            let _connection = connection;
             let result = async {
                 let mut stream = stream;
                 let mut prefix = [0_u8; 8];
@@ -320,9 +518,17 @@ async fn serve_tls_listener_with_acceptor(
                                     "PostgreSQL TLS handshake timed out",
                                 )
                             })??;
-                    return dispatch_by_first_bytes(db, auth, storage_policy, stream).await;
+                    if control_only {
+                        return dispatch_cancel_connection(db, stream).await;
+                    }
+                    return dispatch_by_first_bytes(db, auth, storage_policy, stream, true).await;
                 }
 
+                if control_only {
+                    return Err(std::io::Error::other(
+                        "regular connection capacity exhausted",
+                    ));
+                }
                 // Native ChironWire uses direct TLS on the same port. Replay
                 // the bytes consumed for protocol detection into rustls.
                 let replay = PrefixedStream::new(prefix.to_vec(), stream);
@@ -334,7 +540,9 @@ async fn serve_tls_listener_with_acceptor(
                             "ChironWire TLS handshake timed out",
                         )
                     })??;
-                dispatch_by_first_bytes(db, auth, storage_policy, stream).await
+                // Direct TLS is ChironWire only. PostgreSQL must first send
+                // SSLRequest on the plain socket, then complete TLS.
+                dispatch_by_first_bytes(db, auth, storage_policy, stream, false).await
             }
             .await;
             if let Err(error) = result {
@@ -342,6 +550,36 @@ async fn serve_tls_listener_with_acceptor(
             }
         });
     }
+    drain_connection_tasks(&mut connections).await;
+    Ok(())
+}
+
+async fn dispatch_cancel_connection<S>(db: Db, mut stream: S) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut prefix = [0u8; 8];
+    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut prefix))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "cancel preface timed out")
+        })??;
+    if u32::from_be_bytes(prefix[..4].try_into().expect("fixed length")) != 16
+        || u32::from_be_bytes(prefix[4..].try_into().expect("fixed magic"))
+            != wire_postgres::CANCEL_REQUEST_MAGIC
+    {
+        wire_postgres::write_error_response(
+            &mut stream,
+            "FATAL",
+            "53300",
+            "regular connection capacity exhausted",
+            None,
+        )
+        .await?;
+        stream.shutdown().await?;
+        return Ok(());
+    }
+    wire_postgres::handle_protected_connection(db, stream, prefix).await
 }
 
 pub async fn send_request(
@@ -409,7 +647,18 @@ where
     let writer_task = tokio::spawn(write_responses(writer, response_receiver));
     let mut read_tasks = JoinSet::new();
 
-    while let Some(frame) = read_frame(&mut reader).await? {
+    loop {
+        let (frame, frame_permit) = if let Some(authority) = db.identity_authority() {
+            match read_protected_frame(&mut reader, authority.frame_pool()).await? {
+                Some((frame, permit)) => (Some(frame), Some(permit)),
+                None => (None, None),
+            }
+        } else {
+            (read_frame(&mut reader).await?, None)
+        };
+        let Some(frame) = frame else {
+            break;
+        };
         let request = match pb::WireRequest::decode(frame.as_slice()) {
             Ok(request) => request,
             Err(error) => {
@@ -424,6 +673,41 @@ where
                 continue;
             }
         };
+        if db.is_shutting_down() {
+            send_wire_response(
+                &response_sender,
+                error_response(
+                    request.request_id,
+                    Status::unavailable("server is shutting down"),
+                ),
+            )
+            .await?;
+            break;
+        }
+
+        // Unauthenticated frame buffers cannot consume authenticated work capacity.
+        let work = if let Some(authority) = db.identity_authority() {
+            if let Err(error) = authority.authenticate(&request.api_key) {
+                send_wire_response(
+                    &response_sender,
+                    error_response(
+                        request.request_id,
+                        crate::grpc_protected::authentication_error(error),
+                    ),
+                )
+                .await?;
+                continue;
+            }
+            Some(Arc::new(
+                authority
+                    .work_pool()
+                    .try_acquire_owned()
+                    .map_err(|_| std::io::Error::other("server overloaded"))?,
+            ))
+        } else {
+            None
+        };
+        drop(frame_permit);
 
         if is_read_only_operation(&request.operation) {
             let db = db.clone();
@@ -438,16 +722,22 @@ where
                 // MultiSearch on the same connection). The +20-50µs
                 // spawn_blocking overhead is acceptable for correct
                 // out-of-order response delivery.
-                let response = dispatch_request_blocking(db, auth, storage_policy, request).await?;
+                let response =
+                    dispatch_request_blocking(db, auth, storage_policy, request, work).await?;
                 send_wire_response(&response_sender, response).await
             });
             continue;
         }
 
         drain_read_tasks(&mut read_tasks).await?;
-        let response =
-            dispatch_request_blocking(db.clone(), auth.clone(), storage_policy.clone(), request)
-                .await?;
+        let response = dispatch_request_blocking(
+            db.clone(),
+            auth.clone(),
+            storage_policy.clone(),
+            request,
+            work,
+        )
+        .await?;
         send_wire_response(&response_sender, response).await?;
     }
 
@@ -459,23 +749,38 @@ where
 
 async fn write_responses<W>(
     mut writer: W,
-    mut receiver: mpsc::Receiver<pb::WireResponse>,
+    mut receiver: mpsc::Receiver<Outbound>,
 ) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
     while let Some(response) = receiver.recv().await {
-        write_frame(&mut writer, &response).await?;
+        if let Some(guard) = &response.guard {
+            let mut writer = GuardedWriter {
+                writer: &mut writer,
+                guard,
+            };
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                write_frame(&mut writer, &response.response),
+            )
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "wire output timed out")
+            })??;
+        } else {
+            write_frame(&mut writer, &response.response).await?;
+        }
     }
     Ok(())
 }
 
 async fn send_wire_response(
-    sender: &mpsc::Sender<pb::WireResponse>,
-    response: pb::WireResponse,
+    sender: &mpsc::Sender<Outbound>,
+    response: impl Into<Outbound>,
 ) -> std::io::Result<()> {
     sender
-        .send(response)
+        .send(response.into())
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "GaussWire writer closed"))
 }
@@ -488,19 +793,49 @@ async fn drain_read_tasks(tasks: &mut JoinSet<std::io::Result<()>>) -> std::io::
 }
 
 fn is_read_only_operation(operation: &Option<wire_request::Operation>) -> bool {
-    matches!(
-        operation,
-        Some(wire_request::Operation::Health(_))
-            | Some(wire_request::Operation::ListCollections(_))
-            | Some(wire_request::Operation::Search(_))
-            | Some(wire_request::Operation::HybridSearch(_))
-            | Some(wire_request::Operation::TextHybridSearch(_))
-            | Some(wire_request::Operation::MultiSearch(_))
-            | Some(wire_request::Operation::Recommend(_))
-            | Some(wire_request::Operation::Count(_))
-            | Some(wire_request::Operation::Scroll(_))
-            | Some(wire_request::Operation::GetPoints(_))
-    )
+    match operation {
+        Some(wire_request::Operation::Sql(request)) => wire_sql_action(request) == Action::Read,
+        Some(wire_request::Operation::SqlTransaction(request)) => {
+            wire_sql_transaction_action(request) == Action::Read
+        }
+        Some(
+            wire_request::Operation::Health(_)
+            | wire_request::Operation::ListCollections(_)
+            | wire_request::Operation::Search(_)
+            | wire_request::Operation::HybridSearch(_)
+            | wire_request::Operation::TextHybridSearch(_)
+            | wire_request::Operation::MultiSearch(_)
+            | wire_request::Operation::Recommend(_)
+            | wire_request::Operation::Count(_)
+            | wire_request::Operation::Scroll(_)
+            | wire_request::Operation::GetPoints(_),
+        ) => true,
+        _ => false,
+    }
+}
+
+fn wire_sql_action(request: &pb::WireSqlRequest) -> Action {
+    match serde_json::from_str::<crate::SqlExecutionRequest>(&request.request_json) {
+        Ok(request) if crate::RelationalEngine::request_is_read_only(&request).unwrap_or(false) => {
+            Action::Read
+        }
+        _ => Action::Write,
+    }
+}
+
+fn wire_sql_transaction_action(request: &pb::WireSqlTransactionRequest) -> Action {
+    match request.action.as_str() {
+        "begin" | "rollback" => Action::Read,
+        "execute" => request
+            .request_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<crate::SqlExecutionRequest>(json).ok())
+            .filter(|request| {
+                crate::RelationalEngine::request_is_read_only(request).unwrap_or(false)
+            })
+            .map_or(Action::Write, |_| Action::Read),
+        _ => Action::Write,
+    }
 }
 
 async fn dispatch_request_blocking(
@@ -508,10 +843,286 @@ async fn dispatch_request_blocking(
     auth: AuthConfig,
     storage_policy: StoragePolicy,
     request: pb::WireRequest,
-) -> std::io::Result<pb::WireResponse> {
-    tokio::task::spawn_blocking(move || dispatch_request(&db, &auth, &storage_policy, request))
-        .await
-        .map_err(std::io::Error::other)
+    work: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+) -> std::io::Result<Outbound> {
+    tokio::task::spawn_blocking(move || {
+        if db.identity_authority().is_some() {
+            dispatch_protected_request(&db, request, work)
+        } else {
+            dispatch_request(&db, &auth, &storage_policy, request)
+        }
+    })
+    .await
+    .map_err(std::io::Error::other)
+}
+
+fn dispatch_protected_request(
+    db: &Db,
+    request: pb::WireRequest,
+    work: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+) -> Outbound {
+    let id = request.request_id;
+    let result = (|| {
+        if work.is_none() {
+            return Err(Status::unavailable("admission is missing"));
+        }
+        let authority = db
+            .identity_authority()
+            .ok_or_else(|| Status::unavailable("authority unavailable"))?;
+        let identity = authority
+            .authenticate(&request.api_key)
+            .map_err(crate::grpc_protected::authentication_error)?;
+        let identity = db
+            .management_identity(&identity)
+            .map_err(crate::grpc::status_from_error)?;
+        let output_admission;
+        let (payload, guard) = match request.operation {
+            Some(wire_request::Operation::GetPoints(query)) => {
+                let context = db
+                    .bind_access(
+                        &identity,
+                        &query.collection,
+                        &identity.principal().tenant,
+                        crate::security::Action::Read,
+                    )
+                    .map_err(crate::grpc::status_from_error)?;
+                let output = db
+                    .get_points_authorized(&context, &query.ids)
+                    .map_err(crate::grpc_protected::engine_error)?;
+                let guard =
+                    crate::chironql_protected::PublicationGuard::Data(output.publication_context());
+                let (encoded, admission) = output
+                    .publish(crate::response_output::points)
+                    .map_err(crate::grpc_protected::engine_error)??;
+                output_admission = Some(admission);
+                (wire_response::Payload::GetPoints(encoded), guard)
+            }
+            Some(wire_request::Operation::Scroll(query)) => {
+                let context = db
+                    .bind_access(
+                        &identity,
+                        &query.collection,
+                        &identity.principal().tenant,
+                        crate::security::Action::Read,
+                    )
+                    .map_err(crate::grpc::status_from_error)?;
+                let output = db
+                    .scroll_authorized(
+                        &context,
+                        crate::model::ScrollRequest {
+                            offset: crate::grpc::optional_string(query.offset),
+                            limit: crate::grpc::scroll_limit_or_default(query.limit)?,
+                            filter: crate::grpc::filter_from_json(&query.filter_json)?,
+                        },
+                    )
+                    .map_err(crate::grpc_protected::engine_error)?;
+                let guard =
+                    crate::chironql_protected::PublicationGuard::Data(output.publication_context());
+                let (encoded, admission) = output
+                    .publish(crate::response_output::scroll)
+                    .map_err(crate::grpc_protected::engine_error)??;
+                output_admission = Some(admission);
+                (wire_response::Payload::Scroll(encoded), guard)
+            }
+            Some(wire_request::Operation::TextHybridSearch(query)) => {
+                let context = db
+                    .bind_access(
+                        &identity,
+                        &query.collection,
+                        &identity.principal().tenant,
+                        crate::security::Action::Search,
+                    )
+                    .map_err(crate::grpc::status_from_error)?;
+                let output = db
+                    .text_hybrid_search_authorized(
+                        &context,
+                        crate::grpc::text_hybrid_from_proto(&query)?,
+                        Some(identity.cancelled()),
+                    )
+                    .map_err(crate::grpc_protected::engine_error)?;
+                let guard =
+                    crate::chironql_protected::PublicationGuard::Data(output.publication_context());
+                let (encoded, admission) = output
+                    .publish(crate::grpc::protected_hits_to_proto)
+                    .map_err(crate::grpc_protected::engine_error)??;
+                output_admission = Some(admission);
+                (wire_response::Payload::Search(encoded), guard)
+            }
+            Some(wire_request::Operation::Chironql(query)) => {
+                if query.deferred_session_id.is_some() {
+                    return Err(Status::permission_denied(
+                        "deferred sessions are unavailable",
+                    ));
+                }
+                let output = crate::chironql_protected::execute(
+                    db,
+                    &request.api_key,
+                    &chirondb_types::chironql::ChironQlRequest {
+                        query: query.query,
+                        collection: query.collection,
+                        trace: query.trace,
+                        confirm: query.confirm,
+                        parameters: query
+                            .parameters_json
+                            .as_deref()
+                            .map(serde_json::from_str::<Vec<crate::RelationalValue>>)
+                            .transpose()
+                            .map_err(|_| {
+                                Status::invalid_argument("invalid ChironQL parameters_json")
+                            })?
+                            .unwrap_or_default(),
+                        idempotency_key: query.idempotency_key,
+                        retry_id: query.retry_id,
+                    },
+                )
+                .map_err(crate::grpc_protected::error_status)?;
+                let guard = output.guard();
+                let (encoded, admission) = output
+                    .publish(crate::response_output::chironql)
+                    .map_err(|_| Status::permission_denied("authorization was revoked"))??;
+                output_admission = Some(admission);
+                (
+                    wire_response::Payload::Chironql(pb::WireChironQlResponse {
+                        kind: encoded.kind,
+                        columns: encoded.columns,
+                        rows_json: encoded.rows_json,
+                        stats_json: encoded.stats_json,
+                        next: encoded.next,
+                        query_id: encoded.query_id,
+                        trace_json: encoded.trace_json,
+                        credential_json: encoded.credential_json,
+                        column_types_json: encoded.column_types_json,
+                        domains: encoded.domains,
+                        snapshot_id: encoded.snapshot_id,
+                        transaction_id: encoded.transaction_id,
+                        committed: encoded.committed,
+                    }),
+                    guard,
+                )
+            }
+            Some(wire_request::Operation::Sql(sql)) => {
+                let sql_request =
+                    serde_json::from_str::<crate::SqlExecutionRequest>(&sql.request_json)
+                        .map_err(|_| Status::invalid_argument("invalid SQL request"))?;
+                let response = db
+                    .execute_sql_authorized_owned(&identity, sql_request, "chironwire-protected")
+                    .map_err(crate::grpc::status_from_error)?;
+                let reference = db
+                    .sql_reference_publication_context(&identity, &response.results)
+                    .map_err(crate::grpc::status_from_error)?;
+                let (response_json, admission) = crate::response_output::wire_json(&response)?;
+                output_admission = Some(admission);
+                (
+                    wire_response::Payload::Sql(pb::WireSqlResponse { response_json }),
+                    match reference {
+                        Some(context) => crate::chironql_protected::PublicationGuard::Data(context),
+                        None => crate::chironql_protected::PublicationGuard::Identity(identity),
+                    },
+                )
+            }
+            Some(wire_request::Operation::SqlTransaction(transaction)) => {
+                let mut reference = None;
+                let (response_json, admission) = match transaction.action.as_str() {
+                    "begin" => crate::response_output::wire_json(
+                        &db.begin_sql_transaction_authorized(&identity, "chironwire-protected")
+                            .map_err(crate::grpc::status_from_error)?,
+                    ),
+                    "execute" => {
+                        let handle = transaction.handle.as_deref().ok_or_else(|| {
+                            Status::invalid_argument("transaction handle is required")
+                        })?;
+                        let sql_request = serde_json::from_str::<crate::SqlExecutionRequest>(
+                            transaction.request_json.as_deref().ok_or_else(|| {
+                                Status::invalid_argument("transaction request_json is required")
+                            })?,
+                        )
+                        .map_err(|_| Status::invalid_argument("invalid SQL request"))?;
+                        let response = db
+                            .execute_sql_transaction_authorized_owned(
+                                &identity,
+                                handle,
+                                sql_request,
+                                "chironwire-protected",
+                            )
+                            .map_err(crate::grpc::status_from_error)?;
+                        reference = db
+                            .sql_reference_publication_context(&identity, &response.results)
+                            .map_err(crate::grpc::status_from_error)?;
+                        crate::response_output::wire_json(&response)
+                    }
+                    "commit" => {
+                        let handle = transaction.handle.as_deref().ok_or_else(|| {
+                            Status::invalid_argument("transaction handle is required")
+                        })?;
+                        crate::response_output::wire_json(
+                            &db.commit_sql_transaction_authorized_owned(
+                                &identity,
+                                handle,
+                                "chironwire-protected",
+                            )
+                            .map_err(crate::grpc::status_from_error)?,
+                        )
+                    }
+                    "rollback" => {
+                        let handle = transaction.handle.as_deref().ok_or_else(|| {
+                            Status::invalid_argument("transaction handle is required")
+                        })?;
+                        crate::response_output::wire_json(
+                            &db.rollback_sql_transaction_authorized(
+                                &identity,
+                                handle,
+                                "chironwire-protected",
+                            )
+                            .map_err(crate::grpc::status_from_error)?,
+                        )
+                    }
+                    action => {
+                        return Err(Status::invalid_argument(format!(
+                            "unknown SQL transaction action {action}"
+                        )));
+                    }
+                }?;
+                output_admission = Some(admission);
+                (
+                    wire_response::Payload::Sql(pb::WireSqlResponse { response_json }),
+                    match reference {
+                        Some(context) => crate::chironql_protected::PublicationGuard::Data(context),
+                        None => crate::chironql_protected::PublicationGuard::Identity(identity),
+                    },
+                )
+            }
+            _ => {
+                return Err(Status::permission_denied(
+                    "operation is unavailable on protected authority",
+                ));
+            }
+        };
+        let response = pb::WireResponse {
+            request_id: id,
+            error_code: String::new(),
+            error_message: String::new(),
+            error_details_json: None,
+            payload: Some(payload),
+        };
+        if response.encoded_len() > 8 * 1024 * 1024 {
+            return Err(Status::resource_exhausted("output limit exceeded"));
+        }
+        Ok((response, guard, output_admission))
+    })();
+    match result {
+        Ok((response, guard, admission)) => Outbound {
+            response,
+            _output_admission: admission,
+            guard: Some(guard),
+            _work: work,
+        },
+        Err(status) => Outbound {
+            response: error_response(id, status),
+            _output_admission: None,
+            guard: None,
+            _work: work,
+        },
+    }
 }
 
 fn dispatch_request(
@@ -519,6 +1130,23 @@ fn dispatch_request(
     auth: &AuthConfig,
     storage_policy: &StoragePolicy,
     request: pb::WireRequest,
+) -> Outbound {
+    let mut output_admission = None;
+    let response = dispatch_request_inner(db, auth, storage_policy, request, &mut output_admission);
+    Outbound {
+        response,
+        _output_admission: output_admission,
+        guard: None,
+        _work: None,
+    }
+}
+
+fn dispatch_request_inner(
+    db: &Db,
+    auth: &AuthConfig,
+    storage_policy: &StoragePolicy,
+    request: pb::WireRequest,
+    output_admission: &mut Option<crate::response_output::SharedAdmission>,
 ) -> pb::WireResponse {
     let request_id = request.request_id;
     let api_key = optional_api_key(&request.api_key);
@@ -556,6 +1184,7 @@ fn dispatch_request(
     let (action, collection) = wire_policy(operation);
     let collection = collection.map(str::to_string);
     let is_chironql = matches!(operation, wire_request::Operation::Chironql(_));
+    let is_health = matches!(operation, wire_request::Operation::Health(_));
     if db
         .audit_access_event(
             "authentication",
@@ -631,13 +1260,26 @@ fn dispatch_request(
             Status::resource_exhausted("rate limit exceeded"),
         );
     }
-    let Some(_work_permit) = auth.try_begin_work(&principal) else {
-        metrics::counter!("gaussdb_work_limited_requests_total", "transport" => "wire")
-            .increment(1);
-        return error_response(request_id, Status::resource_exhausted("server overloaded"));
+    // The constant-time readiness probe must remain available while data work is
+    // saturated. Authentication, authorization, rate limiting and audit still apply.
+    let _work_permit = if is_health {
+        None
+    } else {
+        let Some(permit) = auth.try_begin_work(&principal) else {
+            metrics::counter!("gaussdb_work_limited_requests_total", "transport" => "wire")
+                .increment(1);
+            return error_response(request_id, Status::resource_exhausted("server overloaded"));
+        };
+        Some(permit)
     };
 
-    let result = dispatch_operation(db, &principal, storage_policy, request.operation);
+    let result = dispatch_operation(
+        db,
+        &principal,
+        storage_policy,
+        request.operation,
+        output_admission,
+    );
     if (action == Action::Read || is_chironql)
         && db
             .audit_access_event(
@@ -682,11 +1324,11 @@ fn wire_policy(operation: &wire_request::Operation) -> (Action, Option<&str>) {
             (Action::Read, None)
         }
         wire_request::Operation::CreateCollection(request) => (
-            Action::Write,
+            Action::Admin,
             request.config.as_ref().map(|config| config.name.as_str()),
         ),
         wire_request::Operation::UpdatePayloadSchema(request) => {
-            (Action::Write, Some(&request.collection))
+            (Action::Admin, Some(&request.collection))
         }
         wire_request::Operation::Upsert(request) => (Action::Write, Some(&request.collection)),
         wire_request::Operation::Delete(request) => (Action::Write, Some(&request.collection)),
@@ -699,10 +1341,10 @@ fn wire_policy(operation: &wire_request::Operation) -> (Action, Option<&str>) {
         wire_request::Operation::Recommend(request) => (Action::Read, Some(&request.collection)),
         wire_request::Operation::Count(request) => (Action::Read, Some(&request.collection)),
         wire_request::Operation::Scroll(request) => (Action::Read, Some(&request.collection)),
-        wire_request::Operation::Compact(request) => (Action::Write, Some(&request.collection)),
-        wire_request::Operation::TierCold(request) => (Action::Write, Some(&request.collection)),
+        wire_request::Operation::Compact(request) => (Action::Admin, Some(&request.collection)),
+        wire_request::Operation::TierCold(request) => (Action::Admin, Some(&request.collection)),
         wire_request::Operation::PruneWalArchive(request) => {
-            (Action::Write, Some(&request.collection))
+            (Action::Admin, Some(&request.collection))
         }
         wire_request::Operation::Snapshot(_)
         | wire_request::Operation::Restore(_)
@@ -713,6 +1355,10 @@ fn wire_policy(operation: &wire_request::Operation) -> (Action, Option<&str>) {
             (Action::Write, Some(&request.collection))
         }
         wire_request::Operation::Chironql(request) => (Action::Read, request.collection.as_deref()),
+        wire_request::Operation::Sql(request) => (wire_sql_action(request), None),
+        wire_request::Operation::SqlTransaction(request) => {
+            (wire_sql_transaction_action(request), None)
+        }
     }
 }
 
@@ -757,6 +1403,7 @@ fn dispatch_operation(
     principal: &Permission,
     storage_policy: &StoragePolicy,
     operation: Option<wire_request::Operation>,
+    output_admission: &mut Option<crate::response_output::SharedAdmission>,
 ) -> Result<wire_response::Payload, Status> {
     let operation = operation.ok_or_else(|| Status::invalid_argument("operation is required"))?;
     match operation {
@@ -1143,6 +1790,13 @@ fn dispatch_operation(
             }))
         }
         wire_request::Operation::Chironql(request) => {
+            let parameters = request
+                .parameters_json
+                .as_deref()
+                .map(serde_json::from_str::<Vec<crate::RelationalValue>>)
+                .transpose()
+                .map_err(|_| Status::invalid_argument("invalid ChironQL parameters_json"))?
+                .unwrap_or_default();
             let mut session = crate::chironql_exec::Session {
                 collection: request.collection,
                 graph_deferred_session: request
@@ -1158,30 +1812,121 @@ fn dispatch_operation(
                     .then(|| principal.allowed_collections().into_iter().collect()),
                 want_trace: request.trace,
                 confirm: request.confirm,
+                parameters,
+                idempotency_key: request.idempotency_key,
+                retry_id: request.retry_id,
                 tenant: principal.tenant_scope(principal.id.clone()),
             };
-            crate::chironql_exec::execute(&mut ctx, &request.query)
-                .map(|response| {
-                    wire_response::Payload::Chironql(pb::WireChironQlResponse {
-                        kind: match response.kind {
-                            chirondb_types::chironql::ChironQlKind::Rows => "rows",
-                            chirondb_types::chironql::ChironQlKind::Affected => "affected",
-                            chirondb_types::chironql::ChironQlKind::Empty => "empty",
-                        }
-                        .to_string(),
-                        columns: response.columns,
-                        rows_json: response.rows.iter().map(ToString::to_string).collect(),
-                        stats_json: serde_json::to_string(&response.stats)
-                            .unwrap_or_else(|_| "{}".to_string()),
-                        next: response.next,
-                        query_id: response.query_id,
-                        trace_json: response
-                            .trace
-                            .as_ref()
-                            .and_then(|trace| serde_json::to_string(trace).ok()),
-                    })
-                })
-                .map_err(grpc::chironql_status)
+            let value = crate::chironql_exec::execute_owned(&mut ctx, &request.query)
+                .map_err(grpc::chironql_status)?;
+            let (encoded, admission) = value
+                .consume(crate::response_output::chironql)
+                .map_err(crate::grpc_protected::engine_error)??;
+            *output_admission = Some(admission);
+            Ok(wire_response::Payload::Chironql(pb::WireChironQlResponse {
+                kind: encoded.kind,
+                columns: encoded.columns,
+                rows_json: encoded.rows_json,
+                stats_json: encoded.stats_json,
+                next: encoded.next,
+                query_id: encoded.query_id,
+                trace_json: encoded.trace_json,
+                credential_json: encoded.credential_json,
+                column_types_json: encoded.column_types_json,
+                domains: encoded.domains,
+                snapshot_id: encoded.snapshot_id,
+                transaction_id: encoded.transaction_id,
+                committed: encoded.committed,
+            }))
+        }
+
+        wire_request::Operation::Sql(request) => {
+            let request = serde_json::from_str::<crate::SqlExecutionRequest>(&request.request_json)
+                .map_err(|error| {
+                    Status::invalid_argument(format!("invalid SQL request: {error}"))
+                })?;
+            let action = if db
+                .sql_request_is_read_only(&request)
+                .map_err(grpc::status_from_error)?
+            {
+                Action::Read
+            } else {
+                Action::Write
+            };
+            authorize(principal, action, None)
+                .map_err(|_| Status::permission_denied("operation is not permitted"))?;
+            let audit_context = chirondb_core::audit::AuditContext {
+                principal_id: principal.id.clone(),
+                tenant_id: principal.tenant_id.clone(),
+                transport: "chironwire".to_string(),
+                request_id: request.retry_id.clone(),
+            };
+            let response = db
+                .execute_sql_with_audit_owned(request, &audit_context)
+                .map_err(grpc::status_from_error)?;
+            let (response_json, admission) = crate::response_output::wire_json(&response)?;
+            *output_admission = Some(admission);
+            Ok(wire_response::Payload::Sql(pb::WireSqlResponse {
+                response_json,
+            }))
+        }
+        wire_request::Operation::SqlTransaction(request) => {
+            let audit_context = chirondb_core::audit::AuditContext {
+                principal_id: principal.id.clone(),
+                tenant_id: principal.tenant_id.clone(),
+                transport: "chironwire".to_string(),
+                request_id: request.handle.clone(),
+            };
+            let (response_json, admission) = match request.action.as_str() {
+                "begin" => crate::response_output::wire_json(
+                    &db.begin_sql_transaction(&audit_context)
+                        .map_err(grpc::status_from_error)?,
+                ),
+                "execute" => {
+                    let handle = request.handle.as_deref().ok_or_else(|| {
+                        Status::invalid_argument("transaction handle is required")
+                    })?;
+                    let sql_request = serde_json::from_str::<crate::SqlExecutionRequest>(
+                        request.request_json.as_deref().ok_or_else(|| {
+                            Status::invalid_argument("transaction request_json is required")
+                        })?,
+                    )
+                    .map_err(|error| {
+                        Status::invalid_argument(format!("invalid SQL request: {error}"))
+                    })?;
+                    crate::response_output::wire_json(
+                        &db.execute_sql_transaction_owned(handle, sql_request, &audit_context)
+                            .map_err(grpc::status_from_error)?,
+                    )
+                }
+                "commit" => {
+                    let handle = request.handle.as_deref().ok_or_else(|| {
+                        Status::invalid_argument("transaction handle is required")
+                    })?;
+                    crate::response_output::wire_json(
+                        &db.commit_sql_transaction_owned(handle, &audit_context)
+                            .map_err(grpc::status_from_error)?,
+                    )
+                }
+                "rollback" => {
+                    let handle = request.handle.as_deref().ok_or_else(|| {
+                        Status::invalid_argument("transaction handle is required")
+                    })?;
+                    crate::response_output::wire_json(
+                        &db.rollback_sql_transaction(handle, &audit_context)
+                            .map_err(grpc::status_from_error)?,
+                    )
+                }
+                action => {
+                    return Err(Status::invalid_argument(format!(
+                        "unknown SQL transaction action {action}"
+                    )));
+                }
+            }?;
+            *output_admission = Some(admission);
+            Ok(wire_response::Payload::Sql(pb::WireSqlResponse {
+                response_json,
+            }))
         }
     }
 }
@@ -1190,21 +1935,56 @@ async fn read_frame<S>(stream: &mut S) -> std::io::Result<Option<Vec<u8>>>
 where
     S: AsyncRead + Unpin,
 {
+    read_frame_with_limit(stream, MAX_FRAME_LEN).await
+}
+
+async fn read_frame_with_limit<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    limit: usize,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let Some(len) = read_frame_length(stream, limit).await? else {
+        return Ok(None);
+    };
+    let mut frame = vec![0_u8; len];
+    stream.read_exact(&mut frame).await?;
+    Ok(Some(frame))
+}
+
+async fn read_protected_frame<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    pool: Arc<tokio::sync::Semaphore>,
+) -> std::io::Result<Option<(Vec<u8>, tokio::sync::OwnedSemaphorePermit)>> {
+    // Idle connections must not reserve a maximum-sized request buffer.
+    let Some(len) = read_frame_length(stream, 8 * 1024 * 1024).await? else {
+        return Ok(None);
+    };
+    let permit = pool
+        .try_acquire_owned()
+        .map_err(|_| std::io::Error::other("server overloaded"))?;
+    let mut frame = vec![0_u8; len];
+    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut frame))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "wire frame timed out"))??;
+    Ok(Some((frame, permit)))
+}
+
+async fn read_frame_length<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    limit: usize,
+) -> std::io::Result<Option<usize>> {
     let mut len = [0_u8; 4];
     if stream.read(&mut len[..1]).await? == 0 {
         return Ok(None);
     }
     stream.read_exact(&mut len[1..]).await?;
     let len = u32::from_be_bytes(len) as usize;
-    if len > MAX_FRAME_LEN {
+    if len > limit.min(MAX_FRAME_LEN) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("GaussWire frame too large: {len} bytes"),
         ));
     }
-    let mut frame = vec![0_u8; len];
-    stream.read_exact(&mut frame).await?;
-    Ok(Some(frame))
+    Ok(Some(len))
 }
 
 async fn write_frame<S, M>(stream: &mut S, message: &M) -> std::io::Result<()>
@@ -1212,18 +1992,26 @@ where
     S: AsyncWrite + Unpin,
     M: Message,
 {
-    let mut frame = Vec::with_capacity(message.encoded_len());
-    message.encode(&mut frame).map_err(std::io::Error::other)?;
-    if frame.len() > MAX_FRAME_LEN {
+    let length = message.encoded_len();
+    if length > MAX_FRAME_LEN {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("GaussWire frame too large: {} bytes", frame.len()),
+            format!("GaussWire frame too large: {length} bytes"),
         ));
     }
-    stream
-        .write_all(&(frame.len() as u32).to_be_bytes())
-        .await?;
-    stream.write_all(&frame).await?;
+    let mut frame = crate::response_buffer::ResponseBuffer::allocate(length, MAX_FRAME_LEN)
+        .map_err(std::io::Error::other)?;
+    let mut remaining = frame.as_mut();
+    message
+        .encode(&mut remaining)
+        .map_err(std::io::Error::other)?;
+    if !remaining.is_empty() {
+        return Err(std::io::Error::other(
+            "wire message length changed during encoding",
+        ));
+    }
+    stream.write_all(&(length as u32).to_be_bytes()).await?;
+    stream.write_all(frame.as_ref()).await?;
     stream.flush().await
 }
 
@@ -1300,9 +2088,189 @@ fn code_name(code: Code) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use tokio::io::AsyncWriteExt;
+    use std::time::Duration;
 
-    use super::read_frame;
+    use tokio::io::AsyncWriteExt;
+    use tokio_util::sync::CancellationToken;
+
+    use super::{read_frame, read_protected_frame, serve_listener_with_policy_until};
+
+    #[test]
+    fn legacy_health_preserves_authentication_when_data_work_is_saturated() {
+        let data = tempfile::tempdir().unwrap();
+        let db = crate::Db::open(data.path()).unwrap();
+        let auth = crate::auth::AuthConfig::from_optional_key(Some("health-key".into()));
+        let principal = auth.permission_for(Some("health-key")).unwrap();
+        let mut permits = Vec::new();
+        while let Some(permit) = auth.try_begin_work(&principal) {
+            permits.push(permit);
+        }
+        assert!(!permits.is_empty());
+        let policy = crate::security_paths::StoragePolicy::default();
+        let request = |id, key: &str, operation| super::pb::WireRequest {
+            request_id: id,
+            api_key: key.into(),
+            operation: Some(operation),
+        };
+        let health = super::dispatch_request(
+            &db,
+            &auth,
+            &policy,
+            request(
+                1,
+                "health-key",
+                super::wire_request::Operation::Health(super::pb::HealthRequest {}),
+            ),
+        )
+        .response;
+        assert!(health.error_code.is_empty(), "{health:?}");
+        assert!(matches!(
+            health.payload,
+            Some(super::wire_response::Payload::Health(_))
+        ));
+        let denied = super::dispatch_request(
+            &db,
+            &auth,
+            &policy,
+            request(
+                2,
+                "",
+                super::wire_request::Operation::Health(super::pb::HealthRequest {}),
+            ),
+        )
+        .response;
+        assert_eq!(denied.error_code, "UNAUTHENTICATED");
+        let query = super::dispatch_request(
+            &db,
+            &auth,
+            &policy,
+            request(
+                3,
+                "health-key",
+                super::wire_request::Operation::ListCollections(
+                    super::pb::ListCollectionsRequest {},
+                ),
+            ),
+        )
+        .response;
+        assert_eq!(query.error_code, "RESOURCE_EXHAUSTED");
+        assert!(auth.try_begin_work(&principal).is_none());
+        drop(permits);
+        assert!(auth.try_begin_work(&principal).is_some());
+    }
+
+    #[tokio::test]
+    async fn wire_output_checks_size_before_encoder_and_fixed_frame_roundtrips() {
+        struct Oversized;
+        impl prost::Message for Oversized {
+            fn encoded_len(&self) -> usize {
+                super::MAX_FRAME_LEN + 1
+            }
+            fn encode_raw(&self, _: &mut impl prost::bytes::BufMut) {
+                panic!("oversized output must not invoke encoder");
+            }
+            fn merge_field(
+                &mut self,
+                tag: u32,
+                wire: prost::encoding::WireType,
+                buffer: &mut impl prost::bytes::Buf,
+                context: prost::encoding::DecodeContext,
+            ) -> Result<(), prost::DecodeError> {
+                prost::encoding::skip_field(wire, tag, buffer, context)
+            }
+            fn clear(&mut self) {}
+        }
+        let mut writer = Vec::new();
+        let error = super::write_frame(&mut writer, &Oversized)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(writer.is_empty());
+        let message = super::pb::WireResponse {
+            request_id: 17,
+            error_code: String::new(),
+            error_message: String::new(),
+            error_details_json: None,
+            payload: Some(super::wire_response::Payload::Search(
+                super::pb::SearchResponse {
+                    hits: vec![super::pb::SearchHit {
+                        id: "日本語".into(),
+                        score: -0.0,
+                        payload_json: "{\"text\":\"allowed\"}".into(),
+                    }],
+                    ..Default::default()
+                },
+            )),
+        };
+        super::write_frame(&mut writer, &message).await.unwrap();
+        let length = u32::from_be_bytes(writer[..4].try_into().unwrap()) as usize;
+        assert_eq!(length, prost::Message::encoded_len(&message));
+        let decoded: super::pb::WireResponse = prost::Message::decode(&writer[4..]).unwrap();
+        assert_eq!(decoded, message);
+    }
+
+    #[tokio::test]
+    async fn protected_frames_reserve_after_header_and_release_on_abort() {
+        let pool = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let (mut client, mut server) = tokio::io::duplex(32);
+        let reader_pool = pool.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let reader = tokio::spawn(async move {
+            started.send(()).unwrap();
+            read_protected_frame(&mut server, reader_pool).await
+        });
+        ready.await.unwrap();
+        assert_eq!(
+            pool.available_permits(),
+            1,
+            "idle socket holds no frame slot"
+        );
+        client.write_all(&4u32.to_be_bytes()).await.unwrap();
+        client.write_all(b"test").await.unwrap();
+        let frame = reader.await.unwrap().unwrap().unwrap();
+        assert_eq!(frame.0, b"test");
+        assert_eq!(pool.available_permits(), 0);
+        drop(frame);
+        assert_eq!(pool.available_permits(), 1);
+
+        let occupied = pool.clone().acquire_owned().await.unwrap();
+        let (mut client, mut server) = tokio::io::duplex(8);
+        client
+            .write_all(&(8u32 * 1024 * 1024).to_be_bytes())
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_protected_frame(&mut server, pool.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "server overloaded",
+            "reject before waiting for or allocating the payload"
+        );
+        drop(occupied);
+
+        let (mut client, mut server) = tokio::io::duplex(8);
+        client.write_all(&4096u32.to_be_bytes()).await.unwrap();
+        let reader_pool = pool.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let reader = tokio::spawn(async move {
+            started.send(()).unwrap();
+            read_protected_frame(&mut server, reader_pool).await
+        });
+        ready.await.unwrap();
+        assert_eq!(pool.available_permits(), 0);
+        reader.abort();
+        assert!(reader.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            pool.available_permits(),
+            1,
+            "interrupted payload read releases reservation"
+        );
+    }
 
     #[tokio::test]
     async fn empty_stream_is_clean_eof_but_partial_frame_header_is_not() {
@@ -1315,5 +2283,137 @@ mod tests {
         client.shutdown().await.unwrap();
         let error = read_frame(&mut server).await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_an_idle_connection_within_the_protocol_deadline() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let db = crate::Db::open(directory.path()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let server = tokio::spawn(async move {
+            serve_listener_with_policy_until(
+                db,
+                crate::auth::AuthConfig::disabled(),
+                listener,
+                crate::security_paths::StoragePolicy::default(),
+                server_shutdown,
+            )
+            .await
+        });
+        let _idle = tokio::net::TcpStream::connect(address).await.unwrap();
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(6), server)
+            .await
+            .expect("wire shutdown exceeded protocol deadline")
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod protected_publication_tests {
+    use super::*;
+    #[tokio::test]
+    async fn queued_wire_point_response_revoke_releases_receiving_admission() {
+        let (_directory, authority, key) = crate::chironql_protected::tests::identity_fixture();
+        let identity = authority.authenticate(&key.secret).unwrap();
+        let (message, admission) = crate::response_output::points(vec![crate::Point {
+            id: "visible".into(),
+            vector: vec![1.0],
+            vectors: Default::default(),
+            sparse_vector: None,
+            payload: serde_json::json!({"text":"visible"}),
+        }])
+        .unwrap();
+        let weak = Arc::downgrade(&admission);
+        let reply = Outbound {
+            response: pb::WireResponse {
+                request_id: 1,
+                error_code: String::new(),
+                error_message: String::new(),
+                error_details_json: None,
+                payload: Some(wire_response::Payload::GetPoints(message)),
+            },
+            _output_admission: Some(admission),
+            guard: Some(crate::chironql_protected::PublicationGuard::Identity(
+                identity.clone(),
+            )),
+            _work: Some(Arc::new(authority.work_pool().try_acquire_owned().unwrap())),
+        };
+        let (sender, receiver) = mpsc::channel(1);
+        sender.send(reply).await.unwrap();
+        drop(sender);
+        assert!(weak.upgrade().is_some());
+        authority
+            .revoke_credential(&identity, identity.revision(), &key.id)
+            .unwrap();
+        let mut bytes = Vec::new();
+        assert!(write_responses(&mut bytes, receiver).await.is_err());
+        assert!(bytes.is_empty());
+        assert!(weak.upgrade().is_none());
+        assert_eq!(
+            authority.work_pool().available_permits(),
+            crate::resource_profile::current().query_workers
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_wire_sql_revoke_releases_json_and_codec_admission() {
+        let (_directory, authority, key) = crate::chironql_protected::tests::identity_fixture();
+        let identity = authority.authenticate(&key.secret).unwrap();
+        let (json, admission) = crate::response_output::wire_json(
+            &serde_json::json!({"results":[{"kind":"rows","rows":[["secret"]]}]}),
+        )
+        .unwrap();
+        let weak = Arc::downgrade(&admission);
+        let reply = Outbound {
+            response: pb::WireResponse {
+                request_id: 1,
+                error_code: String::new(),
+                error_message: String::new(),
+                error_details_json: None,
+                payload: Some(wire_response::Payload::Sql(pb::WireSqlResponse {
+                    response_json: json,
+                })),
+            },
+            _output_admission: Some(admission),
+            guard: Some(crate::chironql_protected::PublicationGuard::Identity(
+                identity.clone(),
+            )),
+            _work: None,
+        };
+        let (sender, receiver) = mpsc::channel(1);
+        sender.send(reply).await.unwrap();
+        drop(sender);
+        assert!(weak.upgrade().is_some());
+        authority
+            .revoke_credential(&identity, identity.revision(), &key.id)
+            .unwrap();
+        let mut bytes = Vec::new();
+        assert!(write_responses(&mut bytes, receiver).await.is_err());
+        assert!(bytes.is_empty());
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn queued_wire_reply_cannot_write_after_acknowledged_revocation() {
+        let (_directory, authority, key) = crate::chironql_protected::tests::identity_fixture();
+        let identity = authority.authenticate(&key.secret).unwrap();
+        let guard = crate::chironql_protected::PublicationGuard::Identity(identity.clone());
+        let mut bytes = Vec::new();
+        let mut writer = GuardedWriter {
+            writer: &mut bytes,
+            guard: &guard,
+        };
+        writer.write_all(b"before-revoke").await.unwrap();
+        authority
+            .revoke_credential(&identity, identity.revision(), &key.id)
+            .unwrap();
+        assert!(writer.write_all(b"after-revoke").await.is_err());
+        assert!(writer.flush().await.is_err());
+        assert_eq!(bytes, b"before-revoke");
     }
 }

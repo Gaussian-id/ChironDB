@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_stream::{StreamExt, wrappers::TcpListenerStream};
+use tokio_util::sync::CancellationToken;
 use tonic::{
     Request, Response, Status, service::interceptor::InterceptedService, transport::Server,
 };
@@ -161,6 +162,18 @@ pub struct GrpcServerOptions {
     pub storage_policy: StoragePolicy,
 }
 
+fn protected_server_builder(protected: bool) -> Server {
+    let server = Server::builder();
+    if protected {
+        server
+            .max_concurrent_streams(32)
+            .concurrency_limit_per_connection(32)
+            .timeout(Duration::from_secs(35))
+    } else {
+        server
+    }
+}
+
 pub async fn serve(db: Db, addr: SocketAddr) -> Result<(), tonic::transport::Error> {
     serve_with_auth(db, AuthConfig::disabled(), addr).await
 }
@@ -179,24 +192,33 @@ async fn serve_with_storage_policy(
     addr: SocketAddr,
     storage_policy: StoragePolicy,
 ) -> Result<(), tonic::transport::Error> {
+    let message_limit = if db.identity_authority().is_some() {
+        8 * 1024 * 1024
+    } else {
+        MAX_GRPC_MESSAGE_BYTES
+    };
     let interceptor = GrpcAuthInterceptor::new(auth, db.clone());
     let chiron_service = InterceptedService::new(
         chiron_pb::chiron_db_server::ChironDbServer::new(ChironDbService {
             db: db.clone(),
             storage_policy: storage_policy.clone(),
         })
-        .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
-        .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
+        .max_decoding_message_size(message_limit)
+        .max_encoding_message_size(message_limit),
         interceptor.clone(),
+    );
+    let chiron_service = crate::grpc_protected::GuardedService::new(
+        chiron_service,
+        db.identity_authority().is_some(),
     );
     let service = InterceptedService::new(
         pb::gauss_db_server::GaussDbServer::new(ChironDbService { db, storage_policy })
-            .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
-            .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
+            .max_decoding_message_size(message_limit)
+            .max_encoding_message_size(message_limit),
         interceptor.clone(),
     );
     let reflection = InterceptedService::new(reflection_service(), interceptor);
-    Server::builder()
+    protected_server_builder(message_limit == 8 * 1024 * 1024)
         .add_service(chiron_service)
         .add_service(service)
         .add_service(reflection)
@@ -217,27 +239,36 @@ pub async fn serve_with_options(
     }
 
     let cors = grpc_web_cors(&options.cors_origins)?;
+    let message_limit = if db.identity_authority().is_some() {
+        8 * 1024 * 1024
+    } else {
+        MAX_GRPC_MESSAGE_BYTES
+    };
     let interceptor = GrpcAuthInterceptor::new(auth, db.clone());
     let chiron_service = InterceptedService::new(
         chiron_pb::chiron_db_server::ChironDbServer::new(ChironDbService {
             db: db.clone(),
             storage_policy: options.storage_policy.clone(),
         })
-        .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
-        .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
+        .max_decoding_message_size(message_limit)
+        .max_encoding_message_size(message_limit),
         interceptor.clone(),
+    );
+    let chiron_service = crate::grpc_protected::GuardedService::new(
+        chiron_service,
+        db.identity_authority().is_some(),
     );
     let service = InterceptedService::new(
         pb::gauss_db_server::GaussDbServer::new(ChironDbService {
             db,
             storage_policy: options.storage_policy,
         })
-        .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
-        .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
+        .max_decoding_message_size(message_limit)
+        .max_encoding_message_size(message_limit),
         interceptor.clone(),
     );
     let reflection = InterceptedService::new(reflection_service(), interceptor);
-    Server::builder()
+    protected_server_builder(message_limit == 8 * 1024 * 1024)
         .accept_http1(true)
         .layer(cors)
         .layer(GrpcWebLayer::new())
@@ -246,6 +277,67 @@ pub async fn serve_with_options(
         .add_service(reflection)
         .serve(addr)
         .await?;
+    Ok(())
+}
+
+pub async fn serve_with_options_until(
+    db: Db,
+    auth: AuthConfig,
+    addr: SocketAddr,
+    options: GrpcServerOptions,
+    shutdown: CancellationToken,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let cors = options
+        .grpc_web_enabled
+        .then(|| grpc_web_cors(&options.cors_origins))
+        .transpose()?;
+    let message_limit = if db.identity_authority().is_some() {
+        8 * 1024 * 1024
+    } else {
+        MAX_GRPC_MESSAGE_BYTES
+    };
+    let interceptor = GrpcAuthInterceptor::new(auth, db.clone());
+    let chiron_service = InterceptedService::new(
+        chiron_pb::chiron_db_server::ChironDbServer::new(ChironDbService {
+            db: db.clone(),
+            storage_policy: options.storage_policy.clone(),
+        })
+        .max_decoding_message_size(message_limit)
+        .max_encoding_message_size(message_limit),
+        interceptor.clone(),
+    );
+    let chiron_service = crate::grpc_protected::GuardedService::new(
+        chiron_service,
+        db.identity_authority().is_some(),
+    );
+    let service = InterceptedService::new(
+        pb::gauss_db_server::GaussDbServer::new(ChironDbService {
+            db,
+            storage_policy: options.storage_policy,
+        })
+        .max_decoding_message_size(message_limit)
+        .max_encoding_message_size(message_limit),
+        interceptor.clone(),
+    );
+    let reflection = InterceptedService::new(reflection_service(), interceptor);
+    if let Some(cors) = cors {
+        protected_server_builder(message_limit == 8 * 1024 * 1024)
+            .accept_http1(true)
+            .layer(cors)
+            .layer(GrpcWebLayer::new())
+            .add_service(chiron_service)
+            .add_service(service)
+            .add_service(reflection)
+            .serve_with_shutdown(addr, shutdown.cancelled_owned())
+            .await?;
+    } else {
+        protected_server_builder(message_limit == 8 * 1024 * 1024)
+            .add_service(chiron_service)
+            .add_service(service)
+            .add_service(reflection)
+            .serve_with_shutdown(addr, shutdown.cancelled_owned())
+            .await?;
+    }
     Ok(())
 }
 
@@ -328,29 +420,38 @@ pub async fn serve_tls_config_with_options(
                 })?
         }
     });
+    let message_limit = if db.identity_authority().is_some() {
+        8 * 1024 * 1024
+    } else {
+        MAX_GRPC_MESSAGE_BYTES
+    };
     let interceptor = GrpcAuthInterceptor::new(auth, db.clone());
     let chiron_service = InterceptedService::new(
         chiron_pb::chiron_db_server::ChironDbServer::new(ChironDbService {
             db: db.clone(),
             storage_policy: options.storage_policy.clone(),
         })
-        .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
-        .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
+        .max_decoding_message_size(message_limit)
+        .max_encoding_message_size(message_limit),
         interceptor.clone(),
+    );
+    let chiron_service = crate::grpc_protected::GuardedService::new(
+        chiron_service,
+        db.identity_authority().is_some(),
     );
     let service = InterceptedService::new(
         pb::gauss_db_server::GaussDbServer::new(ChironDbService {
             db,
             storage_policy: options.storage_policy,
         })
-        .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
-        .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
+        .max_decoding_message_size(message_limit)
+        .max_encoding_message_size(message_limit),
         interceptor.clone(),
     );
     let reflection = InterceptedService::new(reflection_service(), interceptor);
     if options.grpc_web_enabled {
         let cors = grpc_web_cors(&options.cors_origins)?;
-        Server::builder()
+        protected_server_builder(message_limit == 8 * 1024 * 1024)
             .accept_http1(true)
             .layer(cors)
             .layer(GrpcWebLayer::new())
@@ -360,11 +461,87 @@ pub async fn serve_tls_config_with_options(
             .serve_with_incoming(incoming)
             .await?;
     } else {
-        Server::builder()
+        protected_server_builder(message_limit == 8 * 1024 * 1024)
             .add_service(chiron_service)
             .add_service(service)
             .add_service(reflection)
             .serve_with_incoming(incoming)
+            .await?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_tls_config_with_options_until(
+    db: Db,
+    auth: AuthConfig,
+    addr: SocketAddr,
+    tls: crate::tls::ReloadingTlsConfig,
+    options: GrpcServerOptions,
+    shutdown: CancellationToken,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let listener = TcpListener::bind(addr).await?;
+    let acceptor = TlsAcceptor::from(tls.server_config());
+    let incoming = TcpListenerStream::new(listener).then(move |socket| {
+        let acceptor = acceptor.clone();
+        async move {
+            let socket = socket?;
+            tokio::time::timeout(Duration::from_secs(10), acceptor.accept(socket))
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "gRPC TLS handshake timed out")
+                })?
+        }
+    });
+    let cors = options
+        .grpc_web_enabled
+        .then(|| grpc_web_cors(&options.cors_origins))
+        .transpose()?;
+    let message_limit = if db.identity_authority().is_some() {
+        8 * 1024 * 1024
+    } else {
+        MAX_GRPC_MESSAGE_BYTES
+    };
+    let interceptor = GrpcAuthInterceptor::new(auth, db.clone());
+    let chiron_service = InterceptedService::new(
+        chiron_pb::chiron_db_server::ChironDbServer::new(ChironDbService {
+            db: db.clone(),
+            storage_policy: options.storage_policy.clone(),
+        })
+        .max_decoding_message_size(message_limit)
+        .max_encoding_message_size(message_limit),
+        interceptor.clone(),
+    );
+    let chiron_service = crate::grpc_protected::GuardedService::new(
+        chiron_service,
+        db.identity_authority().is_some(),
+    );
+    let service = InterceptedService::new(
+        pb::gauss_db_server::GaussDbServer::new(ChironDbService {
+            db,
+            storage_policy: options.storage_policy,
+        })
+        .max_decoding_message_size(message_limit)
+        .max_encoding_message_size(message_limit),
+        interceptor.clone(),
+    );
+    let reflection = InterceptedService::new(reflection_service(), interceptor);
+    if let Some(cors) = cors {
+        protected_server_builder(message_limit == 8 * 1024 * 1024)
+            .accept_http1(true)
+            .layer(cors)
+            .layer(GrpcWebLayer::new())
+            .add_service(chiron_service)
+            .add_service(service)
+            .add_service(reflection)
+            .serve_with_incoming_shutdown(incoming, shutdown.cancelled_owned())
+            .await?;
+    } else {
+        protected_server_builder(message_limit == 8 * 1024 * 1024)
+            .add_service(chiron_service)
+            .add_service(service)
+            .add_service(reflection)
+            .serve_with_incoming_shutdown(incoming, shutdown.cancelled_owned())
             .await?;
     }
     Ok(())
@@ -456,7 +633,7 @@ impl pb::gauss_db_server::GaussDb for ChironDbService {
             .config
             .ok_or_else(|| Status::invalid_argument("config is required"))
             .and_then(collection_config_from_proto)?;
-        authorize_grpc(&self.db, &principal, Action::Write, Some(&config.name))?;
+        authorize_grpc(&self.db, &principal, Action::Admin, Some(&config.name))?;
         if let Some(limit) = principal.max_collections {
             let current = self
                 .db
@@ -500,7 +677,7 @@ impl pb::gauss_db_server::GaussDb for ChironDbService {
         authorize_grpc(
             &self.db,
             &principal,
-            Action::Write,
+            Action::Admin,
             Some(&request.get_ref().collection),
         )?;
         self.db
@@ -517,7 +694,7 @@ impl pb::gauss_db_server::GaussDb for ChironDbService {
         authorize_grpc(
             &self.db,
             &principal,
-            Action::Write,
+            Action::Admin,
             Some(&request.get_ref().collection),
         )?;
         let request = request.into_inner();
@@ -599,6 +776,43 @@ impl pb::gauss_db_server::GaussDb for ChironDbService {
         &self,
         request: Request<pb::GetPointsRequest>,
     ) -> Result<Response<pb::GetPointsResponse>, Status> {
+        if self.db.identity_authority().is_some() {
+            let caller = request
+                .extensions()
+                .get::<crate::grpc_protected::Caller>()
+                .cloned()
+                .ok_or_else(|| Status::unauthenticated("catalog principal is missing"))?;
+            let request = request.into_inner();
+            let db = self.db.clone();
+            let work = caller.work.clone();
+            let output = tokio::task::spawn_blocking(move || {
+                let _work = caller.work;
+                let identity = db
+                    .identity_authority()
+                    .ok_or(crate::security::SecurityError::Unavailable)?
+                    .authenticate(&caller.token)?;
+                let context = db.bind_access(
+                    &identity,
+                    &request.collection,
+                    &identity.principal().tenant,
+                    crate::security::Action::Read,
+                )?;
+                db.get_points_authorized(&context, &request.ids)
+            })
+            .await
+            .map_err(|_| Status::unavailable("read worker failed"))?
+            .map_err(crate::grpc_protected::engine_error)?;
+            let guard =
+                crate::chironql_protected::PublicationGuard::Data(output.publication_context());
+            let (encoded, admission) = output
+                .publish(crate::response_output::points)
+                .map_err(crate::grpc_protected::engine_error)??;
+            let mut response = Response::new(encoded);
+            response.extensions_mut().insert(guard);
+            response.extensions_mut().insert(admission);
+            response.extensions_mut().insert(work);
+            return Ok(response);
+        }
         let principal = grpc_principal(&request)?;
         authorize_grpc(
             &self.db,
@@ -729,6 +943,44 @@ impl pb::gauss_db_server::GaussDb for ChironDbService {
         &self,
         request: Request<pb::TextHybridSearchRequest>,
     ) -> Result<Response<pb::SearchResponse>, Status> {
+        if self.db.identity_authority().is_some() {
+            let caller = request
+                .extensions()
+                .get::<crate::grpc_protected::Caller>()
+                .cloned()
+                .ok_or_else(|| Status::unauthenticated("catalog principal is missing"))?;
+            let request = request.into_inner();
+            let query = text_hybrid_from_proto(&request)?;
+            let db = self.db.clone();
+            let work = caller.work.clone();
+            let output = tokio::task::spawn_blocking(move || {
+                let _work = caller.work;
+                let identity = db
+                    .identity_authority()
+                    .ok_or(crate::security::SecurityError::Unavailable)?
+                    .authenticate(&caller.token)?;
+                let context = db.bind_access(
+                    &identity,
+                    &request.collection,
+                    &identity.principal().tenant,
+                    crate::security::Action::Search,
+                )?;
+                db.text_hybrid_search_authorized(&context, query, Some(identity.cancelled()))
+            })
+            .await
+            .map_err(|_| Status::unavailable("search worker failed"))?
+            .map_err(crate::grpc_protected::engine_error)?;
+            let guard =
+                crate::chironql_protected::PublicationGuard::Data(output.publication_context());
+            let (encoded, admission) = output
+                .publish(protected_hits_to_proto)
+                .map_err(crate::grpc_protected::engine_error)??;
+            let mut response = Response::new(encoded);
+            response.extensions_mut().insert(guard);
+            response.extensions_mut().insert(admission);
+            response.extensions_mut().insert(work);
+            return Ok(response);
+        }
         let principal = grpc_principal(&request)?;
         authorize_grpc(
             &self.db,
@@ -922,6 +1174,48 @@ impl pb::gauss_db_server::GaussDb for ChironDbService {
         &self,
         request: Request<pb::ScrollRequest>,
     ) -> Result<Response<pb::ScrollResponse>, Status> {
+        if self.db.identity_authority().is_some() {
+            let caller = request
+                .extensions()
+                .get::<crate::grpc_protected::Caller>()
+                .cloned()
+                .ok_or_else(|| Status::unauthenticated("catalog principal is missing"))?;
+            let request = request.into_inner();
+            let query = crate::model::ScrollRequest {
+                offset: optional_string(request.offset),
+                limit: scroll_limit_or_default(request.limit)?,
+                filter: filter_from_json(&request.filter_json)?,
+            };
+            let db = self.db.clone();
+            let work = caller.work.clone();
+            let output = tokio::task::spawn_blocking(move || {
+                let _work = caller.work;
+                let identity = db
+                    .identity_authority()
+                    .ok_or(crate::security::SecurityError::Unavailable)?
+                    .authenticate(&caller.token)?;
+                let context = db.bind_access(
+                    &identity,
+                    &request.collection,
+                    &identity.principal().tenant,
+                    crate::security::Action::Read,
+                )?;
+                db.scroll_authorized(&context, query)
+            })
+            .await
+            .map_err(|_| Status::unavailable("read worker failed"))?
+            .map_err(crate::grpc_protected::engine_error)?;
+            let guard =
+                crate::chironql_protected::PublicationGuard::Data(output.publication_context());
+            let (encoded, admission) = output
+                .publish(crate::response_output::scroll)
+                .map_err(crate::grpc_protected::engine_error)??;
+            let mut response = Response::new(encoded);
+            response.extensions_mut().insert(guard);
+            response.extensions_mut().insert(admission);
+            response.extensions_mut().insert(work);
+            return Ok(response);
+        }
         let principal = grpc_principal(&request)?;
         authorize_grpc(
             &self.db,
@@ -962,7 +1256,7 @@ impl pb::gauss_db_server::GaussDb for ChironDbService {
         authorize_grpc(
             &self.db,
             &principal,
-            Action::Write,
+            Action::Admin,
             Some(&request.get_ref().collection),
         )?;
         let request = request.into_inner();
@@ -1004,7 +1298,7 @@ impl pb::gauss_db_server::GaussDb for ChironDbService {
         authorize_grpc(
             &self.db,
             &principal,
-            Action::Write,
+            Action::Admin,
             Some(&request.get_ref().collection),
         )?;
         let request = request.into_inner();
@@ -1030,7 +1324,7 @@ impl pb::gauss_db_server::GaussDb for ChironDbService {
         authorize_grpc(
             &self.db,
             &principal,
-            Action::Write,
+            Action::Admin,
             Some(&request.get_ref().collection),
         )?;
         let request = request.into_inner();
@@ -1285,6 +1579,79 @@ fn graph_enum_to_string(value: &impl serde::Serialize) -> Result<String, Status>
         .as_str()
         .map(ToString::to_string)
         .ok_or_else(|| Status::internal("graph enum did not serialize as a string"))
+}
+
+fn sql_value_from_proto(value: chiron_pb::SqlValue) -> Result<crate::RelationalValue, Status> {
+    use chiron_pb::sql_value::Value;
+    match value
+        .value
+        .ok_or_else(|| Status::invalid_argument("SQL value variant is required"))?
+    {
+        Value::Null(_) => Ok(crate::RelationalValue::Null),
+        Value::Boolean(value) => Ok(crate::RelationalValue::Boolean(value)),
+        Value::Integer(value) => Ok(crate::RelationalValue::Integer(value)),
+        Value::Floating(value) => Ok(crate::RelationalValue::Float(value)),
+        Value::Decimal(value) => Ok(crate::RelationalValue::Decimal(value)),
+        Value::Text(value) => Ok(crate::RelationalValue::Text(value)),
+        Value::TimestampUtc(value) => Ok(crate::RelationalValue::TimestampUtc(value)),
+        Value::Uuid(value) => uuid::Uuid::parse_str(&value)
+            .map(crate::RelationalValue::Uuid)
+            .map_err(|_| Status::invalid_argument("SQL UUID parameter is invalid")),
+        Value::Vector(value) => Ok(crate::RelationalValue::Vector(value.values)),
+        Value::RecordRef(value) => Ok(crate::RelationalValue::RecordRef(crate::RecordRef {
+            namespace: value.namespace,
+            id: value.id,
+        })),
+        Value::BytesValue(value) => Ok(crate::RelationalValue::Bytes(value)),
+        Value::Date(value) => Ok(crate::RelationalValue::Date(value)),
+        Value::Jsonb(value) => serde_json::from_str(&value)
+            .map(crate::RelationalValue::Json)
+            .map_err(|_| Status::invalid_argument("SQL JSONB parameter is invalid")),
+    }
+}
+
+fn sql_request_from_proto(
+    request: chiron_pb::SqlExecutionRequest,
+) -> Result<crate::SqlExecutionRequest, Status> {
+    Ok(crate::SqlExecutionRequest {
+        statements: request
+            .statements
+            .into_iter()
+            .map(|statement| {
+                Ok(crate::SqlStatementRequest {
+                    sql: statement.sql,
+                    parameters: statement
+                        .parameters
+                        .into_iter()
+                        .map(sql_value_from_proto)
+                        .collect::<Result<_, _>>()?,
+                })
+            })
+            .collect::<Result<_, Status>>()?,
+        idempotency_key: request.idempotency_key,
+        retry_id: request.retry_id,
+    })
+}
+
+fn sql_transaction_handle_to_proto(
+    response: crate::SqlTransactionHandleResponse,
+) -> chiron_pb::SqlTransactionHandleResponse {
+    let state = match response.state {
+        crate::SqlTransactionState::Active => chiron_pb::SqlTransactionState::Active,
+        crate::SqlTransactionState::Aborted => chiron_pb::SqlTransactionState::Aborted,
+        crate::SqlTransactionState::Committed => chiron_pb::SqlTransactionState::Committed,
+        crate::SqlTransactionState::RolledBack => chiron_pb::SqlTransactionState::RolledBack,
+        crate::SqlTransactionState::Expired => chiron_pb::SqlTransactionState::Expired,
+        crate::SqlTransactionState::OutcomeUnknown => {
+            chiron_pb::SqlTransactionState::OutcomeUnknown
+        }
+    };
+    chiron_pb::SqlTransactionHandleResponse {
+        handle: response.handle,
+        snapshot: response.snapshot,
+        state: state as i32,
+        transaction_id: response.transaction_id,
+    }
 }
 
 macro_rules! impl_chiron_service {
@@ -1624,6 +1991,341 @@ macro_rules! impl_chiron_service {
                 self.finish_deferred_graph_session(request, false)
             }
 
+            async fn execute_sql(
+                &self,
+                request: Request<chiron_pb::SqlExecutionRequest>,
+            ) -> Result<Response<chiron_pb::SqlExecutionResponse>, Status> {
+                if self.db.identity_authority().is_some() {
+                    let caller = request
+                        .extensions()
+                        .get::<crate::grpc_protected::Caller>()
+                        .cloned()
+                        .ok_or_else(|| Status::unauthenticated("catalog principal is missing"))?;
+                    let sql_request = sql_request_from_proto(request.into_inner())?;
+                    let db = self.db.clone();
+                    let work = caller.work.clone();
+                    let (identity, reference, response) = tokio::task::spawn_blocking(move || {
+                        let _work = caller.work;
+                        let authority = db
+                            .identity_authority()
+                            .ok_or(crate::security::SecurityError::Unavailable)?;
+                        let identity = authority.authenticate(&caller.token)?;
+                        let identity = db.management_identity(&identity)?;
+                        let response = db.execute_sql_authorized_owned(
+                            &identity,
+                            sql_request,
+                            "grpc-protected",
+                        )?;
+                        let reference =
+                            db.sql_reference_publication_context(&identity, &response.results)?;
+                        Ok::<_, crate::GaussError>((identity, reference, response))
+                    })
+                    .await
+                    .map_err(|_| Status::unavailable("SQL worker failed"))?
+                    .map_err(status_from_error)?;
+                    let (message, admission) = crate::response_output::sql(response)?;
+                    let mut response = Response::new(message);
+                    response.extensions_mut().insert(admission);
+                    response.extensions_mut().insert(match reference {
+                        Some(context) => crate::chironql_protected::PublicationGuard::Data(context),
+                        None => crate::chironql_protected::PublicationGuard::Identity(identity),
+                    });
+                    response.extensions_mut().insert(work);
+                    return Ok(response);
+                }
+                let principal = grpc_principal(&request)?;
+                let request = sql_request_from_proto(request.into_inner())?;
+                let read_only = self
+                    .db
+                    .sql_request_is_read_only(&request)
+                    .map_err(status_from_error)?;
+                authorize_grpc(
+                    &self.db,
+                    &principal,
+                    if read_only { Action::Read } else { Action::Write },
+                    None,
+                )?;
+                let audit_context = chirondb_core::audit::AuditContext {
+                    principal_id: principal.id,
+                    tenant_id: principal.tenant_id,
+                    transport: "grpc".to_string(),
+                    request_id: request.retry_id.clone(),
+                };
+                let db = self.db.clone();
+                let response = tokio::task::spawn_blocking(move || {
+                    db.execute_sql_with_audit_owned(request, &audit_context)
+                })
+                .await
+                .map_err(|_| Status::unavailable("SQL worker failed"))?
+                .map_err(status_from_error)?;
+                {
+                    let (message, admission) = crate::response_output::sql(response)?;
+                    let mut response = Response::new(message);
+                    response.extensions_mut().insert(admission);
+                    Ok(response)
+                }
+            }
+
+            async fn begin_sql_transaction(
+                &self,
+                request: Request<chiron_pb::BeginSqlTransactionRequest>,
+            ) -> Result<Response<chiron_pb::SqlTransactionHandleResponse>, Status> {
+                if self.db.identity_authority().is_some() {
+                    let caller = request
+                        .extensions()
+                        .get::<crate::grpc_protected::Caller>()
+                        .cloned()
+                        .ok_or_else(|| Status::unauthenticated("catalog principal is missing"))?;
+                    let db = self.db.clone();
+                    let work = caller.work.clone();
+                    let (identity, response) = tokio::task::spawn_blocking(move || {
+                        let _work = caller.work;
+                        let authority = db
+                            .identity_authority()
+                            .ok_or(crate::security::SecurityError::Unavailable)?;
+                        let identity = authority.authenticate(&caller.token)?;
+                        let identity = db.management_identity(&identity)?;
+                        let response = db.begin_sql_transaction_authorized(
+                            &identity,
+                            "grpc-protected",
+                        )?;
+                        Ok::<_, crate::GaussError>((identity, response))
+                    })
+                    .await
+                    .map_err(|_| Status::unavailable("SQL transaction worker failed"))?
+                    .map_err(status_from_error)?;
+                    let mut response = Response::new(sql_transaction_handle_to_proto(response));
+                    response.extensions_mut().insert(
+                        crate::chironql_protected::PublicationGuard::Identity(identity),
+                    );
+                    response.extensions_mut().insert(work);
+                    return Ok(response);
+                }
+                let principal = grpc_principal(&request)?;
+                authorize_grpc(&self.db, &principal, Action::Read, None)?;
+                let audit_context = chirondb_core::audit::AuditContext {
+                    principal_id: principal.id,
+                    tenant_id: principal.tenant_id,
+                    transport: "grpc".to_string(),
+                    request_id: None,
+                };
+                let db = self.db.clone();
+                let response = tokio::task::spawn_blocking(move || {
+                    db.begin_sql_transaction(&audit_context)
+                })
+                    .await
+                    .map_err(|_| Status::unavailable("SQL transaction worker failed"))?
+                    .map_err(status_from_error)?;
+                Ok(Response::new(sql_transaction_handle_to_proto(response)))
+            }
+
+            async fn execute_sql_transaction(
+                &self,
+                request: Request<chiron_pb::SqlTransactionExecuteRequest>,
+            ) -> Result<Response<chiron_pb::SqlExecutionResponse>, Status> {
+                if self.db.identity_authority().is_some() {
+                    let caller = request
+                        .extensions()
+                        .get::<crate::grpc_protected::Caller>()
+                        .cloned()
+                        .ok_or_else(|| Status::unauthenticated("catalog principal is missing"))?;
+                    let request = request.into_inner();
+                    let sql_request = sql_request_from_proto(
+                        request
+                            .request
+                            .ok_or_else(|| Status::invalid_argument("SQL request is required"))?,
+                    )?;
+                    let handle = request.handle;
+                    let db = self.db.clone();
+                    let work = caller.work.clone();
+                    let (identity, reference, response) = tokio::task::spawn_blocking(move || {
+                        let _work = caller.work;
+                        let authority = db
+                            .identity_authority()
+                            .ok_or(crate::security::SecurityError::Unavailable)?;
+                        let identity = authority.authenticate(&caller.token)?;
+                        let identity = db.management_identity(&identity)?;
+                        let response = db.execute_sql_transaction_authorized_owned(
+                            &identity,
+                            &handle,
+                            sql_request,
+                            "grpc-protected",
+                        )?;
+                        let reference =
+                            db.sql_reference_publication_context(&identity, &response.results)?;
+                        Ok::<_, crate::GaussError>((identity, reference, response))
+                    })
+                    .await
+                    .map_err(|_| Status::unavailable("SQL transaction worker failed"))?
+                    .map_err(status_from_error)?;
+                    let (message, admission) = crate::response_output::sql(response)?;
+                    let mut response = Response::new(message);
+                    response.extensions_mut().insert(admission);
+                    response.extensions_mut().insert(match reference {
+                        Some(context) => crate::chironql_protected::PublicationGuard::Data(context),
+                        None => crate::chironql_protected::PublicationGuard::Identity(identity),
+                    });
+                    response.extensions_mut().insert(work);
+                    return Ok(response);
+                }
+                let principal = grpc_principal(&request)?;
+                let request = request.into_inner();
+                let sql_request = sql_request_from_proto(
+                    request
+                        .request
+                        .ok_or_else(|| Status::invalid_argument("SQL request is required"))?,
+                )?;
+                let read_only = self
+                    .db
+                    .sql_request_is_read_only(&sql_request)
+                    .map_err(status_from_error)?;
+                authorize_grpc(
+                    &self.db,
+                    &principal,
+                    if read_only { Action::Read } else { Action::Write },
+                    None,
+                )?;
+                let audit_context = chirondb_core::audit::AuditContext {
+                    principal_id: principal.id,
+                    tenant_id: principal.tenant_id,
+                    transport: "grpc".to_string(),
+                    request_id: sql_request.retry_id.clone(),
+                };
+                let db = self.db.clone();
+                let handle = request.handle;
+                let response = tokio::task::spawn_blocking(move || {
+                    db.execute_sql_transaction_owned(&handle, sql_request, &audit_context)
+                })
+                    .await
+                    .map_err(|_| Status::unavailable("SQL transaction worker failed"))?
+                    .map_err(status_from_error)?;
+                {
+                    let (message, admission) = crate::response_output::sql(response)?;
+                    let mut response = Response::new(message);
+                    response.extensions_mut().insert(admission);
+                    Ok(response)
+                }
+            }
+
+            async fn commit_sql_transaction(
+                &self,
+                request: Request<chiron_pb::SqlTransactionHandleRequest>,
+            ) -> Result<Response<chiron_pb::SqlExecutionResponse>, Status> {
+                if self.db.identity_authority().is_some() {
+                    let caller = request
+                        .extensions()
+                        .get::<crate::grpc_protected::Caller>()
+                        .cloned()
+                        .ok_or_else(|| Status::unauthenticated("catalog principal is missing"))?;
+                    let handle = request.into_inner().handle;
+                    let db = self.db.clone();
+                    let work = caller.work.clone();
+                    let (identity, response) = tokio::task::spawn_blocking(move || {
+                        let _work = caller.work;
+                        let authority = db
+                            .identity_authority()
+                            .ok_or(crate::security::SecurityError::Unavailable)?;
+                        let identity = authority.authenticate(&caller.token)?;
+                        let identity = db.management_identity(&identity)?;
+                        let response = db.commit_sql_transaction_authorized_owned(
+                            &identity,
+                            &handle,
+                            "grpc-protected",
+                        )?;
+                        Ok::<_, crate::GaussError>((identity, response))
+                    })
+                    .await
+                    .map_err(|_| Status::unavailable("SQL transaction worker failed"))?
+                    .map_err(status_from_error)?;
+                    let (message, admission) = crate::response_output::sql(response)?;
+                    let mut response = Response::new(message);
+                    response.extensions_mut().insert(admission);
+                    response.extensions_mut().insert(
+                        crate::chironql_protected::PublicationGuard::Identity(identity),
+                    );
+                    response.extensions_mut().insert(work);
+                    return Ok(response);
+                }
+                let principal = grpc_principal(&request)?;
+                authorize_grpc(&self.db, &principal, Action::Write, None)?;
+                let handle = request.into_inner().handle;
+                let audit_context = chirondb_core::audit::AuditContext {
+                    principal_id: principal.id,
+                    tenant_id: principal.tenant_id,
+                    transport: "grpc".to_string(),
+                    request_id: Some(handle.clone()),
+                };
+                let db = self.db.clone();
+                let response = tokio::task::spawn_blocking(move || {
+                    db.commit_sql_transaction_owned(&handle, &audit_context)
+                })
+                    .await
+                    .map_err(|_| Status::unavailable("SQL transaction worker failed"))?
+                    .map_err(status_from_error)?;
+                {
+                    let (message, admission) = crate::response_output::sql(response)?;
+                    let mut response = Response::new(message);
+                    response.extensions_mut().insert(admission);
+                    Ok(response)
+                }
+            }
+
+            async fn rollback_sql_transaction(
+                &self,
+                request: Request<chiron_pb::SqlTransactionHandleRequest>,
+            ) -> Result<Response<chiron_pb::SqlTransactionHandleResponse>, Status> {
+                if self.db.identity_authority().is_some() {
+                    let caller = request
+                        .extensions()
+                        .get::<crate::grpc_protected::Caller>()
+                        .cloned()
+                        .ok_or_else(|| Status::unauthenticated("catalog principal is missing"))?;
+                    let handle = request.into_inner().handle;
+                    let db = self.db.clone();
+                    let work = caller.work.clone();
+                    let (identity, response) = tokio::task::spawn_blocking(move || {
+                        let _work = caller.work;
+                        let authority = db
+                            .identity_authority()
+                            .ok_or(crate::security::SecurityError::Unavailable)?;
+                        let identity = authority.authenticate(&caller.token)?;
+                        let identity = db.management_identity(&identity)?;
+                        let response = db.rollback_sql_transaction_authorized(
+                            &identity,
+                            &handle,
+                            "grpc-protected",
+                        )?;
+                        Ok::<_, crate::GaussError>((identity, response))
+                    })
+                    .await
+                    .map_err(|_| Status::unavailable("SQL transaction worker failed"))?
+                    .map_err(status_from_error)?;
+                    let mut response = Response::new(sql_transaction_handle_to_proto(response));
+                    response.extensions_mut().insert(
+                        crate::chironql_protected::PublicationGuard::Identity(identity),
+                    );
+                    response.extensions_mut().insert(work);
+                    return Ok(response);
+                }
+                let principal = grpc_principal(&request)?;
+                authorize_grpc(&self.db, &principal, Action::Read, None)?;
+                let handle = request.into_inner().handle;
+                let audit_context = chirondb_core::audit::AuditContext {
+                    principal_id: principal.id,
+                    tenant_id: principal.tenant_id,
+                    transport: "grpc".to_string(),
+                    request_id: Some(handle.clone()),
+                };
+                let db = self.db.clone();
+                let response = tokio::task::spawn_blocking(move || {
+                    db.rollback_sql_transaction(&handle, &audit_context)
+                })
+                    .await
+                    .map_err(|_| Status::unavailable("SQL transaction worker failed"))?
+                    .map_err(status_from_error)?;
+                Ok(Response::new(sql_transaction_handle_to_proto(response)))
+            }
+
             /// ChironQL over gRPC.
             ///
             /// Hand-written rather than forwarded, because this rpc exists only
@@ -1634,12 +2336,42 @@ macro_rules! impl_chiron_service {
                 &self,
                 request: Request<chiron_pb::ChironQlRequest>,
             ) -> Result<Response<chiron_pb::ChironQlResponse>, Status> {
-                // The auth interceptor put the resolved principal here. When
-                // RBAC is not configured there is no principal to scope by, so
-                // the request is refused under enforcement rather than served
-                // unscoped — the same fail-closed rule the core applies.
-                let permission = request.extensions().get::<crate::rbac::Permission>().cloned();
+                if self.db.identity_authority().is_some() {
+                    let caller = request.extensions().get::<crate::grpc_protected::Caller>().cloned()
+                        .ok_or_else(|| Status::unauthenticated("catalog principal is missing"))?;
+                    let request = request.into_inner();
+                    let query = chirondb_types::chironql::ChironQlRequest {
+                        query: request.query,
+                        collection: request.collection,
+                        trace: request.trace,
+                        confirm: request.confirm,
+                        parameters: request.parameters.into_iter().map(sql_value_from_proto).collect::<Result<_, _>>()?,
+                        idempotency_key: request.idempotency_key,
+                        retry_id: request.retry_id,
+                    };
+                    let db = self.db.clone();
+                    let work = caller.work.clone();
+                    let output = tokio::task::spawn_blocking(move || {
+                        let _work = caller.work;
+                        crate::chironql_protected::execute(&db, &caller.token, &query)
+                    }).await.map_err(|_| Status::unavailable("query worker failed"))?
+                        .map_err(crate::grpc_protected::error_status)?;
+                    let guard = output.guard();
+                    let (encoded, admission) = output.publish(crate::response_output::chironql)
+                        .map_err(|_| Status::permission_denied("authorization was revoked"))??;
+                    let mut response = Response::new(encoded);
+                    response.extensions_mut().insert(guard);
+                    response.extensions_mut().insert(admission);
+                    response.extensions_mut().insert(work);
+                    return Ok(response);
+                }
+                let permission = grpc_principal(&request)?;
                 let request = request.into_inner();
+                let parameters = request
+                    .parameters
+                    .into_iter()
+                    .map(sql_value_from_proto)
+                    .collect::<Result<Vec<_>, _>>()?;
                 let db = self.db.clone();
                 let mut session = crate::chironql_exec::Session {
                     collection: request.collection.clone(),
@@ -1648,59 +2380,23 @@ macro_rules! impl_chiron_service {
                 let mut ctx = crate::chironql_exec::ExecContext {
                     db: &db,
                     session: &mut session,
-                    // gRPC auth is enforced by the interceptor before the
-                    // request reaches here; it does not carry a per-key role
-                    // the way the HTTP layer does, so the caller is treated as
-                    // it is for every other rpc on this service.
-                    role: permission
-                        .as_ref()
-                        .map(|perm| perm.role)
-                        .unwrap_or(crate::rbac::Role::Admin),
-                    allowed_collections: permission
-                        .as_ref()
-                        .filter(|perm| perm.is_restricted())
-                        .map(|perm| perm.allowed_collections().into_iter().collect()),
+                    role: permission.role,
+                    allowed_collections: permission.is_restricted().then(|| permission.allowed_collections().into_iter().collect()),
                     want_trace: request.trace,
                     confirm: request.confirm,
-                    tenant: match &permission {
-                        Some(perm) => perm.tenant_scope(
-                            perm.id.clone(),
-                        ),
-                        // No principal at all: act as an untenanted caller,
-                        // which reads nothing once enforcement is on.
-                        None => chirondb_core::tenant::TenantScope::untenanted("grpc")
-                            .with_graph_capabilities([
-                                chirondb_types::graph::GraphCapability::Read,
-                                chirondb_types::graph::GraphCapability::Write,
-                                chirondb_types::graph::GraphCapability::Admin,
-                                chirondb_types::graph::GraphCapability::TypeConfigure,
-                            ]),
-                    },
+                    parameters,
+                    idempotency_key: request.idempotency_key,
+                    retry_id: request.retry_id,
+                    tenant: permission.tenant_scope(permission.id.clone()),
                 };
 
-                match crate::chironql_exec::execute(&mut ctx, &request.query) {
-                    Ok(response) => Ok(Response::new(chiron_pb::ChironQlResponse {
-                        kind: match response.kind {
-                            chirondb_types::chironql::ChironQlKind::Rows => "rows",
-                            chirondb_types::chironql::ChironQlKind::Affected => "affected",
-                            chirondb_types::chironql::ChironQlKind::Empty => "empty",
-                        }
-                        .to_string(),
-                        columns: response.columns,
-                        rows_json: response
-                            .rows
-                            .iter()
-                            .map(|row| row.to_string())
-                            .collect(),
-                        stats_json: serde_json::to_string(&response.stats)
-                            .unwrap_or_else(|_| "{}".to_string()),
-                        next: response.next,
-                        query_id: response.query_id,
-                        trace_json: response
-                            .trace
-                            .as_ref()
-                            .and_then(|trace| serde_json::to_string(trace).ok()),
-                    })),
+                match crate::chironql_exec::execute_owned(&mut ctx, &request.query) {
+                    Ok(response) => {
+                        let (message, admission) = response.consume(crate::response_output::chironql).map_err(crate::grpc_protected::engine_error)??;
+                        let mut response = Response::new(message);
+                        response.extensions_mut().insert(admission);
+                        Ok(response)
+                    }
                     Err(error) => Err(chironql_status(error)),
                 }
             }
@@ -1725,10 +2421,15 @@ pub(crate) fn chironql_status(error: chirondb_types::chironql::ChironQlError) ->
         | "graph.type_unknown"
         | "graph.deferred_session_not_found" => Code::NotFound,
         "chironql.confirmation_required" => Code::FailedPrecondition,
+        "chironql.snapshot_changed" => Code::Aborted,
         "chironql.not_implemented" => Code::Unimplemented,
         "chironql.resource_exhausted" | "graph.overloaded" => Code::ResourceExhausted,
         "graph.cancelled" => Code::Cancelled,
-        "graph.slo_unavailable" | "chironql.storage_unavailable" => Code::Unavailable,
+        "graph.slo_unavailable"
+        | "chironql.storage_unavailable"
+        | "chironql.snapshot_busy"
+        | "chironql.outcome_unknown" => Code::Unavailable,
+        "chironql.transaction_rejected" => Code::Aborted,
         "chironql.storage_corruption" | "chironql.io_error" | "chironql.engine_error" => {
             Code::Internal
         }
@@ -1968,6 +2669,14 @@ pub(crate) fn search_request_from_proto(query: pb::SearchQuery) -> Result<Search
     })
 }
 
+/// Protected native responses expose hits only. Legacy wire fields are fixed
+/// defaults, not measurements of a physical or unauthorized candidate domain.
+pub(crate) fn protected_hits_to_proto(
+    hits: Vec<crate::SearchHit>,
+) -> Result<(pb::SearchResponse, crate::response_output::SharedAdmission), Status> {
+    crate::response_output::hits(hits)
+}
+
 pub(crate) fn search_response_to_proto(
     response: SearchResponse,
 ) -> crate::Result<pb::SearchResponse> {
@@ -2086,9 +2795,26 @@ pub(crate) fn optional_usize_from_u64(value: u64, name: &str) -> Result<Option<u
 
 pub(crate) fn status_from_error(error: GaussError) -> Status {
     match error {
+        GaussError::Security(error) => {
+            use chirondb_core::security::SecurityError;
+            let code = match &error {
+                SecurityError::Unauthenticated => tonic::Code::Unauthenticated,
+                SecurityError::Forbidden => tonic::Code::PermissionDenied,
+                SecurityError::NotFound => tonic::Code::NotFound,
+                SecurityError::Conflict => tonic::Code::Aborted,
+                SecurityError::Unavailable => tonic::Code::Unavailable,
+                SecurityError::Invalid(_) => tonic::Code::InvalidArgument,
+                SecurityError::BudgetExceeded => tonic::Code::ResourceExhausted,
+            };
+            Status::new(code, format!("{}: {error}", error.code()))
+        }
         GaussError::Graph(error) => graph_status(error),
         GaussError::CollectionNotFound(_) | GaussError::PointNotFound(_) => {
             Status::not_found(error.to_string())
+        }
+        GaussError::DuplicateKey => Status::already_exists(error.to_string()),
+        GaussError::CommitRejected { .. } | GaussError::SqlRowPreconditionFailed { .. } => {
+            Status::aborted(error.to_string())
         }
         GaussError::CollectionExists(_)
         | GaussError::DimensionMismatch { .. }
@@ -2097,6 +2823,7 @@ pub(crate) fn status_from_error(error: GaussError) -> Status {
         GaussError::ResourceExhausted(_) => Status::resource_exhausted(error.to_string()),
         GaussError::WalUnavailable(_)
         | GaussError::AuditUnavailable(_)
+        | GaussError::CommitOutcomeUnknown { .. }
         | GaussError::DataDirLocked { .. } => Status::unavailable(error.to_string()),
         GaussError::WalCorruption { .. }
         | GaussError::SegmentCorruption { .. }
@@ -2246,6 +2973,7 @@ mod tests {
         let response = pb::WireResponse {
             payload: Some(pb::wire_response::Payload::Chironql(
                 pb::WireChironQlResponse {
+                    credential_json: None,
                     kind: "rows".to_string(),
                     ..Default::default()
                 },

@@ -122,7 +122,7 @@ pub fn read_checkpoint(collection_dir: &Path) -> Result<Option<CollectionCheckpo
             message: "checkpoint shorter than header".to_string(),
         });
     }
-    let header = file.read_range(0..HEADER_LEN)?;
+    let header = file.read_range_admitted(0..HEADER_LEN)?;
     if &header[0..8] != CHECKPOINT_MAGIC {
         return Err(GaussError::SegmentCorruption {
             path: path.display().to_string(),

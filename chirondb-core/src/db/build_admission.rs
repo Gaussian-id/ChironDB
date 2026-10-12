@@ -4,20 +4,16 @@ use std::{collections::VecDeque, sync::atomic::AtomicBool};
 use crate::{GaussError, Result};
 
 const MIB: usize = 1024 * 1024;
-const MIN_BUILD_BUDGET: usize = 512 * MIB;
 const MAX_BUILD_BUDGET: usize = 4 * 1024 * MIB;
-const BUDGET_PER_CORE: usize = 256 * MIB;
 
 fn host_workers() -> usize {
-    std::thread::available_parallelism()
-        .map(|workers| workers.get())
-        .unwrap_or(1)
+    crate::resource_profile::current().effective_cores
 }
 
 fn build_budget() -> usize {
-    host_workers()
-        .saturating_mul(BUDGET_PER_CORE)
-        .clamp(MIN_BUILD_BUDGET, MAX_BUILD_BUDGET)
+    usize::try_from(crate::resource_profile::current().engine_budget_bytes / 4)
+        .unwrap_or(MAX_BUILD_BUDGET)
+        .clamp(1, MAX_BUILD_BUDGET)
 }
 
 pub(super) static BUILD_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {

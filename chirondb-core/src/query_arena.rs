@@ -8,8 +8,8 @@
 //!
 //! `Bump::with_capacity(64 KiB)` matches the typical working-set size of a
 //! single ANN query at k=10 with ef_search=64 across a few hundred candidates.
-//! Larger queries grow the arena; the high-water mark is preserved across
-//! resets (`reset()` does not shrink).
+//! Larger queries may grow the arena, but a per-thread retained-cap prevents
+//! one outlier from pinning an unbounded allocation for the worker lifetime.
 //!
 //! ## Usage
 //!
@@ -25,25 +25,45 @@
 //! });
 //! ```
 
-use std::cell::RefCell;
+use std::{
+    cell::RefCell,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use bumpalo::Bump;
 
 const INITIAL_CAPACITY: usize = 64 * 1024;
+const MAX_RETAINED_CAPACITY: usize = 8 * 1024 * 1024;
+
+static HIGH_WATER_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     static QUERY_ARENA: RefCell<Bump> = RefCell::new(Bump::with_capacity(INITIAL_CAPACITY));
 }
 
 /// Run `f` with exclusive access to the calling thread's query arena.
-/// The arena is reset (cursor rewound to zero) on entry; capacity is preserved.
+/// The arena is reset (cursor rewound to zero) on entry. Capacity is reused up
+/// to the internal retained cap; larger arenas are replaced after the query.
 /// Returns whatever `f` returns. The arena reference must not escape `f`.
 pub fn with_query_arena<R>(f: impl FnOnce(&Bump) -> R) -> R {
     QUERY_ARENA.with(|cell| {
         let mut arena = cell.borrow_mut();
         arena.reset();
-        f(&arena)
+        let result = f(&arena);
+        let allocated = arena.allocated_bytes();
+        HIGH_WATER_BYTES.fetch_max(allocated, Ordering::Relaxed);
+        if allocated > MAX_RETAINED_CAPACITY {
+            *arena = Bump::with_capacity(INITIAL_CAPACITY);
+            metrics::counter!("chirondb_query_arena_shrinks_total").increment(1);
+        }
+        result
     })
+}
+
+/// Largest arena allocation observed by this process. Exported through the
+/// database metrics refresh path without exposing query- or tenant-level data.
+pub fn high_water_bytes() -> usize {
+    HIGH_WATER_BYTES.load(Ordering::Relaxed)
 }
 
 /// Bytes currently allocated in the calling thread's query arena.
@@ -142,5 +162,21 @@ mod tests {
         });
         assert_eq!(h1.join().unwrap(), 4096);
         assert_eq!(h2.join().unwrap(), 8192);
+    }
+
+    #[test]
+    fn oversized_arena_is_released_after_query() {
+        with_query_arena(|arena| {
+            let mut v: BumpVec<u8> =
+                BumpVec::with_capacity_in(MAX_RETAINED_CAPACITY + INITIAL_CAPACITY, arena);
+            v.resize(MAX_RETAINED_CAPACITY + INITIAL_CAPACITY, 0xAA);
+        });
+
+        assert!(high_water_bytes() > MAX_RETAINED_CAPACITY);
+        assert!(
+            allocated_bytes() <= INITIAL_CAPACITY * 2,
+            "oversized query arena must not stay retained: {} bytes",
+            allocated_bytes()
+        );
     }
 }

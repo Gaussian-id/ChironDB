@@ -8,12 +8,12 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet, VecDeque},
     fs::{self, File},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     ops::Range,
     path::{Path, PathBuf},
     sync::{
         Arc, OnceLock, RwLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -34,13 +34,19 @@ use crate::{
     fs_util::{atomic_write, atomic_write_with, read_exact_bounded},
 };
 
+mod admission;
+mod range;
+pub(crate) use range::AdmittedRange;
+
 pub const MAGIC: &[u8; 8] = b"CHIRENC1";
 pub const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
-const MAX_ENCRYPTION_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_ENCRYPTION_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 pub const PERSISTENT_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const PERSISTENT_PROBATION_BYTES: usize = 8 * 1024 * 1024;
 const PERSISTENT_MAIN_BYTES: usize = PERSISTENT_CACHE_BYTES - PERSISTENT_PROBATION_BYTES;
 const MAX_KEYRING_BYTES: u64 = 1024 * 1024;
+const MAX_KEY_ID_BYTES: usize = 128;
+const MAX_TREE_KEY_IDS: usize = 32 * 1024;
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 const FIXED_HEADER_LEN: usize = 8 + 1 + 1 + 2 + 16 + 8 + 4 + NONCE_LEN + 2;
@@ -53,6 +59,7 @@ static NEXT_PERSISTENT_CACHE_ID: AtomicU64 = AtomicU64::new(1);
 static PERSISTENT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 static PERSISTENT_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 static PERSISTENT_CACHE_DECRYPTED_BYTES: AtomicU64 = AtomicU64::new(0);
+static PERSISTENT_CACHE_HIGH_WATER_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 pub struct PersistentCacheStats {
@@ -73,6 +80,17 @@ pub fn persistent_cache_stats() -> PersistentCacheStats {
         misses: PERSISTENT_CACHE_MISSES.load(Ordering::Relaxed),
         decrypted_bytes: PERSISTENT_CACHE_DECRYPTED_BYTES.load(Ordering::Relaxed),
     }
+}
+
+pub fn persistent_cache_usage_bytes() -> (usize, usize) {
+    let current = persistent_chunk_cache()
+        .read()
+        .map(|cache| cache.bytes)
+        .unwrap_or(0);
+    (
+        current,
+        PERSISTENT_CACHE_HIGH_WATER_BYTES.load(Ordering::Relaxed),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -151,7 +169,7 @@ impl Keyring {
         let mut encoded_id_len = None;
         for entry in document.keys {
             if entry.id.is_empty()
-                || entry.id.len() > 128
+                || entry.id.len() > MAX_KEY_ID_BYTES
                 || !entry
                     .id
                     .bytes()
@@ -232,6 +250,37 @@ pub fn encryption_enforced() -> bool {
     ENCRYPTION_ENFORCED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Bind rebuildable verified-byte caches to the complete decryption context.
+/// Changing or removing a historical key must force normal authenticated reads.
+pub(crate) fn recovery_context_fingerprint() -> Result<[u8; 32]> {
+    let mut hash = Sha256::new();
+    hash.update(b"CHIRON-RECOVERY-KEY-CONTEXT-1");
+    hash.update([u8::from(encryption_enforced())]);
+    if let Some(keyring) = PROCESS_KEYRING.get() {
+        let mut memory = crate::relational::wal_decode::MetadataCharge::default();
+        memory.prepare(
+            (keyring.keys.len() as u64)
+                .checked_mul(32)
+                .and_then(|n| n.checked_add(1024))
+                .ok_or_else(|| GaussError::ResourceExhausted("key context is too large".into()))?,
+        )?;
+        let mut keys = Vec::new();
+        keys.try_reserve_exact(keyring.keys.len())
+            .map_err(|_| GaussError::ResourceExhausted("key context allocation failed".into()))?;
+        keys.extend(keyring.keys.iter());
+        keys.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        hash.update((keys.len() as u64).to_le_bytes());
+        hash.update((keyring.active_key_id.len() as u64).to_le_bytes());
+        hash.update(keyring.active_key_id.as_bytes());
+        for (id, key) in keys {
+            hash.update((id.len() as u64).to_le_bytes());
+            hash.update(id.as_bytes());
+            hash.update(&key.0);
+        }
+    }
+    Ok(hash.finalize().into())
+}
+
 pub fn read_persistent(path: &Path) -> Result<Vec<u8>> {
     let bytes = fs::read(path)?;
     match (is_encrypted(&bytes), PROCESS_KEYRING.get()) {
@@ -253,27 +302,39 @@ pub fn atomic_write_persistent(path: &Path, file_type: FileType, plaintext: &[u8
     atomic_write(path, &encoded)
 }
 
-/// Encrypt an existing immutable plaintext file without materialising either
-/// the plaintext or ciphertext as a whole-file buffer.
-pub fn encrypt_file_in_place(path: &Path, file_type: FileType) -> Result<()> {
-    let Some(keyring) = PROCESS_KEYRING.get() else {
-        if encryption_enforced() {
-            return Err(GaussError::InvalidRequest(
-                "secure persistence requires an encryption keyring".to_string(),
-            ));
-        }
-        return Ok(());
-    };
-    let mut input = File::open(path)?;
-    let plaintext_len = input.metadata()?.len();
-    let mut prefix = [0_u8; MAGIC.len()];
-    let prefix_len = input.read(&mut prefix)?;
-    if prefix_len == MAGIC.len() && prefix == *MAGIC {
-        return Ok(());
+/// Atomically persist an exact-length stream, encrypting in fixed-size chunks.
+/// No plaintext staging file or whole-file buffer is created. Input errors,
+/// length mismatches and failures before rename leave the prior file intact.
+pub(crate) fn atomic_write_persistent_stream(
+    path: &Path,
+    file_type: FileType,
+    plaintext_len: u64,
+    input: impl Read,
+) -> Result<()> {
+    let keyring = PROCESS_KEYRING.get().map(Arc::as_ref);
+    if keyring.is_none() && encryption_enforced() {
+        return Err(GaussError::InvalidRequest(
+            "secure persistence requires an encryption keyring".into(),
+        ));
     }
-    input.seek(SeekFrom::Start(0))?;
-    let keyring = Arc::clone(keyring);
-    atomic_write_with(path, move |output| {
+    write_persistent_stream(path, file_type, plaintext_len, input, keyring)
+}
+
+fn write_persistent_stream(
+    path: &Path,
+    file_type: FileType,
+    plaintext_len: u64,
+    mut input: impl Read,
+    keyring: Option<&Keyring>,
+) -> Result<()> {
+    atomic_write_with(path, |output| {
+        let Some(keyring) = keyring else {
+            let copied = std::io::copy(&mut input.by_ref().take(plaintext_len), output)?;
+            if copied != plaintext_len {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            }
+            return require_stream_end(&mut input);
+        };
         let rng = SystemRandom::new();
         let mut dek = Zeroizing::new([0_u8; 32]);
         rng.fill(&mut *dek)
@@ -305,20 +366,12 @@ pub fn encrypt_file_in_place(path: &Path, file_type: FileType) -> Result<()> {
         output.write_all(&wrapped_dek)?;
         wrapped_dek.zeroize();
 
+        let mut remaining = plaintext_len;
         let mut index = 0_u32;
         let mut chunk = Zeroizing::new(vec![0_u8; DEFAULT_CHUNK_SIZE]);
-        loop {
-            let mut read = 0_usize;
-            while read < chunk.len() {
-                let count = input.read(&mut chunk[read..])?;
-                if count == 0 {
-                    break;
-                }
-                read += count;
-            }
-            if read == 0 {
-                break;
-            }
+        while remaining != 0 {
+            let read = remaining.min(DEFAULT_CHUNK_SIZE as u64) as usize;
+            input.read_exact(&mut chunk[..read])?;
             let mut ciphertext = Zeroizing::new(chunk[..read].to_vec());
             let aad = chunk_aad(
                 file_type,
@@ -331,12 +384,51 @@ pub fn encrypt_file_in_place(path: &Path, file_type: FileType) -> Result<()> {
             output.write_all(&(ciphertext.len() as u32).to_le_bytes())?;
             output.write_all(&ciphertext)?;
             chunk[..read].zeroize();
+            remaining -= read as u64;
             index = index
                 .checked_add(1)
                 .ok_or_else(|| corruption("chunk index overflow"))?;
         }
-        Ok(())
+        require_stream_end(&mut input)
     })
+}
+
+fn require_stream_end(input: &mut impl Read) -> Result<()> {
+    let mut extra = [0_u8; 1];
+    loop {
+        match input.read(&mut extra) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {
+                return Err(GaussError::InvalidRequest(
+                    "persistent stream exceeds declared plaintext length".into(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+/// Encrypt an existing immutable plaintext file without materialising either
+/// the plaintext or ciphertext as a whole-file buffer.
+pub fn encrypt_file_in_place(path: &Path, file_type: FileType) -> Result<()> {
+    if PROCESS_KEYRING.get().is_none() {
+        if encryption_enforced() {
+            return Err(GaussError::InvalidRequest(
+                "secure persistence requires an encryption keyring".into(),
+            ));
+        }
+        return Ok(());
+    }
+    let mut input = File::open(path)?;
+    let plaintext_len = input.metadata()?.len();
+    let mut prefix = [0_u8; MAGIC.len()];
+    let prefix_len = input.read(&mut prefix)?;
+    if prefix_len == MAGIC.len() && prefix == *MAGIC {
+        return Ok(());
+    }
+    input.seek(SeekFrom::Start(0))?;
+    atomic_write_persistent_stream(path, file_type, plaintext_len, input)
 }
 
 pub fn encode_persistent<'a>(file_type: FileType, plaintext: &'a [u8]) -> Result<Cow<'a, [u8]>> {
@@ -368,12 +460,29 @@ pub fn map_persistent(path: &Path) -> Result<Mmap> {
 /// authenticated one chunk at a time and never materialized as a whole-file
 /// plaintext buffer.
 pub fn open_persistent_reader(path: &Path) -> Result<Box<dyn Read>> {
+    open_persistent_reader_bounded(path, MAX_ENCRYPTION_CHUNK_SIZE)
+}
+
+/// Refuse a larger encryption chunk before allocating or decrypting its body.
+/// The reader owns header/layout and retained/replacement chunk admission.
+/// The caller owns its output buffer; mmap/cache/range output are separate.
+pub(crate) fn open_persistent_reader_bounded(
+    path: &Path,
+    max_chunk_size: usize,
+) -> Result<Box<dyn Read>> {
+    let (mut memory, root_bytes) =
+        admission::path(path, std::mem::size_of::<EncryptedChunkReader>())?;
     let mut file = File::open(path)?;
     let mut prefix = [0_u8; MAGIC.len()];
     let read = file.read(&mut prefix)?;
     file.seek(SeekFrom::Start(0))?;
     if read == MAGIC.len() && prefix == *MAGIC {
-        return Ok(Box::new(EncryptedChunkReader::open(file)?));
+        return Ok(Box::new(EncryptedChunkReader::open(
+            file,
+            max_chunk_size,
+            memory,
+            root_bytes,
+        )?));
     }
     if encryption_enforced() {
         return Err(GaussError::InvalidRequest(format!(
@@ -381,16 +490,44 @@ pub fn open_persistent_reader(path: &Path) -> Result<Box<dyn Read>> {
             path.display()
         )));
     }
-    Ok(Box::new(file))
+    memory.reduce(root_bytes);
+    Ok(Box::new(PlainReader {
+        file,
+        _memory: memory,
+    }))
+}
+
+struct PlainReader {
+    file: File,
+    _memory: crate::relational::wal_decode::MetadataCharge,
+}
+impl Read for PlainReader {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        self.file.read(output)
+    }
 }
 
 #[derive(Debug)]
 struct CachedChunk {
     bytes: Vec<u8>,
     referenced: AtomicBool,
+    // Shared Arc pins keep this lease after eviction; bytes drop first.
+    _memory: crate::relational::wal_decode::MetadataCharge,
 }
 
 impl CachedChunk {
+    fn admitted(bytes: Vec<u8>, mut memory: crate::relational::wal_decode::MetadataCharge) -> Self {
+        memory.reduce(bytes.capacity() as u64 + admission::cached_chunk_root_bytes());
+        Self {
+            bytes,
+            referenced: AtomicBool::new(false),
+            _memory: memory,
+        }
+    }
+
+    // Synthetic queue policy fixtures allocate their own input outside the
+    // cache. Production chunk construction always uses admitted().
+    #[cfg(test)]
     fn new(bytes: Vec<u8>) -> Self {
         Self {
             bytes,
@@ -398,6 +535,7 @@ impl CachedChunk {
             // hit earns a clock second chance, preventing one-pass graph and
             // quantizer scans from displacing the repeatedly used hot set.
             referenced: AtomicBool::new(false),
+            _memory: Default::default(),
         }
     }
 }
@@ -416,6 +554,10 @@ struct PersistentChunkCache {
     bytes: usize,
     probation_bytes: usize,
     main_bytes: usize,
+    // HashMap::capacity can fall with tombstones without freeing buckets.
+    hash_capacity: usize,
+    // Capacity remains charged after eviction until the containers are freed.
+    _memory: crate::relational::wal_decode::MetadataCharge,
 }
 
 #[derive(Debug)]
@@ -438,18 +580,51 @@ impl PersistentChunkCache {
         Some(chunk)
     }
 
+    #[cfg(test)]
     fn insert(&mut self, key: (u64, usize), chunk: Arc<CachedChunk>) {
+        self.try_insert(key, chunk).unwrap();
+    }
+
+    fn try_insert(&mut self, key: (u64, usize), chunk: Arc<CachedChunk>) -> Result<()> {
         // A concurrent reader may have filled the miss while this caller was
         // decrypting. Keep the already-published entry and avoid duplicate
         // queue nodes; this caller can still use its authenticated local Arc.
         if self.chunks.contains_key(&key) {
-            return;
+            return Ok(());
         }
+        if self.chunks.capacity() == 0
+            && self.probation.capacity() == 0
+            && self.main.capacity() == 0
+        {
+            self._memory = Default::default();
+        }
+        let peak = admission::cache_containers(self, true)?;
+        self._memory.prepare(peak)?;
+        self.chunks
+            .try_reserve(1)
+            .map_err(|_| admission::cache_allocation_error())?;
+        self.hash_capacity = self.hash_capacity.max(self.chunks.capacity());
+        self.probation
+            .try_reserve(1)
+            .map_err(|_| admission::cache_allocation_error())?;
+        // One large chunk can promote the entire probationary queue. Admit
+        // and reserve those moves before any cache/queue publication.
+        self.main
+            .try_reserve(self.probation.len() + 1)
+            .map_err(|_| admission::cache_allocation_error())?;
+        self._memory
+            .reduce(admission::cache_containers(self, false)?);
         self.bytes = self.bytes.saturating_add(chunk.bytes.len());
         self.probation_bytes = self.probation_bytes.saturating_add(chunk.bytes.len());
         self.chunks.insert(key, CachedEntry { chunk });
         self.probation.push_back(key);
+        PERSISTENT_CACHE_HIGH_WATER_BYTES.fetch_max(self.bytes, Ordering::Relaxed);
         self.rebalance();
+        if crate::streamer::memory_pressure() {
+            self.shrink_to(PERSISTENT_CACHE_BYTES / 2);
+            metrics::counter!("chirondb_persistent_cache_pressure_shrinks_total").increment(1);
+        }
+        Ok(())
     }
 
     fn rebalance(&mut self) {
@@ -505,6 +680,39 @@ impl PersistentChunkCache {
             .map(|entry| entry.chunk.bytes.len())
             .sum();
         self.bytes = self.probation_bytes.saturating_add(self.main_bytes);
+        self.release_empty_containers();
+    }
+
+    fn shrink_to(&mut self, target_bytes: usize) {
+        while self.bytes > target_bytes {
+            if let Some(key) = self.probation.pop_front() {
+                if let Some(entry) = self.chunks.remove(&key) {
+                    let bytes = entry.chunk.bytes.len();
+                    self.probation_bytes = self.probation_bytes.saturating_sub(bytes);
+                    self.bytes = self.bytes.saturating_sub(bytes);
+                }
+                continue;
+            }
+            let Some(key) = self.main.pop_front() else {
+                break;
+            };
+            if let Some(entry) = self.chunks.remove(&key) {
+                let bytes = entry.chunk.bytes.len();
+                self.main_bytes = self.main_bytes.saturating_sub(bytes);
+                self.bytes = self.bytes.saturating_sub(bytes);
+            }
+        }
+        self.release_empty_containers();
+    }
+
+    fn release_empty_containers(&mut self) {
+        if self.chunks.is_empty() {
+            drop(std::mem::take(&mut self.chunks));
+            drop(std::mem::take(&mut self.probation));
+            drop(std::mem::take(&mut self.main));
+            self.hash_capacity = 0;
+            self._memory.reduce(0);
+        }
     }
 }
 
@@ -532,10 +740,13 @@ pub struct PersistentFile {
     len: usize,
     cache_id: u64,
     storage: PersistentStorage,
+    // Last: mapping/path/layout owners die before their root reservation.
+    _memory: crate::relational::wal_decode::MetadataCharge,
 }
 
 impl PersistentFile {
     pub fn open(path: &Path) -> Result<Self> {
+        let (mut memory, root_bytes) = admission::path(path, std::mem::size_of::<Self>())?;
         let mut file = File::open(path)?;
         let file_len = file.metadata()?.len();
         let mut prefix = [0_u8; MAGIC.len()];
@@ -544,22 +755,7 @@ impl PersistentFile {
             if file_len < FIXED_HEADER_LEN as u64 {
                 return Err(corruption("truncated encrypted header"));
             }
-            file.seek(SeekFrom::Start(0))?;
-            let mut fixed = [0_u8; FIXED_HEADER_LEN];
-            file.read_exact(&mut fixed)?;
-            let key_len = u16::from_le_bytes(fixed[10..12].try_into().expect("key id length"));
-            let wrapped_len =
-                u16::from_le_bytes(fixed[52..54].try_into().expect("wrapped DEK length"));
-            let header_len = FIXED_HEADER_LEN
-                .checked_add(key_len as usize)
-                .and_then(|length| length.checked_add(wrapped_len as usize))
-                .ok_or_else(|| corruption("encrypted header length overflow"))?;
-            if header_len as u64 > file_len {
-                return Err(corruption("truncated encrypted header"));
-            }
-            file.seek(SeekFrom::Start(0))?;
-            let mut header = vec![0_u8; header_len];
-            file.read_exact(&mut header)?;
+            let header = read_encrypted_header(&mut file)?;
             let layout = EncryptedLayout::from_header(&header)?;
             let len = usize::try_from(layout.info().plaintext_len)
                 .map_err(|_| corruption("plaintext length exceeds usize"))?;
@@ -575,11 +771,14 @@ impl PersistentFile {
             // lets the OS page ciphertext normally while authenticated
             // plaintext remains confined to the bounded chunk cache.
             let ciphertext = unsafe { Mmap::map(&file)? };
+            let path = path.to_path_buf();
+            memory.reduce(root_bytes);
             return Ok(Self {
-                path: path.to_path_buf(),
+                path,
                 len,
                 cache_id: NEXT_PERSISTENT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
                 storage: PersistentStorage::Encrypted { ciphertext, layout },
+                _memory: memory,
             });
         }
         if encryption_enforced() {
@@ -592,16 +791,23 @@ impl PersistentFile {
         // SAFETY: persisted immutable files are atomically replaced instead
         // of being modified while readers hold a read-only mapping.
         let mmap = unsafe { Mmap::map(&file)? };
+        let path = path.to_path_buf();
+        memory.reduce(root_bytes);
         Ok(Self {
-            path: path.to_path_buf(),
+            path,
             len: mmap.len(),
             cache_id: 0,
             storage: PersistentStorage::Plain(mmap),
+            _memory: memory,
         })
     }
 
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     pub fn is_empty(&self) -> bool {
@@ -613,6 +819,12 @@ impl PersistentFile {
     }
 
     pub fn read_range(&self, range: Range<usize>) -> Result<Cow<'_, [u8]>> {
+        // Public Cow compatibility cannot carry the internal output lease.
+        self.read_range_admitted(range)
+            .map(AdmittedRange::into_compat)
+    }
+
+    pub(crate) fn read_range_admitted(&self, range: Range<usize>) -> Result<AdmittedRange<'_>> {
         if range.start > range.end || range.end > self.len {
             return Err(GaussError::InvalidRequest(format!(
                 "persisted range {}..{} is outside {} ({} bytes)",
@@ -623,15 +835,16 @@ impl PersistentFile {
             )));
         }
         match &self.storage {
-            PersistentStorage::Plain(mmap) => Ok(Cow::Borrowed(&mmap[range])),
+            PersistentStorage::Plain(mmap) => Ok(AdmittedRange::borrowed(&mmap[range])),
             PersistentStorage::Encrypted { ciphertext, layout } => {
                 if range.is_empty() {
-                    return Ok(Cow::Owned(Vec::new()));
+                    return Ok(AdmittedRange::owned(Vec::new(), Default::default()));
                 }
                 let chunk_size = layout.info().chunk_size;
                 let first = range.start / chunk_size;
                 let last = (range.end - 1) / chunk_size;
-                let mut output = Vec::with_capacity(range.end - range.start);
+                // Tuple fields drop in order, including on a late chunk failure.
+                let mut output = AdmittedRange::buffer(range.end - range.start)?;
                 for index in first..=last {
                     let chunk = self.encrypted_chunk(ciphertext, layout, index)?;
                     let chunk_start = index
@@ -640,18 +853,18 @@ impl PersistentFile {
                     let copy_start = range.start.saturating_sub(chunk_start);
                     let copy_end =
                         range.end.min(chunk_start.saturating_add(chunk.bytes.len())) - chunk_start;
-                    output.extend_from_slice(
+                    output.0.extend_from_slice(
                         chunk
                             .bytes
                             .get(copy_start..copy_end)
                             .ok_or_else(|| corruption("plaintext chunk slice is out of bounds"))?,
                     );
                 }
-                if output.len() != range.end - range.start {
-                    output.zeroize();
+                if output.0.len() != range.end - range.start {
+                    output.0.zeroize();
                     return Err(corruption("plaintext range length mismatch"));
                 }
-                Ok(Cow::Owned(output))
+                Ok(AdmittedRange::owned(output.0, output.1))
             }
         }
     }
@@ -686,7 +899,7 @@ impl PersistentFile {
         let mut offset = range.start;
         while offset < range.end {
             let end = range.end.min(offset.saturating_add(DEFAULT_CHUNK_SIZE));
-            hasher.update(&self.read_range(offset..end)?);
+            hasher.update(&self.read_range_admitted(offset..end)?);
             offset = end;
         }
         Ok(hasher.finalize())
@@ -714,13 +927,14 @@ impl PersistentFile {
         let frame = ciphertext
             .get(start..end)
             .ok_or_else(|| corruption("encrypted chunk frame is out of bounds"))?;
+        let memory = admission::cached_chunk(frame.len())?;
         let plaintext = layout.decrypt_chunk_frame(index, frame)?;
         PERSISTENT_CACHE_DECRYPTED_BYTES.fetch_add(plaintext.len() as u64, Ordering::Relaxed);
-        let chunk = Arc::new(CachedChunk::new(plaintext));
+        let chunk = Arc::new(CachedChunk::admitted(plaintext, memory));
         persistent_chunk_cache()
             .write()
             .expect("persistent chunk cache poisoned")
-            .insert(key, chunk.clone());
+            .try_insert(key, chunk.clone())?;
         Ok(chunk)
     }
 }
@@ -751,8 +965,8 @@ impl Read for PersistentReader<'_> {
         );
         let bytes = self
             .file
-            .read_range(self.position..end)
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
+            .read_range_admitted(self.position..end)
+            .map_err(std::io::Error::other)?;
         buffer[..bytes.len()].copy_from_slice(&bytes);
         self.position = end;
         Ok(bytes.len())
@@ -774,6 +988,70 @@ pub fn decode_persistent<'a>(bytes: &'a [u8]) -> Result<Cow<'a, [u8]>> {
     Ok(Cow::Borrowed(bytes))
 }
 
+/// Reject an expanded envelope length before decrypt_bytes allocates output.
+/// Chiron encryption does not compress: plaintext cannot exceed its frame.
+pub(crate) fn decode_persistent_bounded(bytes: &[u8], limit: usize) -> Result<Cow<'_, [u8]>> {
+    if is_encrypted(bytes) && parse_header(bytes)?.info.plaintext_len > limit as u64 {
+        return Err(corruption("encrypted plaintext exceeds admitted frame"));
+    }
+    decode_persistent(bytes)
+}
+
+/// Audit recovery may discard only a structurally incomplete final envelope.
+/// A complete header authenticates before any body-length decision; complete
+/// chunks authenticate before truncation is reported. Missing keys never
+/// become permission to truncate data. The caller admits input/decrypt overlap.
+pub(crate) fn audit_frame_is_truncated(bytes: &[u8], limit: usize) -> Result<bool> {
+    let keyring = PROCESS_KEYRING.get().ok_or_else(|| {
+        GaussError::InvalidRequest("encrypted bytes require an encryption keyring".into())
+    })?;
+    if bytes.len() < MAGIC.len() {
+        return if MAGIC.starts_with(bytes) {
+            Ok(true)
+        } else {
+            Err(corruption("missing CHIRENC1 header"))
+        };
+    }
+    if !bytes.starts_with(MAGIC) {
+        return Err(corruption("missing CHIRENC1 header"));
+    }
+    if bytes.len() > 8 && bytes[8] != 1 {
+        return Err(corruption("unsupported encrypted envelope version"));
+    }
+    if bytes.len() > 9 && FileType::try_from(bytes[9])? != FileType::Audit {
+        return Err(corruption("encrypted audit frame has another file type"));
+    }
+    if bytes.len() < FIXED_HEADER_LEN {
+        return Ok(true);
+    }
+    let parsed = match parse_header(bytes) {
+        Ok(parsed) => parsed,
+        Err(GaussError::InvalidRequest(message))
+            if message == "encrypted envelope corruption: truncated encrypted header" =>
+        {
+            return Ok(true);
+        }
+        Err(error) => return Err(error),
+    };
+    if parsed.info.plaintext_len > limit as u64 {
+        return Err(corruption("encrypted plaintext exceeds admitted frame"));
+    }
+    match decrypt_bytes(keyring, bytes) {
+        Ok(_) => Ok(false),
+        Err(GaussError::InvalidRequest(message))
+            if matches!(
+                message.as_str(),
+                "encrypted envelope corruption: truncated encrypted chunk length"
+                    | "encrypted envelope corruption: truncated encrypted chunk"
+                    | "encrypted envelope corruption: plaintext length mismatch"
+            ) =>
+        {
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EnvelopeInfo {
     pub file_type: FileType,
@@ -790,6 +1068,7 @@ pub struct EncryptedLayout {
     info: EnvelopeInfo,
     body_offset: usize,
     dek: Vec<u8>,
+    _memory: crate::relational::wal_decode::MetadataCharge,
 }
 
 impl std::fmt::Debug for EncryptedLayout {
@@ -809,12 +1088,22 @@ impl Drop for EncryptedLayout {
 }
 
 impl EncryptedLayout {
+    pub(crate) fn from_file_header(file: &mut File) -> Result<Self> {
+        let header = read_encrypted_header(file)?;
+        Self::from_header(&header)
+    }
+
     pub fn from_header(envelope_header: &[u8]) -> Result<Self> {
         let keyring = PROCESS_KEYRING.get().ok_or_else(|| {
             GaussError::InvalidRequest("encrypted bytes require an encryption keyring".to_string())
         })?;
+        Self::from_header_with_keyring(keyring, envelope_header)
+    }
+
+    fn from_header_with_keyring(keyring: &Keyring, envelope_header: &[u8]) -> Result<Self> {
+        let memory = admission::layout(envelope_header)?;
         let parsed = parse_header(envelope_header)?;
-        let mut dek = parsed.wrapped_dek.to_vec();
+        let mut dek = Zeroizing::new(parsed.wrapped_dek.to_vec());
         open_in_place(
             keyring.key(&parsed.info.key_id)?,
             parsed.wrap_nonce,
@@ -828,7 +1117,8 @@ impl EncryptedLayout {
         Ok(Self {
             info: parsed.info,
             body_offset: parsed.body_offset,
-            dek,
+            dek: std::mem::take(&mut *dek),
+            _memory: memory,
         })
     }
 
@@ -906,21 +1196,8 @@ impl EncryptedLayout {
     }
 }
 
-fn read_encrypted_layout(file: &mut File) -> Result<EncryptedLayout> {
-    file.seek(SeekFrom::Start(0))?;
-    let mut fixed = [0_u8; FIXED_HEADER_LEN];
-    file.read_exact(&mut fixed)?;
-    let key_len = u16::from_le_bytes(fixed[10..12].try_into().expect("key id length")) as usize;
-    let wrapped_len =
-        u16::from_le_bytes(fixed[52..54].try_into().expect("wrapped DEK length")) as usize;
-    let header_len = FIXED_HEADER_LEN
-        .checked_add(key_len)
-        .and_then(|len| len.checked_add(wrapped_len))
-        .ok_or_else(|| corruption("encrypted header length overflow"))?;
-    let mut header = vec![0_u8; header_len];
-    header[..FIXED_HEADER_LEN].copy_from_slice(&fixed);
-    file.read_exact(&mut header[FIXED_HEADER_LEN..])?;
-    EncryptedLayout::from_header(&header)
+fn read_encrypted_header(file: &mut File) -> Result<admission::Header> {
+    admission::header(file)
 }
 
 struct EncryptedChunkReader {
@@ -932,13 +1209,40 @@ struct EncryptedChunkReader {
     plaintext_read: u64,
     chunk: Vec<u8>,
     chunk_offset: usize,
+    _memory: crate::relational::wal_decode::MetadataCharge,
 }
 
 impl EncryptedChunkReader {
-    fn open(mut file: File) -> Result<Self> {
+    fn open(
+        mut file: File,
+        max_chunk_size: usize,
+        mut memory: crate::relational::wal_decode::MetadataCharge,
+        root_bytes: u64,
+    ) -> Result<Self> {
         let encoded_len = file.metadata()?.len();
-        let layout = read_encrypted_layout(&mut file)?;
+        let header = read_encrypted_header(&mut file)?;
+        let chunk_size =
+            u32::from_le_bytes(header[36..40].try_into().expect("chunk size")) as usize;
+        if chunk_size > max_chunk_size && chunk_size <= MAX_ENCRYPTION_CHUNK_SIZE {
+            return Err(GaussError::ResourceExhausted(
+                "encrypted reader chunk exceeds admitted memory".into(),
+            ));
+        }
+        let layout = EncryptedLayout::from_header(&header)?;
         let encoded_end = layout.body_offset as u64;
+        // Old retained chunk, encoded frame and freshly decrypted replacement
+        // can coexist. Admit the peak once, before any body allocation/read.
+        let overlap = layout
+            .info()
+            .plaintext_len
+            .min(chunk_size as u64)
+            .checked_add((4 + TAG_LEN) as u64)
+            .and_then(|n| n.checked_mul(3))
+            .and_then(|n| n.checked_add(root_bytes))
+            .ok_or_else(|| {
+                GaussError::ResourceExhausted("encrypted stream memory overflow".into())
+            })?;
+        memory.prepare(overlap)?;
         Ok(Self {
             file,
             layout,
@@ -948,6 +1252,7 @@ impl EncryptedChunkReader {
             plaintext_read: 0,
             chunk: Vec::new(),
             chunk_offset: 0,
+            _memory: memory,
         })
     }
 
@@ -1016,7 +1321,7 @@ fn invalid_data(message: &str) -> std::io::Error {
 }
 
 fn invalid_data_error(error: GaussError) -> std::io::Error {
-    invalid_data(&error.to_string())
+    std::io::Error::new(std::io::ErrorKind::InvalidData, error)
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -1161,6 +1466,12 @@ pub fn decrypt_bytes(keyring: &Keyring, envelope: &[u8]) -> Result<(EnvelopeInfo
             &aad,
             &mut chunk,
         )?;
+        // The authenticated declared length is the output allocation bound.
+        // Reject excess chunks before extend could grow past that reservation.
+        if chunk.len() > expected_len.saturating_sub(plaintext.len()) {
+            dek.zeroize();
+            return Err(corruption("encrypted plaintext exceeds declared length"));
+        }
         plaintext.extend_from_slice(&chunk);
         offset = end;
         index = index
@@ -1192,43 +1503,64 @@ pub fn inspect_file(path: &Path) -> Result<EnvelopeInfo> {
 }
 
 pub fn persistent_plaintext_len(path: &Path) -> Result<u64> {
+    let (_memory, _) = admission::path(path, std::mem::size_of::<File>())?;
     let mut file = File::open(path)?;
     let mut prefix = [0_u8; 8];
     let read = file.read(&mut prefix)?;
     if read == MAGIC.len() && prefix == *MAGIC {
-        return inspect_file(path).map(|info| info.plaintext_len);
+        let header = read_encrypted_header(&mut file)?;
+        return Ok(parse_header(&header)?.info.plaintext_len);
     }
     Ok(file.metadata()?.len())
 }
 
 pub fn verify_file(keyring: &Keyring, path: &Path) -> Result<EnvelopeInfo> {
-    let bytes = fs::read(path)?;
-    let (info, mut plaintext) = decrypt_bytes(keyring, &bytes)?;
-    plaintext.zeroize();
-    Ok(info)
+    let mut file = File::open(path)?;
+    let encoded_len = file.metadata()?.len();
+    let header = read_encrypted_header(&mut file)?;
+    let layout = EncryptedLayout::from_header_with_keyring(keyring, &header)?;
+    let mut end = layout.body_offset as u64;
+    for index in 0..layout.chunk_count() {
+        let range = layout.encrypted_chunk_range(index)?;
+        if range.end > encoded_len {
+            return Err(corruption("truncated encrypted chunk frame"));
+        }
+        let frame_len = usize::try_from(range.end - range.start)
+            .map_err(|_| corruption("encrypted chunk frame exceeds usize"))?;
+        let mut frame = Zeroizing::new(vec![0_u8; frame_len]);
+        file.seek(SeekFrom::Start(range.start))?;
+        file.read_exact(&mut frame)?;
+        let mut plaintext = layout.decrypt_chunk_frame(index, &frame)?;
+        plaintext.zeroize();
+        end = range.end;
+    }
+    if end != encoded_len {
+        return Err(corruption("encrypted file length mismatch"));
+    }
+    Ok(layout.info().clone())
 }
 
 pub fn inspect_tree(root: &Path) -> Result<EncryptionTreeReport> {
     let mut report = EncryptionTreeReport::default();
     walk_files(root, &mut |path| {
         let metadata = fs::metadata(path)?;
-        let bytes = fs::read(path)?;
-        match classify_persisted_file(path, &bytes)? {
-            PersistedFileKind::Encrypted(infos) => {
+        match inspect_persisted_file(path, None)? {
+            Some(key_ids) => {
                 report.encrypted_files = report.encrypted_files.saturating_add(1);
                 report.encrypted_bytes = report.encrypted_bytes.saturating_add(metadata.len());
-                report
-                    .key_ids
-                    .extend(infos.into_iter().map(|info| info.key_id));
+                report.key_ids.extend(key_ids);
+                if report.key_ids.len() > MAX_TREE_KEY_IDS {
+                    return Err(corruption("encrypted tree has too many key IDs"));
+                }
             }
-            PersistedFileKind::Plaintext => {
+            None if !is_bootstrap_file(path) => {
                 report.plaintext_files = report.plaintext_files.saturating_add(1);
                 report.plaintext_bytes = report.plaintext_bytes.saturating_add(metadata.len());
                 if report.plaintext_paths.len() < 16 {
                     report.plaintext_paths.push(path.display().to_string());
                 }
             }
-            PersistedFileKind::Bootstrap => {}
+            None => {}
         }
         Ok(())
     })?;
@@ -1245,25 +1577,13 @@ pub fn verify_tree(keyring: &Keyring, root: &Path) -> Result<EncryptionTreeRepor
         )));
     }
     walk_files(root, &mut |path| {
-        let bytes = fs::read(path)?;
-        match classify_persisted_file(path, &bytes)? {
-            PersistedFileKind::Encrypted(_) if is_audit_log(path) => {
-                verify_audit_frames(keyring, &bytes).map(|_| ())
-            }
-            PersistedFileKind::Encrypted(_) if is_encrypted(&bytes) => {
-                decrypt_bytes(keyring, &bytes).map(|_| ())
-            }
-            PersistedFileKind::Encrypted(_) if is_wal_segment(path) => {
-                verify_wal_frames(keyring, &bytes).map(|_| ())
-            }
-            PersistedFileKind::Bootstrap => Ok(()),
-            PersistedFileKind::Plaintext | PersistedFileKind::Encrypted(_) => {
-                Err(GaussError::InvalidRequest(format!(
-                    "unsupported persisted file {}",
-                    path.display()
-                )))
-            }
+        if inspect_persisted_file(path, Some(keyring))?.is_none() && !is_bootstrap_file(path) {
+            return Err(GaussError::InvalidRequest(format!(
+                "unsupported persisted file {}",
+                path.display()
+            )));
         }
+        Ok(())
     })?;
     Ok(report)
 }
@@ -1316,7 +1636,19 @@ fn rewrap_envelope(keyring: &Keyring, envelope: &[u8]) -> Result<(EnvelopeInfo, 
     Ok((info, rotated))
 }
 
+fn validate_rotation_frontier(root: &Path) -> Result<()> {
+    let marker = root.join(".protected-installation");
+    match fs::read(marker) {
+        Ok(bytes) if bytes.starts_with(b"CHRNINSTALL7\n") => Err(GaussError::InvalidRequest(
+            "key rewrapping is not qualified for common-frontier format 1; retain the existing keyring".into())),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub fn rewrap_tree(keyring: &Keyring, root: &Path) -> Result<u64> {
+    validate_rotation_frontier(root)?;
     let mut rotated = 0_u64;
     walk_files(root, &mut |path| {
         let bytes = fs::read(path)?;
@@ -1495,6 +1827,7 @@ fn hex_digest(bytes: &[u8]) -> String {
 /// idempotent; the durable journal makes an interrupted run explicit and a
 /// subsequent invocation safely continues over already-rotated files.
 pub fn rewrap_tree_resumable(keyring: &Keyring, root: &Path) -> Result<u64> {
+    validate_rotation_frontier(root)?;
     let journal = root.join(".key-rotation.json");
     let logical_digest = logical_tree_digest(root, Some(keyring))?;
     if journal.exists() {
@@ -1560,7 +1893,9 @@ pub fn referenced_key_ids(root: &Path) -> Result<HashSet<String>> {
 /// files must be empty (callers compact first); immutable WAL archives are
 /// encrypted as complete envelopes and remain readable by the archive loader.
 pub fn migrate_plain_tree_in_place(keyring: &Keyring, root: &Path) -> Result<u64> {
-    let mut migrated = 0_u64;
+    let mut migrated = u64::from(crate::wal::Wal::migrate_transaction_journal_for_encryption(
+        root, keyring,
+    )?);
     walk_files(root, &mut |path| {
         let bytes = fs::read(path)?;
         match classify_persisted_file(path, &bytes)? {
@@ -1585,6 +1920,10 @@ pub fn migrate_plain_tree_in_place(keyring: &Keyring, root: &Path) -> Result<u64
         Ok(())
     })?;
     Ok(migrated)
+}
+
+pub(crate) fn inspect_wal_frames_for_migration(bytes: &[u8]) -> Result<Option<Vec<EnvelopeInfo>>> {
+    inspect_wal_frames(bytes)
 }
 
 fn is_active_wal_segment(path: &Path) -> bool {
@@ -1659,6 +1998,13 @@ fn classify_persisted_file(path: &Path, bytes: &[u8]) -> Result<PersistedFileKin
             None => PersistedFileKind::Plaintext,
         });
     }
+    if is_bootstrap_file(path) {
+        return Ok(PersistedFileKind::Bootstrap);
+    }
+    Ok(PersistedFileKind::Plaintext)
+}
+
+fn is_bootstrap_file(path: &Path) -> bool {
     let name = path.file_name().and_then(|name| name.to_str());
     let bootstrap_current = name == Some("CURRENT")
         && path
@@ -1666,17 +2012,151 @@ fn classify_persisted_file(path: &Path, bytes: &[u8]) -> Result<PersistedFileKin
             .and_then(Path::file_name)
             .and_then(|name| name.to_str())
             != Some("overlays");
-    if bootstrap_current
+    bootstrap_current
         || name.is_some_and(|name| {
             matches!(
                 name,
-                ".chirondb.lock" | ".generation-migration.json" | ".key-rotation.json"
+                ".chirondb.lock"
+                    | ".generation-migration.json"
+                    | ".key-rotation.json"
+                    | ".protected-installation"
             )
         })
-    {
-        return Ok(PersistedFileKind::Bootstrap);
+}
+
+/// Inspect one persisted file with memory bounded by a single WAL/audit
+/// frame or encrypted chunk. Backup and restore use this on large trees.
+fn inspect_persisted_file(
+    path: &Path,
+    keyring: Option<&Keyring>,
+) -> Result<Option<HashSet<String>>> {
+    if is_audit_log(path) {
+        return inspect_audit_file(path, keyring);
     }
-    Ok(PersistedFileKind::Plaintext)
+    let mut file = File::open(path)?;
+    let mut prefix = [0_u8; MAGIC.len()];
+    let prefix_len = file.read(&mut prefix)?;
+    if prefix_len == MAGIC.len() && prefix == *MAGIC {
+        let info = if let Some(keyring) = keyring {
+            verify_file(keyring, path)?
+        } else {
+            let header = read_encrypted_header(&mut file)?;
+            parse_header(&header)?.info
+        };
+        return Ok(Some(HashSet::from([info.key_id])));
+    }
+    if is_wal_segment(path) {
+        return inspect_wal_file(path, keyring);
+    }
+    Ok(None)
+}
+
+fn inspect_wal_file(path: &Path, keyring: Option<&Keyring>) -> Result<Option<HashSet<String>>> {
+    const MAX_WAL_RECORD: usize = 64 * 1024 * 1024;
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut keys = HashSet::new();
+    loop {
+        let mut header = [0_u8; 8];
+        if reader.read(&mut header[..1])? == 0 {
+            return Ok(Some(keys));
+        }
+        reader
+            .read_exact(&mut header[1..])
+            .map_err(|_| corruption("partial WAL frame header"))?;
+        let len = u32::from_le_bytes(header[..4].try_into().expect("WAL frame length")) as usize;
+        if len > MAX_WAL_RECORD {
+            return Err(corruption("WAL frame exceeds maximum size"));
+        }
+        let mut payload = Zeroizing::new(vec![0_u8; len]);
+        reader
+            .read_exact(&mut payload)
+            .map_err(|_| corruption("partial WAL frame payload"))?;
+        if crc32fast::hash(&payload)
+            != u32::from_le_bytes(header[4..].try_into().expect("WAL frame CRC"))
+        {
+            return Err(corruption("WAL frame CRC mismatch"));
+        }
+        if !is_encrypted(&payload) {
+            return Ok(None);
+        }
+        let info = if let Some(keyring) = keyring {
+            let (info, mut plaintext) = decrypt_bytes(keyring, &payload)?;
+            plaintext.zeroize();
+            info
+        } else {
+            parse_header(&payload)?.info
+        };
+        record_tree_key_id(&mut keys, info.key_id)?;
+    }
+}
+
+fn inspect_audit_file(path: &Path, keyring: Option<&Keyring>) -> Result<Option<HashSet<String>>> {
+    const MAX_AUDIT_LINE: usize = 128 * 1024 * 1024;
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut keys = HashSet::new();
+    let mut line = Vec::new();
+    while read_bounded_line(&mut reader, &mut line, MAX_AUDIT_LINE)? {
+        let text = std::str::from_utf8(&line).map_err(|_| corruption("audit log is not UTF-8"))?;
+        let text = text.strip_suffix('\n').unwrap_or(text);
+        let text = text.strip_suffix('\r').unwrap_or(text);
+        if text.is_empty() {
+            continue;
+        }
+        let Some(encoded) = text.strip_prefix("CHIRENC1:") else {
+            return Ok(None);
+        };
+        let envelope = Zeroizing::new(
+            STANDARD
+                .decode(encoded)
+                .map_err(|_| corruption("invalid audit frame base64"))?,
+        );
+        if !is_encrypted(&envelope) {
+            return Err(corruption("audit frame lacks CHIRENC1 envelope"));
+        }
+        let info = if let Some(keyring) = keyring {
+            let (info, mut plaintext) = decrypt_bytes(keyring, &envelope)?;
+            plaintext.zeroize();
+            info
+        } else {
+            parse_header(&envelope)?.info
+        };
+        if info.file_type != FileType::Audit {
+            return Err(corruption("audit frame has the wrong file type"));
+        }
+        record_tree_key_id(&mut keys, info.key_id)?;
+    }
+    Ok(Some(keys))
+}
+
+fn record_tree_key_id(keys: &mut HashSet<String>, id: String) -> Result<()> {
+    if keys.len() >= MAX_TREE_KEY_IDS && !keys.contains(&id) {
+        return Err(corruption("encrypted tree has too many key IDs"));
+    }
+    keys.insert(id);
+    Ok(())
+}
+
+fn read_bounded_line(reader: &mut impl BufRead, line: &mut Vec<u8>, limit: usize) -> Result<bool> {
+    line.clear();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(!line.is_empty());
+        }
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if line.len().saturating_add(take) > limit {
+            return Err(corruption("audit frame exceeds maximum size"));
+        }
+        let complete = available[take - 1] == b'\n';
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if complete {
+            return Ok(true);
+        }
+    }
 }
 
 fn is_wal_segment(path: &Path) -> bool {
@@ -1735,29 +2215,6 @@ fn inspect_wal_frames(bytes: &[u8]) -> Result<Option<Vec<EnvelopeInfo>>> {
     Ok(Some(infos))
 }
 
-fn verify_wal_frames(keyring: &Keyring, bytes: &[u8]) -> Result<Vec<EnvelopeInfo>> {
-    let infos = inspect_wal_frames(bytes)?
-        .ok_or_else(|| corruption("plaintext WAL frame in encrypted tree"))?;
-    let mut offset = 0_usize;
-    for info in &infos {
-        let len = u32::from_le_bytes(
-            bytes[offset..offset + 4]
-                .try_into()
-                .expect("validated WAL frame length"),
-        ) as usize;
-        let payload_start = offset + 8;
-        let payload_end = payload_start + len;
-        let (actual, mut plaintext) = decrypt_bytes(keyring, &bytes[payload_start..payload_end])?;
-        if &actual != info {
-            plaintext.zeroize();
-            return Err(corruption("WAL frame metadata changed during verification"));
-        }
-        plaintext.zeroize();
-        offset = payload_end;
-    }
-    Ok(infos)
-}
-
 fn inspect_audit_frames(bytes: &[u8]) -> Result<Option<Vec<EnvelopeInfo>>> {
     let text = std::str::from_utf8(bytes).map_err(|_| corruption("audit log is not UTF-8"))?;
     let mut infos = Vec::new();
@@ -1778,29 +2235,6 @@ fn inspect_audit_frames(bytes: &[u8]) -> Result<Option<Vec<EnvelopeInfo>>> {
         infos.push(info);
     }
     Ok(Some(infos))
-}
-
-fn verify_audit_frames(keyring: &Keyring, bytes: &[u8]) -> Result<Vec<EnvelopeInfo>> {
-    let infos = inspect_audit_frames(bytes)?
-        .ok_or_else(|| corruption("plaintext audit frame in encrypted tree"))?;
-    let text = std::str::from_utf8(bytes).map_err(|_| corruption("audit log is not UTF-8"))?;
-    for (line, info) in text.lines().filter(|line| !line.is_empty()).zip(&infos) {
-        let envelope = STANDARD
-            .decode(
-                line.strip_prefix("CHIRENC1:")
-                    .expect("validated audit prefix"),
-            )
-            .map_err(|_| corruption("invalid audit frame base64"))?;
-        let (actual, mut plaintext) = decrypt_bytes(keyring, &envelope)?;
-        if &actual != info {
-            plaintext.zeroize();
-            return Err(corruption(
-                "audit frame metadata changed during verification",
-            ));
-        }
-        plaintext.zeroize();
-    }
-    Ok(infos)
 }
 
 fn rewrap_wal_frames(keyring: &Keyring, path: &Path, bytes: &[u8]) -> Result<()> {
@@ -1891,6 +2325,9 @@ fn parse_header(envelope: &[u8]) -> Result<ParsedHeader<'_>> {
     }
     let file_type = FileType::try_from(envelope[9])?;
     let key_len = u16::from_le_bytes(envelope[10..12].try_into().expect("key id length")) as usize;
+    if key_len == 0 || key_len > MAX_KEY_ID_BYTES {
+        return Err(corruption("invalid encrypted key ID length"));
+    }
     let file_uuid = Uuid::from_bytes(envelope[12..28].try_into().expect("file uuid"));
     let plaintext_len = u64::from_le_bytes(envelope[28..36].try_into().expect("plaintext length"));
     let chunk_size = u32::from_le_bytes(envelope[36..40].try_into().expect("chunk size")) as usize;
@@ -2014,11 +2451,74 @@ fn validate_keyring_permissions(_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    mod admission;
     use std::io::Write;
 
     use tempfile::NamedTempFile;
 
     use super::*;
+
+    #[test]
+    fn authenticated_excess_plaintext_is_rejected_before_output_growth() {
+        let (_key, ring) = keyring();
+        let original = encrypt_bytes(&ring, FileType::Wal, b"excess").unwrap();
+        let parsed = parse_header(&original).unwrap();
+        let mut dek = parsed.wrapped_dek.to_vec();
+        open_in_place(
+            ring.key(&parsed.info.key_id).unwrap(),
+            parsed.wrap_nonce,
+            parsed.aad_header,
+            &mut dek,
+        )
+        .unwrap();
+        let mut header = parsed.aad_header.to_vec();
+        // Authenticate a one-byte declaration with a valid six-byte chunk;
+        // this exercises the output bound rather than an authentication error.
+        header[28..36].copy_from_slice(&1_u64.to_le_bytes());
+        let mut wrapped = dek.clone();
+        seal_in_place(
+            ring.key(&parsed.info.key_id).unwrap(),
+            parsed.wrap_nonce,
+            &header,
+            &mut wrapped,
+        )
+        .unwrap();
+        let mut chunk = b"excess".to_vec();
+        seal_in_place(
+            &dek,
+            chunk_nonce(parsed.info.file_uuid, 0),
+            &chunk_aad(
+                FileType::Wal,
+                parsed.info.file_uuid,
+                1,
+                parsed.info.chunk_size,
+                0,
+            ),
+            &mut chunk,
+        )
+        .unwrap();
+        header.extend_from_slice(&wrapped);
+        header.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+        header.extend_from_slice(&chunk);
+        let error = decrypt_bytes(&ring, &header).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("encrypted plaintext exceeds declared length"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn encrypted_tree_key_ids_refuse_growth_beyond_the_metadata_budget() {
+        let mut keys = HashSet::new();
+        for index in 0..MAX_TREE_KEY_IDS {
+            record_tree_key_id(&mut keys, format!("key-{index:05}")).unwrap();
+        }
+        record_tree_key_id(&mut keys, "key-00000".into()).unwrap();
+        assert!(record_tree_key_id(&mut keys, "new-key".into()).is_err());
+        assert_eq!(keys.len(), MAX_TREE_KEY_IDS);
+    }
 
     fn keyring() -> (NamedTempFile, Keyring) {
         let mut file = NamedTempFile::new().unwrap();
@@ -2036,6 +2536,145 @@ mod tests {
         }
         let ring = Keyring::load(file.path()).unwrap();
         (file, ring)
+    }
+
+    #[test]
+    fn bounded_reader_rejects_a_larger_chunk_before_opening_plaintext() {
+        let (_key, ring) = keyring();
+        let file = NamedTempFile::new().unwrap();
+        let bytes = encrypt_bytes_with_chunk_size(
+            &ring,
+            FileType::Metadata,
+            b"small payload",
+            DEFAULT_CHUNK_SIZE * 2,
+        )
+        .unwrap();
+        fs::write(file.path(), bytes).unwrap();
+        // No process keyring is installed. Admission must reject the declared
+        // chunk before even attempting to unwrap a key or allocate its body.
+        assert!(matches!(
+            open_persistent_reader_bounded(file.path(), DEFAULT_CHUNK_SIZE),
+            Err(GaussError::ResourceExhausted(_))
+        ));
+    }
+
+    #[test]
+    fn persistent_stream_round_trips_chunk_boundaries_with_bounded_reads() {
+        struct BoundedInput<'a>(&'a [u8]);
+        impl Read for BoundedInput<'_> {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                assert!(output.len() <= DEFAULT_CHUNK_SIZE);
+                // Exercise short input reads as well as envelope boundaries.
+                let len = output.len().min(37);
+                self.0.read(&mut output[..len])
+            }
+        }
+        let (_key, ring) = keyring();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("stream");
+        for encrypted in [false, true] {
+            for len in [
+                0,
+                1,
+                DEFAULT_CHUNK_SIZE - 1,
+                DEFAULT_CHUNK_SIZE,
+                DEFAULT_CHUNK_SIZE + 1,
+                DEFAULT_CHUNK_SIZE * 3 + 17,
+            ] {
+                let expected = (0..len).map(|n| (n % 251) as u8).collect::<Vec<_>>();
+                write_persistent_stream(
+                    &path,
+                    FileType::Segment,
+                    len as u64,
+                    BoundedInput(&expected),
+                    encrypted.then_some(&ring),
+                )
+                .unwrap();
+                let actual = fs::read(&path).unwrap();
+                if encrypted {
+                    assert!(is_encrypted(&actual));
+                    assert_eq!(decrypt_bytes(&ring, &actual).unwrap().1, expected);
+                } else {
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn persistent_stream_rejects_bad_lengths_input_errors_and_failed_publication() {
+        struct FailedInput;
+        impl Read for FailedInput {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+            }
+        }
+        let (_key, ring) = keyring();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("stream");
+        for encrypted in [false, true] {
+            let ring = encrypted.then_some(&ring);
+            write_persistent_stream(&path, FileType::Segment, 3, &b"old"[..], ring).unwrap();
+            let original = fs::read(&path).unwrap();
+            for declared in [0, 2, 4] {
+                assert!(
+                    write_persistent_stream(&path, FileType::Segment, declared, &b"new"[..], ring)
+                        .is_err()
+                );
+                assert_eq!(fs::read(&path).unwrap(), original);
+                assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+            }
+            assert!(
+                write_persistent_stream(&path, FileType::Segment, 1, FailedInput, ring).is_err()
+            );
+            assert_eq!(fs::read(&path).unwrap(), original);
+            let refused = directory.path().join("cannot-replace-directory");
+            fs::create_dir(&refused).unwrap();
+            fs::write(refused.join("sentinel"), b"old").unwrap();
+            assert!(
+                write_persistent_stream(&refused, FileType::Segment, 3, &b"new"[..], ring).is_err()
+            );
+            assert_eq!(fs::read(refused.join("sentinel")).unwrap(), b"old");
+            assert_eq!(fs::read(&path).unwrap(), original);
+            assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+            fs::remove_dir_all(refused).unwrap();
+        }
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn persistent_stream_atomic_boundaries_leave_complete_old_or_new_file() {
+        let (_key, ring) = keyring();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("stream");
+        for encrypted in [false, true] {
+            let ring = encrypted.then_some(&ring);
+            for (boundary, expected) in [
+                ("atomic.before_temp_sync", b"old"),
+                ("atomic.after_temp_sync", b"old"),
+                ("atomic.after_rename_before_dir_sync", b"new"),
+            ] {
+                write_persistent_stream(&path, FileType::Segment, 3, &b"old"[..], ring).unwrap();
+                {
+                    let _fault = crate::failpoint::test_env(
+                        &format!("error:{boundary}"),
+                        &directory.path().join("marker"),
+                        &directory.path().join("release"),
+                    );
+                    assert!(
+                        write_persistent_stream(&path, FileType::Segment, 3, &b"new"[..], ring)
+                            .is_err()
+                    );
+                }
+                let bytes = fs::read(&path).unwrap();
+                let actual = ring.map_or_else(
+                    || bytes.clone(),
+                    |ring| decrypt_bytes(ring, &bytes).unwrap().1,
+                );
+                assert_eq!(actual, expected);
+                assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+            }
+        }
     }
 
     #[test]
@@ -2148,6 +2787,24 @@ mod tests {
         assert!(hot_cache.main_bytes <= PERSISTENT_MAIN_BYTES);
         assert!(hot_cache.bytes <= PERSISTENT_CACHE_BYTES);
         assert!(hot_cache.get((hot_file_id, resident_chunks)).is_some());
+    }
+
+    #[test]
+    fn persistent_chunk_cache_releases_residency_to_pressure_target() {
+        let mut cache = PersistentChunkCache::default();
+        for index in 0..32 {
+            cache.insert(
+                (3, index),
+                Arc::new(CachedChunk::new(vec![0_u8; DEFAULT_CHUNK_SIZE])),
+            );
+            assert!(cache.get((3, index)).is_some());
+        }
+        cache.shrink_to(4 * DEFAULT_CHUNK_SIZE);
+        assert!(cache.bytes <= 4 * DEFAULT_CHUNK_SIZE);
+        assert_eq!(
+            cache.bytes,
+            cache.probation_bytes.saturating_add(cache.main_bytes)
+        );
     }
 
     #[test]

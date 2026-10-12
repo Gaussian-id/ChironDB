@@ -9,7 +9,7 @@ use chirondb::{
         MultiSearchRequest, Point, PruneWalArchiveRequest, RecommendRequest, RestoreRequest,
         ScrollRequest, SearchQuery, SearchRequest, SearchResponse, ShardMoveRequest,
         SnapshotRequest, SparseVector, UpdatePayloadSchemaRequest, UpsertRequest,
-        WireChironQlRequest, WireRequest, wire_request, wire_response,
+        WireChironQlRequest, WireRequest, WireSqlRequest, wire_request, wire_response,
     },
     wire,
 };
@@ -155,6 +155,21 @@ enum Command {
         yes: bool,
         #[arg(long)]
         deferred_session_id: Option<String>,
+        /// Durable key for a standalone SQL mutation.
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    /// Execute one native relational SQL statement.
+    Sql {
+        statement: String,
+        /// JSON array of tagged RelationalValue parameters.
+        #[arg(long, default_value = "[]")]
+        parameters: String,
+        #[arg(long)]
+        retry_id: Option<String>,
+        /// Durable mutation key; distinct from audit correlation.
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
     Scroll {
         collection: String,
@@ -375,13 +390,37 @@ async fn main() -> anyhow::Result<()> {
                 trace,
                 yes,
                 deferred_session_id,
+                idempotency_key,
             } => wire_request::Operation::Chironql(WireChironQlRequest {
                 query: statement,
                 collection,
                 trace,
                 confirm: yes,
                 deferred_session_id,
+                parameters_json: None,
+                idempotency_key,
+                retry_id: None,
             }),
+            Command::Sql {
+                statement,
+                parameters,
+                retry_id,
+                idempotency_key,
+            } => {
+                let parameters = serde_json::from_str(&parameters)
+                    .context("--parameters must be a JSON array of tagged relational values")?;
+                let request = chirondb::SqlExecutionRequest {
+                    statements: vec![chirondb::SqlStatementRequest {
+                        sql: statement,
+                        parameters,
+                    }],
+                    retry_id,
+                    idempotency_key,
+                };
+                wire_request::Operation::Sql(WireSqlRequest {
+                    request_json: serde_json::to_string(&request)?,
+                })
+            }
             Command::Scroll {
                 collection,
                 offset,
@@ -575,6 +614,8 @@ fn response_json(response: chirondb::grpc::pb::WireResponse) -> anyhow::Result<V
             "trace": response.trace_json.as_deref()
                 .and_then(|trace| serde_json::from_str::<Value>(trace).ok()),
         }),
+        wire_response::Payload::Sql(response) => serde_json::from_str(&response.response_json)
+            .context("server returned invalid SQL response JSON")?,
     })
 }
 

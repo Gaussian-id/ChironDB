@@ -2,9 +2,10 @@ name: chirondb
 
 services:
   chirondb:
-    image: ghcr.io/gaussian-id/chirondb:0.1.0-beta.1
+    image: ghcr.io/gaussian-id/chirondb:0.1.0-beta.2
     pull_policy: always
     restart: unless-stopped
+    stop_grace_period: 15s
     ports:
       - "127.0.0.1:7401:7401"
       - "127.0.0.1:7402:7402"

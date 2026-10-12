@@ -360,7 +360,11 @@ pub(crate) fn replay_restored_wal_archives(
         for (_, _, archive) in ranges {
             wal.replay_archive(&archive, |record| {
                 replay.records += 1;
-                if matches!(record.entry, WalEntry::Schema { .. }) {
+                let entry = match &record.entry {
+                    WalEntry::TransactionApply { entry, .. } => entry.as_ref(),
+                    entry => entry,
+                };
+                if matches!(entry, WalEntry::Schema { .. }) {
                     replay.schema_records += 1;
                 }
                 Ok(())

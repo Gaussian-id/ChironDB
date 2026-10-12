@@ -5,7 +5,7 @@
 //! derives pending work from the collection resolver reconstructed from WAL.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     num::NonZeroU64,
     sync::atomic::AtomicBool,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -13,7 +13,7 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
-use crate::{GaussError, Point, Result, wal::WalEntry};
+use crate::{GaussError, Point, Result, transaction_journal::TransactionAudit, wal::WalEntry};
 
 use super::{
     Collection, Db, GraphBatchCommitReceipt, audit_context, build_admission, insert_sparse_point,
@@ -30,6 +30,14 @@ const DEFAULT_GRAPH_NAMESPACE: &str = "@chiron:default";
 // degree because the refusal and successful result carry no count.
 const GRAPH_DELETE_ACK_DEGREE_THRESHOLD: usize = 0;
 
+pub(super) struct MultiModelGraphMutations {
+    pub points: Vec<Point>,
+    pub point_deletes: Vec<String>,
+    pub relations: Vec<crate::graph::RelateRequest>,
+    pub edge_deletes: Vec<crate::graph::EdgeToken>,
+    pub edge_updates: Vec<(crate::graph::EdgeToken, crate::graph::UpdateEdgeRequest)>,
+}
+
 impl Collection {
     pub(super) fn graph_backfill_pending(&self) -> bool {
         if !self.graph_lifecycle.is_enabled() {
@@ -45,6 +53,244 @@ impl Collection {
 }
 
 impl Db {
+    pub(super) fn build_multimodel_graph_batch_locked(
+        &self,
+        collection: &Collection,
+        mutations: MultiModelGraphMutations,
+        scope: &crate::tenant::TenantScope,
+    ) -> Result<(crate::wal::GraphBatch, Vec<crate::graph::EdgeToken>)> {
+        let MultiModelGraphMutations {
+            mut points,
+            point_deletes,
+            relations,
+            edge_deletes,
+            edge_updates,
+        } = mutations;
+        if points.is_empty()
+            && point_deletes.is_empty()
+            && relations.is_empty()
+            && edge_deletes.is_empty()
+            && edge_updates.is_empty()
+        {
+            return Err(GaussError::InvalidRequest(
+                "multi-model transaction requires a vector or graph mutation".to_string(),
+            ));
+        }
+        if !points.is_empty() && !point_deletes.is_empty() {
+            return Err(GaussError::InvalidRequest(
+                "multi-model transaction accepts one vector mutation kind".to_string(),
+            ));
+        }
+        let mutable = active_mutable_graph(collection)?;
+        let graph_epoch = mutable.epoch();
+        let enforcement = self.tenant_enforcement();
+        let mut staged_points = BTreeMap::new();
+        for point in &mut points {
+            scope.stamp_payload(enforcement, &mut point.payload)?;
+            if staged_points
+                .insert(point.id.clone(), point.clone())
+                .is_some()
+            {
+                return Err(GaussError::InvalidRequest(format!(
+                    "multi-model UPSERT contains duplicate point ID '{}'",
+                    point.id
+                )));
+            }
+        }
+        let resolver = collection.graph_resolver.as_ref().ok_or_else(|| {
+            GaussError::InvalidRequest(
+                "enabled graph lifecycle has no point incarnation resolver".to_string(),
+            )
+        })?;
+        let mut deleted_points = BTreeSet::new();
+        for point_id in point_deletes {
+            validate_public_graph_key("point ID", &point_id)?;
+            if !deleted_points.insert(point_id.clone()) {
+                return Err(GaussError::InvalidRequest(format!(
+                    "multi-model DELETE contains duplicate point ID '{point_id}'"
+                )));
+            }
+            let point = collection
+                .try_resolve(&point_id)?
+                .ok_or_else(endpoint_not_found)?;
+            scope
+                .may_write_payload(enforcement, &point.payload)
+                .map_err(|_| endpoint_not_found())?;
+        }
+        let mut endpoint_ids = staged_points.keys().cloned().collect::<BTreeSet<_>>();
+        endpoint_ids.extend(deleted_points.iter().cloned());
+        for relation in &relations {
+            validate_public_graph_key("source point ID", &relation.source_point_id)?;
+            validate_public_graph_key("target point ID", &relation.target_point_id)?;
+            validate_public_catalog_name("edge type", &relation.edge_type)?;
+            validate_public_properties(&relation.properties)?;
+            if relation.idempotency_key.is_some() {
+                return Err(GaussError::InvalidRequest(
+                    "per-edge idempotency keys are not supported inside a multi-model transaction; use the transaction idempotency_key"
+                        .to_string(),
+                ));
+            }
+            endpoint_ids.insert(relation.source_point_id.clone());
+            endpoint_ids.insert(relation.target_point_id.clone());
+            if deleted_points.contains(&relation.source_point_id)
+                || deleted_points.contains(&relation.target_point_id)
+            {
+                return Err(GaussError::InvalidRequest(
+                    "a related endpoint cannot be deleted in the same transaction".to_string(),
+                ));
+            }
+        }
+        for point_id in &endpoint_ids {
+            if !staged_points.contains_key(point_id) && !collection.id_index.contains_key(point_id)
+            {
+                return Err(endpoint_not_found());
+            }
+        }
+        let missing = endpoint_ids
+            .iter()
+            .filter(|point_id| resolver.live_nid(point_id).is_none())
+            .count();
+        let mut allocated = NonZeroU64::new(missing as u64)
+            .map(|count| self.graph_identity.allocate_nids(count))
+            .transpose()?
+            .into_iter()
+            .flat_map(|range| range.nids());
+        let mut point_nids = BTreeMap::new();
+        let mut handle_assignments = Vec::with_capacity(missing);
+        for point_id in endpoint_ids {
+            let nid = match resolver.live_nid(&point_id) {
+                Some(nid) => nid,
+                None => {
+                    let nid = allocated
+                        .next()
+                        .expect("allocated the exact number of missing Nids");
+                    handle_assignments.push(crate::wal::GraphHandleAssignment {
+                        point_id: point_id.clone(),
+                        nid,
+                    });
+                    nid
+                }
+            };
+            point_nids.insert(point_id, nid);
+        }
+        debug_assert!(allocated.next().is_none());
+
+        let endpoint = |point_id: &str| -> Result<ResolvedGraphEndpoint> {
+            if let Some(point) = staged_points.get(point_id) {
+                scope
+                    .may_write_payload(enforcement, &point.payload)
+                    .map_err(|_| endpoint_not_found())?;
+                return Ok(ResolvedGraphEndpoint {
+                    tenant: point
+                        .payload
+                        .get(crate::tenant::TENANT_FIELD)
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(DEFAULT_GRAPH_NAMESPACE)
+                        .to_string(),
+                });
+            }
+            resolve_graph_endpoint(collection, point_id, scope, enforcement)
+        };
+        let mut explicit_edge_ids = HashSet::new();
+        let mut edge_mutations = Vec::with_capacity(
+            relations
+                .len()
+                .saturating_add(edge_deletes.len())
+                .saturating_add(edge_updates.len()),
+        );
+        for token in edge_deletes {
+            let edge_id = crate::edge_token::decode(self.graph_database_id(), &token)?;
+            if !explicit_edge_ids.insert(edge_id) {
+                return Err(GaussError::InvalidRequest(
+                    "multi-model graph mutation contains a duplicate edge token".to_string(),
+                ));
+            }
+            let namespace = mutable
+                .edge_namespace(edge_id)?
+                .ok_or_else(endpoint_not_found)?;
+            authorize_edge_mutation(namespace, scope, enforcement)?;
+            edge_mutations.push(crate::graph::EdgeMutation::Unrelate(
+                crate::graph::UnrelateMutation { edge_id },
+            ));
+        }
+        for (token, update) in edge_updates {
+            validate_public_properties(&update.properties)?;
+            let edge_id = crate::edge_token::decode(self.graph_database_id(), &token)?;
+            if !explicit_edge_ids.insert(edge_id) {
+                return Err(GaussError::InvalidRequest(
+                    "multi-model graph mutation contains a duplicate edge token".to_string(),
+                ));
+            }
+            let namespace = mutable
+                .edge_namespace(edge_id)?
+                .ok_or_else(endpoint_not_found)?;
+            authorize_edge_mutation(namespace, scope, enforcement)?;
+            edge_mutations.push(crate::graph::EdgeMutation::Properties(
+                crate::graph::EdgePropertyMutation {
+                    edge_id,
+                    mode: update.mode,
+                    properties: update.properties,
+                },
+            ));
+        }
+        let edge_range = NonZeroU64::new(relations.len() as u64)
+            .map(|count| self.graph_identity.allocate_edge_ids(count))
+            .transpose()?;
+        let mut edge_ids = edge_range.into_iter().flat_map(|range| range.edge_ids());
+        let mut edge_tokens = Vec::with_capacity(relations.len());
+        for relation in relations {
+            let source = endpoint(&relation.source_point_id)?;
+            let target = endpoint(&relation.target_point_id)?;
+            let namespace = relation_namespace(&source, &target, relation.scope, scope)?;
+            let type_id = mutable
+                .types()
+                .resolve_name(&relation.edge_type)
+                .ok_or_else(|| {
+                    crate::graph::GraphError::new(
+                        crate::graph::GraphErrorCode::TypeNotFound,
+                        format!("edge type '{}' is not configured", relation.edge_type),
+                    )
+                })?;
+            let edge_id = edge_ids
+                .next()
+                .expect("allocated the exact number of EdgeIds");
+            edge_mutations.push(crate::graph::EdgeMutation::Relate(
+                crate::graph::RelateMutation {
+                    edge_id,
+                    source: point_nids[&relation.source_point_id],
+                    target: point_nids[&relation.target_point_id],
+                    type_id,
+                    namespace,
+                    properties: relation.properties,
+                },
+            ));
+            edge_tokens.push(crate::edge_token::encode(
+                self.graph_database_id(),
+                edge_id,
+            )?);
+        }
+        debug_assert!(edge_ids.next().is_none());
+        let mut point_mutations = staged_points
+            .into_values()
+            .map(|point| crate::wal::GraphPointMutation::Upsert { point })
+            .collect::<Vec<_>>();
+        point_mutations.extend(deleted_points.into_iter().map(|point_id| {
+            crate::wal::GraphPointMutation::Delete {
+                nid: point_nids[&point_id],
+                point_id,
+            }
+        }));
+        let batch = crate::wal::GraphBatch {
+            graph_epoch,
+            point_mutations,
+            handle_assignments,
+            edge_mutations,
+            ..crate::wal::GraphBatch::default()
+        };
+        batch.validate()?;
+        Ok((batch, edge_tokens))
+    }
+
     /// Route an ordinary point UPSERT through GraphBatch while graph is
     /// enabled. Duplicate IDs retain the legacy last-write-wins result, but
     /// only the final value is encoded because GraphBatch forbids ambiguous
@@ -66,6 +312,25 @@ impl Db {
         wait: bool,
         deferred_session_id: Option<&str>,
     ) -> Result<(GraphBatchCommitReceipt, usize)> {
+        self.commit_graph_point_upserts_with_security_locked(
+            collection,
+            points,
+            wait,
+            deferred_session_id,
+            None,
+            None,
+        )
+    }
+
+    pub(super) fn commit_graph_point_upserts_with_security_locked(
+        &self,
+        collection: &mut Collection,
+        points: Vec<Point>,
+        wait: bool,
+        deferred_session_id: Option<&str>,
+        security: Option<crate::security::SecurityDelta>,
+        decision: Option<(&crate::audit::AuditContext, &std::sync::atomic::AtomicBool)>,
+    ) -> Result<(GraphBatchCommitReceipt, usize)> {
         debug_assert!(!points.is_empty());
         let mut seen = HashSet::with_capacity(points.len());
         let mut points = points
@@ -79,10 +344,10 @@ impl Db {
             .iter()
             .map(|point| {
                 collection
-                    .resolve(&point.id)
-                    .map(std::borrow::Cow::into_owned)
+                    .try_resolve(&point.id)
+                    .map(|point| point.map(std::borrow::Cow::into_owned))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         let resolver = collection.graph_resolver.as_ref().ok_or_else(|| {
             GaussError::InvalidRequest(
                 "enabled graph lifecycle has no point incarnation resolver".to_string(),
@@ -167,7 +432,7 @@ impl Db {
         let vamana_present_before = collection.vamana.is_some();
         let ivf_present_before = collection.ivf.is_some();
         let vector_dim = collection.config.vector_dim;
-        let receipt = self.commit_graph_batch_locked(
+        let receipt = self.commit_graph_batch_security_locked(
             collection,
             crate::wal::GraphBatch {
                 graph_epoch,
@@ -181,6 +446,8 @@ impl Db {
                 ..crate::wal::GraphBatch::default()
             },
             wait,
+            security,
+            decision,
         )?;
 
         for (point, old_point) in points.iter().zip(old_points) {
@@ -220,12 +487,64 @@ impl Db {
     /// Retire every currently live requested point through one GraphBatch.
     /// Missing and duplicate IDs keep the legacy idempotent delete result and
     /// therefore do not create invalid duplicate/missing graph mutations.
+    pub(super) fn validate_graph_delete_ack_locked(
+        collection: &Collection,
+        ids: &[String],
+        acknowledged: bool,
+    ) -> Result<()> {
+        if acknowledged || !collection.graph_lifecycle.is_enabled() {
+            return Ok(());
+        }
+        let mutable = active_mutable_graph(collection)?;
+        let resolver = collection
+            .graph_resolver
+            .as_ref()
+            .ok_or_else(|| GaussError::InvalidRequest("graph resolver is unavailable".into()))?;
+        for id in ids {
+            if let (Some(nid), Some(point)) = (resolver.live_nid(id), collection.try_resolve(id)?) {
+                let tenant = point
+                    .payload
+                    .get(crate::tenant::TENANT_FIELD)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(DEFAULT_GRAPH_NAMESPACE);
+                if mutable.live_incident_edge_ids(nid, tenant, resolver)?.len()
+                    > GRAPH_DELETE_ACK_DEGREE_THRESHOLD
+                {
+                    return Err(crate::graph::GraphError::new(
+                        crate::graph::GraphErrorCode::EdgesExist,
+                        "point deletion requires the WITH EDGES acknowledgement",
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn commit_graph_point_deletes_locked(
         &self,
         collection: &mut Collection,
         ids: &[String],
         with_edges_acknowledged: bool,
     ) -> Result<(Option<GraphBatchCommitReceipt>, usize, usize)> {
+        self.commit_graph_point_deletes_with_security_locked(
+            collection,
+            ids,
+            with_edges_acknowledged,
+            None,
+            None,
+        )
+    }
+
+    pub(super) fn commit_graph_point_deletes_with_security_locked(
+        &self,
+        collection: &mut Collection,
+        ids: &[String],
+        with_edges_acknowledged: bool,
+        security: Option<crate::security::SecurityDelta>,
+        decision: Option<(&crate::audit::AuditContext, &std::sync::atomic::AtomicBool)>,
+    ) -> Result<(Option<GraphBatchCommitReceipt>, usize, usize)> {
+        Self::validate_graph_delete_ack_locked(collection, ids, with_edges_acknowledged)?;
         let mut seen = HashSet::with_capacity(ids.len());
         let live_ids = ids
             .iter()
@@ -238,8 +557,9 @@ impl Db {
 
         let old_points = live_ids
             .iter()
-            .filter_map(|id| collection.resolve(id).map(std::borrow::Cow::into_owned))
-            .collect::<Vec<_>>();
+            .filter_map(|id| collection.try_resolve(id).transpose())
+            .map(|point| point.map(std::borrow::Cow::into_owned))
+            .collect::<Result<Vec<_>>>()?;
         if old_points.len() != live_ids.len() {
             return Err(GaussError::InvalidRequest(
                 "live point index could not resolve every graph delete".to_string(),
@@ -269,17 +589,6 @@ impl Db {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        if !with_edges_acknowledged
-            && incident_by_node
-                .iter()
-                .any(|edges| edges.len() > GRAPH_DELETE_ACK_DEGREE_THRESHOLD)
-        {
-            return Err(crate::graph::GraphError::new(
-                crate::graph::GraphErrorCode::EdgesExist,
-                "point deletion requires the WITH EDGES acknowledgement",
-            )
-            .into());
-        }
         let orphaned_edges = incident_by_node
             .into_iter()
             .flatten()
@@ -312,7 +621,7 @@ impl Db {
             .graph_lifecycle
             .epoch()
             .expect("enabled graph lifecycle has an epoch");
-        let receipt = self.commit_graph_batch_locked(
+        let receipt = self.commit_graph_batch_security_locked(
             collection,
             crate::wal::GraphBatch {
                 graph_epoch,
@@ -321,6 +630,8 @@ impl Db {
                 ..crate::wal::GraphBatch::default()
             },
             true,
+            security,
+            decision,
         )?;
 
         for point in &old_points {
@@ -342,8 +653,125 @@ impl Db {
         request: crate::graph::GraphTraverseRequest,
         scope: &crate::tenant::TenantScope,
     ) -> Result<crate::graph::GraphTraversalResult> {
-        let cancelled = AtomicBool::new(false);
-        self.traverse_cancellable_scoped(collection_name, request, scope, &cancelled)
+        self.traverse_cancellable_scoped(
+            collection_name,
+            request,
+            scope,
+            self.build_lifecycle.cancellation(),
+        )
+    }
+
+    /// Traverse a protected graph using physical storage identities internally
+    /// and expose only public identities authorized by the bound policy
+    /// snapshot. Node filters use Query-authorized payload projection. Edge
+    /// properties inherit GraphRead visibility from both endpoints.
+    pub fn traverse_authorized(
+        &self,
+        context: &crate::security::AccessContext,
+        request: crate::graph::GraphTraverseRequest,
+        cancelled: &AtomicBool,
+    ) -> Result<crate::security::AuthorizedOutput<crate::graph::GraphTraversalResult>> {
+        self.traverse_query_authorized(
+            context,
+            crate::graph::GraphTraversalQueryRequest {
+                traversal: request,
+                returns: crate::graph::GraphTraversalReturn::Nodes,
+                limit: None,
+                with_payload: false,
+            },
+            cancelled,
+        )?
+        .map(|result| {
+            let crate::graph::GraphTraversalRows::Nodes(nodes) = result.result else {
+                unreachable!("node materialization requested")
+            };
+            crate::graph::GraphTraversalResult {
+                nodes: nodes
+                    .into_iter()
+                    .map(|node| crate::graph::GraphTraversalNode {
+                        point_id: node.id,
+                        depth: node.depth,
+                    })
+                    .collect(),
+                stats: result.stats,
+                truncation: result.truncation,
+                warnings: result.warnings,
+                graph_epoch: result.graph_epoch,
+            }
+        })
+    }
+
+    /// Protected nodes, edges and simple paths share endpoint visibility,
+    /// field projection, admission, cancellation and publication fencing.
+    pub fn traverse_query_authorized(
+        &self,
+        context: &crate::security::AccessContext,
+        mut query: crate::graph::GraphTraversalQueryRequest,
+        cancelled: &AtomicBool,
+    ) -> Result<crate::security::AuthorizedOutput<crate::graph::GraphTraversalQueryResult>> {
+        if context.action() != crate::security::Action::GraphRead {
+            return Err(crate::security::SecurityError::Forbidden.into());
+        }
+        if query.returns == crate::graph::GraphTraversalReturn::Paths && query.limit.is_none() {
+            return Err(GaussError::InvalidRequest(
+                "graph path traversal requires an explicit limit".into(),
+            ));
+        }
+        let request = &mut query.traversal;
+        validate_traversal_request(request)?;
+        // Validate protected predicate syntax and encoded size before admission.
+        for filter in [request.node_filter.as_ref(), request.edge_filter.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            crate::security::SecurityFilter::compile(filter.clone())?;
+        }
+        request.budget.max_time_ms = request.budget.max_time_ms.min(30_000);
+        request.budget = crate::graph_admission::resolve_default_memory(request.budget);
+        context.publication_permit()?;
+        for anchor in &mut request.anchors {
+            *anchor = context.authorize(anchor)?.storage_id.to_string();
+        }
+        let budget = request.budget.validate()?;
+        let coll = self.get_coll_authorized(context)?;
+        {
+            let collection = coll.read();
+            active_mutable_graph(&collection)?;
+        }
+        // Protected storage derives tenancy from the authority binding rather
+        // than the legacy payload tenant stamp. Resource authorization below
+        // remains the only visibility filter for this path.
+        let scope = crate::tenant::TenantScope::system();
+        let _permit =
+            crate::graph_admission::acquire(context.collection(), &scope, budget, cancelled)?;
+        // Keep response hydration within the same admitted reservation while
+        // traversal retains its captured visits/edges/paths. Charge before
+        // cloning JSON; the 64x estimate includes tree/map/string overhead.
+        let output_limit = (budget.max_memory_bytes / 4).min(64 * 1024 * 1024);
+        query.traversal.budget.max_memory_bytes = budget.max_memory_bytes - output_limit;
+        let _lifecycle = self.lifecycle_gate.read();
+        let collection = coll.read();
+        let visibility = collection.overlay_read_state();
+        let result = super::graph_retrieval::traverse_query_locked(
+            &collection,
+            &visibility,
+            &query,
+            &scope,
+            self.tenant_enforcement(),
+            cancelled,
+            super::graph_retrieval::GraphQueryIdentity {
+                database_id: self.graph_database_id(),
+                authorization: Some(context),
+                output_limit,
+                output_bytes: Default::default(),
+            },
+        )?;
+        context.publication_permit()?;
+        crate::security::storage::serialized_len(&result, 8 * 1024 * 1024)?;
+        Ok(crate::security::AuthorizedOutput::new(
+            context.clone(),
+            result,
+        ))
     }
 
     /// Exact mutable-graph BFS with request-timeout/client-disconnect
@@ -352,10 +780,11 @@ impl Db {
     pub fn traverse_cancellable_scoped(
         &self,
         collection_name: &str,
-        request: crate::graph::GraphTraverseRequest,
+        mut request: crate::graph::GraphTraverseRequest,
         scope: &crate::tenant::TenantScope,
         cancelled: &AtomicBool,
     ) -> Result<crate::graph::GraphTraversalResult> {
+        request.budget = crate::graph_admission::resolve_default_memory(request.budget);
         validate_traversal_request(&request)?;
         let budget = request.budget.validate()?;
         let coll = self.get_coll(collection_name)?;
@@ -403,8 +832,12 @@ impl Db {
         request: crate::graph::GraphTraversalQueryRequest,
         scope: &crate::tenant::TenantScope,
     ) -> Result<crate::graph::GraphTraversalQueryResult> {
-        let cancelled = AtomicBool::new(false);
-        self.traverse_query_cancellable_scoped(collection_name, request, scope, &cancelled)
+        self.traverse_query_cancellable_scoped(
+            collection_name,
+            request,
+            scope,
+            self.build_lifecycle.cancellation(),
+        )
     }
 
     /// Exact pure traversal with one pinned vector/graph read state for all
@@ -412,10 +845,12 @@ impl Db {
     pub fn traverse_query_cancellable_scoped(
         &self,
         collection_name: &str,
-        request: crate::graph::GraphTraversalQueryRequest,
+        mut request: crate::graph::GraphTraversalQueryRequest,
         scope: &crate::tenant::TenantScope,
         cancelled: &AtomicBool,
     ) -> Result<crate::graph::GraphTraversalQueryResult> {
+        request.traversal.budget =
+            crate::graph_admission::resolve_default_memory(request.traversal.budget);
         validate_traversal_request(&request.traversal)?;
         if request.returns == crate::graph::GraphTraversalReturn::Paths && request.limit.is_none() {
             return Err(GaussError::InvalidRequest(
@@ -440,7 +875,12 @@ impl Db {
             scope,
             enforcement,
             cancelled,
-            self.graph_database_id(),
+            super::graph_retrieval::GraphQueryIdentity {
+                database_id: self.graph_database_id(),
+                authorization: None,
+                output_limit: 0,
+                output_bytes: Default::default(),
+            },
         )
     }
 
@@ -496,6 +936,7 @@ impl Db {
                 graph_epoch,
                 deferred_sessions: vec![crate::wal::GraphDeferredSessionMutation::Open {
                     session_id: session_id.clone(),
+                    owner: Some(scope.session_owner()),
                 }],
                 ..crate::wal::GraphBatch::default()
             },
@@ -503,12 +944,15 @@ impl Db {
         )?;
         let receipt = public_receipt(receipt, false);
         drop(collection);
-        audit_operation.success(serde_json::json!({
-            "graph_epoch": receipt.graph_epoch.raw(),
-            "operation_lsn": receipt.operation_lsn,
-            "wait": wait,
-            "state": "open",
-        }))?;
+        self.finish_committed_legacy_audit(
+            audit_operation,
+            serde_json::json!({
+                "graph_epoch": receipt.graph_epoch.raw(),
+                "operation_lsn": receipt.operation_lsn,
+                "wait": wait,
+                "state": "open",
+            }),
+        );
         self.refresh_metrics();
         Ok(crate::graph::GraphDeferredSessionResult {
             session_id: crate::graph::GraphDeferredSessionId::from_encoded(session_id),
@@ -541,7 +985,7 @@ impl Db {
             collection_name,
             points,
             wait,
-            super::MutationContext::client(audit_context(scope)),
+            super::MutationContext::scoped(scope),
             None,
             Some(session_id),
         )?;
@@ -557,7 +1001,7 @@ impl Db {
             receipt: crate::graph::GraphMutationReceipt {
                 graph_epoch,
                 operation_lsn: Some(receipt.operation_lsn),
-                durable: wait,
+                durable: true,
                 replayed: false,
             },
         })
@@ -584,6 +1028,12 @@ impl Db {
         let request_sha256: [u8; 32] =
             Sha256::digest(serde_json::to_vec(&(session_id, &request))?).into();
 
+        let scoped_key = request
+            .idempotency_key
+            .as_deref()
+            .map(|key| scoped_idempotency_key(scope, collection_name, "deferred_relate", key))
+            .transpose()?;
+
         let _lifecycle = self.lifecycle_gate.read();
         self.ensure_storage_mutations_available()?;
         let _admission = self.maintenance_barrier.read();
@@ -596,47 +1046,7 @@ impl Db {
         let mut collection = coll.write();
         let graph_epoch = active_mutable_graph(&collection)?.epoch();
 
-        if let Some(key) = request.idempotency_key.as_deref()
-            && let Some(existing) = active_mutable_graph(&collection)?.idempotency(key)
-        {
-            if existing.request_sha256 != request_sha256 {
-                return Err(GaussError::InvalidRequest(format!(
-                    "idempotency key '{key}' is already bound to another graph request in epoch {}",
-                    graph_epoch.raw()
-                )));
-            }
-            let [edge_id] = existing.edge_ids.as_slice() else {
-                return Err(GaussError::InvalidRequest(
-                    "durable deferred RELATE idempotency result is not singular".to_string(),
-                ));
-            };
-            if wait && let Err(error) = collection.wal.sync() {
-                self.mark_durability_degraded("graph_deferred_relate_retry_sync", &error);
-                return Err(error);
-            }
-            let edge_id = crate::edge_token::encode(self.graph_database_id(), *edge_id)?;
-            let receipt = crate::graph::GraphMutationReceipt {
-                graph_epoch,
-                operation_lsn: None,
-                durable: wait,
-                replayed: true,
-            };
-            drop(collection);
-            audit_operation.success(serde_json::json!({
-                "graph_epoch": graph_epoch.raw(),
-                "operation_lsn": null,
-                "wait": wait,
-                "edge_count": 1,
-                "idempotency_replay": true,
-            }))?;
-            self.refresh_metrics();
-            return Ok(crate::graph::RelateResult { edge_id, receipt });
-        }
-
-        let mutable = active_mutable_graph(&collection)?;
-        if !mutable.deferred_session_is_open(session_id.as_str()) {
-            return Err(deferred_session_not_found());
-        }
+        active_mutable_graph(&collection)?.authorize_deferred_owner(session_id.as_str(), scope)?;
         let enforcement = self.tenant_enforcement();
         let source = resolve_graph_endpoint_optional(
             &collection,
@@ -650,6 +1060,62 @@ impl Db {
             scope,
             enforcement,
         )?;
+        deferred_relation_namespace(source.as_ref(), target.as_ref(), request.scope, scope)?;
+        if let Some(key) = scoped_key.as_deref()
+            && let Some(existing) = active_mutable_graph(&collection)?.idempotency(key)
+        {
+            if current_unix_ms()? >= existing.expires_at_unix_ms {
+                return Err(GaussError::InvalidRequest(
+                    "idempotency result expired".into(),
+                ));
+            }
+            if existing.request_sha256 != request_sha256 {
+                return Err(GaussError::InvalidRequest(format!(
+                    "idempotency key '{key}' is already bound to another graph request in epoch {}",
+                    graph_epoch.raw()
+                )));
+            }
+            let [edge_id] = existing.edge_ids.as_slice() else {
+                return Err(GaussError::InvalidRequest(
+                    "durable deferred RELATE idempotency result is not singular".to_string(),
+                ));
+            };
+            let mutable = active_mutable_graph(&collection)?;
+            let namespace = mutable
+                .edge_namespace(*edge_id)?
+                .or_else(|| mutable.pending_edge_namespace(*edge_id, session_id.as_str()))
+                .ok_or_else(edge_not_found)?;
+            authorize_edge_mutation(namespace, scope, enforcement)?;
+            if wait && let Err(error) = collection.wal.sync() {
+                self.mark_durability_degraded("graph_deferred_relate_retry_sync", &error);
+                return Err(error);
+            }
+            let edge_id = crate::edge_token::encode(self.graph_database_id(), *edge_id)?;
+            let receipt = crate::graph::GraphMutationReceipt {
+                graph_epoch,
+                operation_lsn: None,
+                durable: wait,
+                replayed: true,
+            };
+            drop(collection);
+            self.finish_committed_legacy_audit(
+                audit_operation,
+                serde_json::json!({
+                        "graph_epoch": graph_epoch.raw(),
+                        "operation_lsn": null,
+                        "wait": wait,
+                        "edge_count": 1,
+                        "idempotency_replay": true,
+                }),
+            );
+            self.refresh_metrics();
+            return Ok(crate::graph::RelateResult { edge_id, receipt });
+        }
+
+        let mutable = active_mutable_graph(&collection)?;
+        if !mutable.deferred_session_is_open(session_id.as_str()) {
+            return Err(deferred_session_not_found());
+        }
         let type_id = mutable
             .types()
             .resolve_name(&request.edge_type)
@@ -710,7 +1176,7 @@ impl Db {
             .edge_ids()
             .next()
             .expect("one EdgeId was allocated");
-        let idempotency = if let Some(key) = request.idempotency_key.as_ref() {
+        let idempotency = if let Some(key) = scoped_key.as_ref() {
             let now = current_unix_ms()?;
             Some(crate::wal::GraphIdempotencyState {
                 key: key.clone(),
@@ -750,15 +1216,18 @@ impl Db {
         let receipt = public_receipt(receipt, false);
         let edge_id = crate::edge_token::encode(self.graph_database_id(), edge_id)?;
         drop(collection);
-        audit_operation.success(serde_json::json!({
-            "graph_epoch": receipt.graph_epoch.raw(),
-            "operation_lsn": receipt.operation_lsn,
-            "wait": wait,
-            "edge_count": 1,
-            "pending_endpoints": pending_endpoints,
-            "idempotency_key_present": request.idempotency_key.is_some(),
-            "idempotency_replay": false,
-        }))?;
+        self.finish_committed_legacy_audit(
+            audit_operation,
+            serde_json::json!({
+                "graph_epoch": receipt.graph_epoch.raw(),
+                "operation_lsn": receipt.operation_lsn,
+                "wait": wait,
+                "edge_count": 1,
+                "pending_endpoints": pending_endpoints,
+                "idempotency_key_present": request.idempotency_key.is_some(),
+                "idempotency_replay": false,
+            }),
+        );
         self.refresh_metrics();
         Ok(crate::graph::RelateResult { edge_id, receipt })
     }
@@ -825,6 +1294,7 @@ impl Db {
         let mut collection = coll.write();
         let mutable = active_mutable_graph(&collection)?;
         let graph_epoch = mutable.epoch();
+        mutable.authorize_deferred_owner(session_id.as_str(), scope)?;
         let already_target = match target {
             crate::graph::GraphDeferredSessionState::Committed => {
                 mutable.deferred_session_is_committed(session_id.as_str())
@@ -850,13 +1320,16 @@ impl Db {
                 replayed: true,
             };
             drop(collection);
-            audit_operation.success(serde_json::json!({
-                "graph_epoch": graph_epoch.raw(),
-                "operation_lsn": null,
-                "wait": wait,
-                "state": target,
-                "replayed": true,
-            }))?;
+            self.finish_committed_legacy_audit(
+                audit_operation,
+                serde_json::json!({
+                        "graph_epoch": graph_epoch.raw(),
+                        "operation_lsn": null,
+                        "wait": wait,
+                        "state": target,
+                        "replayed": true,
+                }),
+            );
             self.refresh_metrics();
             return Ok(crate::graph::GraphDeferredSessionResult {
                 session_id: session_id.clone(),
@@ -894,14 +1367,17 @@ impl Db {
         )?;
         let receipt = public_receipt(receipt, false);
         drop(collection);
-        audit_operation.success(serde_json::json!({
-            "graph_epoch": receipt.graph_epoch.raw(),
-            "operation_lsn": receipt.operation_lsn,
-            "wait": wait,
-            "state": target,
-            "pending_edges_before": pending_edges,
-            "replayed": false,
-        }))?;
+        self.finish_committed_legacy_audit(
+            audit_operation,
+            serde_json::json!({
+                "graph_epoch": receipt.graph_epoch.raw(),
+                "operation_lsn": receipt.operation_lsn,
+                "wait": wait,
+                "state": target,
+                "pending_edges_before": pending_edges,
+                "replayed": false,
+            }),
+        );
         self.refresh_metrics();
         Ok(crate::graph::GraphDeferredSessionResult {
             session_id: session_id.clone(),
@@ -970,12 +1446,15 @@ impl Db {
             public_receipt(receipt, false)
         };
         drop(collection);
-        audit_operation.success(serde_json::json!({
-            "graph_epoch": receipt.graph_epoch.raw(),
-            "operation_lsn": receipt.operation_lsn,
-            "wait": wait,
-            "changed": !unchanged,
-        }))?;
+        self.finish_committed_legacy_audit(
+            audit_operation,
+            serde_json::json!({
+                "graph_epoch": receipt.graph_epoch.raw(),
+                "operation_lsn": receipt.operation_lsn,
+                "wait": wait,
+                "changed": !unchanged,
+            }),
+        );
         self.refresh_metrics();
         Ok(crate::graph::ConfigureEdgeTypeResult {
             edge_type: crate::graph::GraphEdgeType {
@@ -1004,6 +1483,12 @@ impl Db {
         validate_public_properties(&request.properties)?;
         let request_sha256: [u8; 32] = Sha256::digest(serde_json::to_vec(&request)?).into();
 
+        let scoped_key = request
+            .idempotency_key
+            .as_deref()
+            .map(|key| scoped_idempotency_key(scope, collection_name, "relate", key))
+            .transpose()?;
+
         let _lifecycle = self.lifecycle_gate.read();
         self.ensure_storage_mutations_available()?;
         let _admission = self.maintenance_barrier.read();
@@ -1016,9 +1501,20 @@ impl Db {
         let mut collection = coll.write();
         let graph_epoch = active_mutable_graph(&collection)?.epoch();
 
-        if let Some(key) = request.idempotency_key.as_deref()
+        let enforcement = self.tenant_enforcement();
+        let source =
+            resolve_graph_endpoint(&collection, &request.source_point_id, scope, enforcement)?;
+        let target =
+            resolve_graph_endpoint(&collection, &request.target_point_id, scope, enforcement)?;
+        relation_namespace(&source, &target, request.scope, scope)?;
+        if let Some(key) = scoped_key.as_deref()
             && let Some(existing) = active_mutable_graph(&collection)?.idempotency(key)
         {
+            if current_unix_ms()? >= existing.expires_at_unix_ms {
+                return Err(GaussError::InvalidRequest(
+                    "idempotency result expired".into(),
+                ));
+            }
             if existing.request_sha256 != request_sha256 {
                 return Err(GaussError::InvalidRequest(format!(
                     "idempotency key '{key}' is already bound to another graph request in epoch {}",
@@ -1030,6 +1526,11 @@ impl Db {
                     "durable RELATE idempotency result is not singular".to_string(),
                 ));
             };
+            let mutable = active_mutable_graph(&collection)?;
+            let namespace = mutable
+                .edge_namespace(*edge_id)?
+                .ok_or_else(edge_not_found)?;
+            authorize_edge_mutation(namespace, scope, enforcement)?;
             if wait && let Err(error) = collection.wal.sync() {
                 self.mark_durability_degraded("graph_relate_retry_sync", &error);
                 return Err(error);
@@ -1042,22 +1543,20 @@ impl Db {
                 replayed: true,
             };
             drop(collection);
-            audit_operation.success(serde_json::json!({
-                "graph_epoch": graph_epoch.raw(),
-                "operation_lsn": null,
-                "wait": wait,
-                "edge_count": 1,
-                "idempotency_replay": true,
-            }))?;
+            self.finish_committed_legacy_audit(
+                audit_operation,
+                serde_json::json!({
+                        "graph_epoch": graph_epoch.raw(),
+                        "operation_lsn": null,
+                        "wait": wait,
+                        "edge_count": 1,
+                        "idempotency_replay": true,
+                }),
+            );
             self.refresh_metrics();
             return Ok(crate::graph::RelateResult { edge_id, receipt });
         }
 
-        let enforcement = self.tenant_enforcement();
-        let source =
-            resolve_graph_endpoint(&collection, &request.source_point_id, scope, enforcement)?;
-        let target =
-            resolve_graph_endpoint(&collection, &request.target_point_id, scope, enforcement)?;
         let type_id = active_mutable_graph(&collection)?
             .types()
             .resolve_name(&request.edge_type)
@@ -1111,7 +1610,7 @@ impl Db {
             .edge_ids()
             .next()
             .expect("one EdgeId was allocated");
-        let idempotency = if let Some(key) = request.idempotency_key.as_ref() {
+        let idempotency = if let Some(key) = scoped_key.as_ref() {
             let now = current_unix_ms()?;
             Some(crate::wal::GraphIdempotencyState {
                 key: key.clone(),
@@ -1148,14 +1647,17 @@ impl Db {
         let public_receipt = public_receipt(receipt, false);
         let token = crate::edge_token::encode(self.graph_database_id(), edge_id)?;
         drop(collection);
-        audit_operation.success(serde_json::json!({
-            "graph_epoch": public_receipt.graph_epoch.raw(),
-            "operation_lsn": public_receipt.operation_lsn,
-            "wait": wait,
-            "edge_count": 1,
-            "idempotency_key_present": request.idempotency_key.is_some(),
-            "idempotency_replay": false,
-        }))?;
+        self.finish_committed_legacy_audit(
+            audit_operation,
+            serde_json::json!({
+                "graph_epoch": public_receipt.graph_epoch.raw(),
+                "operation_lsn": public_receipt.operation_lsn,
+                "wait": wait,
+                "edge_count": 1,
+                "idempotency_key_present": request.idempotency_key.is_some(),
+                "idempotency_replay": false,
+            }),
+        );
         self.refresh_metrics();
         Ok(crate::graph::RelateResult {
             edge_id: token,
@@ -1253,12 +1755,15 @@ impl Db {
         )?;
         let receipt = public_receipt(receipt, false);
         drop(collection);
-        audit_operation.success(serde_json::json!({
-            "graph_epoch": receipt.graph_epoch.raw(),
-            "operation_lsn": receipt.operation_lsn,
-            "wait": wait,
-            "edge_count": edge_count,
-        }))?;
+        self.finish_committed_legacy_audit(
+            audit_operation,
+            serde_json::json!({
+                "graph_epoch": receipt.graph_epoch.raw(),
+                "operation_lsn": receipt.operation_lsn,
+                "wait": wait,
+                "edge_count": edge_count,
+            }),
+        );
         self.refresh_metrics();
         Ok((receipt, edge_count))
     }
@@ -1323,12 +1828,15 @@ impl Db {
         )?;
         let receipt = public_receipt(receipt, false);
         drop(collection);
-        audit_operation.success(serde_json::json!({
-            "graph_epoch": receipt.graph_epoch.raw(),
-            "operation_lsn": receipt.operation_lsn,
-            "wait": wait,
-            "edge_count": 1,
-        }))?;
+        self.finish_committed_legacy_audit(
+            audit_operation,
+            serde_json::json!({
+                "graph_epoch": receipt.graph_epoch.raw(),
+                "operation_lsn": receipt.operation_lsn,
+                "wait": wait,
+                "edge_count": 1,
+            }),
+        );
         self.refresh_metrics();
         Ok(receipt)
     }
@@ -1402,13 +1910,21 @@ impl Db {
             let epoch = collection.graph_lifecycle.next_epoch()?;
             let mut staged_lifecycle = collection.graph_lifecycle;
             staged_lifecycle.apply_advance(epoch, enabled)?;
-            let operation_lsn = collection
-                .wal
-                .append_no_sync(&WalEntry::GraphEpochAdvance { epoch, enabled })?;
-            if wait && let Err(error) = collection.wal.sync() {
-                self.mark_durability_degraded("graph_lifecycle_sync", &error);
-                return Err(error);
-            }
+            let (transaction, operation_lsn) = self.commit_collection_transaction(
+                collection_name,
+                &mut collection,
+                WalEntry::GraphEpochAdvance { epoch, enabled },
+                TransactionAudit::mutation(
+                    operation,
+                    Some(collection_name),
+                    &audit_context(scope),
+                    serde_json::json!({
+                        "enabled": enabled,
+                        "graph_epoch": epoch.raw(),
+                        "wait_requested": wait,
+                    }),
+                ),
+            )?;
 
             collection.graph_lifecycle = staged_lifecycle;
             if enabled && collection.graph_resolver.is_none() {
@@ -1424,27 +1940,30 @@ impl Db {
                 .and_then(|_| collection.overlays.publish_pending())
             {
                 self.mark_durability_degraded("graph_lifecycle_overlay", &error);
-                return Err(error);
             }
+            self.project_transaction_audit(&transaction);
             crate::graph::GraphLifecycleResult {
                 enabled,
                 graph_epoch: Some(epoch),
                 operation_lsn: Some(operation_lsn),
-                durable: wait,
+                durable: true,
                 transitioned: true,
                 backfill_in_progress: collection.graph_backfill_pending(),
             }
         };
         drop(collection);
 
-        audit_operation.success(serde_json::json!({
-            "enabled": enabled,
-            "graph_epoch": receipt.graph_epoch.map(crate::graph::GraphEpoch::raw),
-            "operation_lsn": receipt.operation_lsn,
-            "wait": wait,
-            "transitioned": receipt.transitioned,
-            "backfill_in_progress": receipt.backfill_in_progress,
-        }))?;
+        self.finish_committed_legacy_audit(
+            audit_operation,
+            serde_json::json!({
+                "enabled": enabled,
+                "graph_epoch": receipt.graph_epoch.map(crate::graph::GraphEpoch::raw),
+                "operation_lsn": receipt.operation_lsn,
+                "wait": wait,
+                "transitioned": receipt.transitioned,
+                "backfill_in_progress": receipt.backfill_in_progress,
+            }),
+        );
         drop(admission_guard);
         drop(lifecycle_guard);
 
@@ -1469,8 +1988,22 @@ impl Db {
         }
     }
 
-    fn start_graph_handle_backfill(&self, collection_name: &str) {
-        let Ok(coll) = self.get_coll(collection_name) else {
+    /// Internal maintenance lookup, also valid for protected generations.
+    /// Content-facing APIs must continue to use get_coll_authorized.
+    fn graph_backfill_collection(
+        &self,
+        name: &str,
+    ) -> Result<std::sync::Arc<parking_lot::RwLock<Collection>>> {
+        self.inner
+            .read()
+            .collections
+            .get(name)
+            .cloned()
+            .ok_or_else(|| GaussError::CollectionNotFound(name.into()))
+    }
+
+    pub(super) fn start_graph_handle_backfill(&self, collection_name: &str) {
+        let Ok(coll) = self.graph_backfill_collection(collection_name) else {
             return;
         };
         {
@@ -1491,7 +2024,7 @@ impl Db {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 db.run_graph_handle_backfill(&collection_name)
             }));
-            if let Ok(coll) = db.get_coll(&collection_name) {
+            if let Ok(coll) = db.graph_backfill_collection(&collection_name) {
                 coll.write().graph_backfill_in_flight = false;
             }
             match outcome {
@@ -1529,7 +2062,7 @@ impl Db {
         let _lifecycle = self.lifecycle_gate.read();
         self.ensure_storage_mutations_available()?;
         let _admission = self.maintenance_barrier.read();
-        let coll = self.get_coll(collection_name)?;
+        let coll = self.graph_backfill_collection(collection_name)?;
         let mut collection = coll.write();
         if !collection.graph_lifecycle.is_enabled() {
             return Ok(true);
@@ -1568,22 +2101,40 @@ impl Db {
             .epoch()
             .expect("enabled graph lifecycle has an epoch");
         let assignment_count = assignments.len();
-        let receipt = self.commit_graph_batch_locked(
-            &mut collection,
-            crate::wal::GraphBatch {
-                graph_epoch,
-                handle_assignments: assignments,
-                ..crate::wal::GraphBatch::default()
-            },
-            true,
-        )?;
+        let batch = crate::wal::GraphBatch {
+            graph_epoch,
+            handle_assignments: assignments,
+            ..crate::wal::GraphBatch::default()
+        };
+        let receipt = if let Some(authority) = collection.security.clone() {
+            authority.graph_backfill_with_commit(|security| {
+                self.commit_graph_batch_audited_locked(
+                    &mut collection,
+                    batch,
+                    true,
+                    Some(security),
+                    &crate::audit::AuditContext {
+                        principal_id: "system".into(),
+                        tenant_id: None,
+                        transport: "graph-handle-backfill".into(),
+                        request_id: None,
+                    },
+                    None,
+                )
+            })?
+        } else {
+            self.commit_graph_batch_locked(&mut collection, batch, true)?
+        };
         drop(collection);
-        audit_operation.success(serde_json::json!({
-            "graph_epoch": graph_epoch.raw(),
-            "operation_lsn": receipt.operation_lsn,
-            "handle_assignments": assignment_count,
-            "remaining": has_more,
-        }))?;
+        self.finish_committed_legacy_audit(
+            audit_operation,
+            serde_json::json!({
+                "graph_epoch": graph_epoch.raw(),
+                "operation_lsn": receipt.operation_lsn,
+                "handle_assignments": assignment_count,
+                "remaining": has_more,
+            }),
+        );
         self.refresh_metrics();
         Ok(!has_more)
     }
@@ -1616,7 +2167,7 @@ fn resolve_graph_endpoint(
     enforcement: crate::tenant::TenantEnforcement,
 ) -> Result<ResolvedGraphEndpoint> {
     let point = collection
-        .resolve(point_id)
+        .try_resolve(point_id)?
         .ok_or_else(endpoint_not_found)?;
     if scope
         .may_write_payload(enforcement, &point.payload)
@@ -1639,7 +2190,7 @@ fn resolve_graph_endpoint_optional(
     scope: &crate::tenant::TenantScope,
     enforcement: crate::tenant::TenantEnforcement,
 ) -> Result<Option<ResolvedGraphEndpoint>> {
-    let Some(point) = collection.resolve(point_id) else {
+    let Some(point) = collection.try_resolve(point_id)? else {
         return Ok(None);
     };
     if scope
@@ -1819,7 +2370,7 @@ fn validate_deferred_session_id(session_id: &crate::graph::GraphDeferredSessionI
     Ok(())
 }
 
-fn validate_public_catalog_name(label: &str, value: &str) -> Result<()> {
+pub(super) fn validate_public_catalog_name(label: &str, value: &str) -> Result<()> {
     if value.is_empty() || value.len() > crate::graph::MAX_GRAPH_CATALOG_NAME_BYTES {
         return Err(GaussError::InvalidRequest(format!(
             "{label} must contain 1..={} UTF-8 bytes",
@@ -1880,4 +2431,17 @@ fn deferred_session_not_found() -> GaussError {
         "deferred graph session does not exist or is not visible",
     )
     .into()
+}
+
+fn scoped_idempotency_key(
+    scope: &crate::tenant::TenantScope,
+    collection: &str,
+    operation: &str,
+    key: &str,
+) -> Result<String> {
+    let encoded = serde_json::to_vec(&(scope.session_owner(), collection, operation, key))?;
+    Ok(base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        Sha256::digest(encoded),
+    ))
 }

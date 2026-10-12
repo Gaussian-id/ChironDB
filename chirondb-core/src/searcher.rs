@@ -76,9 +76,26 @@ pub enum SegmentStore {
 
 impl SegmentStore {
     pub fn get(&self, id: &str) -> Option<Cow<'_, Point>> {
+        self.try_get(id).ok().flatten()
+    }
+
+    pub fn try_get(&self, id: &str) -> crate::Result<Option<Cow<'_, Point>>> {
         match self {
-            SegmentStore::Heap(points) => points.get(id).map(Cow::Borrowed),
-            SegmentStore::V4(store) => store.get(id).map(Cow::Owned),
+            SegmentStore::Heap(points) => Ok(points.get(id).map(Cow::Borrowed)),
+            SegmentStore::V4(store) => store.try_get(id).map(|point| point.map(Cow::Owned)),
+        }
+    }
+
+    pub(crate) fn try_get_admitted(
+        &self,
+        id: &str,
+    ) -> crate::Result<Option<crate::seal::AdmittedPoint>> {
+        match self {
+            SegmentStore::Heap(points) => points
+                .get(id)
+                .map(crate::seal::AdmittedPoint::copy)
+                .transpose(),
+            SegmentStore::V4(store) => store.try_get_admitted(id),
         }
     }
 
@@ -103,10 +120,16 @@ impl SegmentStore {
     }
 
     pub fn iter_points(&self) -> Box<dyn Iterator<Item = Cow<'_, Point>> + '_> {
+        Box::new(self.try_iter_points().filter_map(crate::Result::ok))
+    }
+
+    pub fn try_iter_points(&self) -> Box<dyn Iterator<Item = crate::Result<Cow<'_, Point>>> + '_> {
         match self {
-            SegmentStore::Heap(points) => Box::new(points.values().map(Cow::Borrowed)),
+            SegmentStore::Heap(points) => {
+                Box::new(points.values().map(|point| Ok(Cow::Borrowed(point))))
+            }
             SegmentStore::V4(store) => Box::new(
-                (0..store.len()).filter_map(|ordinal| store.get_ordinal(ordinal).map(Cow::Owned)),
+                (0..store.len()).map(|ordinal| store.try_get_ordinal(ordinal).map(Cow::Owned)),
             ),
         }
     }
@@ -118,14 +141,36 @@ impl SegmentStore {
         }
     }
 
-    pub(crate) fn iter_aux_index_points(&self) -> Box<dyn Iterator<Item = Cow<'_, Point>> + '_> {
+    pub(crate) fn iter_aux_index_points(
+        &self,
+    ) -> Box<dyn Iterator<Item = crate::Result<Cow<'_, Point>>> + '_> {
         match self {
-            SegmentStore::Heap(points) => Box::new(points.values().map(Cow::Borrowed)),
-            SegmentStore::V4(store) => {
-                Box::new((0..store.len()).filter_map(|ordinal| {
-                    store.get_ordinal_for_aux_indexes(ordinal).map(Cow::Owned)
-                }))
+            SegmentStore::Heap(points) => {
+                Box::new(points.values().map(|point| Ok(Cow::Borrowed(point))))
             }
+            SegmentStore::V4(store) => Box::new(
+                (0..store.len())
+                    .map(|ordinal| store.get_ordinal_for_aux_indexes(ordinal).map(Cow::Owned)),
+            ),
+        }
+    }
+
+    fn ordinal_payload_index(
+        &self,
+    ) -> crate::Result<Option<crate::payload_index::OrdinalPayloadIndex>> {
+        match self {
+            SegmentStore::V4(store) => crate::payload_index::try_build_ordinal_payload_index(
+                (0..store.len()).map(|ordinal| {
+                    let ordinal_u32 = u32::try_from(ordinal).map_err(|_| {
+                        crate::GaussError::InvalidRequest("payload ordinal exceeds u32".into())
+                    })?;
+                    store
+                        .get_ordinal_for_aux_indexes(ordinal)
+                        .map(|point| (ordinal_u32, point))
+                }),
+            )
+            .map(Some),
+            SegmentStore::Heap(_) => Ok(None),
         }
     }
 }
@@ -199,17 +244,7 @@ impl SegmentSearcher {
             Some(store) => SegmentStore::V4(store),
             None => SegmentStore::Heap(points),
         };
-        let ordinal_payload_index = match &store {
-            SegmentStore::V4(store) => Some(crate::payload_index::build_ordinal_payload_index(
-                (0..store.len()).filter_map(|ordinal| {
-                    let ordinal_u32 = u32::try_from(ordinal).ok()?;
-                    store
-                        .get_ordinal_for_aux_indexes(ordinal)
-                        .map(|point| (ordinal_u32, point))
-                }),
-            )),
-            SegmentStore::Heap(_) => None,
-        };
+        let ordinal_payload_index = store.ordinal_payload_index()?;
         let named_index = if algorithm2 {
             load_named_algorithm2_indexes(&dir, metric)?
         } else {
@@ -239,19 +274,9 @@ impl SegmentSearcher {
         store: SegmentStore,
         tombstones: HashSet<String>,
         tombstone_ordinals: RoaringBitmap,
-    ) -> Self {
-        let ordinal_payload_index = match &store {
-            SegmentStore::V4(store) => Some(crate::payload_index::build_ordinal_payload_index(
-                (0..store.len()).filter_map(|ordinal| {
-                    let ordinal_u32 = u32::try_from(ordinal).ok()?;
-                    store
-                        .get_ordinal_for_aux_indexes(ordinal)
-                        .map(|point| (ordinal_u32, point))
-                }),
-            )),
-            SegmentStore::Heap(_) => None,
-        };
-        Self {
+    ) -> crate::Result<Self> {
+        let ordinal_payload_index = store.ordinal_payload_index()?;
+        Ok(Self {
             id,
             dir,
             index,
@@ -260,7 +285,7 @@ impl SegmentSearcher {
             ordinal_payload_index,
             tombstones,
             tombstone_ordinals,
-        }
+        })
     }
 
     pub(crate) fn payload_ordinal_candidates(
@@ -289,13 +314,15 @@ impl SegmentSearcher {
         &self,
         ordinal: u32,
         point_tombstones: Option<&RoaringBitmap>,
-    ) -> Option<Cow<'_, Point>> {
+    ) -> crate::Result<Option<Cow<'_, Point>>> {
         if point_tombstones.is_some_and(|tombstones| tombstones.contains(ordinal)) {
-            return None;
+            return Ok(None);
         }
         match &self.store {
-            SegmentStore::V4(store) => store.get_ordinal(ordinal as usize).map(Cow::Owned),
-            SegmentStore::Heap(_) => None,
+            SegmentStore::V4(store) => store
+                .try_get_ordinal(ordinal as usize)
+                .map(|point| Some(Cow::Owned(point))),
+            SegmentStore::Heap(_) => Ok(None),
         }
     }
 
@@ -350,41 +377,95 @@ impl SegmentSearcher {
         }
     }
 
-    /// Live (non-tombstoned) point lookup.
+    /// Live (non-tombstoned) point lookup, retained for source compatibility.
     pub fn get_live(&self, id: &str) -> Option<Cow<'_, Point>> {
+        self.try_get_live(id).ok().flatten()
+    }
+
+    pub fn try_get_live(&self, id: &str) -> crate::Result<Option<Cow<'_, Point>>> {
         if self.is_tombstoned(id) {
-            return None;
+            return Ok(None);
         }
-        if let (SegmentIndex::Ivf(index), SegmentStore::V4(store)) = (&self.index, &self.store)
-            && index.uses_diskann()
-        {
-            let ordinal = store.ordinal(id)?;
-            let vector = index.diskann_vector(ordinal)?;
-            return store
-                .get_ordinal_with_vector(ordinal, vector)
-                .map(Cow::Owned);
-        }
-        self.store.get(id)
+        self.read_point(id)
     }
 
     pub(crate) fn get_visible(
         &self,
         id: &str,
         point_tombstones: Option<&RoaringBitmap>,
-    ) -> Option<Cow<'_, Point>> {
+    ) -> crate::Result<Option<Cow<'_, Point>>> {
         if self.is_hidden(id, point_tombstones) {
-            return None;
+            return Ok(None);
         }
+        self.read_point(id)
+    }
+
+    pub(crate) fn visible_ids<'a>(
+        &'a self,
+        tombstones: Option<&'a RoaringBitmap>,
+    ) -> impl Iterator<Item = &'a str> {
+        self.store
+            .iter_ids()
+            .filter(move |id| !self.is_hidden(id, tombstones))
+    }
+
+    pub(crate) fn get_live_admitted(
+        &self,
+        id: &str,
+    ) -> crate::Result<Option<crate::search::CandidatePoint<'_>>> {
+        if self.is_tombstoned(id) {
+            return Ok(None);
+        }
+        self.read_point_admitted(id)
+    }
+
+    pub(crate) fn get_visible_admitted(
+        &self,
+        id: &str,
+        tombstones: Option<&RoaringBitmap>,
+    ) -> crate::Result<Option<crate::search::CandidatePoint<'_>>> {
+        if self.is_hidden(id, tombstones) {
+            return Ok(None);
+        }
+        self.read_point_admitted(id)
+    }
+
+    fn read_point_admitted(
+        &self,
+        id: &str,
+    ) -> crate::Result<Option<crate::search::CandidatePoint<'_>>> {
+        use crate::search::CandidatePoint;
         if let (SegmentIndex::Ivf(index), SegmentStore::V4(store)) = (&self.index, &self.store)
             && index.uses_diskann()
         {
-            let ordinal = store.ordinal(id)?;
+            let Some(ordinal) = store.ordinal(id) else {
+                return Ok(None);
+            };
+            return store
+                .get_ordinal_admitted_with(ordinal, || index.diskann_vector(ordinal))
+                .map(|point| Some(CandidatePoint::Owned(point)));
+        }
+        match &self.store {
+            SegmentStore::Heap(points) => Ok(points.get(id).map(CandidatePoint::Borrowed)),
+            SegmentStore::V4(store) => store
+                .try_get_admitted(id)
+                .map(|point| point.map(CandidatePoint::Owned)),
+        }
+    }
+
+    fn read_point(&self, id: &str) -> crate::Result<Option<Cow<'_, Point>>> {
+        if let (SegmentIndex::Ivf(index), SegmentStore::V4(store)) = (&self.index, &self.store)
+            && index.uses_diskann()
+        {
+            let Some(ordinal) = store.ordinal(id) else {
+                return Ok(None);
+            };
             let vector = index.diskann_vector(ordinal)?;
             return store
                 .get_ordinal_with_vector(ordinal, vector)
-                .map(Cow::Owned);
+                .map(|point| Some(Cow::Owned(point)));
         }
-        self.store.get(id)
+        self.store.try_get(id)
     }
 
     /// Read-state visibility without materializing a sealed point. Sparse
@@ -404,35 +485,60 @@ impl SegmentSearcher {
                 .max(self.tombstones.len())
     }
 
-    /// Iterate live (non-tombstoned) points.
+    /// Iterate live points, retained for source compatibility.
     pub fn iter_live(&self) -> Box<dyn Iterator<Item = Cow<'_, Point>> + '_> {
+        Box::new(self.try_iter_live().filter_map(crate::Result::ok))
+    }
+
+    pub fn try_iter_live(&self) -> Box<dyn Iterator<Item = crate::Result<Cow<'_, Point>>> + '_> {
         Box::new(
             self.store
-                .iter_points()
-                .filter(|point| !self.is_tombstoned(&point.id)),
+                .iter_ids()
+                .filter(|id| !self.is_tombstoned(id))
+                .map(|id| {
+                    self.read_point(id).and_then(|point| {
+                        point.ok_or_else(|| crate::GaussError::PointNotFound(id.to_owned()))
+                    })
+                }),
         )
     }
 
     pub(crate) fn iter_visible<'a>(
         &'a self,
         point_tombstones: Option<&'a RoaringBitmap>,
-    ) -> Box<dyn Iterator<Item = Cow<'a, Point>> + 'a> {
+    ) -> Box<dyn Iterator<Item = crate::Result<Cow<'a, Point>>> + 'a> {
         Box::new(
             self.store
-                .iter_points()
-                .filter(move |point| !self.is_hidden(&point.id, point_tombstones)),
+                .iter_ids()
+                .filter(move |id| !self.is_hidden(id, point_tombstones))
+                .map(|id| {
+                    self.read_point(id).and_then(|point| {
+                        point.ok_or_else(|| crate::GaussError::PointNotFound(id.to_owned()))
+                    })
+                }),
         )
     }
 
     pub(crate) fn iter_visible_aux_index_points<'a>(
         &'a self,
         point_tombstones: Option<&'a RoaringBitmap>,
-    ) -> Box<dyn Iterator<Item = Cow<'a, Point>> + 'a> {
-        Box::new(
-            self.store
-                .iter_aux_index_points()
-                .filter(move |point| !self.is_hidden(&point.id, point_tombstones)),
-        )
+    ) -> Box<dyn Iterator<Item = crate::Result<Cow<'a, Point>>> + 'a> {
+        match &self.store {
+            SegmentStore::Heap(points) => Box::new(
+                points
+                    .values()
+                    .filter(move |point| !self.is_hidden(&point.id, point_tombstones))
+                    .map(|point| Ok(Cow::Borrowed(point))),
+            ),
+            SegmentStore::V4(store) => Box::new(
+                store
+                    .ids()
+                    .iter()
+                    .enumerate()
+                    .filter(move |(_, id)| !self.is_hidden(id, point_tombstones))
+                    .map(|(ordinal, _)| store.get_ordinal_for_aux_indexes(ordinal).map(Cow::Owned)),
+            ),
+        }
     }
 }
 

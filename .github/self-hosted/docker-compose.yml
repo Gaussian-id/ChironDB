@@ -1,0 +1,24 @@
+services:
+  chirondb-linux-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.linux-x64
+    platform: linux/amd64
+    privileged: true
+    restart: unless-stopped
+    environment:
+      REPOSITORY_URL: ${REPOSITORY_URL:?set REPOSITORY_URL}
+      RUNNER_TOKEN: ${RUNNER_TOKEN:-}
+    volumes:
+      - runner-state:/runner-state
+      - runner-work:/opt/actions-runner/_work
+      - cargo-cache:/home/runner/.cargo/registry
+      - rustup-cache:/home/runner/.rustup
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /dev:/dev
+
+volumes:
+  runner-state:
+  runner-work:
+  cargo-cache:
+  rustup-cache:

@@ -4,8 +4,10 @@ from __future__ import annotations
 import base64
 import json
 import math
+import re
 from dataclasses import dataclass
 from typing import Any, Iterator, Optional
+from urllib.parse import quote, urlencode
 
 import requests
 
@@ -15,6 +17,12 @@ class ChironDbError(Exception):
         super().__init__(f"HTTP {status}: {message}")
         self.status = status
         self.message = message
+
+
+def _ml_name(value: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value) is None:
+        raise ValueError("ML names must start with a letter or underscore and contain only letters, digits, or underscores")
+    return value
 
 
 @dataclass(frozen=True)
@@ -259,6 +267,139 @@ class ChironDbClient:
     def health(self) -> dict:
         """Return server health info."""
         return self._get("/health")
+
+    def execute_sql(
+        self,
+        statements: list[dict[str, Any]],
+        retry_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Execute an atomic native relational request.
+
+        Each statement is ``{"sql": "...", "parameters": [...]}``. Parameter
+        values use the tagged wire shape, for example
+        ``{"type": "integer", "value": 7}`` or ``{"type": "null"}``.
+        """
+        body: dict[str, Any] = {"statements": statements}
+        if retry_id is not None:
+            body["retry_id"] = retry_id
+        if idempotency_key is not None:
+            body["idempotency_key"] = idempotency_key
+        return self._post("/v1/sql", body)
+
+    def sql(
+        self,
+        statement: str,
+        parameters: Optional[list[dict[str, Any]]] = None,
+        retry_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Execute one native SQL statement with typed parameters."""
+        return self.execute_sql(
+            [{"sql": statement, "parameters": parameters or []}],
+            retry_id=retry_id,
+            idempotency_key=idempotency_key,
+        )
+
+    def begin_sql_transaction(self) -> dict[str, Any]:
+        """Open a relational transaction and return its opaque handle."""
+        return self._post_without_body("/v1/sql/transactions")
+
+    def execute_sql_transaction(
+        self,
+        handle: str,
+        statements: list[dict[str, Any]],
+        retry_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Execute statements against a transaction's private snapshot."""
+        body: dict[str, Any] = {"statements": statements}
+        if retry_id is not None:
+            body["retry_id"] = retry_id
+        return self._post(f"/v1/sql/transactions/{handle}/execute", body)
+
+    def commit_sql_transaction(self, handle: str) -> dict[str, Any]:
+        """Durably commit an interactive relational transaction."""
+        return self._post_without_body(f"/v1/sql/transactions/{handle}/commit")
+
+    def rollback_sql_transaction(self, handle: str) -> dict[str, Any]:
+        """Discard an interactive relational transaction."""
+        return self._delete(f"/v1/sql/transactions/{handle}")
+
+    def chironql(
+        self,
+        query: str,
+        parameters: Optional[list[dict[str, Any]]] = None,
+        retry_id: Optional[str] = None,
+        collection: Optional[str] = None,
+        trace: bool = False,
+        confirm: bool = False,
+        idempotency_key: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Execute one ChironQL 1.4 statement.
+
+        ``SQL ...`` routes to the native relational executor. ``PIPELINE ...``
+        combines bounded vector, graph, and relational read stages.
+        """
+        body: dict[str, Any] = {
+            "query": query,
+            "parameters": parameters or [],
+            "trace": trace,
+            "confirm": confirm,
+        }
+        if retry_id is not None:
+            body["retry_id"] = retry_id
+        if collection is not None:
+            body["collection"] = collection
+        if idempotency_key is not None:
+            body["idempotency_key"] = idempotency_key
+        return self._post("/v1/chironql", body)
+
+    def materialize_ml(
+        self,
+        view: str,
+        source: str,
+        target: str,
+        features: list[str],
+        task: str,
+        model: str,
+    ) -> dict[str, Any]:
+        """Create or refresh a tabular ML materialized view using one syntax."""
+        if not features:
+            raise ValueError("features must not be empty")
+        if task.lower() not in {"classification", "regression"}:
+            raise ValueError("task must be classification or regression")
+        if model.lower() not in {"decision_tree", "random_forest"}:
+            raise ValueError("model is unsupported")
+        names = [_ml_name(name) for name in features]
+        if len(set(names)) != len(names):
+            raise ValueError("features must be distinct")
+        query = (
+            f"ML MATERIALIZE {_ml_name(view)} FROM {_ml_name(source)} "
+            f"TARGET {_ml_name(target)} FEATURES ({', '.join(names)}) "
+            f"TASK {task.upper()} USING {model.upper()};"
+        )
+        return self.chironql(query)
+
+    def get_ml_job(self, job_id: str) -> dict[str, Any]:
+        """Read status and measurements for an ML materialization job."""
+        if not job_id:
+            raise ValueError("job_id must not be empty")
+        return self._get(f"/v1/ml/jobs/{quote(job_id, safe='')}")
+
+    def get_ml_view(
+        self, name: str, limit: int = 100, cursor: Optional[str] = None
+    ) -> dict[str, Any]:
+        """Read one page from the latest published materialized view."""
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        params = {"limit": limit}
+        if cursor is not None:
+            params["cursor"] = cursor
+        return self._get(f"/v1/ml/views/{_ml_name(name)}?{urlencode(params)}")
+
+    def drop_ml_view(self, name: str) -> dict[str, Any]:
+        """Remove a materialized view before changing its ML definition."""
+        return self._delete(f"/v1/ml/views/{_ml_name(name)}")
 
     def create_collection(
         self,
@@ -647,7 +788,7 @@ class ChironDbClient:
         text_field: str, k: int = 10, filter: Optional[dict] = None,
         budget_ms: Optional[int] = None,
     ) -> dict:
-        """Fuse dense retrieval with native BM25 over a top-level text field."""
+        """BM25 over a top-level text field; pass [] for BM25 only, or a vector for RRF."""
         body = {"vector": vector, "query": query, "text_field": text_field, "k": k}
         if filter is not None:
             body["filter"] = filter

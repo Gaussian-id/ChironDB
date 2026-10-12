@@ -67,6 +67,9 @@ fn run_as(
         allowed_collections: None,
         want_trace: true,
         confirm,
+        parameters: Vec::new(),
+        idempotency_key: None,
+        retry_id: None,
         tenant: TenantScope::system(),
     };
     chirondb::chironql_exec::execute(&mut ctx, query)
@@ -101,19 +104,32 @@ fn field(response: &ChironQlResponse, name: &str) -> serde_json::Value {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn ddl_needs_a_write_role() {
+fn ddl_requires_admin_and_preserves_data_when_refused() {
     let (_dir, db) = fixture();
 
-    run_as(&db, "CREATE COLLECTION fresh DIM 3;", Role::ReadWrite, true)
-        .expect("read_write may create collections");
-    run_as(&db, "DROP COLLECTION products;", Role::ReadWrite, true)
-        .expect("read_write may drop collections");
+    for role in [Role::ReadOnly, Role::ReadWrite] {
+        for query in [
+            "CREATE COLLECTION fresh DIM 3;",
+            "DROP COLLECTION products;",
+        ] {
+            let error = run_as(&db, query, role, true).expect_err("data roles cannot run DDL");
+            assert_eq!(error.code, "chironql.permission_denied");
+            assert!(error.hint.as_deref().unwrap_or_default().contains("admin"));
+        }
+        assert_eq!(collection_names(&db), vec![COLLECTION.to_string()]);
+        assert_eq!(
+            db.get_points(
+                COLLECTION,
+                &["phone".into(), "laptop".into(), "book".into()]
+            )
+            .unwrap()
+            .len(),
+            3
+        );
+    }
 
-    let error = run_as(&db, "CREATE COLLECTION denied DIM 3;", Role::ReadOnly, true)
-        .expect_err("read_only refused");
-    assert_eq!(error.code, "chironql.permission_denied");
-    assert!(error.hint.as_deref().unwrap_or_default().contains("write"));
-
+    confirmed(&db, "CREATE COLLECTION fresh DIM 3;").expect("admin creates collections");
+    confirmed(&db, "DROP COLLECTION products;").expect("admin drops collections");
     assert_eq!(collection_names(&db), vec!["fresh".to_string()]);
 }
 
@@ -298,6 +314,9 @@ fn dropping_the_session_collection_clears_it() {
             allowed_collections: None,
             want_trace: false,
             confirm,
+            parameters: Vec::new(),
+            idempotency_key: None,
+            retry_id: None,
             tenant: TenantScope::system(),
         };
         chirondb::chironql_exec::execute(&mut ctx, query).expect(query);

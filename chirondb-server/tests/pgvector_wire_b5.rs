@@ -154,10 +154,13 @@ async fn reject_taxonomy_complete_through_wire() {
         "#subquery",
     )
     .await;
-    // §3.0.1 row 4: transaction control (executed at dispatch — exec layer)
-    assert_reject(&mut s, "BEGIN;", "#transactions").await;
-    assert_reject(&mut s, "COMMIT;", "#transactions").await;
-    assert_reject(&mut s, "ROLLBACK;", "#transactions").await;
+    // Transaction control is now owned by the native relational session.
+    // Compatibility statements outside such a session retain the legacy
+    // pgvector routing and rejection taxonomy below.
+    let begin = query_collect_replies(&mut s, "BEGIN;").await;
+    assert!(begin.iter().any(|(kind, _)| *kind == b'C'));
+    let rollback = query_collect_replies(&mut s, "ROLLBACK;").await;
+    assert!(rollback.iter().any(|(kind, _)| *kind == b'C'));
     // §3.0.1 row 5: PREPARE/EXECUTE
     assert_reject(&mut s, "PREPARE q AS SELECT 1;", "#extended-protocol").await;
     // §3.0.1 row 6: aggregates / GROUP BY

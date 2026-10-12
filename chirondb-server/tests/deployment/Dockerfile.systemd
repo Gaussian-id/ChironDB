@@ -1,0 +1,13 @@
+# Test-only Linux systemd harness. BASE_IMAGE is the locally built production
+# image tag; the E2E harness pins runtime IDs and verifies its binary hashes.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends systemd systemd-sysv dbus \
+    && rm -rf /var/lib/apt/lists/*
+ENV container=docker
+HEALTHCHECK NONE
+STOPSIGNAL SIGRTMIN+3
+ENTRYPOINT ["/sbin/init"]
+CMD []

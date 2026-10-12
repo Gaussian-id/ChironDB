@@ -79,6 +79,12 @@ pub trait VectorSource {
     fn len(&self) -> usize;
     fn vector(&self, ordinal: usize) -> Result<Cow<'_, [f32]>>;
 
+    /// Retain owned row admission through use. Existing implementations remain
+    /// source compatible; producers must admit their own allocation beforehand.
+    fn read_vector(&self, ordinal: usize) -> Result<crate::index::VectorRead<'_>> {
+        crate::index::VectorRead::adopt(self.vector(ordinal)?)
+    }
+
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -105,11 +111,11 @@ impl IvfArtifact {
         if file.len() < IVF_HEADER_BYTES {
             return Err(ivf_corrupt(path, "bad or truncated IVF header"));
         }
-        let header = file.read_range(0..IVF_HEADER_BYTES)?;
+        let header = file.read_range_admitted(0..IVF_HEADER_BYTES)?;
         if &header[..8] != IVF_MAGIC {
             return Err(ivf_corrupt(path, "bad or truncated IVF header"));
         }
-        let version = read_u32(&file, 8).ok_or_else(|| ivf_corrupt(path, "missing version"))?;
+        let version = read_u32(&file, 8)?;
         if !matches!(version, 1 | 2) {
             return Err(ivf_corrupt(path, "unsupported IVF version"));
         }
@@ -122,8 +128,8 @@ impl IvfArtifact {
                 "invalid IVF count, dimension, or cell count",
             ));
         }
-        let expected_crc = read_u32(&file, 36).ok_or_else(|| ivf_corrupt(path, "missing CRC"))?;
-        let reserved = read_u32(&file, 40).ok_or_else(|| ivf_corrupt(path, "missing flags"))?;
+        let expected_crc = read_u32(&file, 36)?;
+        let reserved = read_u32(&file, 40)?;
         if reserved != 0 {
             return Err(ivf_corrupt(path, "unsupported IVF flags"));
         }
@@ -170,7 +176,7 @@ impl IvfArtifact {
         if let Some(start) = radii_start {
             for cell in 0..nlist {
                 let offset = start + cell * 4;
-                let bytes = file.read_range(offset..offset + 4)?;
+                let bytes = file.read_range_admitted(offset..offset + 4)?;
                 let radius = f32::from_le_bytes(bytes.as_ref().try_into().unwrap());
                 if !radius.is_finite() || radius < 0.0 {
                     return Err(ivf_corrupt(path, "invalid IVF cell radius"));
@@ -182,13 +188,15 @@ impl IvfArtifact {
         let mut seen = vec![false; count];
         for cell in 0..=nlist {
             let offset = read_usize(&file, offsets_start + cell * 8, path, "posting offset")?;
-            if offset < previous || offset > count || (cell == nlist && offset != count) {
+            if offset < previous
+                || offset > count
+                || (cell == 0 && offset != 0)
+                || (cell == nlist && offset != count)
+            {
                 return Err(ivf_corrupt(path, "invalid IVF posting offsets"));
             }
             for posting in previous..offset {
-                let ordinal = read_u32(&file, postings_start + posting * 4)
-                    .ok_or_else(|| ivf_corrupt(path, "truncated posting"))?
-                    as usize;
+                let ordinal = read_u32(&file, postings_start + posting * 4)? as usize;
                 if ordinal >= count || std::mem::replace(&mut seen[ordinal], true) {
                     return Err(ivf_corrupt(
                         path,
@@ -228,13 +236,20 @@ impl IvfArtifact {
     }
 
     pub fn centroids(&self) -> Vec<Vec<f32>> {
+        self.try_centroids().unwrap_or_default()
+    }
+
+    pub fn try_centroids(&self) -> Result<Vec<Vec<f32>>> {
         (0..self.nlist)
             .map(|cell| {
                 (0..self.vector_dim)
                     .map(|dim| {
                         let offset = self.centroid_start + (cell * self.vector_dim + dim) * 4;
-                        let bytes = self.file.read_range(offset..offset + 4).unwrap();
-                        f32::from_le_bytes(bytes.as_ref().try_into().unwrap())
+                        let value = f32::from_bits(read_u32(&self.file, offset)?);
+                        if !value.is_finite() {
+                            return Err(ivf_corrupt(self.file.path(), "invalid IVF centroid"));
+                        }
+                        Ok(value)
                     })
                     .collect()
             })
@@ -242,39 +257,81 @@ impl IvfArtifact {
     }
 
     pub fn cell_radius(&self, cell: usize) -> Option<f32> {
-        let start = self.radii_start?;
-        let offset = start.checked_add(cell.checked_mul(4)?)?;
-        let bytes = self.file.read_range(offset..offset + 4).ok()?;
-        let radius = f32::from_le_bytes(bytes.as_ref().try_into().ok()?);
-        (radius.is_finite() && radius >= 0.0).then_some(radius)
+        self.try_cell_radius(cell).ok().flatten()
+    }
+
+    /// None denotes a legacy v1 artifact without radii, not a failed read.
+    pub fn try_cell_radius(&self, cell: usize) -> Result<Option<f32>> {
+        if cell >= self.nlist {
+            return Err(GaussError::InvalidRequest("IVF cell out of bounds".into()));
+        }
+        let Some(start) = self.radii_start else {
+            return Ok(None);
+        };
+        let radius = f32::from_bits(read_u32(&self.file, start + cell * 4)?);
+        if !radius.is_finite() || radius < 0.0 {
+            return Err(ivf_corrupt(self.file.path(), "invalid IVF cell radius"));
+        }
+        Ok(Some(radius))
     }
 
     pub fn postings(&self, cell: usize) -> Option<Vec<u32>> {
-        let range = self.posting_range(cell)?;
-        Some(
-            range
-                .map(|posting| self.posting_ordinal(posting).unwrap())
-                .collect(),
-        )
+        self.try_postings(cell).ok()
+    }
+
+    pub fn try_postings(&self, cell: usize) -> Result<Vec<u32>> {
+        self.try_posting_range(cell)?
+            .map(|posting| self.try_posting_ordinal(posting))
+            .collect()
     }
 
     /// Global posting-index range for one cell. Keeping this separate from
     /// ordinals lets companion artifacts use the same cell-major row order.
     pub fn posting_range(&self, cell: usize) -> Option<std::ops::Range<usize>> {
+        self.try_posting_range(cell).ok()
+    }
+
+    pub fn try_posting_range(&self, cell: usize) -> Result<std::ops::Range<usize>> {
         if cell >= self.nlist {
-            return None;
+            return Err(GaussError::InvalidRequest("IVF cell out of bounds".into()));
         }
-        let start = usize::try_from(read_u64(&self.file, self.offsets_start + cell * 8)?).ok()?;
-        let end =
-            usize::try_from(read_u64(&self.file, self.offsets_start + (cell + 1) * 8)?).ok()?;
-        Some(start..end)
+        let start = read_usize(
+            &self.file,
+            self.offsets_start + cell * 8,
+            self.file.path(),
+            "posting offset",
+        )?;
+        let end = read_usize(
+            &self.file,
+            self.offsets_start + (cell + 1) * 8,
+            self.file.path(),
+            "posting offset",
+        )?;
+        if start > end
+            || end > self.count
+            || (cell == 0 && start != 0)
+            || (cell + 1 == self.nlist && end != self.count)
+        {
+            return Err(ivf_corrupt(self.file.path(), "invalid IVF posting offsets"));
+        }
+        Ok(start..end)
     }
 
     pub fn posting_ordinal(&self, posting: usize) -> Option<u32> {
+        self.try_posting_ordinal(posting).ok()
+    }
+
+    pub fn try_posting_ordinal(&self, posting: usize) -> Result<u32> {
         if posting >= self.count {
-            return None;
+            return Err(GaussError::InvalidRequest(
+                "IVF posting out of bounds".into(),
+            ));
         }
-        read_u32(&self.file, self.postings_start + posting * 4)
+        let ordinal = read_u32(&self.file, self.postings_start + posting * 4)?;
+        if ordinal as usize >= self.count {
+            return Err(ivf_corrupt(self.file.path(), "invalid IVF posting ordinal"));
+        }
+        Ok(ordinal)
     }
 }
 
@@ -301,7 +358,7 @@ pub fn write_ivf_artifact<S: VectorSource + ?Sized>(
     for (centroid, cell) in centroids.iter().zip(&postings) {
         let mut radius = 0.0f32;
         for &ordinal in cell {
-            let vector = source.vector(ordinal as usize)?;
+            let vector = source.read_vector(ordinal as usize)?;
             validate_training_dim(&vector, vector_dim)?;
             radius = radius.max(squared_l2(&vector, centroid).sqrt());
         }
@@ -353,14 +410,24 @@ fn write_crc(writer: &mut impl Write, crc: &mut crc32fast::Hasher, bytes: &[u8])
     Ok(())
 }
 
-fn read_u32(file: &crate::encryption::PersistentFile, offset: usize) -> Option<u32> {
-    let bytes = file.read_range(offset..offset.checked_add(4)?).ok()?;
-    Some(u32::from_le_bytes(bytes.as_ref().try_into().ok()?))
+fn read_u32(file: &crate::encryption::PersistentFile, offset: usize) -> Result<u32> {
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| ivf_corrupt(file.path(), "IVF field offset overflow"))?;
+    let bytes = file.read_range_admitted(offset..end)?;
+    Ok(u32::from_le_bytes(bytes.as_ref().try_into().map_err(
+        |_| ivf_corrupt(file.path(), "truncated IVF u32 field"),
+    )?))
 }
 
-fn read_u64(file: &crate::encryption::PersistentFile, offset: usize) -> Option<u64> {
-    let bytes = file.read_range(offset..offset.checked_add(8)?).ok()?;
-    Some(u64::from_le_bytes(bytes.as_ref().try_into().ok()?))
+fn read_u64(file: &crate::encryption::PersistentFile, offset: usize) -> Result<u64> {
+    let end = offset
+        .checked_add(8)
+        .ok_or_else(|| ivf_corrupt(file.path(), "IVF field offset overflow"))?;
+    let bytes = file.read_range_admitted(offset..end)?;
+    Ok(u64::from_le_bytes(bytes.as_ref().try_into().map_err(
+        |_| ivf_corrupt(file.path(), "truncated IVF u64 field"),
+    )?))
 }
 
 fn read_usize(
@@ -369,8 +436,7 @@ fn read_usize(
     path: &Path,
     field: &str,
 ) -> Result<usize> {
-    let value =
-        read_u64(file, offset).ok_or_else(|| ivf_corrupt(path, &format!("missing {field}")))?;
+    let value = read_u64(file, offset)?;
     usize::try_from(value).map_err(|_| ivf_corrupt(path, &format!("{field} exceeds usize")))
 }
 
@@ -741,9 +807,9 @@ pub(crate) fn train_centroids<S: VectorSource + ?Sized>(
         state = crate::h2qg::splitmix64(state);
         let pick = (state as usize) % n;
         if seen.insert(pick) {
-            let vector = source.vector(pick)?;
+            let vector = source.read_vector(pick)?;
             validate_training_dim(&vector, vector_dim)?;
-            centroids.push(vector.into_owned());
+            centroids.push(vector.into_compat().into_owned());
         }
         // Fallback if the corpus has fewer distinct picks than nlist rounds
         // can find quickly (tiny n): fill sequentially.
@@ -753,9 +819,9 @@ pub(crate) fn train_centroids<S: VectorSource + ?Sized>(
                     break;
                 }
                 if seen.insert(i) {
-                    let vector = source.vector(i)?;
+                    let vector = source.read_vector(i)?;
                     validate_training_dim(&vector, vector_dim)?;
-                    centroids.push(vector.into_owned());
+                    centroids.push(vector.into_compat().into_owned());
                 }
             }
             break;
@@ -770,7 +836,7 @@ pub(crate) fn train_centroids<S: VectorSource + ?Sized>(
         for _ in 0..batch {
             state = crate::h2qg::splitmix64(state);
             let xi = (state as usize) % n;
-            let x = source.vector(xi)?;
+            let x = source.read_vector(xi)?;
             validate_training_dim(&x, vector_dim)?;
             let c = nearest_centroid(&x, &centroids);
             counts[c] += 1;
@@ -818,7 +884,7 @@ pub(crate) fn assign_postings_streaming<S: VectorSource + ?Sized>(
                 "IVF segment exceeds the u32 persisted ordinal limit".to_string(),
             )
         })?;
-        let vector = source.vector(ordinal)?;
+        let vector = source.read_vector(ordinal)?;
         validate_training_dim(&vector, vector_dim)?;
         let cell = nearest_centroid_with_capacity(&vector, centroids, &loads, max_cell_load)
             .expect("2x ideal IVF capacity always covers the source");
@@ -851,7 +917,7 @@ fn recompute_posting_centroids<S: VectorSource + ?Sized>(
             continue;
         }
         for &ordinal in ordinals {
-            let vector = source.vector(ordinal as usize)?;
+            let vector = source.read_vector(ordinal as usize)?;
             validate_training_dim(&vector, vector_dim)?;
             for (sum, value) in centroids[cell].iter_mut().zip(vector.iter()) {
                 *sum += value;
@@ -993,6 +1059,86 @@ mod tests {
             }
         }
         (points, centers)
+    }
+
+    #[test]
+    fn fallible_ivf_readers_reject_late_values_and_preserve_legacy_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(IVF_FILE);
+        let vectors = [
+            vec![0.0, 1.0],
+            vec![1.0, 0.0],
+            vec![2.0, 1.0],
+            vec![3.0, 2.0],
+        ];
+        write_ivf_artifact(vectors.as_slice(), 2, 1, &path).unwrap();
+        let artifact = IvfArtifact::open(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let patch = |offset: usize, bytes: &[u8]| {
+            let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.seek(SeekFrom::Start(offset as u64)).unwrap();
+            file.write_all(bytes).unwrap();
+            file.sync_all().unwrap();
+        };
+        patch(artifact.centroid_start, &f32::NAN.to_le_bytes());
+        assert!(matches!(
+            artifact.try_centroids(),
+            Err(GaussError::SegmentCorruption { .. })
+        ));
+        patch(0, &original);
+        patch(artifact.radii_start.unwrap(), &(-1.0f32).to_le_bytes());
+        assert!(matches!(
+            artifact.try_cell_radius(0),
+            Err(GaussError::SegmentCorruption { .. })
+        ));
+        patch(0, &original);
+        patch(artifact.offsets_start + 8, &u64::MAX.to_le_bytes());
+        assert!(matches!(
+            artifact.try_posting_range(0),
+            Err(GaussError::SegmentCorruption { .. })
+        ));
+        patch(0, &original);
+        patch(
+            artifact.postings_start + 4,
+            &(artifact.len() as u32).to_le_bytes(),
+        );
+        assert!(matches!(
+            artifact.try_posting_ordinal(1),
+            Err(GaussError::SegmentCorruption { .. })
+        ));
+        assert!(matches!(
+            artifact.try_postings(0),
+            Err(GaussError::SegmentCorruption { .. })
+        ));
+        patch(0, &original);
+        assert_eq!(artifact.try_postings(0).unwrap().len(), vectors.len());
+        assert!(artifact.try_posting_ordinal(artifact.len()).is_err());
+        let mut invalid = original.clone();
+        invalid[artifact.offsets_start..artifact.offsets_start + 8]
+            .copy_from_slice(&1u64.to_le_bytes());
+        let crc = crc32fast::hash(&invalid[IVF_HEADER_BYTES..]);
+        invalid[36..40].copy_from_slice(&crc.to_le_bytes());
+        let invalid_path = dir.path().join("invalid-offset.gdx");
+        std::fs::write(&invalid_path, invalid).unwrap();
+        assert!(matches!(
+            IvfArtifact::open(&invalid_path),
+            Err(GaussError::SegmentCorruption { .. })
+        ));
+        let mut legacy = original;
+        let start = artifact.radii_start.unwrap();
+        legacy.drain(start..start + 4);
+        legacy[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let crc = crc32fast::hash(&legacy[IVF_HEADER_BYTES..]);
+        legacy[36..40].copy_from_slice(&crc.to_le_bytes());
+        let legacy_path = dir.path().join("legacy.gdx");
+        std::fs::write(&legacy_path, legacy).unwrap();
+        let legacy = IvfArtifact::open(&legacy_path).unwrap();
+        assert_eq!(legacy.try_cell_radius(0).unwrap(), None);
+        assert!(legacy.try_cell_radius(legacy.cells()).is_err());
+        assert_eq!(
+            legacy.try_centroids().unwrap(),
+            artifact.try_centroids().unwrap()
+        );
     }
 
     #[test]

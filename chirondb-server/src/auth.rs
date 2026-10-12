@@ -254,8 +254,51 @@ fn canonical_http_path(path: &str) -> &str {
 fn classify_http(method: &Method, path: &str) -> Option<Action> {
     let path = canonical_http_path(path);
     match (method, path) {
-        (&Method::GET, "/metrics" | "/ws/events" | "/ws/metrics") => Some(Action::Read),
-        (&Method::POST, "/chironql" | "/chironql/parse") => Some(Action::Read),
+        (&Method::GET, "/metrics" | "/ws/events" | "/ws/metrics") => Some(Action::Admin),
+        (&Method::GET, path)
+            if path
+                .strip_prefix("/transactions/")
+                .is_some_and(|transaction_id| {
+                    !transaction_id.is_empty() && !transaction_id.contains('/')
+                }) =>
+        {
+            Some(Action::Read)
+        }
+        (&Method::POST, "/chironql" | "/chironql/parse" | "/sql") => Some(Action::Read),
+        (&Method::GET, path)
+            if ["/ml/jobs/", "/ml/views/"].iter().any(|prefix| {
+                path.strip_prefix(prefix)
+                    .is_some_and(|name| !name.is_empty() && !name.contains('/'))
+            }) =>
+        {
+            Some(Action::Read)
+        }
+        (&Method::DELETE, path)
+            if path
+                .strip_prefix("/ml/views/")
+                .is_some_and(|name| !name.is_empty() && !name.contains('/')) =>
+        {
+            Some(Action::Write)
+        }
+
+        (&Method::POST, "/sql/transactions") => Some(Action::Read),
+        (&Method::POST, path)
+            if sql_transaction_path(path).is_some_and(|(_, action)| action == "execute") =>
+        {
+            // The SQL handler classifies the statement AST and applies the
+            // caller's write permission before touching private state.
+            Some(Action::Read)
+        }
+        (&Method::POST, path)
+            if sql_transaction_path(path).is_some_and(|(_, action)| action == "commit") =>
+        {
+            Some(Action::Write)
+        }
+        (&Method::DELETE, path)
+            if sql_transaction_path(path).is_some_and(|(_, action)| action.is_empty()) =>
+        {
+            Some(Action::Read)
+        }
         (method, path)
             if is_graph_http_path(path)
                 && matches!(
@@ -273,14 +316,12 @@ fn classify_http(method: &Method, path: &str) -> Option<Action> {
         (&Method::POST, path) if path.starts_with("/admin/") => Some(Action::Admin),
         (_, "/mcp") => Some(Action::Read),
         (&Method::GET, "/collections") => Some(Action::Read),
-        (&Method::POST, "/collections") => Some(Action::Write),
-        (&Method::DELETE, path) if is_collection_root(path) => Some(Action::Write),
-        (&Method::PUT, path)
-            if has_collection_suffix(path, "/payload_schema")
-                || has_collection_suffix(path, "/points") =>
-        {
-            Some(Action::Write)
+        (&Method::POST, "/collections") => Some(Action::Admin),
+        (&Method::DELETE, path) if is_collection_root(path) => Some(Action::Admin),
+        (&Method::PUT, path) if has_collection_suffix(path, "/payload_schema") => {
+            Some(Action::Admin)
         }
+        (&Method::PUT, path) if has_collection_suffix(path, "/points") => Some(Action::Write),
         (&Method::GET, path) if has_collection_suffix(path, "/index_status") => Some(Action::Read),
         (&Method::POST, path)
             if [
@@ -303,9 +344,6 @@ fn classify_http(method: &Method, path: &str) -> Option<Action> {
         }
         (&Method::POST, path)
             if [
-                "/points/payload",
-                "/points/delete",
-                "/points/delete/filter",
                 "/compact",
                 "/calibrate",
                 "/compact/stream",
@@ -315,10 +353,26 @@ fn classify_http(method: &Method, path: &str) -> Option<Action> {
             .iter()
             .any(|suffix| has_collection_suffix(path, suffix)) =>
         {
+            Some(Action::Admin)
+        }
+        (&Method::POST, path)
+            if ["/points/payload", "/points/delete", "/points/delete/filter"]
+                .iter()
+                .any(|suffix| has_collection_suffix(path, suffix)) =>
+        {
             Some(Action::Write)
         }
         _ => None,
     }
+}
+
+fn sql_transaction_path(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix("/sql/transactions/")?;
+    let (handle, action) = rest.split_once('/').unwrap_or((rest, ""));
+    if handle.is_empty() || handle.contains('/') || action.contains('/') {
+        return None;
+    }
+    Some((handle, action))
 }
 
 fn is_graph_http_path(path: &str) -> bool {
@@ -390,6 +444,7 @@ pub async fn require_http_auth(
         return Err((StatusCode::FORBIDDEN, "route has no authorization policy").into_response());
     };
     let graph_route = is_graph_http_path(canonical_http_path(path));
+    let mcp_route = canonical_http_path(path) == "/mcp";
     let collection = extract_collection_from_path(path).map(str::to_string);
     audit_http(
         &db,
@@ -426,21 +481,28 @@ pub async fn require_http_auth(
     let request = Request::from_parts(parts, body);
 
     if auth.allows_principal_request(&principal) {
-        let Some(_work_permit) = auth.try_begin_work(&principal) else {
-            metrics::counter!("gaussdb_work_limited_requests_total", "transport" => "http")
-                .increment(1);
-            audit_http(
-                &db,
-                "resource",
-                "http_work_limit",
-                "denied",
-                collection.as_deref(),
-                &principal.id,
-                principal.tenant_id.as_deref(),
-                request_id.as_deref(),
-                Some("resource_exhausted"),
-            )?;
-            return Err((StatusCode::TOO_MANY_REQUESTS, "server overloaded").into_response());
+        // MCP owns admission for each tool, including its blocking work. Taking
+        // another permit for the HTTP envelope can exhaust a one-slot tenant.
+        let _work_permit = if mcp_route {
+            None
+        } else {
+            let Some(permit) = auth.try_begin_work(&principal) else {
+                metrics::counter!("gaussdb_work_limited_requests_total", "transport" => "http")
+                    .increment(1);
+                audit_http(
+                    &db,
+                    "resource",
+                    "http_work_limit",
+                    "denied",
+                    collection.as_deref(),
+                    &principal.id,
+                    principal.tenant_id.as_deref(),
+                    request_id.as_deref(),
+                    Some("resource_exhausted"),
+                )?;
+                return Err((StatusCode::TOO_MANY_REQUESTS, "server overloaded").into_response());
+            };
+            Some(permit)
         };
         let response = next.run(request).await;
         if operation == Action::Read {
@@ -520,6 +582,49 @@ impl GrpcAuthInterceptor {
 
 impl Interceptor for GrpcAuthInterceptor {
     fn call(&mut self, mut request: GrpcRequest<()>) -> Result<GrpcRequest<()>, Status> {
+        if self.db.is_shutting_down() {
+            return Err(Status::unavailable("server is shutting down"));
+        }
+        if let Some(authority) = self.db.identity_authority() {
+            let work = std::sync::Arc::new(
+                authority
+                    .work_pool()
+                    .try_acquire_owned()
+                    .map_err(|_| Status::resource_exhausted("server overloaded"))?,
+            );
+            let token =
+                crate::security_http::credential(&request.metadata().clone().into_headers())
+                    .map_err(|_| Status::unauthenticated("missing or invalid credential"))?;
+            authority
+                .authenticate(&token)
+                .map_err(crate::grpc_protected::authentication_error)?;
+            if request
+                .extensions()
+                .get::<crate::grpc_protected::ProtectedQuery>()
+                .is_none()
+            {
+                return Err(Status::permission_denied(
+                    "operation is unavailable on protected authority",
+                ));
+            }
+            if [
+                "x-tenant-id",
+                "x-principal-id",
+                "x-chirondb-tenant-id",
+                "x-gaussdb-tenant-id",
+            ]
+            .iter()
+            .any(|name| request.metadata().contains_key(*name))
+            {
+                return Err(Status::permission_denied(
+                    "client identity overrides are forbidden",
+                ));
+            }
+            request
+                .extensions_mut()
+                .insert(crate::grpc_protected::Caller { token, work });
+            return Ok(request);
+        }
         let key = extract_grpc_key(request.metadata());
         let Some(permission) = self.auth.permission_for(key) else {
             self.db
@@ -641,14 +746,11 @@ pub struct WorkPermit {
 
 impl Default for WorkLimiter {
     fn default() -> Self {
-        let parallelism = std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(4);
-        let global_limit = parallelism.saturating_mul(4).max(32);
+        let global_limit = chirondb_core::resource_profile::current().query_workers;
         Self {
             state: Arc::new(Mutex::new(WorkState::default())),
             global_limit,
-            tenant_limit: (global_limit / 4).max(2),
+            tenant_limit: global_limit.div_ceil(4).max(1),
         }
     }
 }
@@ -760,10 +862,12 @@ fn principal_key(key: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthConfig, OperationType, classify_http, extract_collection_from_path, extract_http_key,
+        AuthConfig, GrpcAuthInterceptor, OperationType, classify_http,
+        extract_collection_from_path, extract_http_key,
     };
     use crate::rbac::{ApiKeyEntry, Permission, RbacConfig, Role};
     use axum::http::{HeaderMap, HeaderValue};
+    use tonic::{Code, Request, service::Interceptor};
 
     #[test]
     fn chirondb_api_key_header_precedes_legacy_header() {
@@ -778,6 +882,19 @@ mod tests {
     #[test]
     fn accepts_anything_when_disabled() {
         assert!(AuthConfig::disabled().accepts(None));
+    }
+
+    #[test]
+    fn grpc_rejects_new_work_during_shutdown() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = crate::Db::open(temp.path()).unwrap();
+        db.begin_shutdown();
+        let mut interceptor = GrpcAuthInterceptor::new(AuthConfig::disabled(), db);
+
+        let error = interceptor.call(Request::new(())).unwrap_err();
+
+        assert_eq!(error.code(), Code::Unavailable);
+        assert_eq!(error.message(), "server is shutting down");
     }
 
     #[test]
@@ -976,7 +1093,16 @@ mod tests {
         use axum::http::Method;
         let routes = [
             (Method::GET, "/collections", OperationType::Read),
-            (Method::POST, "/collections", OperationType::Write),
+            (
+                Method::GET,
+                "/transactions/550e8400-e29b-41d4-a716-446655440000",
+                OperationType::Read,
+            ),
+            (Method::POST, "/sql", OperationType::Read),
+            (Method::GET, "/ml/jobs/job-123", OperationType::Read),
+            (Method::GET, "/ml/views/forecast", OperationType::Read),
+            (Method::DELETE, "/ml/views/forecast", OperationType::Write),
+            (Method::POST, "/collections", OperationType::Admin),
             (Method::PUT, "/collections/col/points", OperationType::Write),
             (Method::POST, "/collections/col/search", OperationType::Read),
             (
@@ -1037,7 +1163,7 @@ mod tests {
             (
                 Method::POST,
                 "/collections/col/compact",
-                OperationType::Write,
+                OperationType::Admin,
             ),
             (Method::POST, "/admin/snapshot", OperationType::Admin),
             (Method::POST, "/admin/restore", OperationType::Admin),
@@ -1068,7 +1194,7 @@ mod tests {
         );
         assert_eq!(
             classify_http(&Method::POST, "/collections/col/compact"),
-            Some(OperationType::Write)
+            Some(OperationType::Admin)
         );
         assert_eq!(
             classify_http(&Method::POST, "/admin/snapshot"),

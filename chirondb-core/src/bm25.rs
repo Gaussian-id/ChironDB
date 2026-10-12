@@ -1,14 +1,13 @@
 //! Derived, mutable text postings. Payload/WAL remain the persistence authority.
-use std::{
-    cmp::Ordering,
-    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap},
-};
+use std::collections::{BTreeMap, HashMap};
 
 use crate::{
     filter::tokenize,
     model::Point,
-    search::{RankedPoint, SparseSearchOutcome},
+    search::{AdmittedVec, BorrowedMap, RankedHeap, SparseSearchOutcome},
 };
+
+mod query;
 
 const K1: f64 = 1.5;
 const B: f64 = 0.75;
@@ -149,8 +148,16 @@ impl TextIndex {
             .is_some_and(|field| field.documents.contains_key(id))
     }
 
+    pub(crate) fn document_ids<'a>(&'a self, field: &str) -> impl Iterator<Item = &'a str> {
+        self.fields
+            .get(field)
+            .into_iter()
+            .flat_map(|field| field.documents.keys().map(String::as_str))
+    }
+
     /// Merge ID-sorted postings, retaining only a bounded top-k heap. Statistics
     /// belong to the authorized corpus; the ordinary filter only admits candidates.
+    #[cfg(test)]
     pub(crate) fn search(
         &self,
         field: &str,
@@ -160,95 +167,192 @@ impl TextIndex {
         eligible: &dyn Fn(&str) -> bool,
         stopped: &dyn Fn() -> bool,
     ) -> SparseSearchOutcome {
-        let mut outcome = SparseSearchOutcome {
-            ranked: Vec::new(),
-            searched: 0,
-            degraded: false,
-        };
+        self.try_search(field, query, tenant, limit, &|id| Ok(eligible(id)), stopped)
+            .expect("infallible test posting callbacks")
+    }
+
+    pub(crate) fn try_search(
+        &self,
+        field: &str,
+        query: &str,
+        tenant: Option<&str>,
+        limit: usize,
+        eligible: &dyn Fn(&str) -> crate::Result<bool>,
+        stopped: &dyn Fn() -> bool,
+    ) -> crate::Result<SparseSearchOutcome> {
         let Some(field) = self.fields.get(field) else {
-            return outcome;
+            return Ok(empty_outcome());
         };
         let stats = match tenant {
             Some(tenant) => field.tenants.get(&Some(tenant.to_owned())),
             None => Some(&field.all),
         };
-        let Some(stats) = stats.filter(|stats| stats.length > 0) else {
-            return outcome;
+        let Some(stats) = stats else {
+            return Ok(empty_outcome());
         };
-        if limit == 0 {
-            return outcome;
+        let terms = query::Terms::new(query)?;
+        rank_postings(
+            field,
+            &terms,
+            &Corpus {
+                documents: stats.documents,
+                length: stats.length,
+                df: &|term| stats.df.get(term).copied(),
+            },
+            limit,
+            &|id| {
+                let document = &field.documents[id];
+                Ok(
+                    (tenant.is_none_or(|tenant| document.tenant.as_deref() == Some(tenant))
+                        && eligible(id)?)
+                    .then(|| {
+                        field
+                            .documents
+                            .get_key_value(id)
+                            .expect("indexed document")
+                            .0
+                            .as_str()
+                    }),
+                )
+            },
+            &|| Ok(!stopped()),
+        )
+    }
+
+    /// Use only the caller's searchable field domain for N, avgdl and query-term
+    /// document frequency. Ordinary predicates affect candidates, never corpus
+    /// statistics. The returned ID is supplied by authority before top-k ties.
+    pub(crate) fn search_authorized<'a>(
+        &self,
+        field: &str,
+        query: &str,
+        limit: usize,
+        authorize: &dyn Fn(&str) -> crate::Result<Option<&'a str>>,
+        eligible: &dyn Fn(&str) -> crate::Result<bool>,
+        check: &dyn Fn() -> crate::Result<()>,
+    ) -> crate::Result<SparseSearchOutcome> {
+        check()?;
+        let Some(field) = self.fields.get(field) else {
+            return Ok(empty_outcome());
+        };
+        let terms = query::Terms::new(query)?;
+        if limit == 0 || terms.is_empty() {
+            return Ok(empty_outcome());
         }
-        let avg = stats.length as f64 / stats.documents as f64;
-        let terms: BTreeSet<_> = tokenize(query).into_iter().collect();
-        let mut lists: Vec<_> = terms
-            .iter()
-            .filter_map(|term| {
-                let df = *stats.df.get(term)? as f64;
-                let idf = (1.0 + (stats.documents as f64 - df + 0.5) / (df + 0.5)).ln();
-                Some((idf, field.postings.get(term)?.iter().peekable()))
-            })
-            .collect();
-        let mut heap = BinaryHeap::with_capacity(limit);
-        loop {
-            if stopped() {
-                outcome.degraded = true;
-                break;
+        let mut documents = 0;
+        let mut length = 0;
+        let mut df = BorrowedMap::<usize>::default();
+        for (id, document) in &field.documents {
+            check()?;
+            if authorize(id)?.is_none() {
+                continue;
             }
-            let Some(id) = lists
-                .iter_mut()
-                .filter_map(|(_, list)| list.peek().map(|(id, _)| *id))
-                .min()
-                .cloned()
-            else {
-                break;
-            };
-            let document = &field.documents[&id];
-            let admitted = tenant.is_none_or(|tenant| document.tenant.as_deref() == Some(tenant))
-                && eligible(&id);
-            let mut score = 0.0;
-            for (idf, list) in &mut lists {
-                if list.peek().is_some_and(|(next, _)| **next == id) {
-                    let (_, tf) = list.next().expect("peeked posting");
-                    if admitted {
-                        let tf = *tf as f64;
-                        score += *idf * tf * (K1 + 1.0)
-                            / (tf + K1 * (1.0 - B + B * document.length as f64 / avg));
+            documents += 1;
+            length += document.length;
+            for term in terms.iter() {
+                if field
+                    .postings
+                    .get(term)
+                    .is_some_and(|postings| postings.contains_key(id))
+                {
+                    if let Some(count) = df.get_mut(term) {
+                        *count += 1;
+                    } else {
+                        df.insert(term, 1)?;
                     }
                 }
             }
-            if admitted {
-                outcome.searched += 1;
-                heap.push(WorstFirst(RankedPoint {
-                    id,
-                    score: score as f32,
-                }));
-                if heap.len() > limit {
-                    heap.pop();
-                }
-            }
         }
-        outcome.ranked = heap.into_iter().map(|entry| entry.0).collect();
-        outcome.ranked.sort_by(crate::search::rank_order);
-        outcome
+        rank_postings(
+            field,
+            &terms,
+            &Corpus {
+                documents,
+                length,
+                df: &|term| df.get(term).copied(),
+            },
+            limit,
+            &|id| {
+                let Some(public_id) = authorize(id)? else {
+                    return Ok(None);
+                };
+                Ok(eligible(id)?.then_some(public_id))
+            },
+            &|| {
+                check()?;
+                Ok(true)
+            },
+        )
     }
 }
 
-struct WorstFirst(RankedPoint);
-impl PartialEq for WorstFirst {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
+fn empty_outcome() -> SparseSearchOutcome {
+    SparseSearchOutcome {
+        ranked: Default::default(),
+        searched: 0,
+        degraded: false,
     }
 }
-impl Eq for WorstFirst {}
-impl PartialOrd for WorstFirst {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
+
+struct Corpus<'a> {
+    documents: usize,
+    length: usize,
+    df: &'a dyn Fn(&str) -> Option<usize>,
 }
-impl Ord for WorstFirst {
-    fn cmp(&self, other: &Self) -> Ordering {
-        crate::search::rank_order(&self.0, &other.0)
+
+fn rank_postings<'a>(
+    field: &Field,
+    terms: &[String],
+    stats: &Corpus<'_>,
+    limit: usize,
+    candidate: &dyn Fn(&str) -> crate::Result<Option<&'a str>>,
+    proceed: &dyn Fn() -> crate::Result<bool>,
+) -> crate::Result<SparseSearchOutcome> {
+    let mut outcome = empty_outcome();
+    if stats.length == 0 || limit == 0 {
+        return Ok(outcome);
     }
+    let avg = stats.length as f64 / stats.documents as f64;
+    let mut lists = AdmittedVec::default();
+    for term in terms {
+        if let (Some(df), Some(postings)) = ((stats.df)(term), field.postings.get(term)) {
+            let df = df as f64;
+            let idf = (1.0 + (stats.documents as f64 - df + 0.5) / (df + 0.5)).ln();
+            lists.push((idf, postings.iter().peekable()))?;
+        }
+    }
+    let mut heap = RankedHeap::new(limit);
+    loop {
+        if !proceed()? {
+            outcome.degraded = true;
+            break;
+        }
+        let Some(id) = lists
+            .iter_mut()
+            .filter_map(|(_, list)| list.peek().map(|(id, _)| *id))
+            .min()
+        else {
+            break;
+        };
+        let public_id = candidate(id)?;
+        let mut score = 0.0;
+        for (idf, list) in lists.iter_mut() {
+            if list.peek().is_some_and(|(next, _)| *next == id) {
+                let (_, tf) = list.next().expect("peeked posting");
+                if public_id.is_some() {
+                    let tf = *tf as f64;
+                    score += *idf * tf * (K1 + 1.0)
+                        / (tf + K1 * (1.0 - B + B * field.documents[id].length as f64 / avg));
+                }
+            }
+        }
+        if let Some(id) = public_id {
+            outcome.searched += 1;
+            heap.copy_push(id, score as f32)?;
+        }
+    }
+    outcome.ranked = heap.finish();
+    Ok(outcome)
 }
 
 #[cfg(test)]

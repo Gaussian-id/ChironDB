@@ -1,9 +1,14 @@
 # Getting started with ChironDB
 
 Run ChironDB locally, write your first points, and try dense and hybrid search.
-This guide follows the `0.1.0-beta.1` source tree and uses a small collection of
+This guide follows the `0.1.0-beta.2` source tree and uses a small collection of
 demonstration vectors. Generate real embeddings in your application before
 sending them to ChironDB.
+
+For a protected single-tenant server with administrator authentication, use the
+[first-administrator deployment guide](../deploy/protected/README.md). It covers
+offline initialization, verified TLS, authenticated ChironQL and recovery. The
+tutorial below creates an unprotected development installation.
 
 [README](../README.md) · [HTTP reference](HTTP_API.md) ·
 [ChironQL reference](CHIRONQL.md) · [SDKs](SDKS.md) ·
@@ -59,7 +64,7 @@ curl --fail --retry 15 --retry-connrefused --retry-delay 1 --retry-max-time 30 \
 Expected response:
 
 ```json
-{"status":"ok","version":"0.1.0-beta.1"}
+{"status":"ok","version":"0.1.0-beta.2"}
 ```
 
 By default, HTTP uses port `7401`, gRPC uses `7402`, and ChironWire plus the
@@ -129,7 +134,7 @@ profile for an externally reachable service. Wait for the health request above
 to succeed; inspect startup with `docker logs chirondb` if needed.
 
 The repository's [Compose file](../docker-compose.yml) instead pulls
-`ghcr.io/gaussian-id/chirondb:0.1.0-beta.1`. Use it only when that image is
+`ghcr.io/gaussian-id/chirondb:0.1.0-beta.2`. Use it only when that image is
 published and accessible to you. Available signed binaries will be listed on
 the [Releases page](https://github.com/Gaussian-id/ChironDB/releases); a source
 version number alone does not mean release artifacts have been published.
@@ -150,6 +155,21 @@ database tree into a `data/` subdirectory of a new volume. Give UID/GID
 `10001:10001` access to that volume and verify the collections after startup.
 Keep the old volume until verification is complete. Persisted formats and
 encryption keyrings are unchanged by this directory layout.
+
+### Graceful shutdown
+
+Send `SIGTERM` or `SIGINT`; for Docker use `docker stop --timeout 15 chirondb`.
+ChironDB immediately makes readiness unavailable and rejects new work, gives
+existing protocol requests up to five seconds to drain, then flushes WAL and
+audit state. The internal deadline is fixed at 12 seconds, while Compose,
+systemd, and launchd reserve 15 seconds before an external kill.
+
+A clean stop exits `0`. If a stuck request, background build, or final sync
+cannot reach a recovery-safe boundary in time, ChironDB exits `2` before the
+process manager escalates to `SIGKILL`; inspect the final sanitized shutdown
+report and rehearse recovery before returning the node to service. A client
+that disconnects after `COMMIT` without receiving the response must reconcile
+the transaction outcome instead of automatically retrying it.
 
 ## 2. Create a collection
 
@@ -351,7 +371,9 @@ configuration must happen before graph statements can run.
 Graph access has its own capabilities in addition to the ordinary point role
 and collection allowlist. The overlay is single-node. Graph-aware multi-search,
 distributed traversal, shortest-path algorithms, and graph statements over
-PostgreSQL wire are outside the supported surface.
+PostgreSQL wire are outside the supported surface. The supply-chain screenshot
+in the README is an application demo, not an administration UI shipped by the
+server.
 
 ## PostgreSQL and pgvector boundary
 
@@ -366,10 +388,34 @@ Port `7403` accepts a deliberately small PostgreSQL wire compatibility surface:
 | `DELETE` | Deletes matching points |
 | `DROP TABLE` | Deletes the collection |
 
-This is a vector-only subset, not general PostgreSQL compatibility. Joins,
-CTEs, transactions, and `CREATE INDEX … USING hnsw` reject with SQLSTATE
-`0A000`. Keep relational queries in PostgreSQL/pgvector. Graph statements use
-ChironQL or native APIs, and ChironQL itself does not accept SQL `SELECT`.
+These six shapes remain the pgvector compatibility profile for vector
+collections. Native relational tables on the same port are routed to the
+ChironDB relational executor, which supports the documented joins,
+transactions, bounded `ALTER TABLE ... ADD/DROP/RENAME COLUMN`, table rename,
+compatible integer/float/text `ALTER COLUMN ... TYPE`, versioned
+`SET/DROP NOT NULL` and `SET/DROP DEFAULT`, named `ADD/DROP CONSTRAINT`
+plus `RENAME CONSTRAINT` for primary, unique, foreign-key, and CHECK
+constraints with FK dependency protection. `DROP CONSTRAINT ... CASCADE`
+removes foreign keys bound to the selected primary/unique owner atomically
+while preserving unrelated constraints and independently owned user indexes.
+`DROP TABLE ... CASCADE` similarly removes external FKs to the dropped table
+without removing unrelated child constraints or indexes; plain `DROP TABLE`
+remains RESTRICT.
+`ALTER TABLE ... DROP COLUMN ... CASCADE` removes the selected column, local
+constraints/indexes that use it, and external FKs that reference it through one
+catalog commit. Plain `DROP COLUMN` remains RESTRICT and reports dependent
+objects before changing rows. Multiple comma-separated DROP COLUMN actions are
+resolved together and use one rewrite; any failed action rolls back the full
+statement.
+The relational path also supports the
+non-recursive CTE/subquery subset. The server still does not
+claim complete PostgreSQL compatibility: recursive/correlated/lateral queries
+and `CREATE INDEX … USING hnsw` reject explicitly. Graph statements use
+ChironQL or native APIs. In ChironQL, prefix relational statements with `SQL`.
+Named and unnamed statements created by the PostgreSQL extended protocol can
+also be released with SQL `DEALLOCATE <name>` or `DEALLOCATE ALL`; missing names
+return SQLSTATE `26000`. This keeps psycopg's automatic prepared-statement
+maintenance on the same connection usable after its prepare threshold is met.
 
 ## Authentication and network access
 

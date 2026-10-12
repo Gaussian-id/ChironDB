@@ -10,14 +10,29 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_BUILD_JOBS: 2
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+
 jobs:
+  trust-boundary:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Validate repository branch provenance
+        env:
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+        run: test "$HEAD_REPOSITORY" = "${{ github.repository }}"
+
   dependency-policy:
-    runs-on: ubuntu-latest
+    needs: trust-boundary
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@87eb139fed4b08a67bd1fa429a21d1f5d523e03e # 1.92.0
         with:
           toolchain: 1.92.0
+          components: clippy, rustfmt
       - name: Install policy tools
         run: |
           cargo install cargo-audit --version 0.22.2 --locked
@@ -33,8 +48,219 @@ jobs:
       - name: Deterministic crash-consistency suite
         run: cargo test -p chirondb-core --features fault-injection --test crash_consistency --locked
 
+  protected-format-downgrade:
+    needs: trust-boundary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@87eb139fed4b08a67bd1fa429a21d1f5d523e03e # 1.92.0
+        with:
+          toolchain: 1.92.0
+          components: clippy, rustfmt
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler ripgrep
+      - name: Build the pinned public beta.1 pre-protected reader
+        run: |
+          set -euo pipefail
+          legacy_ref=6846a04ab4930913387e8c0875d941c80420690b
+          git fetch --no-tags --depth=1 origin "$legacy_ref"
+          legacy_source="${RUNNER_TEMP}/chirondb-pre-protected"
+          mkdir "$legacy_source"
+          git archive "$legacy_ref" | tar -x -C "$legacy_source"
+          cargo build --manifest-path "$legacy_source/Cargo.toml" --bin chirondb --locked --jobs 2 --target-dir target/pre-protected
+          sha256sum target/pre-protected/debug/chirondb
+          git rev-parse "$legacy_ref"
+      - name: Refuse old binary at root and generation in both encryption modes
+        run: |
+          set -euo pipefail
+          test_name=db::security_runtime::tests::old_binary_rejects_protected_root_and_direct_generation
+          cargo test -p chirondb-core --lib --locked "$test_name" -- --ignored --list | rg --fixed-strings --line-regexp "$test_name: test"
+          CHIRONDB_OLD_BINARY="${GITHUB_WORKSPACE}/target/pre-protected/debug/chirondb" cargo test -p chirondb-core --lib --locked "$test_name" -- --ignored --exact --test-threads=1
+
+      - name: Refuse an empty protected installation at root and generation
+        run: |
+          cargo build -p chirondb --bin chironctl --locked
+          python3 chirondb-server/tests/security_installation_compat.py --ctl target/debug/chironctl --old-binary target/pre-protected/debug/chirondb --output "$RUNNER_TEMP/empty-protected-downgrade"
+
+      - name: Build the pinned public beta.1 pre-transaction-journal reader
+        run: |
+          set -euo pipefail
+          legacy_ref=6846a04ab4930913387e8c0875d941c80420690b
+          git fetch --no-tags --depth=1 origin "$legacy_ref"
+          legacy_source="${RUNNER_TEMP}/chirondb-pre-transaction-journal"
+          mkdir "$legacy_source"
+          git archive "$legacy_ref" | tar -x -C "$legacy_source"
+          cargo build --manifest-path "$legacy_source/Cargo.toml" --bin chirondb --locked --jobs 2 --target-dir target/pre-transaction-journal
+          sha256sum target/pre-transaction-journal/debug/chirondb
+          test "$(git rev-parse "$legacy_ref")" = "$legacy_ref"
+      - name: Refuse the transaction-journal catalog format in the old binary
+        run: |
+          set -euo pipefail
+          test_name=db::tests::old_binary_rejects_transaction_catalog_format
+          cargo test -p chirondb-core --lib --locked "$test_name" -- --ignored --list | rg --fixed-strings --line-regexp "$test_name: test"
+          CHIRONDB_OLD_BINARY="${GITHUB_WORKSPACE}/target/pre-transaction-journal/debug/chirondb" cargo test -p chirondb-core --lib --locked "$test_name" -- --ignored --exact --test-threads=1
+
+  protected-http-five-roles:
+    needs: trust-boundary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@87eb139fed4b08a67bd1fa429a21d1f5d523e03e # 1.92.0
+        with:
+          toolchain: 1.92.0
+          components: clippy, rustfmt
+      - name: Install fixture dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler openssl python3 ripgrep
+      - name: Build actual server and verify E2E registration
+        run: |
+          set -euo pipefail
+          cargo build -p chirondb --bin chirondb --locked
+          test_name=db::security_e2e::five_roles_over_real_tls_http_and_encrypted_restart
+          cargo test -p chirondb-core --lib --locked "$test_name" -- --ignored --list | rg --fixed-strings --line-regexp "$test_name: test"
+      - name: Five-role TLS, revoke and encrypted process-kill recovery
+        env:
+          CHIRONDB_SECURITY_E2E_BINARY: ${{ github.workspace }}/target/debug/chirondb
+          CHIRONDB_SECURITY_E2E_OUTPUT: ${{ runner.temp }}/protected-http-five-roles
+        run: cargo test -p chirondb-core --lib --locked five_roles_over_real_tls -- --ignored --nocapture --test-threads=1
+      - name: Upload redacted evidence only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: protected-http-five-roles-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/protected-http-five-roles/report.json
+            ${{ runner.temp }}/protected-http-five-roles/requests.jsonl
+            ${{ runner.temp }}/protected-http-five-roles/audit-evidence.json
+          if-no-files-found: error
+
+  protected-chironql-five-roles:
+    needs: trust-boundary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@87eb139fed4b08a67bd1fa429a21d1f5d523e03e # 1.92.0
+        with:
+          toolchain: 1.92.0
+          components: clippy, rustfmt
+      - name: Install protocol and PTY dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler openssl python3-venv ripgrep
+          python3 -m venv "$RUNNER_TEMP/chironql-python"
+          "$RUNNER_TEMP/chironql-python/bin/python" -m pip install -r chirondb-server/tests/security_chironql_requirements.txt
+      - name: Build real binaries and provision only the trust root
+        env:
+          CHIRONDB_CHIRONQL_E2E_OUTPUT: ${{ runner.temp }}/protected-chironql
+        run: |
+          cargo build -p chirondb --bin chirondb --bin chironql --bin chironctl --locked
+          cargo test -p chirondb-core --lib chironql_empty_fixture --locked -- --ignored --test-threads=1
+      - name: CLI, PTY, attached console, HTTP aliases, gRPC and ChironWire
+        run: |
+          "$RUNNER_TEMP/chironql-python/bin/python" chirondb-server/tests/security_chironql_e2e.py --binary target/debug/chirondb --cli target/debug/chironql --output "$RUNNER_TEMP/protected-chironql"
+          python3 chirondb-server/tests/security_revision_model.py > "$RUNNER_TEMP/protected-chironql/revision-model.json"
+      - name: Verify encrypted audit and crash boundaries
+        env:
+          CHIRONDB_CHIRONQL_E2E_OUTPUT: ${{ runner.temp }}/protected-chironql
+        run: |
+          cargo test -p chirondb-core --lib chironql_verify_evidence --locked -- --ignored --test-threads=1
+          cargo test -p chirondb-core --lib security::identity::administration_tests --features fault-injection --locked -- --test-threads=1
+          cargo test -p chirondb --lib protected --locked -- --test-threads=1
+      - name: Upload sanitized evidence only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: protected-chironql-five-roles-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/protected-chironql/chironql-report.json
+            ${{ runner.temp }}/protected-chironql/chironql-transcript.json
+            ${{ runner.temp }}/protected-chironql/chironql-requests.json
+            ${{ runner.temp }}/protected-chironql/chironql-matrix.json
+            ${{ runner.temp }}/protected-chironql/chironql-audit-evidence.json
+            ${{ runner.temp }}/protected-chironql/revision-model.json
+          if-no-files-found: error
+
+  protected-installation:
+    needs: trust-boundary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@87eb139fed4b08a67bd1fa429a21d1f5d523e03e # 1.92.0
+        with:
+          toolchain: 1.92.0
+          components: clippy, rustfmt
+      - name: Install E2E dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler openssl python3-venv ripgrep
+          python3 -m venv "$RUNNER_TEMP/install-python"
+          "$RUNNER_TEMP/install-python/bin/pip" install -r chirondb-server/tests/security_chironql_requirements.txt
+      - name: Empty installation, five profiles and administrator recovery
+        run: |
+          cargo build -p chirondb --bin chirondb --bin chironql --bin chironctl --locked
+          "$RUNNER_TEMP/install-python/bin/python" chirondb-server/tests/security_installation_e2e.py --bin-dir target/debug --output "$RUNNER_TEMP/installation-native"
+      - name: Verify complete ChironQL reference and executable examples
+        run: |
+          "$RUNNER_TEMP/install-python/bin/python" chirondb-server/tests/security_documentation_examples.py --bin-dir target/debug --output "$RUNNER_TEMP/documentation-reference"
+      - name: Interrupted initialization, catalog activation and recovery
+        run: |
+          cargo build -p chirondb --bin chirondb --bin chironql --bin chironctl --features fault-injection --locked
+          "$RUNNER_TEMP/install-python/bin/python" chirondb-server/tests/security_installation_faults.py --bin-dir target/debug --output "$RUNNER_TEMP/installation-faults"
+      - name: Upload sanitized reports only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: protected-installation-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/installation-native/report.json
+            ${{ runner.temp }}/documentation-reference/report.json
+            ${{ runner.temp }}/documentation-reference/executed-examples.json
+            ${{ runner.temp }}/installation-faults/*/report.json
+            ${{ runner.temp }}/installation-faults/summary.json
+          if-no-files-found: error
+
+  protected-deployment:
+    needs: trust-boundary
+    runs-on: ubuntu-24.04
+    # Cold release-image builds exceeded 55 minutes in the combined job.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@87eb139fed4b08a67bd1fa429a21d1f5d523e03e # 1.92.0
+        with:
+          toolchain: 1.92.0
+          components: clippy, rustfmt
+      - name: Install E2E dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler openssl python3-venv ripgrep
+          python3 -m venv "$RUNNER_TEMP/install-python"
+          "$RUNNER_TEMP/install-python/bin/pip" install -r chirondb-server/tests/security_chironql_requirements.txt
+      - name: Build clients for deployment verification
+        run: cargo build -p chirondb --bin chirondb --bin chironql --bin chironctl --locked
+      - name: Compose and actual Linux systemd integration
+        run: |
+          docker build -t chirondb-installation-ci:local .
+          image_id="$(docker image inspect chirondb-installation-ci:local --format '{{.Id}}')"
+          docker build -f chirondb-server/tests/deployment/Dockerfile.systemd --build-arg BASE_IMAGE=chirondb-installation-ci:local -t chirondb-installation-systemd-ci:local .
+          "$RUNNER_TEMP/install-python/bin/python" chirondb-server/tests/security_installation_deployments.py --mode compose --image "$image_id" --project installation-compose-ci --bin-dir target/debug --output "$RUNNER_TEMP/installation-compose"
+          "$RUNNER_TEMP/install-python/bin/python" chirondb-server/tests/security_installation_deployments.py --mode systemd --image "$image_id" --systemd-image chirondb-installation-systemd-ci:local --project installation-systemd-ci --bin-dir target/debug --port 17531 --output "$RUNNER_TEMP/installation-systemd"
+      - name: Upload sanitized deployment reports only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: protected-deployment-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/installation-compose/report.json
+            ${{ runner.temp }}/installation-systemd/report.json
+          if-no-files-found: error
+
   fuzz-corpus:
-    runs-on: ubuntu-latest
+    needs: trust-boundary
+    runs-on: ubuntu-24.04
     env:
       RUSTUP_TOOLCHAIN: nightly-2026-08-20
     steps:
@@ -45,25 +271,27 @@ jobs:
       - name: Install protoc and cargo-fuzz
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          sudo apt-get install -y protobuf-compiler ripgrep
           cargo install cargo-fuzz --version 0.13.2 --locked
       - name: Compile independent fuzz workspace
         run: cargo check --manifest-path fuzz/Cargo.toml --locked
       - name: Corpus regression and short smoke
         run: |
-          for target in protocol_decoders query_decoders storage_decoders index_decoders; do
+          for target in protocol_decoders query_decoders storage_decoders index_decoders catalog_wal; do
             cargo fuzz run "$target" fuzz/corpus/"$target" -- -runs=256 -rss_limit_mb=2048
           done
 
   real-disk-full:
-    runs-on: ubuntu-latest
+    needs: trust-boundary
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@87eb139fed4b08a67bd1fa429a21d1f5d523e03e # 1.92.0
         with:
           toolchain: 1.92.0
+          components: clippy, rustfmt
       - name: Install protoc and filesystem tools
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler e2fsprogs
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler e2fsprogs ripgrep
       - name: Resolve tested tree hashes
         id: trees
         run: |
@@ -89,7 +317,12 @@ jobs:
           CHIRONDB_ENOSPC_ROOT="$mountpoint" cargo test -p chirondb-core \
             --features fault-injection --test real_enospc --locked -- --ignored --exact \
             real_enospc_rejects_unacknowledged_write_and_reopens_acknowledged_state
-          CHIRONDB_ENOSPC_ROOT="$mountpoint" cargo test -p chirondb-core \
+          CHIRONDB_ENOSPC_EVIDENCE="${RUNNER_TEMP}/real-enospc-audit.json" \
+            CHIRONDB_ENOSPC_ROOT="$mountpoint" cargo test -p chirondb-core \
+            --features fault-injection --test real_enospc --locked -- --ignored --exact \
+            real_enospc_recovers_committed_audit_projection_exactly_once
+          CHIRONDB_ENOSPC_EVIDENCE="${RUNNER_TEMP}/real-enospc-build.json" \
+            CHIRONDB_ENOSPC_ROOT="$mountpoint" cargo test -p chirondb-core \
             --features fault-injection --test real_enospc --locked -- --ignored --exact \
             real_enospc_preserves_build_checkpoint_and_resumes_after_space_returns
       - name: Upload ENOSPC evidence
@@ -97,21 +330,35 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: real-enospc-${{ github.sha }}
-          path: ${{ runner.temp }}/real-enospc.json
+          path: ${{ runner.temp }}/real-enospc*.json
           if-no-files-found: error
 
   required:
     name: security-required
     if: always()
-    needs: [dependency-policy, fuzz-corpus, real-disk-full]
-    runs-on: ubuntu-latest
+    needs: [trust-boundary, dependency-policy, protected-format-downgrade, protected-http-five-roles, protected-chironql-five-roles, protected-installation, protected-deployment, fuzz-corpus, real-disk-full]
+    runs-on: ubuntu-24.04
     steps:
       - name: Require security gates
         env:
           DEPENDENCY_RESULT: ${{ needs.dependency-policy.result }}
+          DOWNGRADE_RESULT: ${{ needs.protected-format-downgrade.result }}
+          CHIRONQL_RESULT: ${{ needs.protected-chironql-five-roles.result }}
+          HTTP_ROLES_RESULT: ${{ needs.protected-http-five-roles.result }}
+          INSTALLATION_RESULT: ${{ needs.protected-installation.result }}
+          DEPLOYMENT_RESULT: ${{ needs.protected-deployment.result }}
           FUZZ_RESULT: ${{ needs.fuzz-corpus.result }}
           DISK_RESULT: ${{ needs.real-disk-full.result }}
-        run: >-
-          test "$DEPENDENCY_RESULT" = success &&
-          test "$FUZZ_RESULT" = success &&
-          test "$DISK_RESULT" = success
+          TRUST_RESULT: ${{ needs.trust-boundary.result }}
+        run: |
+          result=0
+          for gate in TRUST_RESULT DEPENDENCY_RESULT DOWNGRADE_RESULT HTTP_ROLES_RESULT \
+            CHIRONQL_RESULT INSTALLATION_RESULT DEPLOYMENT_RESULT FUZZ_RESULT DISK_RESULT; do
+            if [[ "${!gate}" != success ]]; then
+              printf '::error::%s expected success, got %q\n' "$gate" "${!gate}"
+              result=1
+            else
+              printf '%s=success\n' "$gate"
+            fi
+          done
+          exit "$result"

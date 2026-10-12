@@ -200,6 +200,126 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum SecurityCommand {
+    /// Export a fenced protected content backup while the server is stopped.
+    Backup {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        destination: PathBuf,
+        #[arg(long)]
+        keyring: PathBuf,
+    },
+    /// Export encrypted journal, identity and audit without another content copy.
+    JournalArchive {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        destination: PathBuf,
+        #[arg(long)]
+        keyring: PathBuf,
+    },
+    /// Verify a fenced protected content backup and its authenticated inventory.
+    VerifyBackup {
+        #[arg(long)]
+        backup: PathBuf,
+        #[arg(long)]
+        keyring: PathBuf,
+    },
+    /// Verify an encrypted protected journal/authority archive.
+    VerifyJournalArchive {
+        #[arg(long)]
+        archive: PathBuf,
+        #[arg(long)]
+        keyring: PathBuf,
+    },
+    /// Restore into a new directory using a separately trusted latest authority.
+    RestoreBackup {
+        #[arg(long)]
+        backup: PathBuf,
+        #[arg(long)]
+        authority_source: PathBuf,
+        #[arg(long)]
+        destination: PathBuf,
+        #[arg(long)]
+        keyring: PathBuf,
+    },
+    /// Initialize an empty encrypted installation and deliver its first administrator key.
+    Init {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        admin: String,
+        #[arg(long)]
+        keyring_out: PathBuf,
+        #[arg(long)]
+        admin_key_out: PathBuf,
+        #[arg(long)]
+        resume: bool,
+    },
+    /// Replace the installation administrator offline without restoring old permissions.
+    RecoverAdmin {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        keyring: PathBuf,
+        #[arg(long)]
+        admin_key_out: PathBuf,
+        #[arg(long)]
+        resume: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Upgrade an inactive identity authority in place; old readers will reject it.
+    MigrateAuthority {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        keyring: Option<PathBuf>,
+    },
+    /// Fence SQL identity installations against older binaries before mutable startup.
+    MigrateSqlGuard {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        keyring: PathBuf,
+    },
+    /// Build durable transaction decisions, consumed keys and retained receipts offline.
+    MigrateTransactionAuthority {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        keyring: PathBuf,
+    },
+    /// Activate coordinated SQL/vector/graph recovery on an offline installation.
+    MigrateCommonFrontier {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        keyring: PathBuf,
+    },
+    /// Install SQL table authority and bind existing tables to persistent incarnations.
+    MigrateTableAuthority {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        keyring: PathBuf,
+    },
+    /// Bind legacy SQL name scopes to current tables and retire SQL name fallback.
+    MigrateSqlScopes {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        keyring: PathBuf,
+    },
+    /// Backfill protected RECORD_REF indexes on an offline installation.
+    MigrateRelationalIndexes {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        keyring: PathBuf,
+    },
     Inspect {
         #[arg(long)]
         data_dir: PathBuf,
@@ -740,6 +860,156 @@ async fn main() -> anyhow::Result<()> {
 
 fn run_security_command(command: &SecurityCommand) -> anyhow::Result<()> {
     match command {
+        SecurityCommand::Backup {
+            data_dir,
+            destination,
+            keyring,
+        } => {
+            let keyring = load_enforced_keyring(keyring)?;
+            let manifest =
+                chirondb::db::create_offline_protected_backup(data_dir, destination, &keyring)?;
+            println!("{}", serde_json::to_string_pretty(&manifest)?);
+        }
+        SecurityCommand::JournalArchive {
+            data_dir,
+            destination,
+            keyring,
+        } => {
+            let keyring = load_enforced_keyring(keyring)?;
+            let manifest = chirondb::db::create_offline_protected_journal_archive(
+                data_dir,
+                destination,
+                &keyring,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&manifest)?);
+        }
+        SecurityCommand::VerifyBackup { backup, keyring } => {
+            let keyring = load_enforced_keyring(keyring)?;
+            let manifest = chirondb::db::verify_offline_protected_backup(backup, &keyring)?;
+            println!("{}", serde_json::to_string_pretty(&manifest)?);
+        }
+        SecurityCommand::VerifyJournalArchive { archive, keyring } => {
+            let keyring = load_enforced_keyring(keyring)?;
+            let manifest =
+                chirondb::db::verify_offline_protected_journal_archive(archive, &keyring)?;
+            println!("{}", serde_json::to_string_pretty(&manifest)?);
+        }
+        SecurityCommand::RestoreBackup {
+            backup,
+            authority_source,
+            destination,
+            keyring,
+        } => {
+            let keyring = load_enforced_keyring(keyring)?;
+            let receipt = chirondb::db::restore_offline_protected_backup(
+                backup,
+                authority_source,
+                destination,
+                &keyring,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&receipt)?);
+        }
+        SecurityCommand::Init {
+            data_dir,
+            tenant,
+            admin,
+            keyring_out,
+            admin_key_out,
+            resume,
+        } => {
+            let report = chirondb::security::onboarding::initialize(
+                data_dir,
+                tenant,
+                admin,
+                keyring_out,
+                admin_key_out,
+                *resume,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        SecurityCommand::RecoverAdmin {
+            data_dir,
+            keyring,
+            admin_key_out,
+            resume,
+            yes,
+        } => {
+            if !yes {
+                use std::io::{IsTerminal, Write};
+                anyhow::ensure!(
+                    std::io::stdin().is_terminal(),
+                    "offline admin recovery requires --yes in a noninteractive session"
+                );
+                eprint!(
+                    "Replace the installation administrator and revoke its old keys? Type yes: "
+                );
+                std::io::stderr().flush()?;
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                anyhow::ensure!(answer.trim() == "yes", "recovery cancelled");
+            }
+            let report = chirondb::security::onboarding::recover_admin(
+                data_dir,
+                keyring,
+                admin_key_out,
+                *resume,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        SecurityCommand::MigrateAuthority { data_dir, keyring } => {
+            if let Some(keyring) = keyring {
+                encryption::install_process_keyring(encryption::Keyring::load(keyring)?, false)?;
+            }
+            let migrated = chirondb::security::IdentityAuthority::migrate_v1(data_dir)?;
+            println!("{}", json!({"identity_format": 2, "migrated": migrated}));
+        }
+        SecurityCommand::MigrateSqlGuard { data_dir, keyring } => {
+            let migrated = chirondb::security::onboarding::migrate_sql_guard(data_dir, keyring)?;
+            println!(
+                "{}",
+                json!({"installation_format": 2, "migrated": migrated})
+            );
+        }
+        SecurityCommand::MigrateTransactionAuthority { data_dir, keyring } => {
+            encryption::install_process_keyring(encryption::Keyring::load(keyring)?, false)?;
+            let migrated = Db::migrate_transaction_authority_offline(data_dir)?;
+            println!(
+                "{}",
+                json!({"transaction_format": 3, "installation_format": 6, "migrated": migrated})
+            );
+        }
+        SecurityCommand::MigrateCommonFrontier { data_dir, keyring } => {
+            encryption::install_process_keyring(encryption::Keyring::load(keyring)?, false)?;
+            let migrated = Db::migrate_common_frontier_offline(data_dir)?;
+            println!(
+                "{}",
+                json!({"common_frontier_format": 1, "installation_format": 7, "migrated": migrated})
+            );
+        }
+        SecurityCommand::MigrateTableAuthority { data_dir, keyring } => {
+            encryption::install_process_keyring(encryption::Keyring::load(keyring)?, false)?;
+            let mut db = Db::open(data_dir)?;
+            let migrated = db.migrate_table_authority_offline()?;
+            println!(
+                "{}",
+                json!({"identity_format": 5, "migrated_tables": migrated})
+            );
+        }
+        SecurityCommand::MigrateSqlScopes { data_dir, keyring } => {
+            encryption::install_process_keyring(encryption::Keyring::load(keyring)?, false)?;
+            let mut db = Db::open(data_dir)?;
+            let migrated = db.migrate_sql_scopes_offline()?;
+            println!(
+                "{}",
+                json!({"identity_format": 6, "installation_format": 5, "migrated": migrated})
+            );
+        }
+        SecurityCommand::MigrateRelationalIndexes { data_dir, keyring } => {
+            encryption::install_process_keyring(encryption::Keyring::load(keyring)?, false)?;
+            let mut db = Db::open(data_dir)?;
+            let migrated = db.migrate_relational_reference_indexes_offline()?;
+            println!("{}", json!({"migrated_tables": migrated}));
+        }
         SecurityCommand::Inspect { data_dir } => {
             let _lock = storage_layout::acquire_exclusive(data_dir)?;
             let layout = storage_layout::resolve(data_dir)?;
@@ -838,6 +1108,12 @@ fn apply_auth(request: reqwest::RequestBuilder, api_key: Option<&str>) -> reqwes
         Some(api_key) => request.bearer_auth(api_key),
         None => request,
     }
+}
+
+fn load_enforced_keyring(path: &Path) -> anyhow::Result<encryption::Keyring> {
+    let keyring = encryption::Keyring::load(path)?;
+    encryption::install_process_keyring(encryption::Keyring::load(path)?, true)?;
+    Ok(keyring)
 }
 
 async fn build_client(

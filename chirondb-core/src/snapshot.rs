@@ -166,7 +166,7 @@ pub fn read_snapshot_marker(root: &Path) -> Result<Option<SnapshotMarker>> {
             message: "snapshot marker shorter than header".to_string(),
         });
     }
-    let header = file.read_range(0..HEADER_LEN)?;
+    let header = file.read_range_admitted(0..HEADER_LEN)?;
     if &header[0..8] != SNAPSHOT_MAGIC && &header[0..8] != GRAPH_SNAPSHOT_MAGIC {
         return Err(GaussError::SegmentCorruption {
             path: path.display().to_string(),

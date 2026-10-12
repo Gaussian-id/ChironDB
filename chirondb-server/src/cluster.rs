@@ -664,21 +664,23 @@ mod tests {
         assert_eq!(resp.hits[0].id, "fast");
     }
 
-    struct DropFlag(Arc<AtomicBool>);
+    struct DropFlag(Option<tokio::sync::oneshot::Sender<()>>);
 
     impl Drop for DropFlag {
         fn drop(&mut self) {
-            self.0.store(true, Ordering::Release);
+            if let Some(done) = self.0.take() {
+                let _ = done.send(());
+            }
         }
     }
 
     struct CancelAwareShard {
-        dropped: Arc<AtomicBool>,
+        drop_flag: DropFlag,
     }
 
     impl ShardClient for CancelAwareShard {
         async fn search(self, _req: SearchRequest) -> crate::error::Result<SearchResponse> {
-            let _drop_flag = DropFlag(self.dropped);
+            let _drop_flag = self.drop_flag;
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             unreachable!("the shard future must be cancelled at the coordinator budget")
         }
@@ -686,7 +688,6 @@ mod tests {
 
     #[tokio::test]
     async fn fan_out_aborts_timed_out_shard_future() {
-        let dropped = Arc::new(AtomicBool::new(false));
         let req = SearchRequest {
             graph: None,
             vector: vec![1.0],
@@ -700,18 +701,25 @@ mod tests {
             with_payload: None,
         };
 
-        let resp = fan_out_search(
-            vec![CancelAwareShard {
-                dropped: Arc::clone(&dropped),
-            }],
-            req,
-            10,
-        )
-        .await;
-        tokio::task::yield_now().await;
-
-        assert!(resp.degraded);
-        assert!(dropped.load(Ordering::Acquire));
+        for budget_ms in [0, 10] {
+            // Own the guard before dispatch, including cancellation before the
+            // task's first poll. Abort schedules cleanup; one yield is not a
+            // completion barrier, so observe the destructor's actual signal.
+            let (done, dropped) = tokio::sync::oneshot::channel();
+            let resp = fan_out_search(
+                vec![CancelAwareShard {
+                    drop_flag: DropFlag(Some(done)),
+                }],
+                req.clone(),
+                budget_ms,
+            )
+            .await;
+            assert!(resp.degraded);
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), dropped)
+                .await
+                .expect("aborted shard cleanup must complete")
+                .expect("shard guard must signal its destruction");
+        }
     }
 
     struct DegradedShard;

@@ -117,10 +117,7 @@ impl StableGraphSeed {
             .ok_or_else(|| GaussError::InvalidRequest("Vamana seed exceeds u32".to_string()))?;
         if metric == crate::DistanceMetric::Cosine {
             for posting in 0..ivf.len() {
-                let ordinal = ivf
-                    .posting_ordinal(posting)
-                    .ok_or_else(|| GaussError::InvalidRequest("IVF posting is missing".into()))?
-                    as usize;
+                let ordinal = ivf.try_posting_ordinal(posting)? as usize;
                 ordinal_to_key[ordinal] = u32::try_from(posting).map_err(|_| {
                     GaussError::InvalidRequest("Vamana record key exceeds u32".to_string())
                 })?;
@@ -174,7 +171,7 @@ impl VamanaArtifact {
         if file.len() < VAMANA_SEGMENT_HEADER_BYTES {
             return Err(vamana_corrupt(path, "bad or truncated Vamana header"));
         }
-        let header = file.read_range(0..VAMANA_SEGMENT_HEADER_BYTES)?;
+        let header = file.read_range_admitted(0..VAMANA_SEGMENT_HEADER_BYTES)?;
         let version =
             vn_u32_bytes(&header, 8).ok_or_else(|| vamana_corrupt(path, "missing version"))?;
         let key_space = match (&header[..8], version) {
@@ -188,20 +185,13 @@ impl VamanaArtifact {
         let count = vn_usize(&file, 12, path, "point count")?;
         let vector_dim = vn_usize(&file, 20, path, "vector dimension")?;
         let nlist = vn_usize(&file, 28, path, "cell count")?;
-        let degree =
-            vn_u32(&file, 36).ok_or_else(|| vamana_corrupt(path, "missing degree"))? as usize;
-        let local_degree =
-            vn_u32(&file, 40).ok_or_else(|| vamana_corrupt(path, "missing local degree"))? as usize;
-        let adjacent = vn_u32(&file, 44)
-            .ok_or_else(|| vamana_corrupt(path, "missing stitch adjacency"))?
-            as usize;
-        let representatives = vn_u32(&file, 48)
-            .ok_or_else(|| vamana_corrupt(path, "missing representative count"))?
-            as usize;
-        let record_bytes =
-            vn_u32(&file, 52).ok_or_else(|| vamana_corrupt(path, "missing record width"))? as usize;
-        let expected_crc = vn_u32(&file, 56).ok_or_else(|| vamana_corrupt(path, "missing CRC"))?;
-        let flags = vn_u32(&file, 60).ok_or_else(|| vamana_corrupt(path, "missing flags"))?;
+        let degree = vn_u32(&file, 36)? as usize;
+        let local_degree = vn_u32(&file, 40)? as usize;
+        let adjacent = vn_u32(&file, 44)? as usize;
+        let representatives = vn_u32(&file, 48)? as usize;
+        let record_bytes = vn_u32(&file, 52)? as usize;
+        let expected_crc = vn_u32(&file, 56)?;
+        let flags = vn_u32(&file, 60)?;
         if flags != 0
             || count != ivf.len()
             || vector_dim != ivf.vector_dim()
@@ -238,10 +228,7 @@ impl VamanaArtifact {
         let legacy_ordinal_to_record = if key_space == VamanaKeySpace::LegacyRecordRows {
             let mut inverse = vec![u32::MAX; count];
             for record in 0..count {
-                let ordinal = ivf
-                    .posting_ordinal(record)
-                    .ok_or_else(|| vamana_corrupt(path, "missing IVF posting ordinal"))?
-                    as usize;
+                let ordinal = ivf.try_posting_ordinal(record)? as usize;
                 let slot = inverse
                     .get_mut(ordinal)
                     .ok_or_else(|| vamana_corrupt(path, "posting ordinal out of bounds"))?;
@@ -259,9 +246,7 @@ impl VamanaArtifact {
             None
         };
         for cell in 0..nlist {
-            let entry = vn_u32(&file, entries_start + cell * 4)
-                .ok_or_else(|| vamana_corrupt(path, "truncated cell entry"))?
-                as usize;
+            let entry = vn_u32(&file, entries_start + cell * 4)? as usize;
             let entry_key = match key_space {
                 VamanaKeySpace::Ordinal => Some(entry),
                 VamanaKeySpace::LegacyRecordRows => legacy_ordinal_to_record
@@ -274,8 +259,7 @@ impl VamanaArtifact {
                 || entry_key.is_none()
                 || (key_space != VamanaKeySpace::Ordinal
                     && !ivf
-                        .posting_range(cell)
-                        .expect("validated IVF cell")
+                        .try_posting_range(cell)?
                         .contains(&entry_key.expect("checked entry key")))
             {
                 return Err(vamana_corrupt(path, "cell entry key is invalid"));
@@ -283,9 +267,7 @@ impl VamanaArtifact {
         }
         for record in 0..count {
             let start = records_start + record * record_bytes;
-            let row = file
-                .read_range(start..start + record_bytes)
-                .map_err(|_| vamana_corrupt(path, "truncated adjacency row"))?;
+            let row = file.read_range_admitted(start..start + record_bytes)?;
             let len = vn_u32_bytes(&row, 0)
                 .ok_or_else(|| vamana_corrupt(path, "truncated adjacency row"))?
                 as usize;
@@ -294,9 +276,7 @@ impl VamanaArtifact {
             }
             let mut unique = [u32::MAX; DEFAULT_R];
             let self_key = if key_space == VamanaKeySpace::LegacyRecordRows {
-                ivf.posting_ordinal(record)
-                    .ok_or_else(|| vamana_corrupt(path, "missing IVF posting ordinal"))?
-                    as usize
+                ivf.try_posting_ordinal(record)? as usize
             } else {
                 record
             };
@@ -346,12 +326,25 @@ impl VamanaArtifact {
         self.degree
     }
 
+    /// Compatibility reader; callers that need storage errors use `try_entry`.
     pub fn entry(&self, cell: usize) -> Option<u32> {
+        self.try_entry(cell).ok()
+    }
+
+    pub fn try_entry(&self, cell: usize) -> Result<u32> {
         if cell >= self.nlist {
-            return None;
+            return Err(GaussError::InvalidRequest(
+                "Vamana cell out of bounds".into(),
+            ));
         }
         let entry = vn_u32(&self.file, self.entries_start + cell * 4)?;
-        Some(entry)
+        if entry as usize >= self.count {
+            return Err(vamana_corrupt(
+                self.file.path(),
+                "invalid Vamana cell entry",
+            ));
+        }
+        Ok(entry)
     }
 
     pub(crate) fn uses_rabitq_record_keys(&self) -> bool {
@@ -386,9 +379,7 @@ impl VamanaArtifact {
         let mut ordinal_to_key = (0..self.count).collect::<Vec<_>>();
         if self.key_space != VamanaKeySpace::Ordinal {
             for key in 0..self.count {
-                let ordinal = ivf.posting_ordinal(key).ok_or_else(|| {
-                    GaussError::InvalidRequest("Vamana record has no IVF posting".to_string())
-                })? as usize;
+                let ordinal = ivf.try_posting_ordinal(key)? as usize;
                 ordinal_to_key[ordinal] = key;
             }
         }
@@ -406,30 +397,28 @@ impl VamanaArtifact {
             GaussError::InvalidRequest(format!("Vamana ordinal {ordinal} is out of bounds"))
         })?;
         let mut neighbors = Vec::new();
-        self.visit_raw_neighbors(key, |neighbor| neighbors.push(neighbor))
-            .ok_or_else(|| {
-                GaussError::InvalidRequest(format!("Vamana adjacency is missing graph key {key}"))
-            })?;
-        neighbors
-            .into_iter()
-            .map(|neighbor| match self.key_space {
-                VamanaKeySpace::Ordinal | VamanaKeySpace::LegacyRecordRows => Ok(neighbor),
-                VamanaKeySpace::RabitqRecord => {
-                    ivf.posting_ordinal(neighbor as usize).ok_or_else(|| {
-                        GaussError::InvalidRequest("Vamana neighbor has no IVF posting".to_string())
-                    })
-                }
-            })
-            .collect()
+        self.try_visit_raw_neighbors(key, Some(ordinal), |neighbor| {
+            neighbors.push(match self.key_space {
+                VamanaKeySpace::Ordinal | VamanaKeySpace::LegacyRecordRows => neighbor,
+                VamanaKeySpace::RabitqRecord => ivf.try_posting_ordinal(neighbor as usize)?,
+            });
+            Ok(())
+        })?;
+        Ok(neighbors)
     }
 
+    /// Compatibility reader; callers that need storage errors use `try_neighbors`.
     pub fn neighbors(&self, ordinal: usize) -> Option<Vec<u32>> {
-        if self.key_space == VamanaKeySpace::RabitqRecord {
-            return None;
-        }
+        self.try_neighbors(ordinal).ok()
+    }
+
+    pub fn try_neighbors(&self, ordinal: usize) -> Result<Vec<u32>> {
         let mut neighbors = Vec::new();
-        self.visit_neighbors(ordinal, |neighbor| neighbors.push(neighbor))?;
-        Some(neighbors)
+        self.try_visit_neighbors(ordinal, |neighbor| {
+            neighbors.push(neighbor);
+            Ok(())
+        })?;
+        Ok(neighbors)
     }
 
     /// Exact weak-connectivity and original-neighbor safety profile used by
@@ -452,15 +441,13 @@ impl VamanaArtifact {
         let mut original_nodes_without_original_neighbors = 0usize;
         for ordinal in 0..self.count {
             let mut has_original_neighbor = false;
-            self.visit_neighbors(ordinal, |neighbor| {
+            self.try_visit_neighbors(ordinal, |neighbor| {
                 let neighbor = neighbor as usize;
                 union.join(ordinal, neighbor);
                 if neighbor < original_nodes {
                     has_original_neighbor = true;
                 }
-            })
-            .ok_or_else(|| {
-                GaussError::InvalidRequest(format!("Vamana adjacency is missing ordinal {ordinal}"))
+                Ok(())
             })?;
             if ordinal < original_nodes && !has_original_neighbor {
                 original_nodes_without_original_neighbors += 1;
@@ -524,48 +511,127 @@ impl VamanaArtifact {
         })
     }
 
+    #[cfg(test)]
     #[inline]
-    pub(crate) fn visit_neighbors(&self, ordinal: usize, visit: impl FnMut(u32)) -> Option<()> {
+    pub(crate) fn visit_neighbors(&self, ordinal: usize, mut visit: impl FnMut(u32)) -> Option<()> {
+        self.try_visit_neighbors(ordinal, |neighbor| {
+            visit(neighbor);
+            Ok(())
+        })
+        .ok()
+    }
+
+    pub(crate) fn try_visit_neighbors(
+        &self,
+        ordinal: usize,
+        visit: impl FnMut(u32) -> Result<()>,
+    ) -> Result<()> {
+        if ordinal >= self.count {
+            return Err(GaussError::InvalidRequest(
+                "Vamana ordinal out of bounds".into(),
+            ));
+        }
         let key = match self.key_space {
             VamanaKeySpace::Ordinal => ordinal,
             VamanaKeySpace::LegacyRecordRows => self
                 .legacy_ordinal_to_record
-                .as_ref()?
-                .get(ordinal)
-                .copied()? as usize,
-            VamanaKeySpace::RabitqRecord => return None,
+                .as_ref()
+                .and_then(|inverse| inverse.get(ordinal))
+                .copied()
+                .ok_or_else(|| vamana_corrupt(self.file.path(), "missing legacy ordinal map"))?
+                as usize,
+            VamanaKeySpace::RabitqRecord => {
+                return Err(GaussError::InvalidRequest(
+                    "Vamana record-key graph requires IVF ordinal translation".into(),
+                ));
+            }
         };
-        self.visit_raw_neighbors(key, visit)
+        self.try_visit_raw_neighbors(key, Some(ordinal), visit)
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) fn visit_neighbor_keys(&self, key: usize, mut visit: impl FnMut(u32)) -> Option<()> {
-        if self.key_space == VamanaKeySpace::LegacyRecordRows {
-            let inverse = self.legacy_ordinal_to_record.as_ref()?;
-            return self.visit_raw_neighbors(key, |ordinal| {
-                if let Some(record) = inverse.get(ordinal as usize) {
-                    visit(*record);
-                }
-            });
-        }
-        self.visit_raw_neighbors(key, visit)
+        self.try_visit_neighbor_keys(key, |neighbor| {
+            visit(neighbor);
+            Ok(())
+        })
+        .ok()
     }
 
-    #[inline]
-    fn visit_raw_neighbors(&self, key: usize, mut visit: impl FnMut(u32)) -> Option<()> {
+    pub(crate) fn try_visit_neighbor_keys(
+        &self,
+        key: usize,
+        mut visit: impl FnMut(u32) -> Result<()>,
+    ) -> Result<()> {
+        if self.key_space == VamanaKeySpace::LegacyRecordRows {
+            let inverse = self
+                .legacy_ordinal_to_record
+                .as_ref()
+                .ok_or_else(|| vamana_corrupt(self.file.path(), "missing legacy ordinal map"))?;
+            return self.try_visit_raw_neighbors(key, None, |ordinal| {
+                let record = inverse.get(ordinal as usize).copied().ok_or_else(|| {
+                    vamana_corrupt(self.file.path(), "invalid legacy neighbor ordinal")
+                })?;
+                visit(record)
+            });
+        }
+        self.try_visit_raw_neighbors(key, None, visit)
+    }
+
+    fn try_visit_raw_neighbors(
+        &self,
+        key: usize,
+        legacy_self: Option<usize>,
+        mut visit: impl FnMut(u32) -> Result<()>,
+    ) -> Result<()> {
         if key >= self.count {
-            return None;
+            return Err(GaussError::InvalidRequest(
+                "Vamana graph key out of bounds".into(),
+            ));
         }
         let start = self.records_start + key * self.record_bytes;
         let row = self
             .file
-            .read_range(start..start.checked_add(self.record_bytes)?)
-            .ok()?;
-        let len = vn_u32_bytes(&row, 0)? as usize;
-        for slot in 0..len {
-            visit(vn_u32_bytes(&row, 4 + slot * 4)?);
+            .read_range_admitted(start..start + self.record_bytes)?;
+        let len = vn_u32_bytes(&row, 0)
+            .ok_or_else(|| vamana_corrupt(self.file.path(), "truncated adjacency row"))?
+            as usize;
+        if len > self.degree {
+            return Err(vamana_corrupt(
+                self.file.path(),
+                "adjacency degree exceeds fixed width",
+            ));
         }
-        Some(())
+        let self_key = if self.key_space == VamanaKeySpace::LegacyRecordRows {
+            legacy_self
+        } else {
+            Some(key)
+        };
+        let mut neighbors = [u32::MAX; DEFAULT_R];
+        // Validate the complete row before exposing any neighbor to the caller.
+        for slot in 0..len {
+            let neighbor = vn_u32_bytes(&row, 4 + slot * 4)
+                .ok_or_else(|| vamana_corrupt(self.file.path(), "truncated neighbor"))?;
+            let is_self = self_key == Some(neighbor as usize)
+                || (self.key_space == VamanaKeySpace::LegacyRecordRows
+                    && self
+                        .legacy_ordinal_to_record
+                        .as_ref()
+                        .and_then(|inverse| inverse.get(neighbor as usize))
+                        .is_some_and(|record| *record as usize == key));
+            if neighbor as usize >= self.count || is_self || neighbors[..slot].contains(&neighbor) {
+                return Err(vamana_corrupt(
+                    self.file.path(),
+                    "invalid Vamana neighbor key",
+                ));
+            }
+            neighbors[slot] = neighbor;
+        }
+        for &neighbor in &neighbors[..len] {
+            visit(neighbor)?;
+        }
+        Ok(())
     }
 }
 
@@ -749,7 +815,7 @@ impl VamanaBackend {
 /// callers discard `vectors` after persisting that cell, bounding peak build
 /// memory to the largest cell rather than the full sealed segment.
 pub(crate) fn build_local_graph(
-    vectors: &[Vec<f32>],
+    vectors: &[impl std::ops::Deref<Target = [f32]>],
     r: usize,
     l: usize,
     alpha: f32,
@@ -773,17 +839,17 @@ pub(crate) fn build_local_graph(
                 neighbors[c].push(p);
             }
             if neighbors[c].len() > r {
-                let c_vec = vectors[c].clone();
-                neighbors[c] = robust_prune(&c_vec, &neighbors[c], vectors, r, alpha);
+                let c_vec = &*vectors[c];
+                neighbors[c] = robust_prune(c_vec, &neighbors[c], vectors, r, alpha);
                 if !neighbors[c].contains(&p) {
                     neighbors[c].push(p);
                     if neighbors[c].len() > r {
-                        let p_vec = vectors[p].clone();
-                        let c_vec = vectors[c].clone();
-                        let p_dist = squared_l2(&c_vec, &p_vec);
+                        let p_vec = &*vectors[p];
+                        let c_vec = &*vectors[c];
+                        let p_dist = squared_l2(c_vec, p_vec);
                         let mut worst: (usize, f32) = (usize::MAX, -1.0);
                         for (slot, &n_idx) in neighbors[c].iter().enumerate() {
-                            let d = squared_l2(&c_vec, &vectors[n_idx]);
+                            let d = squared_l2(c_vec, &vectors[n_idx]);
                             if d > worst.1 {
                                 worst = (slot, d);
                             }
@@ -800,14 +866,14 @@ pub(crate) fn build_local_graph(
                 }
             }
         }
-        let p_vec = vectors[p].clone();
+        let p_vec = &*vectors[p];
         let mut pool: Vec<usize> = candidates.into_iter().filter(|&c| c != p).collect();
         for &c in &neighbors[p] {
             if c != p && !pool.contains(&c) {
                 pool.push(c);
             }
         }
-        neighbors[p] = robust_prune(&p_vec, &pool, vectors, r, alpha);
+        neighbors[p] = robust_prune(p_vec, &pool, vectors, r, alpha);
         if neighbors[p].len() > r {
             neighbors[p].truncate(r);
         }
@@ -949,7 +1015,7 @@ fn write_vamana_artifact_inner<S: VectorSource + ?Sized>(
         )
         .ok_or_else(|| GaussError::InvalidRequest("Vamana graph overflow".to_string()))?;
     let local_degree = DEFAULT_R.saturating_sub(STITCH_ADJACENT_CELLS).max(1);
-    let centroids = ivf.centroids();
+    let centroids = ivf.try_centroids()?;
     let mut entries = vec![0u32; ivf.cells()];
     let mut representatives = vec![Vec::<u32>::new(); ivf.cells()];
     let mut file = OpenOptions::new()
@@ -993,10 +1059,10 @@ fn write_vamana_artifact_inner<S: VectorSource + ?Sized>(
                 "background build cancelled during shutdown".to_string(),
             ));
         }
-        let range = ivf.posting_range(cell).expect("validated IVF cell");
+        let range = ivf.try_posting_range(cell)?;
         let mut keys = Vec::with_capacity(range.len());
         for posting in range.clone() {
-            let ordinal = ivf.posting_ordinal(posting).expect("validated IVF posting");
+            let ordinal = ivf.try_posting_ordinal(posting)?;
             keys.push(match key_space {
                 VamanaKeySpace::Ordinal => ordinal,
                 VamanaKeySpace::LegacyRecordRows | VamanaKeySpace::RabitqRecord => posting as u32,
@@ -1030,15 +1096,15 @@ fn write_vamana_artifact_inner<S: VectorSource + ?Sized>(
         let shard = if shard.neighbors.is_empty() {
             let mut vectors = Vec::with_capacity(range.len());
             for posting in range {
-                let ordinal = ivf.posting_ordinal(posting).expect("validated IVF posting");
-                let vector = source.vector(ordinal as usize)?;
+                let ordinal = ivf.try_posting_ordinal(posting)?;
+                let vector = source.read_vector(ordinal as usize)?;
                 if vector.len() != ivf.vector_dim() {
                     return Err(GaussError::DimensionMismatch {
                         expected: ivf.vector_dim(),
                         actual: vector.len(),
                     });
                 }
-                vectors.push(vector.into_owned());
+                vectors.push(vector);
             }
             let (start, local_neighbors) =
                 build_local_graph(&vectors, local_degree, DEFAULT_L, DEFAULT_ALPHA);
@@ -1398,9 +1464,14 @@ fn append_vamana_neighbor(
     Ok(())
 }
 
-fn vn_u32(file: &crate::encryption::PersistentFile, offset: usize) -> Option<u32> {
-    let bytes = file.read_range(offset..offset.checked_add(4)?).ok()?;
-    Some(u32::from_le_bytes(bytes.as_ref().try_into().ok()?))
+fn vn_u32(file: &crate::encryption::PersistentFile, offset: usize) -> Result<u32> {
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| vamana_corrupt(file.path(), "field offset overflow"))?;
+    let bytes = file.read_range_admitted(offset..end)?;
+    Ok(u32::from_le_bytes(bytes.as_ref().try_into().map_err(
+        |_| vamana_corrupt(file.path(), "truncated u32 field"),
+    )?))
 }
 
 fn vn_u32_bytes(bytes: &[u8], offset: usize) -> Option<u32> {
@@ -1409,9 +1480,14 @@ fn vn_u32_bytes(bytes: &[u8], offset: usize) -> Option<u32> {
     ))
 }
 
-fn vn_u64(file: &crate::encryption::PersistentFile, offset: usize) -> Option<u64> {
-    let bytes = file.read_range(offset..offset.checked_add(8)?).ok()?;
-    Some(u64::from_le_bytes(bytes.as_ref().try_into().ok()?))
+fn vn_u64(file: &crate::encryption::PersistentFile, offset: usize) -> Result<u64> {
+    let end = offset
+        .checked_add(8)
+        .ok_or_else(|| vamana_corrupt(file.path(), "field offset overflow"))?;
+    let bytes = file.read_range_admitted(offset..end)?;
+    Ok(u64::from_le_bytes(bytes.as_ref().try_into().map_err(
+        |_| vamana_corrupt(file.path(), "truncated u64 field"),
+    )?))
 }
 
 fn vn_usize(
@@ -1420,8 +1496,7 @@ fn vn_usize(
     path: &Path,
     field: &str,
 ) -> Result<usize> {
-    let value =
-        vn_u64(file, offset).ok_or_else(|| vamana_corrupt(path, &format!("missing {field}")))?;
+    let value = vn_u64(file, offset)?;
     usize::try_from(value).map_err(|_| vamana_corrupt(path, &format!("{field} exceeds usize")))
 }
 
@@ -1554,7 +1629,7 @@ fn pad_or_trim(v: &[f32], dim: usize) -> Vec<f32> {
 /// that same sample (O(S²) = O(N) work). A uniform sample's medoid concentrates
 /// on the true medoid as N grows, so the entry point stays central while the
 /// build cost drops from quadratic to linear. Small corpora keep the exact pass.
-fn medoid(vectors: &[Vec<f32>]) -> Option<usize> {
+fn medoid(vectors: &[impl std::ops::Deref<Target = [f32]>]) -> Option<usize> {
     let n = vectors.len();
     if n == 0 {
         return None;
@@ -1576,7 +1651,7 @@ fn medoid(vectors: &[Vec<f32>]) -> Option<usize> {
 /// returns the `idxs` element with the smallest sum of squared-L2 distances to
 /// every other `idxs` element. O(|idxs|²). Early-breaks once a running sum
 /// exceeds the best seen.
-fn medoid_over(vectors: &[Vec<f32>], idxs: &[usize]) -> usize {
+fn medoid_over(vectors: &[impl std::ops::Deref<Target = [f32]>], idxs: &[usize]) -> usize {
     let mut best_idx = idxs[0];
     let mut best_sum = f32::INFINITY;
     for &i in idxs {
@@ -1615,7 +1690,7 @@ fn greedy_search(
     target: usize,
     start: usize,
     l: usize,
-    vectors: &[Vec<f32>],
+    vectors: &[impl std::ops::Deref<Target = [f32]>],
     neighbors: &[Vec<usize>],
 ) -> Vec<usize> {
     greedy_search_by_vec(&vectors[target], start, l, vectors, neighbors)
@@ -1625,7 +1700,7 @@ fn greedy_search_by_vec(
     query: &[f32],
     start: usize,
     l: usize,
-    vectors: &[Vec<f32>],
+    vectors: &[impl std::ops::Deref<Target = [f32]>],
     neighbors: &[Vec<usize>],
 ) -> Vec<usize> {
     let n = vectors.len();
@@ -1673,7 +1748,7 @@ fn greedy_search_by_vec(
 fn robust_prune(
     p: &[f32],
     pool: &[usize],
-    vectors: &[Vec<f32>],
+    vectors: &[impl std::ops::Deref<Target = [f32]>],
     r: usize,
     alpha: f32,
 ) -> Vec<usize> {
@@ -1735,6 +1810,82 @@ mod tests {
                 v * 2.0 - 1.0
             })
             .collect()
+    }
+
+    #[test]
+    fn fallible_vamana_validates_whole_row_before_callbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let vectors = [
+            vec![0.0, 1.0],
+            vec![1.0, 0.0],
+            vec![2.0, 1.0],
+            vec![3.0, 2.0],
+        ];
+        let ivf_path = dir.path().join("ivf.gdx");
+        crate::index::ivf::write_ivf_artifact(vectors.as_slice(), 2, 1, &ivf_path).unwrap();
+        let ivf = IvfArtifact::open(&ivf_path).unwrap();
+        let path = dir.path().join(VAMANA_SEGMENT_FILE);
+        write_vamana_artifact(vectors.as_slice(), &ivf, crate::DistanceMetric::L2, &path).unwrap();
+        let artifact = VamanaArtifact::open(&path, &ivf).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let patch = |offset: usize, bytes: &[u8]| {
+            let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+            file.seek(SeekFrom::Start(offset as u64)).unwrap();
+            file.write_all(bytes).unwrap();
+            file.sync_all().unwrap();
+        };
+        // A valid first neighbor must not be published when a later one is bad.
+        for neighbors in [[1u32, 4u32], [1, 1], [1, 0]] {
+            patch(artifact.records_start, &2u32.to_le_bytes());
+            patch(artifact.records_start + 4, &neighbors[0].to_le_bytes());
+            patch(artifact.records_start + 8, &neighbors[1].to_le_bytes());
+            let mut calls = 0;
+            assert!(matches!(
+                artifact.try_visit_neighbors(0, |_| {
+                    calls += 1;
+                    Ok(())
+                }),
+                Err(GaussError::SegmentCorruption { .. })
+            ));
+            assert_eq!(calls, 0);
+            assert!(artifact.try_neighbors(0).is_err());
+            patch(0, &original);
+        }
+        patch(
+            artifact.records_start,
+            &((DEFAULT_R + 1) as u32).to_le_bytes(),
+        );
+        assert!(artifact.try_neighbors(0).is_err());
+        patch(0, &original);
+        patch(
+            artifact.entries_start,
+            &(artifact.len() as u32).to_le_bytes(),
+        );
+        assert!(matches!(
+            artifact.try_entry(0),
+            Err(GaussError::SegmentCorruption { .. })
+        ));
+        patch(0, &original);
+        let error = artifact
+            .try_visit_neighbors(0, |_| {
+                Err(GaussError::ResourceExhausted("callback sentinel".into()))
+            })
+            .unwrap_err();
+        assert!(
+            matches!(error, GaussError::ResourceExhausted(message) if message == "callback sentinel")
+        );
+        let mut calls = 0;
+        assert!(
+            artifact
+                .try_visit_neighbor_keys(artifact.len(), |_| {
+                    calls += 1;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert_eq!(calls, 0);
+        assert!(!artifact.try_neighbors(0).unwrap().is_empty());
+        assert!(VamanaArtifact::open(&path, &ivf).is_ok());
     }
 
     #[test]

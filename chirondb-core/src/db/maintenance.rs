@@ -147,6 +147,14 @@ impl Db {
                 )?,
             );
         }
+        // One coordinated checkpoint at a maintenance boundary, never per
+        // mutation. A busy/deadline refusal retains the previous durable base.
+        if let Err(error) =
+            self.checkpoint_common_frontier(Instant::now() + Duration::from_secs(30))
+        {
+            metrics::counter!("chirondb_common_frontier_deferred_total").increment(1);
+            tracing::warn!(%error, "common frontier maintenance deferred");
+        }
         Ok(compacted)
     }
 }

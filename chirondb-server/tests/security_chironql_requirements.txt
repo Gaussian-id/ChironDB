@@ -1,0 +1,7 @@
+grpcio==1.75.1
+grpcio-tools==1.75.1
+pexpect==4.9.0
+protobuf==6.33.6
+ptyprocess==0.7.0
+requests==2.34.2
+typing_extensions==4.16.0

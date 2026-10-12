@@ -5,7 +5,6 @@ use crate::graph_group::{
     AdjacencyEdge,
     cursor::{Column, TopologyColumns},
 };
-use std::borrow::Cow;
 
 pub(crate) struct BaseEdges<'a> {
     inline: Option<TopologyColumns<'a>>,
@@ -223,7 +222,7 @@ impl OpenedBaseAdjacency {
                         end_chunk: first
                             .checked_add(chunks)
                             .ok_or_else(|| invalid("overflow chunk range overflow"))?,
-                        chunk: Cow::Borrowed(&[]),
+                        chunk: crate::encryption::AdmittedRange::borrowed(&[]),
                         position: 0,
                         payload_end: 0,
                         remaining: 0,
@@ -243,7 +242,7 @@ struct OverflowIds<'a> {
     arena: usize,
     next_chunk: u32,
     end_chunk: u32,
-    chunk: Cow<'a, [u8]>,
+    chunk: crate::encryption::AdmittedRange<'a>,
     position: usize,
     payload_end: usize,
     remaining: u32,
@@ -267,7 +266,7 @@ impl OverflowIds<'_> {
             let end = start
                 .checked_add(AUTHENTICATED_CHUNK_BYTES)
                 .ok_or_else(|| corruption(path, "overflow cursor chunk range overflow"))?;
-            self.chunk = Cow::Borrowed(&[]);
+            self.chunk = crate::encryption::AdmittedRange::borrowed(&[]);
             self.chunk = self
                 .base
                 .artifact

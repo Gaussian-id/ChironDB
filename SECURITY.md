@@ -1,6 +1,6 @@
 # ChironDB Security Policy
 
-ChironDB is under active beta development (`0.1.0-beta.1` in the source tree).
+ChironDB is under active beta development (`0.1.0-beta.2` in the source tree).
 Security controls in a release are evidence for hardening work; they are not
 a claim of SOC 2, FIPS, or other certification.
 

@@ -8,16 +8,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bumpalo::collections::Vec as BumpVec;
-
 use crate::{
     Filter,
     error::{GaussError, Result},
     h2qg::H2qgIndex,
     model::{HybridFusion, Point, SearchHit, SearchResponse, SparseVector},
-    query_arena::with_query_arena,
     sparse_index::{SparseIndex, SparsePosting},
 };
+
+mod candidates;
+pub(crate) use candidates::{AdmittedVec, CandidatePoint};
+mod ranking;
+pub(crate) use ranking::{BorrowedMap, RankedHeap, Rankings};
 
 // ── Shared ranked-point type ─────────────────────────────────────────────────
 
@@ -36,7 +38,7 @@ pub(crate) fn rank_order(left: &RankedPoint, right: &RankedPoint) -> std::cmp::O
 
 #[derive(Debug)]
 pub(crate) struct SparseSearchOutcome {
-    pub(crate) ranked: Vec<RankedPoint>,
+    pub(crate) ranked: Rankings,
     pub(crate) searched: usize,
     pub(crate) degraded: bool,
 }
@@ -48,20 +50,24 @@ pub(crate) struct SparseSearchOutcome {
 /// search helpers hydrate candidate ids without assuming one merged
 /// points map.
 pub(crate) trait PointResolver {
-    fn resolve_point(&self, id: &str) -> Option<Cow<'_, Point>>;
+    fn resolve_point(&self, id: &str) -> Result<Option<Cow<'_, Point>>>;
+
+    fn resolve_candidate(&self, id: &str) -> Result<Option<CandidatePoint<'_>>> {
+        self.resolve_point(id)?
+            .map(CandidatePoint::from_compat)
+            .transpose()
+    }
 
     /// Test read-state visibility without hydrating vector or payload data.
     /// Sealed sparse postings are ID-keyed for compatibility; unfiltered
     /// admission needs only this membership answer until final top-k hydration.
-    fn contains_point(&self, id: &str) -> bool {
-        self.resolve_point(id).is_some()
-    }
+    fn contains_point(&self, id: &str) -> bool;
 }
 
 /// Single-map resolver: the streamer map or a test fixture.
 impl PointResolver for HashMap<String, Point> {
-    fn resolve_point(&self, id: &str) -> Option<Cow<'_, Point>> {
-        self.get(id).map(Cow::Borrowed)
+    fn resolve_point(&self, id: &str) -> Result<Option<Cow<'_, Point>>> {
+        Ok(self.get(id).map(Cow::Borrowed))
     }
 
     fn contains_point(&self, id: &str) -> bool {
@@ -138,7 +144,7 @@ pub(crate) fn search_point_candidates<'a>(
     recall_target: f32,
     filter: Option<&dyn crate::index::FilterPredicate>,
     cancelled: Option<&std::sync::atomic::AtomicBool>,
-) -> Vec<&'a Point> {
+) -> Result<AdmittedVec<&'a Point>> {
     let _span = tracing::info_span!(
         "gaussdb.search.h2qg_candidates",
         points = points.len(),
@@ -156,41 +162,42 @@ pub(crate) fn search_point_candidates<'a>(
     };
 
     let Some(index) = named_dyn else {
-        return points.values().collect();
+        let mut ordered = AdmittedVec::default();
+        for point in points.values() {
+            if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+                break;
+            }
+            ordered.push(point)?;
+        }
+        return Ok(ordered);
     };
 
-    // B3 (Phase 1): borrow-keyed dedup set instead of clone-per-insert.
-    // M4-001 (Phase 1): the working `ordered` Vec lives in the thread-local
-    // bumpalo query arena. Push/grow operations during scratch construction
-    // bump the arena cursor instead of going through the system allocator;
-    // the arena is reset on the next call so the capacity is reused.
-    // P2F: pass `filter` through to the backend so the HNSW engine prunes
-    // filtered-out neighbours during beam expansion.
-    let cand_ids: Vec<String> = if let Some(cancelled) = cancelled {
-        index.candidate_ids_with_recall_target_cancellable(
+    // Candidate IDs and dedup/output containers retain admission while used.
+    let cand_ids = candidates::ids(if let Some(cancelled) = cancelled {
+        index.try_candidate_ids_with_recall_target_cancellable(
             query,
             k,
             ef_search,
             recall_target,
             filter,
             cancelled,
-        )
+        )?
     } else {
-        index.candidate_ids_with_recall_target(query, k, ef_search, recall_target, filter)
-    };
+        index.try_candidate_ids_with_recall_target(query, k, ef_search, recall_target, filter)?
+    })?;
 
-    with_query_arena(|arena| {
-        let mut seen: HashSet<&str> = HashSet::with_capacity(cand_ids.len());
-        let mut ordered: BumpVec<'_, &'a Point> = BumpVec::with_capacity_in(cand_ids.len(), arena);
+    {
+        let mut seen = candidates::Seen::<&str>::default();
+        let mut ordered = AdmittedVec::default();
 
-        for id in &cand_ids {
+        for id in cand_ids.iter() {
             if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
                 break;
             }
-            if seen.insert(id.as_str())
+            if seen.insert(id.as_str())?
                 && let Some(point) = points.get(id.as_str())
             {
-                ordered.push(point);
+                ordered.push(point)?;
             }
         }
 
@@ -215,8 +222,8 @@ pub(crate) fn search_point_candidates<'a>(
                 if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
                     break;
                 }
-                if !index.contains(id) && seen.insert(id.as_str()) {
-                    ordered.push(point);
+                if !index.contains(id) && seen.insert(id.as_str())? {
+                    ordered.push(point)?;
                 }
             }
             let backfilled = ordered.len() - backfilled_before;
@@ -225,10 +232,8 @@ pub(crate) fn search_point_candidates<'a>(
             }
         }
 
-        // Final materialisation: one heap allocation, identical to the prior
-        // contract. The arena holds onto its capacity for the next query.
-        ordered.iter().copied().collect::<Vec<&'a Point>>()
-    })
+        Ok(ordered)
+    }
 }
 
 /// Multi-segment dense candidate selection (LS-Vec rework D3): fans the
@@ -259,62 +264,68 @@ pub(crate) fn fan_out_candidates<'a>(
     filter: Option<&dyn crate::index::FilterPredicate>,
     ordinal_filter: Option<&dyn crate::index::OrdinalFilterPredicate>,
     cancelled: Option<&std::sync::atomic::AtomicBool>,
-) -> Vec<Cow<'a, Point>> {
+) -> Result<AdmittedVec<CandidatePoint<'a>>> {
     if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
-        return Vec::new();
+        return Ok(AdmittedVec::default());
     }
     if let Some(global) = global_backend {
         // Whole-collection backend: candidates resolved via the global ID
         // authority, with the same narrow-window backfill contract as the
         // single-map path (an id upserted after the backend last indexed).
-        let cand_ids = if let Some(cancelled) = cancelled {
-            global.candidate_ids_with_recall_target_cancellable(
+        let cand_ids = candidates::ids(if let Some(cancelled) = cancelled {
+            global.try_candidate_ids_with_recall_target_cancellable(
                 query,
                 k,
                 ef_search,
                 recall_target,
                 filter,
                 cancelled,
-            )
+            )?
         } else {
-            global.candidate_ids_with_recall_target(query, k, ef_search, recall_target, filter)
-        };
-        let mut seen: HashSet<String> = HashSet::with_capacity(cand_ids.len());
-        let mut ordered: Vec<Cow<'a, Point>> = Vec::with_capacity(cand_ids.len());
-        for id in &cand_ids {
+            global.try_candidate_ids_with_recall_target(
+                query,
+                k,
+                ef_search,
+                recall_target,
+                filter,
+            )?
+        })?;
+        let mut seen = candidates::Seen::<String>::default();
+        let mut ordered = AdmittedVec::default();
+        for id in cand_ids.iter() {
             if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
                 break;
             }
-            if seen.insert(id.clone())
-                && let Some(point) = resolver.resolve_point(id.as_str())
+            if seen.insert(id)?
+                && let Some(point) = resolver.resolve_candidate(id.as_str())?
             {
-                ordered.push(point);
+                ordered.push(point)?;
             }
         }
         if global.indexed_points() < total_live {
             let backfilled_before = ordered.len();
-            for point in streamer
+            for id in streamer
                 .points
-                .values()
-                .map(Cow::Borrowed)
+                .keys()
+                .map(String::as_str)
                 .chain(
                     sealing
                         .into_iter()
-                        .flat_map(|streamer| streamer.points.values())
-                        .map(Cow::Borrowed),
+                        .flat_map(|streamer| streamer.points.keys())
+                        .map(String::as_str),
                 )
                 .chain(searchers.iter().enumerate().flat_map(|(index, searcher)| {
-                    searcher.iter_visible(visibility.point_tombstones(index))
+                    searcher.visible_ids(visibility.point_tombstones(index))
                 }))
             {
                 if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
                     break;
                 }
-                if !global.contains(&point.id)
-                    && seen.insert(point.id.clone())
-                    && let Some(point) = resolver.resolve_point(&point.id)
+                if !global.contains(id)
+                    && seen.insert(id)?
+                    && let Some(point) = resolver.resolve_candidate(id)?
                 {
-                    ordered.push(point);
+                    ordered.push(point)?;
                 }
             }
             let backfilled = ordered.len() - backfilled_before;
@@ -322,13 +333,13 @@ pub(crate) fn fan_out_candidates<'a>(
                 crate::observability::observe_index_backfill_scan(backfilled);
             }
         }
-        return ordered;
+        return Ok(ordered);
     }
 
     // Streamer leg: existing single-map candidate selection, including the
     // narrow-window backfill scan (which now only ever scans the streamer —
     // sealed segments are complete by construction).
-    let mut ordered = search_point_candidates(
+    let streamer_candidates = search_point_candidates(
         streamer
             .hnsw
             .as_ref()
@@ -342,12 +353,13 @@ pub(crate) fn fan_out_candidates<'a>(
         recall_target,
         filter,
         cancelled,
-    )
-    .into_iter()
-    .map(Cow::Borrowed)
-    .collect::<Vec<_>>();
-
-    let mut seen: HashSet<String> = ordered.iter().map(|p| p.id.clone()).collect();
+    )?;
+    let mut ordered = AdmittedVec::default();
+    let mut seen = candidates::Seen::<String>::default();
+    for point in streamer_candidates {
+        seen.insert(&point.id)?;
+        ordered.push(CandidatePoint::Borrowed(point))?;
+    }
     if let Some(sealing) = sealing {
         // A frozen leg may still contain IDs superseded by the active
         // streamer. Only IDs actually present in both legs can consume a
@@ -373,14 +385,14 @@ pub(crate) fn fan_out_candidates<'a>(
             recall_target,
             filter,
             cancelled,
-        ) {
+        )? {
             if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
                 break;
             }
-            if seen.insert(point.id.clone())
-                && let Some(point) = resolver.resolve_point(&point.id)
+            if seen.insert(&point.id)?
+                && let Some(point) = resolver.resolve_candidate(&point.id)?
             {
-                ordered.push(point);
+                ordered.push(point)?;
             }
         }
     }
@@ -416,8 +428,8 @@ pub(crate) fn fan_out_candidates<'a>(
         };
         match searcher.backend_for(vector_name) {
             Some(index) => {
-                let candidate_ids = if let Some(cancelled) = cancelled {
-                    index.candidate_ids_with_recall_target_ordinal_filter_cancellable(
+                let candidate_ids = candidates::ids(if let Some(cancelled) = cancelled {
+                    index.try_candidate_ids_with_recall_target_ordinal_filter_cancellable(
                         query,
                         leg_k,
                         ef_search,
@@ -425,27 +437,27 @@ pub(crate) fn fan_out_candidates<'a>(
                         Some(&segment_filter),
                         Some(&segment_ordinal_filter),
                         cancelled,
-                    )
+                    )?
                 } else {
-                    index.candidate_ids_with_recall_target_ordinal_filter(
+                    index.try_candidate_ids_with_recall_target_ordinal_filter(
                         query,
                         leg_k,
                         ef_search,
                         recall_target,
                         Some(&segment_filter),
                         Some(&segment_ordinal_filter),
-                    )
-                };
+                    )?
+                })?;
                 for id in candidate_ids {
                     if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
                     {
                         break;
                     }
-                    if let Some(point) =
-                        searcher.get_visible(&id, visibility.point_tombstones(searcher_index))
-                        && seen.insert(point.id.clone())
+                    if let Some(point) = searcher
+                        .get_visible_admitted(&id, visibility.point_tombstones(searcher_index))?
+                        && seen.insert(&point.id)?
                     {
-                        ordered.push(point);
+                        ordered.push(point)?;
                     }
                 }
             }
@@ -453,19 +465,22 @@ pub(crate) fn fan_out_candidates<'a>(
                 // Segment without an index artifact for this vector field:
                 // flat leg, every live point becomes a candidate (same
                 // contract as the sub-threshold flat path).
-                for point in searcher.iter_visible(visibility.point_tombstones(searcher_index)) {
+                for id in searcher.visible_ids(visibility.point_tombstones(searcher_index)) {
                     if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
                     {
                         break;
                     }
-                    if seen.insert(point.id.clone()) {
-                        ordered.push(point);
+                    if seen.insert(id)?
+                        && let Some(point) = searcher
+                            .get_visible_admitted(id, visibility.point_tombstones(searcher_index))?
+                    {
+                        ordered.push(point)?;
                     }
                 }
             }
         }
     }
-    ordered
+    Ok(ordered)
 }
 
 struct SegmentFilterPredicate<'a> {
@@ -536,7 +551,7 @@ pub(crate) fn sparse_search_ranked(
     sparse_index: &SparseIndex,
     points: &dyn PointResolver,
     params: SparseSearchParams<'_>,
-) -> SparseSearchOutcome {
+) -> Result<SparseSearchOutcome> {
     let SparseSearchParams {
         query,
         limit,
@@ -583,10 +598,10 @@ pub(crate) fn sparse_search_ranked(
             started,
             cancelled,
         )
-    };
-    outcome.ranked.sort_by(rank_order);
+    }?;
+    outcome.ranked.sort_unstable_by(rank_order);
     outcome.ranked.truncate(limit);
-    outcome
+    Ok(outcome)
 }
 
 fn sparse_query_can_use_block_max(sparse_index: &SparseIndex, query: &SparseVector) -> bool {
@@ -613,8 +628,8 @@ fn sparse_search_exhaustive(
     budget: Option<Duration>,
     started: Instant,
     cancelled: Option<&std::sync::atomic::AtomicBool>,
-) -> SparseSearchOutcome {
-    let mut scores = HashMap::<String, f32>::new();
+) -> Result<SparseSearchOutcome> {
+    let mut scores = ranking::BorrowedMap::<f32>::default();
     let mut searched = 0;
     let mut degraded = false;
     'posting_scan: for (&index, &query_value) in query.indices.iter().zip(&query.values) {
@@ -637,17 +652,17 @@ fn sparse_search_exhaustive(
                 match scores.get_mut(posting.id.as_str()) {
                     Some(slot) => *slot += contrib,
                     None => {
-                        scores.insert(posting.id.clone(), contrib);
+                        scores.insert(&posting.id, contrib)?;
                     }
                 }
             }
         }
     }
-    SparseSearchOutcome {
-        ranked: sparse_scores_to_ranked(points, scores, filter),
+    Ok(SparseSearchOutcome {
+        ranked: sparse_scores_to_ranked(points, scores, filter)?,
         searched,
         degraded,
-    }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -661,37 +676,39 @@ fn sparse_search_block_max(
     budget: Option<Duration>,
     started: Instant,
     cancelled: Option<&std::sync::atomic::AtomicBool>,
-) -> SparseSearchOutcome {
-    let mut terms = query
-        .indices
-        .iter()
-        .zip(&query.values)
-        .filter_map(|(&dimension, &query_value)| {
-            let list = sparse_index.dimensions.get(&dimension)?;
+) -> Result<SparseSearchOutcome> {
+    let mut terms = AdmittedVec::default();
+    for (&dimension, &query_value) in query.indices.iter().zip(&query.values) {
+        if let Some(list) = sparse_index.dimensions.get(&dimension) {
             let bound = query_value * list.max_value;
-            Some((dimension, query_value, bound.max(0.0)))
-        })
-        .collect::<Vec<_>>();
-    terms.sort_by(|left, right| {
+            terms.push((dimension, query_value, bound.max(0.0)))?;
+        }
+    }
+    terms.sort_unstable_by(|left, right| {
         right
             .2
             .total_cmp(&left.2)
             .then_with(|| left.0.cmp(&right.0))
     });
-
-    let mut suffix_bounds = vec![0.0_f32; terms.len() + 1];
+    let bound_count = terms
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| GaussError::ResourceExhausted("sparse bound capacity overflow".into()))?;
+    let mut suffix_bounds = AdmittedVec::default();
+    let mut prefix_bounds = AdmittedVec::default();
+    for _ in 0..bound_count {
+        suffix_bounds.push(0.0_f32)?;
+        prefix_bounds.push(0.0_f32)?;
+    }
     for index in (0..terms.len()).rev() {
         suffix_bounds[index] = suffix_bounds[index + 1] + terms[index].2;
     }
-    // prefix_bounds[i] = sum of upper bounds for all terms before position i.
-    // Used in WAND term-level and block-level pruning: a document's accumulated
-    // score from the first i terms is at most prefix_bounds[i].
-    let mut prefix_bounds = vec![0.0_f32; terms.len() + 1];
+    // Conservative bounds for prior terms and the remaining suffix.
     for index in 0..terms.len() {
         prefix_bounds[index + 1] = prefix_bounds[index] + terms[index].2;
     }
 
-    let mut scores = HashMap::<String, f32>::new();
+    let mut scores = ranking::BorrowedMap::<f32>::default();
     let mut searched = 0;
     let mut degraded = false;
     'term_scan: for (term_position, (dimension, query_value, _)) in terms.iter().enumerate() {
@@ -704,7 +721,7 @@ fn sparse_search_block_max(
         // WAND term-level pruning: upper bound for any doc = prev_upper + term_max + future.
         // Since postings are sorted value-desc, list.max_value is the max any doc contributes.
         // If this can't beat the threshold, skip the entire term.
-        if let Some(threshold) = sparse_score_threshold(&scores, limit)
+        if let Some(threshold) = sparse_score_threshold(&scores, limit)?
             && prev_upper + *query_value * list.max_value + remaining_bound < threshold
         {
             continue 'term_scan;
@@ -715,7 +732,7 @@ fn sparse_search_block_max(
                 degraded = true;
                 break 'term_scan;
             }
-            if let Some(threshold) = sparse_score_threshold(&scores, limit) {
+            if let Some(threshold) = sparse_score_threshold(&scores, limit)? {
                 // Conservative block bound: uses global prev_upper (not per-block existing).
                 // Blocks are sorted value-desc so max_value decreases; once this fails,
                 // all remaining blocks for this term also fail → break instead of continue.
@@ -731,7 +748,7 @@ fn sparse_search_block_max(
                     &list.postings[block.start..block.end],
                     payload_candidates,
                     filter,
-                );
+                )?;
                 let block_bound = existing + *query_value * block.max_value + remaining_bound;
                 if block_bound < threshold {
                     // This specific block fails with exact existing scores, but a later block
@@ -744,7 +761,7 @@ fn sparse_search_block_max(
                     degraded = true;
                     break 'term_scan;
                 }
-                if !sparse_posting_matches(points, posting, payload_candidates, filter) {
+                if !sparse_posting_matches(points, posting, payload_candidates, filter)? {
                     continue;
                 }
                 searched += 1;
@@ -753,17 +770,17 @@ fn sparse_search_block_max(
                 match scores.get_mut(posting.id.as_str()) {
                     Some(slot) => *slot += contrib,
                     None => {
-                        scores.insert(posting.id.clone(), contrib);
+                        scores.insert(&posting.id, contrib)?;
                     }
                 }
             }
         }
     }
-    SparseSearchOutcome {
-        ranked: sparse_scores_to_ranked(points, scores, None),
+    Ok(SparseSearchOutcome {
+        ranked: sparse_scores_to_ranked(points, scores, None)?,
         searched,
         degraded,
-    }
+    })
 }
 
 fn sparse_should_stop(
@@ -775,27 +792,32 @@ fn sparse_should_stop(
         || budget.is_some_and(|budget| started.elapsed() >= budget)
 }
 
-fn sparse_score_threshold(scores: &HashMap<String, f32>, limit: usize) -> Option<f32> {
+fn sparse_score_threshold(scores: &HashMap<&str, f32>, limit: usize) -> Result<Option<f32>> {
     if limit == 0 || scores.len() < limit {
-        return None;
+        return Ok(None);
     }
-    let mut vals = scores.values().copied().collect::<Vec<_>>();
-    vals.sort_by(|a, b| b.total_cmp(a));
-    vals.get(limit - 1).copied()
+    let mut vals = AdmittedVec::default();
+    for score in scores.values() {
+        vals.push(*score)?;
+    }
+    vals.sort_unstable_by(|a, b| b.total_cmp(a));
+    Ok(vals.get(limit - 1).copied())
 }
 
 fn max_existing_sparse_score_in_block(
     points: &dyn PointResolver,
-    scores: &HashMap<String, f32>,
+    scores: &HashMap<&str, f32>,
     postings: &[SparsePosting],
     payload_candidates: Option<&HashSet<String>>,
     filter: Option<&Filter>,
-) -> f32 {
-    postings
-        .iter()
-        .filter(|p| sparse_posting_matches(points, p, payload_candidates, filter))
-        .map(|p| scores.get(&p.id).copied().unwrap_or_default())
-        .fold(0.0, f32::max)
+) -> Result<f32> {
+    let mut maximum = 0.0_f32;
+    for posting in postings {
+        if sparse_posting_matches(points, posting, payload_candidates, filter)? {
+            maximum = maximum.max(scores.get(posting.id.as_str()).copied().unwrap_or_default());
+        }
+    }
+    Ok(maximum)
 }
 
 fn sparse_posting_matches(
@@ -803,41 +825,42 @@ fn sparse_posting_matches(
     posting: &SparsePosting,
     payload_candidates: Option<&HashSet<String>>,
     filter: Option<&Filter>,
-) -> bool {
+) -> Result<bool> {
     if payload_candidates.is_some_and(|c| !c.contains(&posting.id)) {
-        return false;
+        return Ok(false);
     }
     if filter.is_none() {
-        return points.contains_point(&posting.id);
+        return Ok(points.contains_point(&posting.id));
     }
-    let Some(point) = points.resolve_point(&posting.id) else {
-        return false;
+    let Some(point) = points.resolve_candidate(&posting.id)? else {
+        return Ok(false);
     };
-    filter.is_none_or(|f| f.matches(&point.payload))
+    Ok(filter.is_none_or(|f| f.matches(&point.payload)))
 }
 
 fn sparse_scores_to_ranked(
     points: &dyn PointResolver,
-    scores: HashMap<String, f32>,
+    scores: ranking::BorrowedMap<'_, f32>,
     filter: Option<&Filter>,
-) -> Vec<RankedPoint> {
-    scores
-        .into_iter()
-        .filter_map(|(id, score)| {
-            if score <= 0.0 {
-                return None;
+) -> Result<Rankings> {
+    let mut ranked = Rankings::default();
+    for (&id, &score) in scores.iter() {
+        if score <= 0.0 {
+            continue;
+        }
+        if let Some(filter) = filter {
+            let Some(point) = points.resolve_candidate(id)? else {
+                continue;
+            };
+            if !filter.matches(&point.payload) {
+                continue;
             }
-            if let Some(filter) = filter {
-                let point = points.resolve_point(&id)?;
-                if !filter.matches(&point.payload) {
-                    return None;
-                }
-            } else if !points.contains_point(&id) {
-                return None;
-            }
-            Some(RankedPoint { id, score })
-        })
-        .collect()
+        } else if !points.contains_point(id) {
+            continue;
+        }
+        ranked.copy_push(id, score)?;
+    }
+    Ok(ranked)
 }
 
 // ── Multi-search / hybrid fusion ─────────────────────────────────────────────
@@ -896,17 +919,15 @@ pub(crate) fn fuse_rankings(
     fusion: HybridFusion,
     dense_weight: f32,
     sparse_weight: f32,
-) -> Vec<RankedPoint> {
+) -> Result<Rankings> {
     fuse_rankings_with_rrf_constant(dense, sparse, fusion, dense_weight, sparse_weight, 60.0)
 }
 
-/// Native text retrieval has a bounded `4 * k` rank window and returns at most
-/// 20 hits. RRF's published smaller constant preserves separation among the
-/// top ranks in this short-list regime while retaining equal branch weights.
+/// Preserve separation among the top ranks in the bounded native text window.
 pub(crate) fn fuse_text_rankings(
     dense: &[RankedPoint],
     sparse: &[RankedPoint],
-) -> Vec<RankedPoint> {
+) -> Result<Rankings> {
     fuse_rankings_with_rrf_constant(dense, sparse, HybridFusion::Rrf, 1.0, 1.0, 10.0)
 }
 
@@ -917,78 +938,74 @@ fn fuse_rankings_with_rrf_constant(
     dense_weight: f32,
     sparse_weight: f32,
     rrf_rank_constant: f32,
-) -> Vec<RankedPoint> {
-    let dense_ranks = dense
-        .iter()
-        .enumerate()
-        .map(|(rank, point)| (point.id.as_str(), rank))
-        .collect::<HashMap<_, _>>();
-    let sparse_ranks = sparse
-        .iter()
-        .enumerate()
-        .map(|(rank, point)| (point.id.as_str(), rank))
-        .collect::<HashMap<_, _>>();
-    let mut scores = HashMap::<String, f32>::new();
-    add_fusion_scores(&mut scores, dense, fusion, dense_weight, rrf_rank_constant);
+) -> Result<Rankings> {
+    let mut scores = ranking::BorrowedMap::<(f32, usize, usize)>::default();
+    add_fusion_scores(
+        &mut scores,
+        dense,
+        fusion,
+        dense_weight,
+        rrf_rank_constant,
+        true,
+    )?;
     add_fusion_scores(
         &mut scores,
         sparse,
         fusion,
         sparse_weight,
         rrf_rank_constant,
-    );
-    let mut fused = scores
-        .into_iter()
-        .map(|(id, score)| RankedPoint { id, score })
-        .collect::<Vec<_>>();
-    fused.sort_by(|left, right| {
+        false,
+    )?;
+    let mut fused = Rankings::default();
+    for (&id, &(score, _, _)) in scores.iter() {
+        fused.copy_push(id, score)?;
+    }
+    fused.sort_unstable_by(|left, right| {
+        let left_ranks = scores.get(left.id.as_str()).expect("fused rank");
+        let right_ranks = scores.get(right.id.as_str()).expect("fused rank");
         right
             .score
             .total_cmp(&left.score)
-            .then_with(|| {
-                dense_ranks
-                    .get(left.id.as_str())
-                    .copied()
-                    .unwrap_or(usize::MAX)
-                    .cmp(
-                        &dense_ranks
-                            .get(right.id.as_str())
-                            .copied()
-                            .unwrap_or(usize::MAX),
-                    )
-            })
-            .then_with(|| {
-                sparse_ranks
-                    .get(left.id.as_str())
-                    .copied()
-                    .unwrap_or(usize::MAX)
-                    .cmp(
-                        &sparse_ranks
-                            .get(right.id.as_str())
-                            .copied()
-                            .unwrap_or(usize::MAX),
-                    )
-            })
+            .then_with(|| left_ranks.1.cmp(&right_ranks.1))
+            .then_with(|| left_ranks.2.cmp(&right_ranks.2))
             .then_with(|| left.id.cmp(&right.id))
     });
-    fused
+    Ok(fused)
 }
 
-fn add_fusion_scores(
-    scores: &mut HashMap<String, f32>,
-    ranked: &[RankedPoint],
+fn add_fusion_scores<'a>(
+    scores: &mut ranking::BorrowedMap<'a, (f32, usize, usize)>,
+    ranked: &'a [RankedPoint],
     fusion: HybridFusion,
     weight: f32,
     rrf_rank_constant: f32,
-) {
+    dense: bool,
+) -> Result<()> {
     let (min, max) = minmax(ranked.iter().map(|point| point.score));
     for (rank, point) in ranked.iter().enumerate() {
         let contribution = match fusion {
             HybridFusion::Rrf => weight / (rrf_rank_constant + rank as f32 + 1.0),
             HybridFusion::Weighted => weight * rescale(point.score, min, max),
         };
-        *scores.entry(point.id.clone()).or_default() += contribution;
+        if let Some(slot) = scores.get_mut(&point.id) {
+            slot.0 += contribution;
+            if dense {
+                slot.1 = rank;
+            } else {
+                slot.2 = rank;
+            }
+        } else {
+            scores.insert(
+                &point.id,
+                (
+                    0.0 + contribution,
+                    if dense { rank } else { usize::MAX },
+                    if dense { usize::MAX } else { rank },
+                ),
+            )?;
+        }
     }
+    Ok(())
 }
 
 /// Min/max over a score list; `Weighted` fusion mixes branches with
@@ -1048,6 +1065,134 @@ mod tests {
         assert!(!filter.matches_ordinal("segment-a", 4));
         assert!(!filter.navigable_ordinal("segment-a", 4));
         assert!(!filter.navigable_ordinal("segment-b", 7));
+    }
+
+    #[derive(Debug)]
+    struct RefusedBackend;
+    impl IndexBackend for RefusedBackend {
+        fn candidate_ids_with_ef(
+            &self,
+            _query: &[f32],
+            _k: usize,
+            _ef: Option<usize>,
+        ) -> Vec<String> {
+            panic!("fallible dispatch must not call the legacy adapter")
+        }
+        fn try_candidate_ids_with_recall_target(
+            &self,
+            _query: &[f32],
+            _k: usize,
+            _ef: Option<usize>,
+            _recall: f32,
+            _filter: Option<&dyn crate::index::FilterPredicate>,
+        ) -> crate::Result<Vec<String>> {
+            Err(crate::GaussError::ResourceExhausted(
+                "candidate refusal".into(),
+            ))
+        }
+        fn try_candidate_ids_with_recall_target_cancellable(
+            &self,
+            query: &[f32],
+            k: usize,
+            ef: Option<usize>,
+            recall: f32,
+            filter: Option<&dyn crate::index::FilterPredicate>,
+            _cancel: &std::sync::atomic::AtomicBool,
+        ) -> crate::Result<Vec<String>> {
+            self.try_candidate_ids_with_recall_target(query, k, ef, recall, filter)
+        }
+        fn insert_point(&mut self, _point: &Point, _dim: usize) -> crate::Result<()> {
+            Ok(())
+        }
+        fn kind(&self) -> IndexKind {
+            IndexKind::Flat
+        }
+        fn indexed_points(&self) -> usize {
+            0
+        }
+        fn vector_dim(&self) -> usize {
+            1
+        }
+        fn contains(&self, _id: &str) -> bool {
+            false
+        }
+        fn cells(&self) -> usize {
+            0
+        }
+        fn is_paged(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn flat_candidate_output_refuses_before_allocation_and_retains_owner() {
+        let points = HashMap::from([("dense".into(), make_point("dense", sv(&[], &[])))]);
+        let named = HashMap::new();
+        crate::relational::wal_decode::with_test_storage_pool(1, |used| {
+            let result = search_point_candidates(
+                None,
+                &named,
+                &points,
+                &[1.0],
+                1,
+                None,
+                None,
+                0.95,
+                None,
+                None,
+            );
+            assert!(matches!(result, Err(GaussError::ResourceExhausted(_))));
+            assert_eq!(used(), 0);
+        });
+        crate::relational::wal_decode::with_test_storage_pool(16 * 1024, |used| {
+            let candidates = search_point_candidates(
+                None,
+                &named,
+                &points,
+                &[1.0],
+                1,
+                None,
+                None,
+                0.95,
+                None,
+                None,
+            )
+            .unwrap();
+            let retained = used();
+            assert!(retained > 0);
+            assert!(std::ptr::eq(candidates[0], &points["dense"]));
+            let mut iter = candidates.into_iter();
+            assert_eq!(used(), retained);
+            assert_eq!(iter.next().unwrap().id, "dense");
+            assert_eq!(used(), retained);
+            drop(iter);
+            assert_eq!(used(), 0);
+        });
+    }
+
+    #[test]
+    fn fallible_candidate_refusal_prevents_backfill_and_preserves_error_type() {
+        let backend = RefusedBackend;
+        let points = HashMap::from([("dense".into(), make_point("dense", sv(&[], &[])))]);
+        let named = HashMap::new();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        for flag in [None, Some(&cancel)] {
+            let result = search_point_candidates(
+                Some(&backend),
+                &named,
+                &points,
+                &[1.0],
+                1,
+                None,
+                None,
+                0.95,
+                None,
+                flag,
+            );
+            assert!(
+                matches!(result,Err(crate::GaussError::ResourceExhausted(message)) if message=="candidate refusal")
+            );
+        }
     }
 
     #[derive(Debug)]
@@ -1180,7 +1325,8 @@ mod tests {
             0.99,
             None,
             None,
-        );
+        )
+        .unwrap();
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].id, "dense");
@@ -1229,7 +1375,7 @@ mod tests {
             },
         ];
 
-        let fused = fuse_rankings(&dense, &sparse, HybridFusion::Weighted, 1.0, 1.0);
+        let fused = fuse_rankings(&dense, &sparse, HybridFusion::Weighted, 1.0, 1.0).unwrap();
 
         // The bug's signature: unnormalized raw-sum fusion produces the sparse
         // branch's own order verbatim (c=30.1, b=25.85, a=1.9 -> c, b, a), with
@@ -1271,8 +1417,8 @@ mod tests {
             score: 0.5,
         });
 
-        let compatibility = fuse_rankings(&dense, &sparse, HybridFusion::Rrf, 1.0, 1.0);
-        let text = fuse_text_rankings(&dense, &sparse);
+        let compatibility = fuse_rankings(&dense, &sparse, HybridFusion::Rrf, 1.0, 1.0).unwrap();
+        let text = fuse_text_rankings(&dense, &sparse).unwrap();
         assert_eq!(compatibility[0].id, "consensus-tail");
         assert_eq!(text[0].id, "dense-top");
     }
@@ -1312,7 +1458,8 @@ mod tests {
                 started: Instant::now(),
                 cancelled: None,
             },
-        );
+        )
+        .unwrap();
 
         assert_eq!(outcome.ranked.len(), 2);
         assert_eq!(outcome.ranked[0].id, "winner");
@@ -1337,7 +1484,8 @@ mod tests {
                 started: Instant::now(),
                 cancelled: Some(&cancelled),
             },
-        );
+        )
+        .unwrap();
 
         assert!(outcome.degraded);
         assert_eq!(outcome.searched, 0);
@@ -1376,7 +1524,8 @@ mod tests {
                 started: Instant::now(),
                 cancelled: None,
             },
-        );
+        )
+        .unwrap();
 
         // Top 5 results should all be from term 0 docs (scores 10, 9, 8, 7, 6)
         assert_eq!(outcome.ranked.len(), 5);
@@ -1384,6 +1533,43 @@ mod tests {
         assert!(top_ids.contains(&"doc_0"));
         assert!(top_ids.contains(&"doc_1"));
         assert!(top_ids.contains(&"doc_2"));
+    }
+
+    #[test]
+    fn sparse_filters_preserve_reader_errors_in_block_max_and_exhaustive_paths() {
+        struct FailedPoint;
+        impl PointResolver for FailedPoint {
+            fn resolve_point(&self, _: &str) -> Result<Option<Cow<'_, Point>>> {
+                Err(GaussError::ResourceExhausted("reader admission".into()))
+            }
+            fn contains_point(&self, _: &str) -> bool {
+                true
+            }
+        }
+        for value in [1.0, -1.0] {
+            let points =
+                HashMap::from([("failed".into(), make_point("failed", sv(&[0], &[value])))]);
+            let index = build_sparse_index(&points);
+            let query = sv(&[0], &[value]);
+            assert_eq!(sparse_query_can_use_block_max(&index, &query), value > 0.0);
+            let filter = Filter(serde_json::json!({"tag": "keep"}));
+            let result = sparse_search_ranked(
+                &index,
+                &FailedPoint,
+                SparseSearchParams {
+                    query: &query,
+                    limit: 1,
+                    payload_candidates: None,
+                    filter: Some(&filter),
+                    budget: None,
+                    started: Instant::now(),
+                    cancelled: None,
+                },
+            );
+            assert!(
+                matches!(result, Err(GaussError::ResourceExhausted(message)) if message == "reader admission")
+            );
+        }
     }
 
     struct CountingResolver {
@@ -1394,13 +1580,14 @@ mod tests {
     }
 
     impl PointResolver for CountingResolver {
-        fn resolve_point(&self, id: &str) -> Option<Cow<'_, Point>> {
+        fn resolve_point(&self, id: &str) -> Result<Option<Cow<'_, Point>>> {
             self.resolve_calls.fetch_add(1, Ordering::Relaxed);
-            self.live
+            Ok(self
+                .live
                 .contains(id)
                 .then(|| self.points.get(id))
                 .flatten()
-                .map(Cow::Borrowed)
+                .map(Cow::Borrowed))
         }
 
         fn contains_point(&self, id: &str) -> bool {
@@ -1438,7 +1625,8 @@ mod tests {
                 started: Instant::now(),
                 cancelled: None,
             },
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             outcome
@@ -1450,5 +1638,58 @@ mod tests {
         );
         assert_eq!(resolver.resolve_calls.load(Ordering::Relaxed), 0);
         assert!(resolver.contains_calls.load(Ordering::Relaxed) >= 2);
+    }
+
+    #[test]
+    fn sparse_ranking_refuses_before_workspace_growth_and_recovers() {
+        let points = HashMap::from([("row".into(), make_point("row", sv(&[0, 1], &[2.0, 3.0])))]);
+        let index = build_sparse_index(&points);
+        for query in [sv(&[0, 1], &[1.0, 0.5]), sv(&[0, 1], &[1.0, -0.5])] {
+            crate::relational::wal_decode::with_test_storage_pool(1, |used| {
+                let result = sparse_search_ranked(
+                    &index,
+                    &points,
+                    SparseSearchParams {
+                        query: &query,
+                        limit: 1,
+                        payload_candidates: None,
+                        filter: None,
+                        budget: None,
+                        started: Instant::now(),
+                        cancelled: None,
+                    },
+                );
+                assert!(
+                    matches!(result, Err(GaussError::ResourceExhausted(_))),
+                    "sparse workspace must preadmit output"
+                );
+                assert_eq!(used(), 0);
+            });
+            crate::relational::wal_decode::with_test_storage_pool(64 * 1024, |used| {
+                let outcome = sparse_search_ranked(
+                    &index,
+                    &points,
+                    SparseSearchParams {
+                        query: &query,
+                        limit: 1,
+                        payload_candidates: None,
+                        filter: None,
+                        budget: None,
+                        started: Instant::now(),
+                        cancelled: None,
+                    },
+                )
+                .unwrap();
+                assert_eq!(outcome.ranked.len(), 1);
+                assert_eq!(outcome.ranked[0].id, "row");
+                assert_eq!(
+                    outcome.ranked[0].score,
+                    2.0 * query.values[0] + 3.0 * query.values[1]
+                );
+                assert!(used() > 0, "returned ranking retains its backing");
+                drop(outcome);
+                assert_eq!(used(), 0);
+            });
+        }
     }
 }

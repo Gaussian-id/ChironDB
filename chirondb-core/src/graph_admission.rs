@@ -13,9 +13,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(target_os = "linux")]
-use std::fs;
-
 use crate::{
     GaussError, Result,
     graph::{GraphError, GraphErrorCode, TraversalBudget},
@@ -24,8 +21,6 @@ use crate::{
 
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
-const FALLBACK_BYTES_PER_CORE: u64 = 256 * MIB;
-const MIN_FALLBACK_CAPACITY: u64 = GIB;
 const MAX_PROCESS_CAPACITY: u64 = 4 * GIB;
 const WAIT_SLICE: Duration = Duration::from_millis(5);
 const ADMISSION_TIMEOUT: Duration = Duration::from_millis(50);
@@ -36,6 +31,25 @@ static PROCESS_POOL: LazyLock<GraphAdmissionPool> = LazyLock::new(|| {
     let cold_capacity = (memory_capacity / 4).max(1);
     GraphAdmissionPool::new(memory_capacity, cold_capacity, ADMISSION_TIMEOUT, true)
 });
+
+/// The serialized legacy default is 512 MiB. Resolve that default against
+/// the installed process profile before both reservation and execution use it.
+/// Caller-specified non-default memory limits retain their exact value.
+pub(crate) fn resolve_default_memory(mut budget: TraversalBudget) -> TraversalBudget {
+    budget.max_memory_bytes = default_memory_for_capacity(
+        budget.max_memory_bytes,
+        PROCESS_POOL.capacity.memory,
+        crate::resource_profile::current().query_workers,
+    );
+    budget
+}
+
+fn default_memory_for_capacity(requested: u64, capacity: u64, workers: usize) -> u64 {
+    if requested != TraversalBudget::default().max_memory_bytes {
+        return requested;
+    }
+    requested.min((capacity / workers.max(1) as u64).max(1))
+}
 
 /// Reserves all aggregate resources required by one traversal.
 pub(crate) fn acquire(
@@ -55,36 +69,7 @@ pub(crate) fn acquire(
 }
 
 fn process_memory_capacity() -> u64 {
-    if let Some(limit) = cgroup_memory_limit() {
-        return (limit / 2).clamp(1, MAX_PROCESS_CAPACITY);
-    }
-
-    let workers = std::thread::available_parallelism()
-        .map(|workers| workers.get() as u64)
-        .unwrap_or(1);
-    workers
-        .saturating_mul(FALLBACK_BYTES_PER_CORE)
-        .clamp(MIN_FALLBACK_CAPACITY, MAX_PROCESS_CAPACITY)
-}
-
-#[cfg(target_os = "linux")]
-fn cgroup_memory_limit() -> Option<u64> {
-    const LIMIT_PATHS: [&str; 2] = [
-        "/sys/fs/cgroup/memory.max",
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-    ];
-    LIMIT_PATHS.into_iter().find_map(|path| {
-        let value = fs::read_to_string(path).ok()?;
-        let limit = value.trim().parse::<u64>().ok()?;
-        // Cgroup v1 commonly reports an enormous sentinel when no limit is
-        // configured. Treat it as absent and use the host-derived fallback.
-        (limit > 0 && limit < (1_u64 << 60)).then_some(limit)
-    })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn cgroup_memory_limit() -> Option<u64> {
-    None
+    (crate::resource_profile::current().engine_budget_bytes / 4).clamp(1, MAX_PROCESS_CAPACITY)
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -496,6 +481,44 @@ mod tests {
     }
 
     #[test]
+    fn default_memory_uses_profile_share_without_changing_explicit_limits() {
+        let lite = crate::resource_profile::ResourceProfile::from_limits(2 * GIB, 2);
+        let capacity = lite.engine_budget_bytes / 4;
+        assert!(capacity < TraversalBudget::default().max_memory_bytes);
+        let resolved = default_memory_for_capacity(
+            TraversalBudget::default().max_memory_bytes,
+            capacity,
+            lite.query_workers,
+        );
+        assert_eq!(resolved, capacity / 2);
+        let pool = pool(capacity, capacity / 4);
+        let cancelled = AtomicBool::new(false);
+        let first = pool
+            .acquire("docs", key("acme"), resolved, 0, &cancelled)
+            .unwrap();
+        let second = pool
+            .acquire("docs", key("acme"), resolved, 0, &cancelled)
+            .unwrap();
+        drop((first, second));
+        assert_eq!(default_memory_for_capacity(64 * MIB, capacity, 2), 64 * MIB);
+        assert_eq!(default_memory_for_capacity(GIB, capacity, 2), GIB);
+        assert_eq!(
+            result_error(pool.acquire("docs", key("acme"), GIB, 0, &cancelled)).code,
+            GraphErrorCode::Overloaded
+        );
+
+        let w0 = crate::resource_profile::ResourceProfile::from_limits(8 * GIB, 4);
+        assert_eq!(
+            default_memory_for_capacity(
+                TraversalBudget::default().max_memory_bytes,
+                w0.engine_budget_bytes / 4,
+                w0.query_workers,
+            ),
+            (w0.engine_budget_bytes / 4) / 4
+        );
+    }
+
+    #[test]
     fn aggregate_reservations_never_exceed_either_pool() {
         let pool = pool(100, 20);
         let cancelled = AtomicBool::new(false);
@@ -717,6 +740,7 @@ mod tests {
                     )
                     .unwrap();
                 let result = exact_bfs(MutableTraversal {
+                    access: None,
                     graph: graph.as_ref(),
                     anchors: vec![center],
                     visible_anchor_count: 1,
@@ -738,7 +762,7 @@ mod tests {
                         }),
                     },
                     cancelled: &cancelled,
-                    payload_for_nid: |nid| payloads.get(&nid).cloned(),
+                    payload_for_nid: |nid| Ok(payloads.get(&nid).cloned()),
                     namespaces_for_payload: |_| vec![GraphNamespace::Tenant("acme".to_string())],
                 })
                 .unwrap()

@@ -69,6 +69,11 @@ pub const SQ8_AUTO_DIM_THRESHOLD: usize = 256;
 
 impl CollectionConfig {
     pub fn normalize(mut self) -> Self {
+        // Compatibility protobuf fields specify zero as the engine default.
+        self.hnsw_m = self.hnsw_m.filter(|value| *value != 0);
+        self.hnsw_ef_construction = self.hnsw_ef_construction.filter(|value| *value != 0);
+        self.hnsw_ef_search = self.hnsw_ef_search.filter(|value| *value != 0);
+
         if self.shards == 0 {
             self.shards = default_shards();
         }
@@ -356,10 +361,12 @@ pub enum HybridFusion {
     Weighted,
 }
 
-/// Native text BM25 + default dense vector retrieval with RRF fusion.
+/// Native BM25, optionally fused with the default dense vector using RRF.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TextHybridSearchRequest {
+    /// Omitted or empty selects BM25 only; otherwise fuse dense and BM25 ranks.
+    #[serde(default)]
     pub vector: Vec<f32>,
     pub query: String,
     pub text_field: String,

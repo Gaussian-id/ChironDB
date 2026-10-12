@@ -2,6 +2,7 @@ use std::{
     collections::HashSet,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, Write},
+    ops::Range,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -27,6 +28,14 @@ use crate::{
 };
 
 mod archive_replay;
+mod checkpoint_prefix;
+mod layout;
+mod ordered;
+mod pinned;
+pub(crate) use checkpoint_prefix::WalPrefix;
+pub(crate) use layout::root as layout_root;
+use layout::{WalSegment, WalSegments, all_wal_segments, wal_segments};
+pub(crate) use ordered::OrderedJournalReader;
 
 const HEADER_LEN: usize = 8;
 const DEFAULT_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
@@ -42,6 +51,7 @@ const WAL_ARCHIVE_MANIFEST_VERSION: u32 = 2;
 /// unbounded allocation during recovery.
 pub const MAX_WAL_RECORD_BYTES: usize = 64 * 1024 * 1024;
 pub const GRAPH_BATCH_VERSION: u16 = 1;
+pub const MULTI_MODEL_BATCH_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -102,18 +112,44 @@ pub struct GraphEdgeBind {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GraphDeferredSessionMutation {
-    Open { session_id: String },
-    Commit { session_id: String },
-    Abort { session_id: String },
+    Open {
+        session_id: String,
+        /// Ownerless historical sessions may be recovered but not admitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner: Option<GraphSessionOwner>,
+    },
+    Commit {
+        session_id: String,
+    },
+    Abort {
+        session_id: String,
+    },
 }
 
 impl GraphDeferredSessionMutation {
     fn session_id(&self) -> &str {
         match self {
-            Self::Open { session_id }
+            Self::Open { session_id, .. }
             | Self::Commit { session_id }
             | Self::Abort { session_id } => session_id,
         }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphSessionOwner {
+    pub principal: String,
+    pub tenant: Option<String>,
+}
+
+impl GraphSessionOwner {
+    pub(crate) fn validate(&self) -> Result<()> {
+        validate_graph_key("session principal", &self.principal)?;
+        if let Some(tenant) = &self.tenant {
+            validate_graph_key("session tenant", tenant)?;
+        }
+        Ok(())
     }
 }
 
@@ -369,6 +405,12 @@ impl GraphBatch {
         let mut session_ids = HashSet::with_capacity(self.deferred_sessions.len());
         for session in &self.deferred_sessions {
             validate_graph_key("deferred session ID", session.session_id())?;
+            if let GraphDeferredSessionMutation::Open {
+                owner: Some(owner), ..
+            } = session
+            {
+                owner.validate()?;
+            }
             if !session_ids.insert(session.session_id()) {
                 return Err(invalid_graph_batch(
                     "one deferred session is mutated more than once",
@@ -389,6 +431,82 @@ impl GraphBatch {
             return Err(invalid_graph_batch(format!(
                 "serialized GraphBatch is {encoded_bytes} bytes; maximum is {MAX_GRAPH_BATCH_BYTES}"
             )));
+        }
+        Ok(())
+    }
+}
+
+/// One collection projection inside an installation-wide multi-model commit.
+///
+/// `GraphBatch` is the collection mutation authority because it already
+/// combines vector point and graph topology changes in one validated record.
+/// The installation transaction journal wraps these projections together
+/// with the relational batch and decides all of them with one COMMIT frame.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MultiModelCollectionBatch {
+    pub collection: String,
+    pub batch: GraphBatch,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security: Option<crate::security::SecurityDelta>,
+}
+
+/// Durable write set for one relational + vector/graph transaction.
+///
+/// This envelope is valid only in the installation transaction journal. On
+/// projection and recovery it is split into a `RelationalBatch` for the
+/// relational WAL and one `GraphBatch` per collection WAL, all carrying the
+/// same transaction ID through `TransactionApply`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MultiModelBatch {
+    pub version: u16,
+    pub relational: crate::relational::RelationalBatch,
+    pub collections: Vec<MultiModelCollectionBatch>,
+}
+
+impl MultiModelBatch {
+    pub fn validate(&self) -> Result<()> {
+        if self.version != MULTI_MODEL_BATCH_VERSION {
+            return Err(GaussError::InvalidRequest(format!(
+                "unsupported multi-model batch version {}; expected {MULTI_MODEL_BATCH_VERSION}",
+                self.version
+            )));
+        }
+        if self.relational.mutations.is_empty() {
+            return Err(GaussError::InvalidRequest(
+                "multi-model batch requires at least one relational mutation".to_string(),
+            ));
+        }
+        if self.collections.is_empty() {
+            return Err(GaussError::InvalidRequest(
+                "multi-model batch requires at least one collection mutation".to_string(),
+            ));
+        }
+        let mut previous = None::<&str>;
+        for projection in &self.collections {
+            if projection.collection.is_empty() {
+                return Err(GaussError::InvalidRequest(
+                    "multi-model collection name cannot be empty".to_string(),
+                ));
+            }
+            if previous.is_some_and(|name| name >= projection.collection.as_str()) {
+                return Err(GaussError::InvalidRequest(
+                    "multi-model collection projections must be unique and sorted".to_string(),
+                ));
+            }
+            projection.batch.validate()?;
+            if let Some(security) = &projection.security {
+                crate::security::ProtectedBatch {
+                    version: crate::security::SECURITY_VERSION,
+                    security: security.clone(),
+                    content: crate::security::ProtectedContent::Graph {
+                        batch: projection.batch.clone(),
+                    },
+                }
+                .validate()?;
+            }
+            previous = Some(&projection.collection);
         }
         Ok(())
     }
@@ -482,9 +600,20 @@ pub enum WalEntry {
     CreateCollection {
         config: CollectionConfig,
     },
+    CreateProtectedCollection {
+        config: CollectionConfig,
+        security: crate::security::SecurityCheckpoint,
+        expected_revision: u64,
+        revision: u64,
+    },
     /// Root catalog WAL entry. Collection WAL replay must reject this variant.
     DropCollection {
         name: String,
+    },
+    DropProtectedCollection {
+        name: String,
+        expected_revision: u64,
+        revision: u64,
     },
     Schema {
         schema_epoch: u64,
@@ -520,6 +649,43 @@ pub enum WalEntry {
     GraphBatch {
         batch: GraphBatch,
     },
+    /// Security metadata and content share one CRC-framed commit record.
+    ProtectedBatch {
+        batch: crate::security::ProtectedBatch,
+    },
+    /// One request-atomic native relational mutation batch. Relational rows
+    /// are independent from vector collections and are projected into the
+    /// dedicated relational WAL after the installation journal commits.
+    RelationalBatch {
+        batch: crate::relational::RelationalBatch,
+    },
+    /// Installation-journal-only envelope for one relational batch plus one
+    /// or more vector/graph collection batches. Storage WALs receive only the
+    /// corresponding inner projection through `TransactionApply`.
+    MultiModelBatch {
+        batch: MultiModelBatch,
+    },
+    /// Installation transaction-journal record. It is never valid in a
+    /// collection or catalog WAL; the journal module validates placement.
+    TransactionPrepare {
+        prepare: crate::transaction_journal::TransactionPrepare,
+    },
+    /// Durable transaction decision. Presence of this record is the sole
+    /// authority that a prepared mutation committed.
+    TransactionCommit {
+        commit: crate::transaction_journal::TransactionCommit,
+    },
+    /// Durable progress for rebuilding collection/catalog and audit
+    /// projections after a committed transaction.
+    TransactionProjection {
+        projection: crate::transaction_journal::TransactionProjection,
+    },
+    /// Idempotency envelope written to a collection or catalog WAL when the
+    /// canonical transaction is projected there.
+    TransactionApply {
+        transaction_id: crate::transaction_journal::TransactionId,
+        entry: Box<WalEntry>,
+    },
 }
 
 fn default_merge() -> bool {
@@ -534,6 +700,38 @@ pub struct WalRecord {
     pub entry: WalEntry,
 }
 
+pub(crate) struct PreparedPayload {
+    bytes: Vec<u8>,
+    _admission: crate::relational::wal_decode::FrameAdmission,
+}
+pub(crate) struct PreparedRecord {
+    record: crate::relational::wal_decode::Owned<WalRecord>,
+    payload: PreparedPayload,
+}
+impl PreparedRecord {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        crate::relational::wal_decode::Owned<WalRecord>,
+        PreparedPayload,
+    ) {
+        (self.record, self.payload)
+    }
+}
+
+#[derive(Serialize)]
+struct BorrowedWalRecord<'a, T> {
+    lsn: u64,
+    unix_ms: u64,
+    entry: &'a T,
+}
+#[derive(Serialize)]
+enum BorrowedPrepare<'a> {
+    TransactionPrepare {
+        prepare: &'a crate::transaction_journal::TransactionPrepare,
+    },
+}
+
 #[derive(Debug)]
 pub struct Wal {
     dir: PathBuf,
@@ -545,6 +743,9 @@ pub struct Wal {
     poisoned: AtomicBool,
     unsynced_bytes: AtomicU64,
     oldest_unsynced_unix_ms: AtomicU64,
+    protected: bool,
+    // Last: file/path owners die before their root reservation.
+    _memory: crate::relational::wal_decode::MetadataCharge,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -569,6 +770,8 @@ pub(crate) struct FrozenWalArchive {
     base_bytes: Option<Vec<u8>>,
     segments: Vec<FrozenWalSegment>,
     end_lsn: u64,
+    _pin: pinned::DirectoryPin,
+    _memory: crate::relational::wal_decode::MetadataCharge,
 }
 
 #[derive(Debug)]
@@ -576,6 +779,7 @@ struct FrozenWalSegment {
     index: u64,
     path: PathBuf,
     bytes: u64,
+    _memory: crate::relational::wal_decode::MetadataCharge,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -612,6 +816,74 @@ pub struct WalScanStats {
 }
 
 impl Wal {
+    pub(crate) fn migrate_transaction_journal_for_encryption(
+        data_dir: &Path,
+        keyring: &crate::encryption::Keyring,
+    ) -> Result<bool> {
+        let dir = data_dir.join(crate::transaction_journal::TRANSACTION_JOURNAL_DIR);
+        if !dir.exists() {
+            return Ok(false);
+        }
+        let records = Self::load(&dir)?;
+        let contains_plaintext = wal_segments(&dir)?.into_iter().try_fold(
+            false,
+            |plaintext, segment| -> Result<bool> {
+                let bytes = fs::read(segment.path)?;
+                Ok(plaintext || encryption::inspect_wal_frames_for_migration(&bytes)?.is_none())
+            },
+        )?;
+        if !contains_plaintext {
+            return Ok(false);
+        }
+
+        let parent = dir.parent().ok_or_else(|| {
+            GaussError::InvalidRequest("transaction journal has no parent directory".into())
+        })?;
+        let staging = parent.join(format!(".journal-encrypted-{}", uuid::Uuid::new_v4()));
+        let retired = parent.join(format!(".journal-plaintext-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&staging)?;
+        let result = (|| -> Result<()> {
+            let path = staging.join(segment_name(0));
+            let mut output = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)?;
+            let mut lsn = 0_u64;
+            for record in records {
+                let plaintext = serde_json::to_vec(&WalRecord {
+                    lsn,
+                    unix_ms: record.unix_ms,
+                    entry: record.entry,
+                })?;
+                let payload = encryption::encrypt_bytes(keyring, FileType::Wal, &plaintext)?;
+                validate_append_payload_len(payload.len())?;
+                let len = u32::try_from(payload.len()).map_err(|_| {
+                    GaussError::ResourceExhausted(
+                        "encrypted transaction journal record exceeds WAL limit".into(),
+                    )
+                })?;
+                output.write_all(&len.to_le_bytes())?;
+                output.write_all(&checksum(&payload).to_le_bytes())?;
+                output.write_all(&payload)?;
+                lsn = lsn
+                    .checked_add(HEADER_LEN as u64 + payload.len() as u64)
+                    .ok_or_else(|| GaussError::ResourceExhausted("WAL LSN overflow".into()))?;
+            }
+            output.sync_all()?;
+            sync_directory(&staging)?;
+            durable_rename(&dir, &retired)?;
+            if let Err(error) = durable_rename(&staging, &dir) {
+                let _ = durable_rename(&retired, &dir);
+                return Err(error);
+            }
+            durable_remove_dir_all(&retired)
+        })();
+        if result.is_err() {
+            let _ = durable_remove_dir_all(&staging);
+        }
+        result.map(|()| true)
+    }
+
     pub fn open(dir: &Path) -> Result<Self> {
         #[cfg(feature = "fault-injection")]
         if let Some(raw_bytes) =
@@ -637,7 +909,17 @@ impl Wal {
         Self::open_with_segment_bytes(dir, DEFAULT_SEGMENT_BYTES)
     }
 
+    /// Open a control journal with the production segment size even when a
+    /// collection-WAL fault test overrides its segment threshold globally.
+    /// Transaction-journal rotation has its own decision-boundary tests; a
+    /// collection projection test must not pause before COMMIT in the control
+    /// journal by accident.
+    pub(crate) fn open_control_journal(dir: &Path) -> Result<Self> {
+        Self::open_with_segment_bytes(dir, DEFAULT_SEGMENT_BYTES)
+    }
+
     fn open_with_segment_bytes(dir: &Path, segment_bytes: u64) -> Result<Self> {
+        let memory = layout::root(dir, std::mem::size_of::<Self>())?;
         let dir_created = !dir.exists();
         fs::create_dir_all(dir)?;
         if dir_created && let Some(parent) = dir.parent() {
@@ -680,6 +962,12 @@ impl Wal {
             poisoned: AtomicBool::new(false),
             unsynced_bytes: AtomicU64::new(0),
             oldest_unsynced_unix_ms: AtomicU64::new(0),
+            protected: dir.parent().is_some_and(|parent| {
+                parent
+                    .join(crate::security::storage::CHECKPOINT_FILE)
+                    .exists()
+            }),
+            _memory: memory,
         })
     }
 
@@ -742,6 +1030,19 @@ impl Wal {
 
     fn append_inner(&mut self, entry: &WalEntry, sync: bool) -> Result<u64> {
         self.ensure_available()?;
+        match entry {
+            WalEntry::TransactionApply { entry, .. } if self.protected => match entry.as_ref() {
+                WalEntry::ProtectedBatch { batch } => batch.validate()?,
+                _ => return Err(crate::security::SecurityError::Forbidden.into()),
+            },
+            WalEntry::ProtectedBatch { batch } if self.protected => batch.validate()?,
+            WalEntry::ProtectedBatch { .. } => {
+                return Err(crate::security::SecurityError::Unavailable.into());
+            }
+            WalEntry::Compact { .. } => {}
+            _ if self.protected => return Err(crate::security::SecurityError::Forbidden.into()),
+            _ => {}
+        }
         if let WalEntry::GraphBatch { batch } = entry {
             batch.validate()?;
         }
@@ -758,6 +1059,44 @@ impl Wal {
             .ok_or_else(|| GaussError::InvalidRequest("WAL LSN overflow".into()))?;
         let payload = encode_record(lsn, entry)?;
         self.append_payload(lsn, &payload, sync)
+    }
+
+    /// Construct and decode the exact PREPARE envelope before consuming a key
+    /// or writing PREPARE. The accepted DTO retains the same recovery admission.
+    pub(crate) fn prepare_transaction_record(
+        lsn: u64,
+        prepare: &crate::transaction_journal::TransactionPrepare,
+    ) -> Result<PreparedRecord> {
+        crate::relational::wal_decode::check_write_set(prepare)?;
+        let entry = BorrowedPrepare::TransactionPrepare { prepare };
+        let encoded = crate::relational::wal_decode::encode(&BorrowedWalRecord {
+            lsn,
+            unix_ms: current_unix_ms(),
+            entry: &entry,
+        })?;
+        let mut admission = crate::relational::wal_decode::FrameAdmission::new()?;
+        admission.prepare(encoded.len(), false)?;
+        let record = decode_plain_record_owned(Path::new("transaction preflight"), lsn, &encoded)?;
+        let bytes = encryption::encode_persistent(FileType::Wal, &encoded)?.into_owned();
+        Ok(PreparedRecord {
+            record,
+            payload: PreparedPayload {
+                bytes,
+                _admission: admission,
+            },
+        })
+    }
+
+    pub(crate) fn append_prepared_transaction(
+        &mut self,
+        lsn: u64,
+        payload: &PreparedPayload,
+    ) -> Result<u64> {
+        // Protected collection WALs may not accept installation PREPAREs.
+        if self.protected {
+            return Err(crate::security::SecurityError::Forbidden.into());
+        }
+        self.append_payload(lsn, &payload.bytes, true)
     }
 
     /// Also used by checked archive replay; do not renumber or re-encode its frames.
@@ -894,7 +1233,10 @@ impl Wal {
 
     pub fn reset(&mut self) -> Result<()> {
         self.ensure_available()?;
-        let result = self.reset_inner();
+        // Refused metadata admission has not changed replay authority and is
+        // retryable. Only failures after entering reset may poison the writer.
+        let old_segments = all_wal_segments(&self.dir)?;
+        let result = self.reset_inner(old_segments);
         if let Err(error) = result {
             self.poisoned.store(true, Ordering::Release);
             return Err(GaussError::WalUnavailable(format!(
@@ -904,7 +1246,7 @@ impl Wal {
         Ok(())
     }
 
-    fn reset_inner(&mut self) -> Result<()> {
+    fn reset_inner(&mut self, old_segments: WalSegments) -> Result<()> {
         self.file.sync_all()?;
         let reset_lsn = self.len()?;
 
@@ -915,7 +1257,6 @@ impl Wal {
         // Before the sidecar commit readers still see the complete old WAL;
         // afterwards they ignore every older segment. Keeping wal.base is what
         // makes both crash windows recoverable without a directory swap.
-        let old_segments = all_wal_segments(&self.dir)?;
         let successor_index = old_segments.last().map_or(Ok(0), |segment| {
             segment.index.checked_add(1).ok_or_else(|| {
                 GaussError::WalUnavailable("WAL segment index overflow during reset".into())
@@ -987,10 +1328,8 @@ impl Wal {
             self.rotate(active_len)?;
         }
         let base = read_wal_base(&self.dir)?;
-        let segments = wal_segments(&self.dir)?
-            .into_iter()
-            .filter(|segment| segment.index < self.active_index)
-            .collect::<Vec<_>>();
+        let mut segments = wal_segments(&self.dir)?;
+        segments.retain(|segment| segment.index < self.active_index);
         FrozenWalArchive::capture(&self.dir, base, segments, end_lsn)
     }
 
@@ -1046,6 +1385,165 @@ impl Wal {
             metrics::counter!("chirondb_wal_corruption_total").increment(1);
         }
         result
+    }
+
+    pub(crate) fn scan_journal_from(
+        dir: &Path,
+        watermark: u64,
+        mut visitor: impl FnMut(crate::relational::wal_decode::Owned<WalRecord>) -> Result<()>,
+    ) -> Result<WalScanStats> {
+        scan_frames_decoded(
+            dir,
+            watermark,
+            TailPolicy::Strict,
+            false,
+            true,
+            decode_record_owned,
+            |record, payload| {
+                drop(payload);
+                visitor(record)
+            },
+        )
+    }
+
+    pub(crate) fn recover_journal_from(
+        dir: &Path,
+        watermark: u64,
+        mut visitor: impl FnMut(crate::relational::wal_decode::Owned<WalRecord>) -> Result<()>,
+    ) -> Result<WalScanStats> {
+        scan_frames_decoded(
+            dir,
+            watermark,
+            TailPolicy::RepairFinalActive,
+            false,
+            true,
+            decode_record_owned,
+            |record, payload| {
+                drop(payload);
+                visitor(record)
+            },
+        )
+    }
+
+    /// Read one CRC-checked record at a known absolute LSN. The transaction
+    /// journal keeps these locations instead of retaining every mutation in
+    /// memory. The file reader authenticates only the touched encrypted range.
+    #[cfg(test)]
+    pub(crate) fn read_at(dir: &Path, lsn: u64) -> Result<WalRecord> {
+        Self::read_at_with(dir, lsn, None, |path, payload| {
+            decode_record(path, lsn, payload)
+        })
+    }
+
+    pub(crate) fn read_at_owned(
+        dir: &Path,
+        lsn: u64,
+    ) -> Result<crate::relational::wal_decode::Owned<WalRecord>> {
+        let mut admission = crate::relational::wal_decode::FrameAdmission::new()?;
+        Self::read_at_with(dir, lsn, Some(&mut admission), |path, payload| {
+            decode_record_owned(path, lsn, payload)
+        })
+    }
+
+    /// Borrowed, admitted inspection for cold journal authority proofs. The
+    /// record and its charge remain alive until the caller's visitor returns.
+    pub(crate) fn inspect_at<R>(
+        dir: &Path,
+        lsn: u64,
+        visitor: impl FnOnce(&WalRecord) -> Result<R>,
+    ) -> Result<R> {
+        let mut admission = crate::relational::wal_decode::FrameAdmission::new()?;
+        Self::read_at_with(dir, lsn, Some(&mut admission), |path, payload| {
+            let plaintext =
+                encryption::decode_persistent_bounded(payload, payload.len()).map_err(|error| {
+                    wal_corruption(path, &format!("cannot authenticate WAL record: {error}"))
+                })?;
+            // Keep the visitor's errors outside the decoder's JSON mapping.
+            // A cancelled hash/serialization must not become WAL corruption.
+            crate::relational::wal_decode::inspect::<PersistedWalRecord, _>(
+                &plaintext,
+                |persisted| {
+                    Ok(match persisted {
+                        PersistedWalRecord::Record(record) => {
+                            if record.lsn != lsn {
+                                Err(wal_corruption(path, "lsn mismatch"))
+                            } else {
+                                visitor(record)
+                            }
+                        }
+                        // Journal PREPAREs always carry their absolute LSN.
+                        PersistedWalRecord::Legacy(_) => {
+                            Err(wal_corruption(path, "journal record lacks LSN envelope"))
+                        }
+                    })
+                },
+            )
+            .map_err(|error| match error {
+                GaussError::Json(_) => {
+                    wal_corruption(path, &format!("invalid WAL record JSON: {error}"))
+                }
+                other => other,
+            })?
+        })
+    }
+
+    fn read_at_with<R>(
+        dir: &Path,
+        lsn: u64,
+        mut admission: Option<&mut crate::relational::wal_decode::FrameAdmission>,
+        visitor: impl FnOnce(&Path, &[u8]) -> Result<R>,
+    ) -> Result<R> {
+        let base = read_wal_base(dir)?;
+        if lsn < base.lsn {
+            return Err(wal_corruption(dir, "record precedes retained WAL base"));
+        }
+        let mut segment_start = base.lsn;
+        for segment in wal_segments(dir)? {
+            let mut file = WalRangeReader::open(&segment.path).map_err(|error| match error {
+                error @ GaussError::ResourceExhausted(_) => error,
+                error => wal_corruption(&segment.path, &error.to_string()),
+            })?;
+            let file_len = file.len();
+            let segment_end = segment_start
+                .checked_add(file_len as u64)
+                .ok_or_else(|| wal_corruption(&segment.path, "WAL length overflow"))?;
+            if lsn >= segment_end {
+                segment_start = segment_end;
+                continue;
+            }
+            let offset = usize::try_from(lsn - segment_start)
+                .map_err(|_| wal_corruption(&segment.path, "WAL offset exceeds usize"))?;
+            let header_end = offset
+                .checked_add(HEADER_LEN)
+                .ok_or_else(|| wal_corruption(&segment.path, "WAL header offset overflow"))?;
+            if header_end > file_len {
+                return Err(wal_corruption(&segment.path, "partial WAL record header"));
+            }
+            if let Some(admission) = admission.as_mut() {
+                admission.prepare(HEADER_LEN, matches!(&file, WalRangeReader::Encrypted(_)))?;
+            }
+            let header = file.read_range_admitted(offset..header_end)?;
+            let payload_len =
+                u32::from_le_bytes(header[0..4].try_into().expect("length header")) as usize;
+            validate_payload_len(&segment.path, payload_len)?;
+            let payload_end = header_end
+                .checked_add(payload_len)
+                .ok_or_else(|| wal_corruption(&segment.path, "WAL payload offset overflow"))?;
+            if payload_end > file_len {
+                return Err(wal_corruption(&segment.path, "torn WAL record"));
+            }
+            let expected_crc = u32::from_le_bytes(header[4..8].try_into().expect("crc header"));
+            drop(header);
+            if let Some(admission) = admission.as_mut() {
+                admission.prepare(payload_len, matches!(&file, WalRangeReader::Encrypted(_)))?;
+            }
+            let payload = file.read_range_admitted(header_end..payload_end)?;
+            if checksum(&payload) != expected_crc {
+                return Err(wal_corruption(&segment.path, "crc mismatch"));
+            }
+            return visitor(&segment.path, &payload);
+        }
+        Err(wal_corruption(dir, "record LSN is past the WAL end"))
     }
 
     /// Recovery scan that repairs only a torn header or payload at the end of
@@ -1109,6 +1607,26 @@ impl Wal {
             return Ok(());
         }
 
+        if self.protected {
+            let directory = self
+                .dir
+                .parent()
+                .ok_or(crate::security::SecurityError::Unavailable)?;
+            let watermark = crate::security::storage::read(directory)?
+                .ok_or(crate::security::SecurityError::Unavailable)?
+                .wal_watermark;
+            if watermark < new_base_lsn {
+                let checkpoint = crate::security::storage::recover(directory, Some(new_base_lsn))?
+                    .ok_or(crate::security::SecurityError::Unavailable)?;
+                crate::security::storage::write(directory, &checkpoint)?;
+            } else {
+                // A prior attempt may have durably checkpointed security but
+                // crashed before publishing the retained WAL base. Keep that
+                // newer authority; retrying a smaller cut must not rewind it.
+                validate_record_boundary(&self.dir, watermark)?;
+            }
+        }
+
         let first_segment = segments[drop_count].index;
         write_wal_base(
             &self.dir,
@@ -1125,6 +1643,15 @@ impl Wal {
     }
 
     pub fn truncate_to_lsn(dir: &Path, target_lsn: u64) -> Result<()> {
+        if let Some(parent) = dir.parent()
+            && let Some(checkpoint) = crate::security::storage::read(parent)?
+            && target_lsn < checkpoint.wal_watermark
+        {
+            return Err(crate::security::SecurityError::Invalid(
+                "PITR cannot rewind a security checkpoint".into(),
+            )
+            .into());
+        }
         let wal_base = read_wal_base(dir)?;
         let segments = wal_segments(dir)?;
         if segments.is_empty() {
@@ -1207,20 +1734,38 @@ impl FrozenWalArchive {
     fn capture(
         wal_dir: &Path,
         base: WalBase,
-        segments: Vec<WalSegment>,
+        segments: WalSegments,
         end_lsn: u64,
     ) -> Result<Option<Self>> {
+        let mut memory = layout::root(wal_dir, std::mem::size_of::<Self>())?;
+        let descriptor_bytes = (segments.len() as u64)
+            .checked_mul(std::mem::size_of::<FrozenWalSegment>() as u64)
+            .and_then(|n| n.checked_mul(2))
+            .and_then(|n| n.checked_add((wal_dir.as_os_str().len() as u64).checked_mul(8)?))
+            .and_then(|n| n.checked_add(8192 + 2 * std::mem::size_of::<Self>() as u64))
+            .ok_or_else(|| {
+                GaussError::ResourceExhausted("WAL archive metadata memory is full".into())
+            })?;
+        memory.prepare(descriptor_bytes)?;
         let mut data_bytes = 0_u64;
-        let mut frozen_segments = Vec::with_capacity(segments.len());
-        for segment in segments {
+        let mut frozen_segments = Vec::new();
+        frozen_segments
+            .try_reserve_exact(segments.len())
+            .map_err(|_| {
+                GaussError::ResourceExhausted("WAL archive metadata memory is full".into())
+            })?;
+        let pin = pinned::DirectoryPin::new(wal_dir)?;
+        for mut segment in segments {
             let bytes = fs::metadata(&segment.path)?.len();
             data_bytes = data_bytes.checked_add(bytes).ok_or_else(|| {
                 GaussError::InvalidRequest("WAL archive byte range overflow".to_string())
             })?;
+            pin.link(&mut segment)?;
             frozen_segments.push(FrozenWalSegment {
                 index: segment.index,
                 path: segment.path,
                 bytes,
+                _memory: segment.memory,
             });
         }
         let computed_end = base.lsn.checked_add(data_bytes).ok_or_else(|| {
@@ -1239,6 +1784,29 @@ impl FrozenWalArchive {
             return Ok(None);
         }
         let base_path = wal_dir.join(WAL_BASE_FILE);
+        match fs::metadata(&base_path) {
+            Ok(metadata) => {
+                if metadata.len() > 1024 * 1024 {
+                    return Err(wal_corruption(
+                        &base_path,
+                        "wal.base exceeds maximum encoded size",
+                    ));
+                }
+                memory.prepare(
+                    metadata
+                        .len()
+                        .checked_mul(2)
+                        .and_then(|n| n.checked_add(descriptor_bytes))
+                        .ok_or_else(|| {
+                            GaussError::ResourceExhausted(
+                                "WAL archive metadata memory is full".into(),
+                            )
+                        })?,
+                )?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         let base_bytes = match fs::read(&base_path) {
             Ok(bytes) => Some(bytes),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -1249,6 +1817,8 @@ impl FrozenWalArchive {
             base_bytes,
             segments: frozen_segments,
             end_lsn,
+            _pin: pin,
+            _memory: memory,
         }))
     }
 
@@ -1392,12 +1962,6 @@ pub fn prune_archives_older_than(
     })
 }
 
-#[derive(Clone, Debug)]
-struct WalSegment {
-    index: u64,
-    path: PathBuf,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TailPolicy {
     Strict,
@@ -1425,11 +1989,51 @@ fn scan_frames<F>(
     dir: &Path,
     watermark: u64,
     tail_policy: TailPolicy,
-    mut visitor: F,
+    visitor: F,
 ) -> Result<WalScanStats>
 where
     F: FnMut(WalRecord, Vec<u8>) -> Result<()>,
 {
+    scan_frames_inner(dir, watermark, tail_policy, false, visitor)
+}
+
+fn scan_frames_inner<F>(
+    dir: &Path,
+    watermark: u64,
+    tail_policy: TailPolicy,
+    verified_prefix: bool,
+    visitor: F,
+) -> Result<WalScanStats>
+where
+    F: FnMut(WalRecord, Vec<u8>) -> Result<()>,
+{
+    scan_frames_decoded(
+        dir,
+        watermark,
+        tail_policy,
+        verified_prefix,
+        false,
+        decode_record,
+        visitor,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_frames_decoded<T, F>(
+    dir: &Path,
+    watermark: u64,
+    tail_policy: TailPolicy,
+    verified_prefix: bool,
+    admitted: bool,
+    mut decoder: impl FnMut(&Path, u64, &[u8]) -> Result<T>,
+    mut visitor: F,
+) -> Result<WalScanStats>
+where
+    F: FnMut(T, Vec<u8>) -> Result<()>,
+{
+    let mut admission = admitted
+        .then(crate::relational::wal_decode::FrameAdmission::new)
+        .transpose()?;
     verify_archive_manifest_if_present(dir)?;
     let wal_base = read_wal_base(dir)?;
     let segments = wal_segments(dir)?;
@@ -1448,14 +2052,34 @@ where
 
     let mut stats = WalScanStats::default();
     let mut offset = wal_base.lsn;
-    let mut watermark_is_boundary = watermark <= wal_base.lsn;
+    let mut watermark_is_boundary = verified_prefix || watermark <= wal_base.lsn;
     for (segment_position, segment) in segments.iter().enumerate() {
         let final_active = segment_position + 1 == segments.len();
-        let (mut file, segment_len) = open_wal_reader(&segment.path)?;
+        let (mut file, segment_len, encrypted_segment) = if verified_prefix {
+            let range = WalRangeReader::open(&segment.path)?;
+            let encrypted_segment = matches!(&range, WalRangeReader::Encrypted(_));
+            let length = range.len() as u64;
+            let start = watermark.saturating_sub(offset).min(length);
+            (
+                checkpoint_prefix::open_reader_at(&segment.path, start)?,
+                length,
+                encrypted_segment,
+            )
+        } else {
+            open_wal_reader(&segment.path)?
+        };
         if segment_len == 0 && !final_active {
             return Err(wal_corruption(&segment.path, "empty sealed wal segment"));
         }
-        let mut segment_offset = 0_u64;
+        let mut segment_offset = if verified_prefix {
+            watermark.saturating_sub(offset).min(segment_len)
+        } else {
+            0
+        };
+        offset += segment_offset;
+        if segment_offset == segment_len {
+            continue;
+        }
         while segment_offset < segment_len {
             let record_lsn = offset;
             let remaining = segment_len - segment_offset;
@@ -1474,6 +2098,9 @@ where
                 );
             }
 
+            if let Some(admission) = &mut admission {
+                admission.prepare(HEADER_LEN, encrypted_segment)?;
+            }
             let mut header = [0_u8; HEADER_LEN];
             file.read_exact(&mut header)?;
             let len = u32::from_le_bytes(header[0..4].try_into().expect("length header"));
@@ -1496,17 +2123,20 @@ where
             }
 
             let expected_crc = u32::from_le_bytes(header[4..8].try_into().expect("crc header"));
+            if let Some(admission) = &mut admission {
+                admission.prepare(payload_len, encrypted_segment)?;
+            }
             let mut payload = vec![0_u8; payload_len];
             file.read_exact(&mut payload)?;
             if checksum(&payload) != expected_crc {
                 return Err(wal_corruption(&segment.path, "crc mismatch"));
             }
 
-            let record = decode_record(&segment.path, record_lsn, &payload)?;
+            let record = decoder(&segment.path, record_lsn, &payload)?;
             if record_lsn == watermark {
                 watermark_is_boundary = true;
             }
-            if record.lsn >= watermark {
+            if record_lsn >= watermark {
                 visitor(record, payload)?;
                 stats.records += 1;
             }
@@ -1597,64 +2227,8 @@ fn wal_corruption(path: &Path, message: &str) -> GaussError {
     }
 }
 
-fn wal_segments(dir: &Path) -> Result<Vec<WalSegment>> {
-    let wal_base = read_wal_base(dir)?;
-    let segments = all_wal_segments(dir)?
-        .into_iter()
-        .filter(|segment| segment.index >= wal_base.first_segment)
-        .collect::<Vec<_>>();
-    for (position, segment) in segments.iter().enumerate() {
-        let expected = wal_base
-            .first_segment
-            .checked_add(position as u64)
-            .ok_or_else(|| wal_corruption(&segment.path, "wal segment index overflow"))?;
-        if segment.index != expected {
-            let message = if position > 0 && segment.index == segments[position - 1].index {
-                format!("duplicate wal segment index {}", segment.index)
-            } else {
-                format!(
-                    "wal segment gap: expected index {expected}, found {}",
-                    segment.index
-                )
-            };
-            return Err(wal_corruption(&segment.path, &message));
-        }
-    }
-    Ok(segments)
-}
-
-fn all_wal_segments(dir: &Path) -> Result<Vec<WalSegment>> {
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut segments = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let path = entry.path();
-        if path
-            .extension()
-            .is_none_or(|extension| extension != "gdwal")
-        {
-            continue;
-        }
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| wal_corruption(&path, "WAL segment name is not valid UTF-8"))?;
-        let index = file_name
-            .strip_suffix(".gdwal")
-            .and_then(|value| value.parse::<u64>().ok())
-            .ok_or_else(|| wal_corruption(&path, "invalid WAL segment index"))?;
-        segments.push(WalSegment { index, path });
-    }
-    segments.sort_by_key(|segment| segment.index);
-    Ok(segments)
-}
-
 fn read_wal_base(dir: &Path) -> Result<WalBase> {
+    let _memory = layout::root(dir, std::mem::size_of::<WalBase>())?;
     let primary = dir.join(WAL_BASE_FILE);
     #[cfg(windows)]
     let path = if primary.exists() {
@@ -1672,13 +2246,17 @@ fn read_wal_base(dir: &Path) -> Result<WalBase> {
     if !path.exists() {
         return Ok(WalBase::default());
     }
-    if fs::metadata(&path)?.len() > 1024 * 1024 {
+    let encoded_len = fs::metadata(&path)?.len();
+    if encoded_len > 1024 * 1024 {
         return Err(wal_corruption(
             &path,
             "wal.base exceeds maximum encoded size",
         ));
     }
-    let bytes = encryption::read_persistent(&path)
+    let mut admission = crate::relational::wal_decode::FrameAdmission::new()?;
+    admission.prepare(encoded_len as usize, false)?;
+    let encoded = fs::read(&path)?;
+    let bytes = encryption::decode_persistent_bounded(&encoded, WAL_BASE_LEN)
         .map_err(|error| wal_corruption(&path, &format!("cannot decode wal.base: {error}")))?;
     if bytes.len() != WAL_BASE_LEN || &bytes[..8] != WAL_BASE_MAGIC {
         return Err(GaussError::WalCorruption {
@@ -1703,6 +2281,9 @@ fn read_wal_base(dir: &Path) -> Result<WalBase> {
 }
 
 fn write_wal_base(dir: &Path, wal_base: WalBase) -> Result<()> {
+    let _memory = layout::root(dir, std::mem::size_of::<WalBase>())?;
+    let mut admission = crate::relational::wal_decode::FrameAdmission::new()?;
+    admission.prepare(WAL_BASE_LEN, false)?;
     let path = dir.join(WAL_BASE_FILE);
     let tmp_path = dir.join(format!("{WAL_BASE_FILE}.tmp"));
     let mut payload = [0_u8; 16];
@@ -2099,20 +2680,69 @@ enum PersistedWalRecord {
     Legacy(WalEntry),
 }
 
-fn open_wal_reader(path: &Path) -> Result<(Box<dyn Read>, u64)> {
+fn open_wal_reader(path: &Path) -> Result<(Box<dyn Read>, u64, bool)> {
     let mut file = File::open(path)?;
     let mut prefix = [0_u8; 8];
     let read = file.read(&mut prefix)?;
     if read == encryption::MAGIC.len() && prefix == *encryption::MAGIC {
-        let length = encryption::persistent_plaintext_len(path)
-            .map_err(|error| wal_corruption(path, &format!("cannot inspect WAL: {error}")))?;
-        let reader = encryption::open_persistent_reader(path)
-            .map_err(|error| wal_corruption(path, &format!("cannot decrypt WAL: {error}")))?;
-        return Ok((reader, length));
+        let length = encryption::persistent_plaintext_len(path).map_err(|error| match error {
+            error @ GaussError::ResourceExhausted(_) => error,
+            error => wal_corruption(path, &format!("cannot inspect WAL: {error}")),
+        })?;
+        let reader = encryption::open_persistent_reader(path).map_err(|error| match error {
+            error @ GaussError::ResourceExhausted(_) => error,
+            error => wal_corruption(path, &format!("cannot decrypt WAL: {error}")),
+        })?;
+        return Ok((reader, length, true));
     }
     file.rewind()?;
     let length = file.metadata()?.len();
-    Ok((Box::new(file), length))
+    Ok((Box::new(file), length, false))
+}
+
+enum WalRangeReader {
+    Raw { file: File, len: usize },
+    Encrypted(encryption::PersistentFile),
+}
+
+impl WalRangeReader {
+    fn open(path: &Path) -> Result<Self> {
+        let mut file = File::open(path)?;
+        let len = usize::try_from(file.metadata()?.len())
+            .map_err(|_| wal_corruption(path, "WAL segment length exceeds usize"))?;
+        let mut prefix = [0_u8; 8];
+        if file.read(&mut prefix)? == encryption::MAGIC.len() && prefix == *encryption::MAGIC {
+            return Ok(Self::Encrypted(encryption::PersistentFile::open(path)?));
+        }
+        // A protected WAL normally has a raw CRC frame around each encrypted
+        // record. Secure persistence therefore must not reject this outer file.
+        Ok(Self::Raw { file, len })
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Raw { len, .. } => *len,
+            Self::Encrypted(file) => file.len(),
+        }
+    }
+
+    fn read_range_admitted(
+        &mut self,
+        range: Range<usize>,
+    ) -> Result<encryption::AdmittedRange<'_>> {
+        if range.start > range.end || range.end > self.len() {
+            return Err(GaussError::InvalidRequest(
+                "WAL range is outside segment".into(),
+            ));
+        }
+        match self {
+            Self::Raw { file, .. } => {
+                file.seek(std::io::SeekFrom::Start(range.start as u64))?;
+                encryption::AdmittedRange::read_from(file, range.end - range.start)
+            }
+            Self::Encrypted(file) => file.read_range_admitted(range),
+        }
+    }
 }
 
 fn decode_record(path: &Path, record_lsn: u64, payload: &[u8]) -> Result<WalRecord> {
@@ -2139,11 +2769,68 @@ fn decode_record(path: &Path, record_lsn: u64, payload: &[u8]) -> Result<WalReco
     }
 }
 
+fn decode_record_owned(
+    path: &Path,
+    lsn: u64,
+    payload: &[u8],
+) -> Result<crate::relational::wal_decode::Owned<WalRecord>> {
+    let plaintext =
+        encryption::decode_persistent_bounded(payload, payload.len()).map_err(|error| {
+            wal_corruption(path, &format!("cannot authenticate WAL record: {error}"))
+        })?;
+    decode_plain_record_owned(path, lsn, &plaintext)
+}
+fn decode_plain_record_owned(
+    path: &Path,
+    lsn: u64,
+    plaintext: &[u8],
+) -> Result<crate::relational::wal_decode::Owned<WalRecord>> {
+    // Inspect only the envelope shape, skipping values without serde's
+    // untagged Content copy of the entire mutation. Shape and typed decoding
+    // each use the same Guard, with separately admitted parser scratch.
+    #[derive(Deserialize)]
+    struct Shape {
+        #[serde(default)]
+        lsn: Option<serde::de::IgnoredAny>,
+        #[serde(default)]
+        entry: Option<serde::de::IgnoredAny>,
+    }
+    let corrupt_json = |error: GaussError| match error {
+        GaussError::Json(_) => wal_corruption(path, &format!("invalid WAL record JSON: {error}")),
+        other => other,
+    };
+    let record_shape = {
+        let shape =
+            crate::relational::wal_decode::decode::<Shape>(plaintext).map_err(corrupt_json)?;
+        shape.lsn.is_some() || shape.entry.is_some()
+    };
+    if record_shape {
+        crate::relational::wal_decode::decode::<WalRecord>(plaintext)
+            .map_err(corrupt_json)?
+            .try_map(|record| {
+                if record.lsn != lsn {
+                    return Err(wal_corruption(path, "lsn mismatch"));
+                }
+                Ok(record)
+            })
+    } else {
+        crate::relational::wal_decode::decode::<WalEntry>(plaintext)
+            .map_err(corrupt_json)?
+            .try_map(|entry| {
+                Ok(WalRecord {
+                    lsn,
+                    unix_ms: 0,
+                    entry,
+                })
+            })
+    }
+}
+
 fn encode_record(lsn: u64, entry: &WalEntry) -> Result<Vec<u8>> {
-    let plaintext = serde_json::to_vec(&WalRecord {
+    let plaintext = serde_json::to_vec(&BorrowedWalRecord {
         lsn,
         unix_ms: current_unix_ms(),
-        entry: entry.clone(),
+        entry,
     })?;
     encryption::encode_persistent(FileType::Wal, &plaintext).map(|payload| payload.into_owned())
 }
@@ -2166,9 +2853,11 @@ mod tests {
     use std::{
         fs::{File, OpenOptions},
         io::Write,
+        process::Command,
         time::Duration,
     };
 
+    use base64::Engine as _;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -2206,6 +2895,84 @@ mod tests {
         let records = Wal::load(temp.path()).unwrap();
         assert_eq!(records[0].lsn, 0);
         assert_eq!(records[1].lsn, first_end);
+    }
+
+    use super::{BorrowedPrepare, BorrowedWalRecord};
+
+    #[test]
+    fn owned_decoder_preserves_legacy_and_reordered_record_validation() {
+        let path = std::path::Path::new("compatibility fixture");
+        for bytes in [
+            br#"{"Delete":{"id":"old"}}"#.as_slice(),
+            br#"{"entry":{"Delete":{"id":"old"}},"unknown":{"array":[1,2]},"lsn":17}"#.as_slice(),
+            br#"{"unknown":null,"unix_ms":23,"lsn":17,"entry":{"Delete":{"id":"old"}}}"#.as_slice(),
+        ] {
+            let ordinary = super::decode_record(path, 17, bytes).unwrap();
+            let owned = super::decode_plain_record_owned(path, 17, bytes).unwrap();
+            assert_eq!(
+                serde_json::to_value(&ordinary).unwrap(),
+                serde_json::to_value(&*owned).unwrap()
+            );
+        }
+        for bytes in [
+            br#"{"lsn":18,"entry":{"Delete":{"id":"old"}}}"#.as_slice(),
+            br#"{"lsn":17,"lsn":17,"entry":{"Delete":{"id":"old"}}}"#.as_slice(),
+            br#"{"entry":{"Delete":{"id":"old"}}}"#.as_slice(),
+            br#"{"lsn":null,"entry":{"Delete":{"id":"old"}}}"#.as_slice(),
+            br#"{"Delete":{"id":"old"},"extra":null}"#.as_slice(),
+        ] {
+            assert!(super::decode_record(path, 17, bytes).is_err());
+            assert!(matches!(
+                super::decode_plain_record_owned(path, 17, bytes),
+                Err(crate::GaussError::WalCorruption { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn borrowed_prepare_and_record_keep_exact_existing_json_shape() {
+        let prepare = crate::transaction_journal::TransactionPrepare {
+            version: 1,
+            transaction_id: crate::transaction_journal::TransactionId::new(),
+            commit_sequence: 7,
+            target: crate::transaction_journal::TransactionTarget::Catalog,
+            mutation: Box::new(WalEntry::DropCollection { name: "雪".into() }),
+            audit: crate::transaction_journal::TransactionAudit::mutation(
+                "drop",
+                Some("雪"),
+                &crate::audit::AuditContext::embedded(),
+                json!({"values":[null,7]}),
+            ),
+            idempotency: None,
+        };
+        let entry = WalEntry::TransactionPrepare {
+            prepare: prepare.clone(),
+        };
+        let old = serde_json::to_vec(&WalRecord {
+            lsn: 17,
+            unix_ms: 23,
+            entry: entry.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            old,
+            serde_json::to_vec(&BorrowedWalRecord {
+                lsn: 17,
+                unix_ms: 23,
+                entry: &entry
+            })
+            .unwrap()
+        );
+        let borrowed = BorrowedPrepare::TransactionPrepare { prepare: &prepare };
+        assert_eq!(
+            old,
+            serde_json::to_vec(&BorrowedWalRecord {
+                lsn: 17,
+                unix_ms: 23,
+                entry: &borrowed
+            })
+            .unwrap()
+        );
     }
 
     #[test]
@@ -2309,6 +3076,7 @@ mod tests {
                 nid: Nid::from_parts(3, 2).unwrap(),
             }],
             deferred_sessions: vec![GraphDeferredSessionMutation::Open {
+                owner: None,
                 session_id: "load-1".to_string(),
             }],
             idempotency: Some(GraphIdempotencyState {
@@ -2825,6 +3593,163 @@ mod tests {
         let error = Wal::load(temp.path()).unwrap_err();
         assert!(matches!(error, crate::GaussError::WalCorruption { .. }));
         assert!(error.to_string().contains("invalid WAL record JSON"));
+    }
+
+    #[test]
+    fn random_record_read_checks_boundary_and_retained_base() {
+        let temp = TempDir::new().unwrap();
+        let mut wal = Wal::open_with_segment_bytes(temp.path(), 100).unwrap();
+        let first_end = wal
+            .append(&WalEntry::Delete { id: "first".into() })
+            .unwrap();
+        let second_end = wal
+            .append(&WalEntry::Delete {
+                id: "second".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            Wal::read_at(temp.path(), 0).unwrap().entry,
+            WalEntry::Delete { id } if id == "first"
+        ));
+        assert!(matches!(
+            Wal::read_at(temp.path(), first_end).unwrap().entry,
+            WalEntry::Delete { id } if id == "second"
+        ));
+        assert!(matches!(
+            Wal::read_at(temp.path(), first_end - 1),
+            Err(crate::GaussError::WalCorruption { .. })
+        ));
+        assert!(matches!(
+            Wal::read_at(temp.path(), second_end),
+            Err(crate::GaussError::WalCorruption { .. })
+        ));
+
+        wal.drop_prefix(first_end).unwrap();
+        assert!(matches!(
+            Wal::read_at(temp.path(), 0),
+            Err(crate::GaussError::WalCorruption { .. })
+        ));
+        assert!(matches!(
+            Wal::read_at(temp.path(), first_end).unwrap().entry,
+            WalEntry::Delete { id } if id == "second"
+        ));
+    }
+
+    #[test]
+    fn encrypted_random_read_handles_raw_frames_and_legacy_envelope() {
+        const CHILD: &str = "CHIRONDB_WAL_RANDOM_READ_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("wal::tests::encrypted_random_read_helper")
+            .arg("--nocapture")
+            .env(CHILD, temp.path())
+            .env("RUST_TEST_THREADS", "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "encrypted WAL helper failed: {status}");
+    }
+
+    #[test]
+    fn encrypted_random_read_helper() {
+        let Some(root) = std::env::var_os("CHIRONDB_WAL_RANDOM_READ_CHILD") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let keyring_path = root.join("keyring.json");
+        std::fs::write(
+            &keyring_path,
+            json!({
+                "version": 1,
+                "active_key_id": "wal-read-key",
+                "keys": [{
+                    "id": "wal-read-key",
+                    "key_base64": base64::engine::general_purpose::STANDARD.encode([91_u8; 32]),
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&keyring_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+        crate::encryption::install_process_keyring(
+            crate::encryption::Keyring::load(&keyring_path).unwrap(),
+            true,
+        )
+        .unwrap();
+        let dir = root.join("wal");
+        let mut wal = Wal::open(&dir).unwrap();
+        let first_end = wal.append(&WalEntry::Delete { id: "one".into() }).unwrap();
+        wal.append(&WalEntry::Delete { id: "two".into() }).unwrap();
+        drop(wal);
+        for lsn in [0, first_end] {
+            Wal::inspect_at(&dir, lsn, |record| {
+                assert!(matches!(&record.entry, WalEntry::Delete { .. }));
+                Ok(())
+            })
+            .unwrap();
+            assert!(matches!(
+                Wal::read_at(&dir, lsn).unwrap().entry,
+                WalEntry::Delete { .. }
+            ));
+        }
+        for lsn in [0, first_end] {
+            let owned = Wal::read_at_owned(&dir, lsn).unwrap();
+            assert!(matches!(&owned.entry, WalEntry::Delete { .. }));
+        }
+        let segment = dir.join("000000.gdwal");
+        crate::encryption::encrypt_file_in_place(&segment, crate::encryption::FileType::Wal)
+            .unwrap();
+        assert_eq!(
+            &std::fs::read(&segment).unwrap()[..8],
+            crate::encryption::MAGIC
+        );
+        assert!(matches!(
+            Wal::read_at(&dir, 0).unwrap().entry,
+            WalEntry::Delete { id } if id == "one"
+        ));
+        assert!(matches!(
+            Wal::read_at(&dir, first_end).unwrap().entry,
+            WalEntry::Delete { id } if id == "two"
+        ));
+        for lsn in [0, first_end] {
+            Wal::inspect_at(&dir, lsn, |record| {
+                assert!(matches!(&record.entry, WalEntry::Delete { .. }));
+                Ok(())
+            })
+            .unwrap();
+        }
+        for lsn in [0, first_end] {
+            let owned = Wal::read_at_owned(&dir, lsn).unwrap();
+            assert!(matches!(&owned.entry, WalEntry::Delete { .. }));
+        }
+        let mut seen = 0;
+        Wal::scan_journal_from(&dir, 0, |owned| {
+            assert!(matches!(&owned.entry, WalEntry::Delete { .. }));
+            seen += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, 2);
+        let keyring = crate::encryption::Keyring::load(&keyring_path).unwrap();
+        let mut forged =
+            crate::encryption::encrypt_bytes(&keyring, crate::encryption::FileType::Wal, b"{}")
+                .unwrap();
+        forged[28..36].copy_from_slice(&u64::MAX.to_le_bytes());
+        let error =
+            crate::encryption::decode_persistent_bounded(&forged, forged.len()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("encrypted plaintext exceeds admitted frame")
+        );
     }
 
     #[test]

@@ -833,7 +833,7 @@ fn read_artifact(path: &Path, expected_flags: u32) -> Result<DecodedArtifact> {
             "overlay artifact length violates fixed limits",
         ));
     }
-    let header = file.read_range(0..ARTIFACT_HEADER_BYTES)?;
+    let header = file.read_range_admitted(0..ARTIFACT_HEADER_BYTES)?;
     if &header[..8] != MAGIC {
         return Err(corruption(path, "bad overlay magic"));
     }
@@ -880,7 +880,7 @@ fn read_artifact(path: &Path, expected_flags: u32) -> Result<DecodedArtifact> {
     if end != file_len || length < 4 {
         return Err(corruption(path, "overlay section range mismatch"));
     }
-    let section_bytes = file.read_range(offset as usize..end as usize)?;
+    let section_bytes = file.read_range_admitted(offset as usize..end as usize)?;
     let payload_len = section_bytes.len() - 4;
     let expected_payload_crc = u32::from_le_bytes(
         section_bytes[payload_len..]

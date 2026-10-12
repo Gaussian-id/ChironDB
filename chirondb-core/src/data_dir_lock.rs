@@ -107,9 +107,28 @@ fn open_lock_file(path: &Path) -> std::io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    options.open(path)
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other(
+            "data directory lock must be a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid takes no pointers and only reads the process identity.
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(std::io::Error::other(
+                "data directory lock must be owned by the caller",
+            ));
+        }
+    }
+    Ok(file)
 }
 
 fn write_owner_metadata(file: &File, root: &Path) -> Result<()> {
@@ -204,6 +223,17 @@ mod tests {
 
     use super::DataDirLock;
     use crate::GaussError;
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_symlink_cannot_overwrite_another_file() {
+        let sandbox = TempDir::new().unwrap();
+        let victim = sandbox.path().join("operator-file");
+        std::fs::write(&victim, b"must remain intact").unwrap();
+        std::os::unix::fs::symlink(&victim, sandbox.path().join(".db.chirondb.lock")).unwrap();
+        assert!(DataDirLock::acquire(&sandbox.path().join("db")).is_err());
+        assert_eq!(std::fs::read(victim).unwrap(), b"must remain intact");
+    }
 
     #[test]
     fn lock_is_exclusive_and_stale_metadata_does_not_block_reopen() {

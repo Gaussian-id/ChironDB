@@ -14,6 +14,8 @@ pub mod rabitq;
 pub mod rabitq_estimator;
 pub mod search_metrics;
 pub mod vamana;
+mod vector_read;
+pub use vector_read::VectorRead;
 
 use crate::Result;
 use crate::model::Point;
@@ -324,6 +326,110 @@ pub trait IndexBackend: Send + Sync + std::fmt::Debug {
             recall_target,
             filter,
             cancelled,
+        )
+    }
+
+    /// Fallible candidate selection. Storage-backed implementations must override
+    /// this adapter to propagate read failures; it preserves legacy implementations.
+    fn try_candidate_ids_with_ef(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: Option<usize>,
+    ) -> Result<Vec<String>> {
+        Ok(self.candidate_ids_with_ef(query, k, ef_search))
+    }
+
+    /// Fallible candidate selection. Storage-backed implementations must override
+    /// this adapter to propagate read failures; it preserves legacy implementations.
+    fn try_candidate_ids_with_ef_filter(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: Option<usize>,
+        filter: Option<&dyn FilterPredicate>,
+    ) -> Result<Vec<String>> {
+        Ok(self.candidate_ids_with_ef_filter(query, k, ef_search, filter))
+    }
+
+    /// Fallible candidate selection. Storage-backed implementations must override
+    /// this adapter to propagate read failures; it preserves legacy implementations.
+    fn try_candidate_ids_with_recall_target(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: Option<usize>,
+        recall_target: f32,
+        filter: Option<&dyn FilterPredicate>,
+    ) -> Result<Vec<String>> {
+        Ok(self.candidate_ids_with_recall_target(query, k, ef_search, recall_target, filter))
+    }
+
+    /// Fallible candidate selection. Storage-backed implementations must override
+    /// this adapter to propagate read failures; it preserves legacy implementations.
+    fn try_candidate_ids_with_recall_target_cancellable(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: Option<usize>,
+        recall_target: f32,
+        filter: Option<&dyn FilterPredicate>,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<String>> {
+        Ok(self.candidate_ids_with_recall_target_cancellable(
+            query,
+            k,
+            ef_search,
+            recall_target,
+            filter,
+            cancelled,
+        ))
+    }
+
+    /// Fallible candidate selection. Storage-backed implementations must override
+    /// this adapter to propagate read failures; it preserves legacy implementations.
+    fn try_candidate_ids_with_recall_target_ordinal_filter(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: Option<usize>,
+        recall_target: f32,
+        filter: Option<&dyn FilterPredicate>,
+        ordinal_filter: Option<&dyn OrdinalFilterPredicate>,
+    ) -> Result<Vec<String>> {
+        Ok(self.candidate_ids_with_recall_target_ordinal_filter(
+            query,
+            k,
+            ef_search,
+            recall_target,
+            filter,
+            ordinal_filter,
+        ))
+    }
+
+    /// Fallible candidate selection. Storage-backed implementations must override
+    /// this adapter to propagate read failures; it preserves legacy implementations.
+    #[allow(clippy::too_many_arguments)]
+    fn try_candidate_ids_with_recall_target_ordinal_filter_cancellable(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: Option<usize>,
+        recall_target: f32,
+        filter: Option<&dyn FilterPredicate>,
+        ordinal_filter: Option<&dyn OrdinalFilterPredicate>,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<String>> {
+        Ok(
+            self.candidate_ids_with_recall_target_ordinal_filter_cancellable(
+                query,
+                k,
+                ef_search,
+                recall_target,
+                filter,
+                ordinal_filter,
+                cancelled,
+            ),
         )
     }
 

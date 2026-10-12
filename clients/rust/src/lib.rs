@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use chirondb_types::Filter;
+pub use chirondb_types::chironql::{ChironQlRequest, ChironQlResponse, ExecutionDomain};
 pub use chirondb_types::graph::{
     ColdTraversalBudget, ConfigureEdgeTypeResult, EdgeToken, GraphConstraint,
     GraphDeferredSessionId, GraphDeferredSessionResult, GraphDeferredSessionState,
@@ -13,6 +14,10 @@ pub use chirondb_types::graph::{
     GraphLifecycleResult, GraphMutationReceipt, GraphRelationScope, GraphTraversalQueryRequest,
     GraphTraversalQueryResult, GraphTraversalReturn, GraphTraversalRows, GraphTraverseRequest,
     RelateRequest, RelateResult, TraversalBudget,
+};
+pub use chirondb_types::relational::{
+    RelationalValue, SqlExecutionRequest, SqlExecutionResponse, SqlResult, SqlStatementRequest,
+    SqlTransactionHandleResponse, SqlTransactionState,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -27,10 +32,145 @@ pub enum Error {
     InvalidStructuralPoint { id: String, message: String },
     #[error("invalid unsafe structural embedding override: {0}")]
     InvalidUnsafeStructuralOverride(String),
+    #[error("invalid ML request: {0}")]
+    InvalidMlRequest(String),
 }
 
 /// Primary public error name. `Error` remains available for source compatibility.
 pub type ChironDbError = Error;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MlTask {
+    Classification,
+    Regression,
+}
+
+impl MlTask {
+    fn keyword(self) -> &'static str {
+        match self {
+            Self::Classification => "CLASSIFICATION",
+            Self::Regression => "REGRESSION",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MlModel {
+    DecisionTree,
+    RandomForest,
+}
+
+impl MlModel {
+    fn keyword(self) -> &'static str {
+        match self {
+            Self::DecisionTree => "DECISION_TREE",
+            Self::RandomForest => "RANDOM_FOREST",
+        }
+    }
+}
+
+#[cfg(test)]
+mod ml_tests {
+    use super::*;
+
+    #[test]
+    fn sdk_uses_one_query_shape_for_every_model_and_task() {
+        for task in [MlTask::Classification, MlTask::Regression] {
+            for model in [MlModel::DecisionTree, MlModel::RandomForest] {
+                let query = ml_query(
+                    "sales_forecast",
+                    "sales",
+                    "demand",
+                    &["sale_date", "region", "price"],
+                    task,
+                    model,
+                )
+                .unwrap();
+                assert!(query.starts_with("ML MATERIALIZE sales_forecast FROM sales TARGET demand FEATURES (sale_date, region, price) TASK "));
+                assert!(query.ends_with(&format!(" USING {};", model.keyword())));
+            }
+        }
+    }
+
+    #[test]
+    fn sdk_rejects_identifier_injection_and_duplicate_features() {
+        assert!(
+            ml_query(
+                "v; DROP TABLE t",
+                "s",
+                "y",
+                &["x"],
+                MlTask::Regression,
+                MlModel::DecisionTree
+            )
+            .is_err()
+        );
+        assert!(
+            ml_query(
+                "v",
+                "s",
+                "y",
+                &["x", "x"],
+                MlTask::Regression,
+                MlModel::DecisionTree
+            )
+            .is_err()
+        );
+    }
+}
+
+fn ml_identifier(value: &str) -> Result<&str> {
+    let mut chars = value.chars();
+    if !matches!(chars.next(), Some('a'..='z' | 'A'..='Z' | '_'))
+        || !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return Err(Error::InvalidMlRequest(format!(
+            "invalid identifier: {value}"
+        )));
+    }
+    Ok(value)
+}
+
+fn ml_job_id(value: &str) -> Result<&str> {
+    if value.is_empty()
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    {
+        return Err(Error::InvalidMlRequest("invalid job ID".into()));
+    }
+    Ok(value)
+}
+
+fn ml_query(
+    view: &str,
+    source: &str,
+    target: &str,
+    features: &[&str],
+    task: MlTask,
+    model: MlModel,
+) -> Result<String> {
+    if features.is_empty() {
+        return Err(Error::InvalidMlRequest("features must not be empty".into()));
+    }
+    let features = features
+        .iter()
+        .map(|feature| ml_identifier(feature))
+        .collect::<Result<Vec<_>>>()?;
+    let mut unique = std::collections::HashSet::new();
+    if !features.iter().all(|feature| unique.insert(*feature)) {
+        return Err(Error::InvalidMlRequest("features must be distinct".into()));
+    }
+    Ok(format!(
+        "ML MATERIALIZE {} FROM {} TARGET {} FEATURES ({}) TASK {} USING {};",
+        ml_identifier(view)?,
+        ml_identifier(source)?,
+        ml_identifier(target)?,
+        features.join(", "),
+        task.keyword(),
+        model.keyword(),
+    ))
+}
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -406,6 +546,140 @@ impl ChironDbClient {
     pub async fn health(&self) -> Result<serde_json::Value> {
         let r = self.req(Method::GET, "/health").send().await?;
         self.ok(r).await
+    }
+
+    /// Execute one atomic native relational request through `/v1/sql`.
+    pub async fn execute_sql(&self, request: &SqlExecutionRequest) -> Result<SqlExecutionResponse> {
+        let response = self
+            .req(Method::POST, "/v1/sql")
+            .json(request)
+            .send()
+            .await?;
+        self.ok(response).await
+    }
+
+    /// Open a server-side relational transaction pinned to the current
+    /// snapshot. The opaque handle is bound to the authenticated principal.
+    pub async fn begin_sql_transaction(&self) -> Result<SqlTransactionHandleResponse> {
+        let response = self
+            .req(Method::POST, "/v1/sql/transactions")
+            .send()
+            .await?;
+        self.ok(response).await
+    }
+
+    /// Execute statements against an interactive transaction's private
+    /// writes. The response has `committed=false` until commit succeeds.
+    pub async fn execute_sql_transaction(
+        &self,
+        handle: &str,
+        request: &SqlExecutionRequest,
+    ) -> Result<SqlExecutionResponse> {
+        let response = self
+            .req(
+                Method::POST,
+                &format!("/v1/sql/transactions/{handle}/execute"),
+            )
+            .json(request)
+            .send()
+            .await?;
+        self.ok(response).await
+    }
+
+    pub async fn commit_sql_transaction(&self, handle: &str) -> Result<SqlExecutionResponse> {
+        let response = self
+            .req(
+                Method::POST,
+                &format!("/v1/sql/transactions/{handle}/commit"),
+            )
+            .send()
+            .await?;
+        self.ok(response).await
+    }
+
+    pub async fn rollback_sql_transaction(
+        &self,
+        handle: &str,
+    ) -> Result<SqlTransactionHandleResponse> {
+        let response = self
+            .req(Method::DELETE, &format!("/v1/sql/transactions/{handle}"))
+            .send()
+            .await?;
+        self.ok(response).await
+    }
+
+    /// Execute one ChironQL 1.4 statement, including `SQL` and read-only
+    /// multi-model `PIPELINE` statements.
+    pub async fn execute_chironql(&self, request: &ChironQlRequest) -> Result<ChironQlResponse> {
+        let response = self
+            .req(Method::POST, "/v1/chironql")
+            .json(request)
+            .send()
+            .await?;
+        self.ok(response).await
+    }
+
+    /// Create or refresh a tabular ML materialized view. Reuse the same
+    /// arguments after source data changes to refresh its published generation.
+    pub async fn materialize_ml(
+        &self,
+        view: &str,
+        source: &str,
+        target: &str,
+        features: &[&str],
+        task: MlTask,
+        model: MlModel,
+    ) -> Result<ChironQlResponse> {
+        let query = ml_query(view, source, target, features, task, model)?;
+        self.execute_chironql(&ChironQlRequest {
+            query,
+            ..ChironQlRequest::default()
+        })
+        .await
+    }
+
+    /// Fetch status, error, source version, and metrics for one ML job.
+    pub async fn get_ml_job(&self, job_id: &str) -> Result<serde_json::Value> {
+        let response = self
+            .req(Method::GET, &format!("/v1/ml/jobs/{}", ml_job_id(job_id)?))
+            .send()
+            .await?;
+        self.ok(response).await
+    }
+
+    /// Read one page of the latest published ML view generation.
+    pub async fn get_ml_view(
+        &self,
+        name: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        if !(1..=1000).contains(&limit) {
+            return Err(Error::InvalidMlRequest(
+                "limit must be between 1 and 1000".into(),
+            ));
+        }
+        let mut request = self.req(
+            Method::GET,
+            &format!("/v1/ml/views/{}", ml_identifier(name)?),
+        );
+        request = request.query(&[("limit", limit.to_string())]);
+        if let Some(cursor) = cursor {
+            request = request.query(&[("cursor", cursor)]);
+        }
+        self.ok(request.send().await?).await
+    }
+
+    /// Drop a materialized view so a new ML definition may use its name.
+    pub async fn drop_ml_view(&self, name: &str) -> Result<serde_json::Value> {
+        let response = self
+            .req(
+                Method::DELETE,
+                &format!("/v1/ml/views/{}", ml_identifier(name)?),
+            )
+            .send()
+            .await?;
+        self.ok(response).await
     }
 
     pub async fn create_collection(&self, config: CollectionConfig) -> Result<CollectionConfig> {
@@ -999,6 +1273,8 @@ impl ChironDbClient {
 /// Additive native text retrieval contract; legacy sparse dimensions are unchanged.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TextHybridQuery {
+    /// Empty selects BM25 only; otherwise fuse default dense and BM25 ranks.
+    #[serde(default)]
     pub vector: Vec<f32>,
     pub query: String,
     pub text_field: String,

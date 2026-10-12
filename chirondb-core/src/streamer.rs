@@ -81,7 +81,7 @@ impl Streamer {
     pub fn should_seal(&self, max_bytes: usize) -> bool {
         self.vector_bytes >= max_bytes
             || (self.vector_bytes >= MEMORY_PRESSURE_SEAL_MIN_BYTES
-                && cgroup_memory_usage_and_limit()
+                && crate::resource_profile::cgroup_memory_usage_and_limit()
                     .is_some_and(|(used, limit)| under_memory_pressure(used, limit)))
     }
 
@@ -99,39 +99,8 @@ fn under_memory_pressure(used: u64, limit: u64) -> bool {
 }
 
 pub(crate) fn memory_pressure() -> bool {
-    cgroup_memory_usage_and_limit().is_some_and(|(used, limit)| under_memory_pressure(used, limit))
-}
-
-#[cfg(target_os = "linux")]
-fn cgroup_memory_usage_and_limit() -> Option<(u64, u64)> {
-    for (usage_path, limit_path) in [
-        ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"),
-        (
-            "/sys/fs/cgroup/memory/memory.usage_in_bytes",
-            "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-        ),
-    ] {
-        let Some(used) = read_cgroup_bytes(usage_path) else {
-            continue;
-        };
-        let Some(limit) = read_cgroup_bytes(limit_path) else {
-            continue;
-        };
-        if limit < (1_u64 << 60) {
-            return Some((used, limit));
-        }
-    }
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn read_cgroup_bytes(path: &str) -> Option<u64> {
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
-}
-
-#[cfg(not(target_os = "linux"))]
-fn cgroup_memory_usage_and_limit() -> Option<(u64, u64)> {
-    None
+    crate::resource_profile::cgroup_memory_usage_and_limit()
+        .is_some_and(|(used, limit)| under_memory_pressure(used, limit))
 }
 
 pub(crate) fn point_bytes(point: &Point) -> usize {

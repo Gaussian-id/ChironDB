@@ -59,6 +59,7 @@ fn execute<'a>(
     include_admin: bool,
 ) -> TraversalExecution {
     exact_bfs(MutableTraversal {
+        access: None,
         graph,
         anchors: vec![anchor],
         visible_anchor_count: 1,
@@ -73,11 +74,11 @@ fn execute<'a>(
         },
         cancelled: &AtomicBool::new(false),
         payload_for_nid: |candidate| {
-            payloads.get(&candidate).and_then(|payload| {
+            Ok(payloads.get(&candidate).and_then(|payload| {
                 let visible = include_admin
                     || payload.get("tenant_id").and_then(Value::as_str) == Some("acme");
                 visible.then(|| payload.clone())
-            })
+            }))
         },
         namespaces_for_payload: |payload| {
             let tenant = payload["tenant_id"].as_str().unwrap();
@@ -160,6 +161,7 @@ fn c11_high_cardinality_tenant_adjacency_is_selected_without_enumeration() {
         let target = nid(tenant_index * 2 + 2);
         let tenant = format!("tenant-{tenant_index:04}");
         let execution = exact_bfs(MutableTraversal {
+            access: None,
             graph: &graph,
             anchors: vec![source],
             visible_anchor_count: 1,
@@ -173,7 +175,7 @@ fn c11_high_cardinality_tenant_adjacency_is_selected_without_enumeration() {
                 ..TraversalBudget::default()
             },
             cancelled: &AtomicBool::new(false),
-            payload_for_nid: |candidate| payloads.get(&candidate).cloned(),
+            payload_for_nid: |candidate| Ok(payloads.get(&candidate).cloned()),
             namespaces_for_payload: |_| vec![GraphNamespace::Tenant(tenant.clone())],
         })
         .unwrap();
@@ -467,7 +469,7 @@ fn c11_scoped_runtime_redacts_existence_and_refuses_incident_tenant_moves() {
             &cross,
         )
         .unwrap_err();
-    assert!(error.to_string().contains("graph.tenant_move_has_edges"));
+    assert!(error.to_string().contains("ownership cannot be changed"));
     assert_eq!(coll.read().wal.len().unwrap(), wal_before);
     assert_eq!(db.graph_identity.snapshot(), identity_before);
     assert_eq!(

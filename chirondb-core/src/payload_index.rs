@@ -176,6 +176,7 @@ pub(crate) fn build_payload_index(points: &HashMap<String, Point>) -> PayloadInd
 
 /// Iterator variant: builds from any live-point stream (multi-segment
 /// collections chain the streamer and every searcher store).
+#[cfg(test)]
 pub(crate) fn build_payload_index_iter<P: Borrow<Point>>(
     points: impl Iterator<Item = P>,
 ) -> PayloadIndex {
@@ -186,6 +187,17 @@ pub(crate) fn build_payload_index_iter<P: Borrow<Point>>(
     index
 }
 
+pub(crate) fn try_build_payload_index_iter<P: Borrow<Point>>(
+    points: impl Iterator<Item = crate::Result<P>>,
+) -> crate::Result<PayloadIndex> {
+    let mut index = PayloadIndex::default();
+    for point in points {
+        insert_payload_point(&mut index, point?.borrow());
+    }
+    Ok(index)
+}
+
+#[cfg(test)]
 pub(crate) fn build_ordinal_payload_index<P: Borrow<Point>>(
     points: impl Iterator<Item = (u32, P)>,
 ) -> OrdinalPayloadIndex {
@@ -194,6 +206,18 @@ pub(crate) fn build_ordinal_payload_index<P: Borrow<Point>>(
         insert_ordinal_payload_point(&mut index, point.borrow(), ordinal);
     }
     index
+}
+
+/// Build postings incrementally and abort if a source record cannot be read.
+pub(crate) fn try_build_ordinal_payload_index<P: Borrow<Point>>(
+    points: impl Iterator<Item = crate::Result<(u32, P)>>,
+) -> crate::Result<OrdinalPayloadIndex> {
+    let mut index = OrdinalPayloadIndex::default();
+    for point in points {
+        let (ordinal, point) = point?;
+        insert_ordinal_payload_point(&mut index, point.borrow(), ordinal);
+    }
+    Ok(index)
 }
 
 fn insert_ordinal_payload_point(index: &mut OrdinalPayloadIndex, point: &Point, ordinal: u32) {

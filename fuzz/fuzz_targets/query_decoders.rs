@@ -11,4 +11,5 @@ fuzz_target!(|data: &[u8]| {
     let _ = serde_json::from_slice::<chirondb_core::SearchRequest>(data);
     let _ = serde_json::from_slice::<chirondb_core::MultiSearchRequest>(data);
     let _ = serde_json::from_slice::<chirondb_core::Point>(data);
+    let _ = serde_json::from_slice::<chirondb_core::security::CollectionPolicy>(data);
 });

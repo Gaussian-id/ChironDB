@@ -13,6 +13,7 @@ use std::{
     time::Instant,
 };
 
+use crate::graph_traversal::TraversalAccess as _;
 use serde_json::Value;
 
 use crate::{
@@ -77,6 +78,41 @@ struct RawPinnedGraphExpansion {
 struct TraversalRunOptions<'a> {
     statement_filter: Option<&'a crate::Filter>,
     capture: TraversalCapture,
+    authorization: Option<&'a crate::security::AccessContext>,
+}
+
+pub(super) struct GraphQueryIdentity<'a> {
+    pub(super) database_id: uuid::Uuid,
+    pub(super) authorization: Option<&'a crate::security::AccessContext>,
+    pub(super) output_limit: u64,
+    pub(super) output_bytes: std::cell::Cell<u64>,
+}
+
+impl GraphQueryIdentity<'_> {
+    fn charge_output(&self, payload: Option<&Value>) -> Result<()> {
+        let Some(context) = self.authorization else {
+            return Ok(());
+        };
+        context.publication_permit()?;
+        let base = self
+            .output_bytes
+            .get()
+            .checked_add(4096)
+            .filter(|next| *next <= self.output_limit)
+            .ok_or(crate::security::SecurityError::BudgetExceeded)?;
+        let payload_bytes = payload.map_or(Ok(0), |payload| {
+            crate::security::storage::serialized_len(
+                payload,
+                ((self.output_limit - base) / 64) as usize,
+            )
+        })? as u64;
+        let next = base
+            .checked_add(payload_bytes.saturating_mul(64))
+            .filter(|next| *next <= self.output_limit)
+            .ok_or(crate::security::SecurityError::BudgetExceeded)?;
+        self.output_bytes.set(next);
+        Ok(())
+    }
 }
 
 /// Traversal view that preserves the mutable graph's exact visibility while
@@ -410,18 +446,23 @@ fn finalize_graph_response(
 
 pub(super) fn audit_error_code(error: &GaussError) -> &'static str {
     match error {
+        GaussError::Security(error) => error.code(),
         GaussError::Graph(error) => error.code.as_str(),
         GaussError::CollectionExists(_) => "chirondb.collection_exists",
         GaussError::CollectionNotFound(_) => "chirondb.collection_not_found",
         GaussError::PointNotFound(_) => "chirondb.point_not_found",
+        GaussError::DuplicateKey => "chirondb.duplicate_key",
         GaussError::DimensionMismatch { .. } => "chirondb.dimension_mismatch",
         GaussError::InvalidCollectionName(_) => "chirondb.invalid_collection_name",
         GaussError::InvalidRequest(_) => "chirondb.invalid_request",
+        GaussError::SqlRowPreconditionFailed { .. } => "chironql.sql_row_precondition_failed",
         GaussError::ResourceExhausted(_) => "chirondb.resource_exhausted",
         GaussError::AuditUnavailable(_) => "chirondb.audit_unavailable",
         GaussError::DataDirLocked { .. } => "chirondb.data_dir_locked",
         GaussError::WalCorruption { .. } => "chirondb.wal_corruption",
         GaussError::WalUnavailable(_) => "chirondb.wal_unavailable",
+        GaussError::CommitOutcomeUnknown { .. } => "transaction.outcome_unknown",
+        GaussError::CommitRejected { .. } => "transaction.rejected",
         GaussError::SegmentCorruption { .. } => "chirondb.segment_corruption",
         GaussError::Io(_) => "chirondb.io",
         GaussError::Json(_) => "chirondb.json",
@@ -554,7 +595,7 @@ enum P3ReachabilityDecision {
 
 #[derive(Debug)]
 struct ProgressiveRankCursor {
-    ranked: Vec<RankedPoint>,
+    ranked: crate::search::Rankings,
     position: usize,
     complete: bool,
 }
@@ -785,7 +826,7 @@ impl Db {
     pub(super) fn prepare_graph_dispatch(
         &self,
         collection_name: &str,
-        graph: GraphConstraint,
+        mut graph: GraphConstraint,
         statement_filter: Option<&Filter>,
         vector_name: Option<&str>,
         k: usize,
@@ -794,6 +835,7 @@ impl Db {
         scope: &crate::tenant::TenantScope,
         cancelled: &AtomicBool,
     ) -> Result<PreparedGraphDispatch> {
+        graph.budget = crate::graph_admission::resolve_default_memory(graph.budget);
         let prepare_started = Instant::now();
         let allow_degraded = graph.allow_degraded;
         if mode == GraphStatementMode::HybridWeighted {
@@ -1477,6 +1519,7 @@ impl Db {
             GaussError::InvalidRequest("P3 graph search requires graph".to_string())
         })?;
         apply_request_time_budget(&mut graph, budget_ms)?;
+        graph.budget = crate::graph_admission::resolve_default_memory(graph.budget);
         let full_request: crate::graph::GraphTraverseRequest = graph.into();
         super::graph_runtime::validate_traversal_request(&full_request)?;
         let budget = full_request.budget.validate()?;
@@ -1769,6 +1812,7 @@ impl Db {
             GaussError::InvalidRequest("P3H graph search requires graph".to_string())
         })?;
         apply_request_time_budget(&mut graph, budget_ms)?;
+        graph.budget = crate::graph_admission::resolve_default_memory(graph.budget);
         let full_request: crate::graph::GraphTraverseRequest = graph.into();
         super::graph_runtime::validate_traversal_request(&full_request)?;
         let budget = full_request.budget.validate()?;
@@ -1865,8 +1909,8 @@ impl Db {
         )?;
 
         let mut candidates = HashMap::<String, P3HybridCandidate>::new();
-        let mut dense_admitted = Vec::<RankedPoint>::new();
-        let mut sparse_admitted = Vec::<RankedPoint>::new();
+        let mut dense_admitted = crate::search::Rankings::default();
+        let mut sparse_admitted = crate::search::Rankings::default();
         let mut dense_windows = Vec::new();
         let mut sparse_windows = Vec::new();
         let mut reachability_decisions = 0_usize;
@@ -1918,7 +1962,7 @@ impl Db {
             }
         }
 
-        let mut fused = Vec::new();
+        let mut fused = crate::search::Rankings::default();
         let mut kth_score = None;
         let mut stopping_bound = f32::INFINITY;
         while !exact_fallback {
@@ -1928,7 +1972,7 @@ impl Db {
                 HybridFusion::Rrf,
                 dense_weight,
                 sparse_weight,
-            );
+            )?;
             kth_score = fused.get(k - 1).map(|point| point.score);
             stopping_bound = p3h_rrf_unseen_bound(
                 &candidates,
@@ -2508,7 +2552,7 @@ impl Db {
                     searched += dense_searched;
                     ranked
                 } else {
-                    Vec::new()
+                    Default::default()
                 };
                 let sparse_ranked = if let Some(query) = &sparse_vector {
                     let outcome = sparse_search_ranked(
@@ -2523,7 +2567,7 @@ impl Db {
                             started,
                             cancelled: Some(cancelled),
                         },
-                    );
+                    )?;
                     searched += outcome.searched;
                     if outcome.degraded {
                         check_execution_budget(cancelled, started, budget)?;
@@ -2533,7 +2577,7 @@ impl Db {
                     }
                     outcome.ranked
                 } else {
-                    Vec::new()
+                    Default::default()
                 };
                 crate::observability::record_graph_fuse(
                     dense_ranked.len(),
@@ -2547,7 +2591,7 @@ impl Db {
                     fusion,
                     dense_weight,
                     sparse_weight,
-                );
+                )?;
                 let ranked = fused
                     .into_iter()
                     .take(k)
@@ -2688,7 +2732,7 @@ impl Db {
                     searched += dense_searched;
                     ranked
                 } else {
-                    Vec::new()
+                    Default::default()
                 };
                 let sparse_ranked = if let Some(query) = &sparse_vector {
                     let outcome = sparse_search_ranked(
@@ -2703,7 +2747,7 @@ impl Db {
                             started,
                             cancelled: Some(cancelled),
                         },
-                    );
+                    )?;
                     searched += outcome.searched;
                     if outcome.degraded {
                         check_execution_budget(cancelled, started, budget)?;
@@ -2713,7 +2757,7 @@ impl Db {
                     }
                     outcome.ranked
                 } else {
-                    Vec::new()
+                    Default::default()
                 };
                 crate::observability::record_graph_fuse(
                     dense_ranked.len(),
@@ -2727,7 +2771,7 @@ impl Db {
                     fusion,
                     dense_weight,
                     sparse_weight,
-                )
+                )?
                 .into_iter()
                 .take(k)
                 .map(|point| ScoredPoint {
@@ -2995,7 +3039,11 @@ impl Db {
                     .map(|node| node.point_id.clone())
                     .collect::<HashSet<_>>();
                 let (dense_ranked, sparse_ranked, approximate_searched) = if exact_fallback {
-                    (Vec::new(), Vec::new(), 0)
+                    (
+                        crate::search::Rankings::default(),
+                        crate::search::Rankings::default(),
+                        0,
+                    )
                 } else {
                     let (dense, dense_searched, bridge_checks) = score_dense_p4_locked(
                         collection,
@@ -3024,7 +3072,7 @@ impl Db {
                             started,
                             cancelled: Some(cancelled),
                         },
-                    );
+                    )?;
                     if sparse.degraded {
                         check_execution_budget(cancelled, started, budget)?;
                         return Err(slo_unavailable(
@@ -3050,7 +3098,7 @@ impl Db {
                         fusion,
                         dense_weight,
                         sparse_weight,
-                    )
+                    )?
                     .into_iter()
                     .take(k)
                     .map(|point| ScoredPoint {
@@ -3152,6 +3200,7 @@ impl Db {
             GaussError::InvalidRequest("P5 graph search requires graph".to_string())
         })?;
         apply_request_time_budget(&mut graph, budget_ms)?;
+        graph.budget = crate::graph_admission::resolve_default_memory(graph.budget);
         let full_request: crate::graph::GraphTraverseRequest = graph.into();
         super::graph_runtime::validate_traversal_request(&full_request)?;
         let budget = full_request.budget.validate()?;
@@ -3227,7 +3276,7 @@ impl Db {
                 continue;
             }
             collection
-                .resolve_in_read_state(&visibility, point_id)
+                .try_resolve_in_read_state(&visibility, point_id)?
                 .filter(|point| scope.may_read_payload(enforcement, &point.payload))
                 .ok_or_else(endpoint_not_found)?;
             frontier.push(P5FrontierPoint {
@@ -3428,7 +3477,7 @@ impl Db {
     fn with_pinned_graph_expansion<T>(
         &self,
         collection_name: &str,
-        graph: GraphConstraint,
+        mut graph: GraphConstraint,
         statement_filter: Option<&Filter>,
         scope: &crate::tenant::TenantScope,
         cancelled: &AtomicBool,
@@ -3440,6 +3489,7 @@ impl Db {
             crate::graph::TraversalBudget,
         ) -> Result<T>,
     ) -> Result<T> {
+        graph.budget = crate::graph_admission::resolve_default_memory(graph.budget);
         let traversal_request: crate::graph::GraphTraverseRequest = graph.into();
         super::graph_runtime::validate_traversal_request(&traversal_request)?;
         let budget = traversal_request.budget.validate()?;
@@ -3750,7 +3800,7 @@ fn materialize_progressive_ann_cursor(
 ) -> Result<ProgressiveRankCursor> {
     if candidate_cap == 0 {
         return Ok(ProgressiveRankCursor {
-            ranked: Vec::new(),
+            ranked: Default::default(),
             position: 0,
             complete: collection.live_points() == 0,
         });
@@ -3796,20 +3846,17 @@ fn materialize_progressive_ann_cursor(
         None,
         None,
         Some(cancelled),
-    );
+    )?;
     check_execution_budget(cancelled, started, budget)?;
-    let mut ranked = Vec::with_capacity(candidates.len().min(candidate_cap));
+    let mut ranked = crate::search::Rankings::default();
     for point in candidates {
         check_execution_budget(cancelled, started, budget)?;
         let Some(vector) = point_vector(&point, vector_name) else {
             continue;
         };
-        ranked.push(RankedPoint {
-            id: point.id.clone(),
-            score: collection.config.metric.score(query, vector)?,
-        });
+        ranked.copy_push(&point.id, collection.config.metric.score(query, vector)?)?;
     }
-    ranked.sort_by(rank_order);
+    ranked.sort_unstable_by(rank_order);
     ranked.truncate(candidate_cap);
     Ok(ProgressiveRankCursor {
         ranked,
@@ -3831,7 +3878,7 @@ fn materialize_progressive_sparse_cursor(
 ) -> Result<ProgressiveRankCursor> {
     if candidate_cap == 0 {
         return Ok(ProgressiveRankCursor {
-            ranked: Vec::new(),
+            ranked: Default::default(),
             position: 0,
             complete: collection.live_points() == 0,
         });
@@ -3856,7 +3903,7 @@ fn materialize_progressive_sparse_cursor(
             started,
             cancelled: Some(cancelled),
         },
-    );
+    )?;
     if outcome.degraded {
         check_execution_budget(cancelled, started, budget)?;
         return Err(slo_unavailable(
@@ -3892,8 +3939,8 @@ fn process_p3h_range_locked(
     anchor_depths: &HashMap<String, u32>,
     ledger: &mut GraphWorkLedger,
     candidates: &mut HashMap<String, P3HybridCandidate>,
-    dense_admitted: &mut Vec<RankedPoint>,
-    sparse_admitted: &mut Vec<RankedPoint>,
+    dense_admitted: &mut crate::search::Rankings,
+    sparse_admitted: &mut crate::search::Rankings,
     reachability_decisions: &mut usize,
     target_probes: &mut usize,
 ) -> Result<bool> {
@@ -3940,18 +3987,12 @@ fn process_p3h_range_locked(
             P3HybridBranch::Dense if state.dense_rank.is_none() => {
                 let rank = dense_admitted.len().saturating_add(1);
                 state.dense_rank = Some(rank);
-                dense_admitted.push(RankedPoint {
-                    id: candidate.id.clone(),
-                    score: candidate.score,
-                });
+                dense_admitted.copy_push(&candidate.id, candidate.score)?;
             }
             P3HybridBranch::Sparse if state.sparse_rank.is_none() => {
                 let rank = sparse_admitted.len().saturating_add(1);
                 state.sparse_rank = Some(rank);
-                sparse_admitted.push(RankedPoint {
-                    id: candidate.id.clone(),
-                    score: candidate.score,
-                });
+                sparse_admitted.copy_push(&candidate.id, candidate.score)?;
             }
             P3HybridBranch::Dense | P3HybridBranch::Sparse => {}
         }
@@ -4128,7 +4169,7 @@ fn candidate_matches_p3_filters(
     enforcement: crate::tenant::TenantEnforcement,
 ) -> Result<bool> {
     let point = collection
-        .resolve_in_read_state(visibility, point_id)
+        .try_resolve_in_read_state(visibility, point_id)?
         .ok_or_else(|| slo_unavailable("a P3 candidate disappeared from the pinned read state"))?;
     Ok(scope.may_read_payload(enforcement, &point.payload)
         && graph_filter.is_none_or(|filter| filter.matches(&point.payload))
@@ -4346,7 +4387,7 @@ fn p3h_exact_fallback_locked(
             started,
             cancelled: Some(cancelled),
         },
-    );
+    )?;
     if sparse.degraded {
         check_execution_budget(cancelled, started, budget)?;
         return Err(slo_unavailable(
@@ -4365,7 +4406,7 @@ fn p3h_exact_fallback_locked(
         HybridFusion::Rrf,
         dense_weight,
         sparse_weight,
-    )
+    )?
     .into_iter()
     .take(k)
     .map(|point| ScoredPoint {
@@ -4434,7 +4475,7 @@ fn p4_exact_hybrid_locked(
             started,
             cancelled: Some(cancelled),
         },
-    );
+    )?;
     if sparse.degraded {
         check_execution_budget(cancelled, started, budget)?;
         return Err(slo_unavailable(
@@ -4453,7 +4494,7 @@ fn p4_exact_hybrid_locked(
         fusion,
         dense_weight,
         sparse_weight,
-    )
+    )?
     .into_iter()
     .take(k)
     .map(|point| ScoredPoint {
@@ -4543,7 +4584,7 @@ fn score_dense_p2_locked(
     cancelled: &AtomicBool,
     started: Instant,
     budget: crate::graph::TraversalBudget,
-) -> Result<(Vec<RankedPoint>, usize)> {
+) -> Result<(crate::search::Rankings, usize)> {
     let (ranked, searched, _) = score_dense_graph_filtered_locked(
         collection,
         visibility,
@@ -4575,7 +4616,7 @@ fn score_dense_p4_locked(
     cancelled: &AtomicBool,
     started: Instant,
     budget: crate::graph::TraversalBudget,
-) -> Result<(Vec<RankedPoint>, usize, usize)> {
+) -> Result<(crate::search::Rankings, usize, usize)> {
     score_dense_graph_filtered_locked(
         collection,
         visibility,
@@ -4606,14 +4647,14 @@ fn score_dense_graph_filtered_locked(
     cancelled: &AtomicBool,
     started: Instant,
     budget: crate::graph::TraversalBudget,
-) -> Result<(Vec<RankedPoint>, usize, usize)> {
+) -> Result<(crate::search::Rankings, usize, usize)> {
     if collection.global_backend().is_some() {
         return Err(slo_unavailable(
             "graph-aware ordinal filtering requires the segmented LS-VEC backend",
         ));
     }
     if limit == 0 || candidates.len() == 0 {
-        return Ok((Vec::new(), 0, 0));
+        return Ok((Default::default(), 0, 0));
     }
     let resolved_recall_target = recall_target
         .or(collection.config.recall_sla)
@@ -4668,10 +4709,10 @@ fn score_dense_graph_filtered_locked(
         Some(&string_filter),
         Some(&ordinal_filter),
         Some(cancelled),
-    );
+    )?;
     check_execution_budget(cancelled, started, budget)?;
 
-    let mut ranked = Vec::with_capacity(dense_candidates.len().min(limit));
+    let mut ranked = crate::search::Rankings::default();
     for point in dense_candidates {
         check_execution_budget(cancelled, started, budget)?;
         if !candidates.contains(collection, &point.id) {
@@ -4680,13 +4721,10 @@ fn score_dense_graph_filtered_locked(
         let Some(vector) = point_vector(&point, vector_name) else {
             continue;
         };
-        ranked.push(RankedPoint {
-            id: point.id.clone(),
-            score: collection.config.metric.score(query, vector)?,
-        });
+        ranked.copy_push(&point.id, collection.config.metric.score(query, vector)?)?;
     }
     let searched = ranked.len();
-    ranked.sort_by(rank_order);
+    ranked.sort_unstable_by(rank_order);
     ranked.truncate(limit);
     Ok((
         ranked,
@@ -4804,20 +4842,17 @@ fn score_dense_all_locked(
     cancelled: &AtomicBool,
     started: Instant,
     budget: crate::graph::TraversalBudget,
-) -> Result<(Vec<RankedPoint>, usize)> {
-    let mut ranked = Vec::with_capacity(nodes.len());
+) -> Result<(crate::search::Rankings, usize)> {
+    let mut ranked = crate::search::Rankings::default();
     for node in nodes {
         check_execution_budget(cancelled, started, budget)?;
         let point = resolve_admitted_point(collection, visibility, &node.point_id)?;
         let Some(vector) = point_vector(&point, vector_name) else {
             continue;
         };
-        ranked.push(RankedPoint {
-            id: point.id.clone(),
-            score: collection.config.metric.score(query, vector)?,
-        });
+        ranked.copy_push(&point.id, collection.config.metric.score(query, vector)?)?;
     }
-    ranked.sort_by(rank_order);
+    ranked.sort_unstable_by(rank_order);
     let searched = ranked.len();
     Ok((ranked, searched))
 }
@@ -4835,7 +4870,7 @@ fn hydrate_hits_locked(
     for ranked in ranked {
         check_execution_budget(cancelled, started, budget)?;
         let point = collection
-            .resolve_in_read_state(visibility, &ranked.id)
+            .try_resolve_in_read_state(visibility, &ranked.id)?
             .ok_or_else(|| {
                 slo_unavailable("a ranked point disappeared from the pinned read state")
             })?;
@@ -4858,7 +4893,7 @@ fn resolve_admitted_point<'a>(
     point_id: &str,
 ) -> Result<std::borrow::Cow<'a, crate::model::Point>> {
     collection
-        .resolve_in_read_state(visibility, point_id)
+        .try_resolve_in_read_state(visibility, point_id)?
         .ok_or_else(|| {
             slo_unavailable("a graph-admitted point disappeared from the pinned read state")
         })
@@ -4905,6 +4940,7 @@ pub(super) fn expand_constraint_locked(
         TraversalRunOptions {
             statement_filter,
             capture: TraversalCapture::Nodes,
+            authorization: None,
         },
     )?;
     let resolver = collection.graph_resolver.as_ref().ok_or_else(|| {
@@ -4953,7 +4989,7 @@ pub(super) fn traverse_query_locked(
     scope: &crate::tenant::TenantScope,
     enforcement: crate::tenant::TenantEnforcement,
     cancelled: &AtomicBool,
-    database_id: uuid::Uuid,
+    identity: GraphQueryIdentity<'_>,
 ) -> Result<GraphTraversalQueryResult> {
     let capture = match request.returns {
         GraphTraversalReturn::Nodes => TraversalCapture::Nodes,
@@ -4980,6 +5016,7 @@ pub(super) fn traverse_query_locked(
         TraversalRunOptions {
             statement_filter: None,
             capture,
+            authorization: identity.authorization,
         },
     )?;
     let mutable = active_mutable_graph(collection)?;
@@ -4989,11 +5026,20 @@ pub(super) fn traverse_query_locked(
         )
     })?;
     let mut truncation = expansion.execution.result.truncation;
+    if identity.authorization.is_some() {
+        if truncation.is_some_and(|reason| reason != crate::graph::TraversalTruncationReason::Limit)
+        {
+            return Err(crate::security::SecurityError::BudgetExceeded.into());
+        }
+        if expansion.backfill_pending && request.traversal.budget.max_depth > 0 {
+            return Err(crate::security::SecurityError::Unavailable.into());
+        }
+    }
     let mut warnings = Vec::new();
     if truncation.is_some() {
         warnings.push(GraphWarning::ResultTruncated);
     }
-    if expansion.backfill_pending {
+    if expansion.backfill_pending && identity.authorization.is_none() {
         warnings.push(GraphWarning::HandleBackfillInProgress);
     }
 
@@ -5004,22 +5050,42 @@ pub(super) fn traverse_query_locked(
                 .result
                 .visits
                 .iter()
-                .filter_map(|visit| {
-                    resolver.live_point_id(visit.nid).map(|point_id| {
-                        graph_node_row(
-                            collection,
-                            visibility,
-                            point_id,
-                            visit.depth,
-                            request.with_payload,
-                        )
-                    })
+                .map(|visit| {
+                    let point_id = resolver
+                        .live_point_id(visit.nid)
+                        .ok_or_else(endpoint_not_found)?;
+                    graph_node_row(
+                        collection,
+                        visibility,
+                        point_id,
+                        visit.depth,
+                        request.with_payload,
+                        &identity,
+                    )
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>>>()?;
             if truncation.is_none() && request.traversal.budget.max_depth == 0 {
-                rows.extend(expansion.unassigned_depth_zero.iter().map(|point_id| {
-                    graph_node_row(collection, visibility, point_id, 0, request.with_payload)
-                }));
+                rows.extend(
+                    expansion
+                        .unassigned_depth_zero
+                        .iter()
+                        .map(|point_id| {
+                            graph_node_row(
+                                collection,
+                                visibility,
+                                point_id,
+                                0,
+                                request.with_payload,
+                                &identity,
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                );
+            }
+            if identity.authorization.is_some() {
+                rows.sort_by(|left, right| {
+                    left.depth.cmp(&right.depth).then(left.id.cmp(&right.id))
+                });
             }
             apply_row_limit(&mut rows, request.limit, &mut truncation, &mut warnings);
             GraphTraversalRows::Nodes(rows)
@@ -5037,7 +5103,7 @@ pub(super) fn traverse_query_locked(
                         resolver,
                         *edge,
                         request.with_payload,
-                        database_id,
+                        &identity,
                     )
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -5061,13 +5127,14 @@ pub(super) fn traverse_query_locked(
                                         .to_string(),
                                 )
                             })?;
-                            Ok(graph_node_row(
+                            graph_node_row(
                                 collection,
                                 visibility,
                                 point_id,
                                 depth as u32,
                                 request.with_payload,
-                            ))
+                                &identity,
+                            )
                         })
                         .collect::<Result<Vec<_>>>()?;
                     let edges = path
@@ -5081,7 +5148,7 @@ pub(super) fn traverse_query_locked(
                                 resolver,
                                 *edge,
                                 request.with_payload,
-                                database_id,
+                                &identity,
                             )
                         })
                         .collect::<Result<Vec<_>>>()?;
@@ -5089,18 +5156,25 @@ pub(super) fn traverse_query_locked(
                 })
                 .collect::<Result<Vec<_>>>()?;
             if truncation.is_none() && request.traversal.budget.max_depth == 0 {
-                rows.extend(expansion.unassigned_depth_zero.iter().map(|point_id| {
-                    GraphTraversalPathRow {
-                        nodes: vec![graph_node_row(
-                            collection,
-                            visibility,
-                            point_id,
-                            0,
-                            request.with_payload,
-                        )],
-                        edges: Vec::new(),
-                    }
-                }));
+                rows.extend(
+                    expansion
+                        .unassigned_depth_zero
+                        .iter()
+                        .map(|point_id| {
+                            Ok(GraphTraversalPathRow {
+                                nodes: vec![graph_node_row(
+                                    collection,
+                                    visibility,
+                                    point_id,
+                                    0,
+                                    request.with_payload,
+                                    &identity,
+                                )?],
+                                edges: Vec::new(),
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                );
             }
             apply_row_limit(&mut rows, request.limit, &mut truncation, &mut warnings);
             GraphTraversalRows::Paths(rows)
@@ -5110,7 +5184,11 @@ pub(super) fn traverse_query_locked(
     crate::observability::observe_graph_traversal(&expansion.execution.result.stats, truncation);
     Ok(GraphTraversalQueryResult {
         result,
-        stats: expansion.execution.result.stats,
+        stats: if identity.authorization.is_some() {
+            Default::default()
+        } else {
+            expansion.execution.result.stats
+        },
         truncation,
         warnings,
         graph_epoch: expansion.graph_epoch,
@@ -5129,6 +5207,7 @@ fn run_traversal_locked(
     let TraversalRunOptions {
         statement_filter,
         capture,
+        authorization,
     } = options;
     let mutable = active_mutable_graph(collection)?;
     let resolver = collection.graph_resolver.as_ref().ok_or_else(|| {
@@ -5139,8 +5218,27 @@ fn run_traversal_locked(
     let graph_epoch = mutable.epoch();
     let backfill_pending = collection.graph_backfill_pending();
 
+    let authority = authorization
+        .map(|context| {
+            super::security_graph_retrieval::TraversalAuthority::new(
+                context, resolver, request, cancelled,
+            )
+        })
+        .transpose()?;
+    if let Some(authority) = &authority {
+        authority.check()?;
+    }
     let selected_types = if request.edge_types.is_empty() {
         None
+    } else if authorization.is_some() {
+        // Unknown and configured-but-invisible types have the same empty result.
+        Some(
+            request
+                .edge_types
+                .iter()
+                .filter_map(|name| mutable.types().resolve_name(name))
+                .collect(),
+        )
     } else {
         Some(
             request
@@ -5166,18 +5264,29 @@ fn run_traversal_locked(
         if !seen_anchors.insert(point_id.clone()) {
             continue;
         }
+        if let Some(context) = authorization {
+            context.authorize_physical(
+                uuid::Uuid::parse_str(point_id)
+                    .map_err(|_| crate::security::SecurityError::Unavailable)?,
+            )?;
+        }
         let point = collection
-            .resolve_in_read_state(visibility, point_id)
+            .try_resolve_in_read_state(visibility, point_id)?
             .filter(|point| scope.may_read_payload(enforcement, &point.payload))
             .ok_or_else(endpoint_not_found)?;
         match resolver.live_nid(point_id) {
             Some(nid) => assigned_anchors.push(nid),
             None if request.budget.max_depth == 0
-                && request
-                    .node_filter
-                    .as_ref()
-                    .is_none_or(|filter| filter.matches(&point.payload))
-                && statement_filter.is_none_or(|filter| filter.matches(&point.payload)) =>
+                && match &authority {
+                    Some(authority) => authority.matches_point(point_id, &point.payload)?,
+                    None => {
+                        request
+                            .node_filter
+                            .as_ref()
+                            .is_none_or(|filter| filter.matches(&point.payload))
+                            && statement_filter.is_none_or(|filter| filter.matches(&point.payload))
+                    }
+                } =>
             {
                 unassigned_depth_zero.push(point_id.clone());
             }
@@ -5192,6 +5301,9 @@ fn run_traversal_locked(
         resolver,
     };
     let traversal = crate::graph_traversal::MutableTraversal {
+        access: authority
+            .as_ref()
+            .map(|value| value as &dyn crate::graph_traversal::TraversalAccess),
         graph: &graph,
         anchors: assigned_anchors,
         visible_anchor_count: seen_anchors.len() as u64,
@@ -5203,11 +5315,13 @@ fn run_traversal_locked(
         budget: request.budget,
         cancelled,
         payload_for_nid: |nid| {
-            resolver
-                .live_point_id(nid)
-                .and_then(|point_id| collection.resolve_in_read_state(visibility, point_id))
+            let Some(point_id) = resolver.live_point_id(nid) else {
+                return Ok(None);
+            };
+            Ok(collection
+                .try_resolve_in_read_state(visibility, point_id)?
                 .filter(|point| scope.may_read_payload(enforcement, &point.payload))
-                .map(|point| point.payload.clone())
+                .map(|point| point.payload.clone()))
         },
         namespaces_for_payload: |payload| {
             let tenant = payload
@@ -5228,6 +5342,9 @@ fn run_traversal_locked(
             crate::graph_traversal::exact_simple_paths(traversal, limit)?
         }
     };
+    if let Some(authority) = &authority {
+        authority.check()?;
+    }
     unassigned_depth_zero.sort_unstable();
     Ok(RawPinnedGraphExpansion {
         execution,
@@ -5243,18 +5360,50 @@ fn graph_node_row(
     point_id: &str,
     depth: u32,
     with_payload: bool,
-) -> GraphTraversalNodeRow {
-    GraphTraversalNodeRow {
-        id: point_id.to_string(),
+    identity: &GraphQueryIdentity<'_>,
+) -> Result<GraphTraversalNodeRow> {
+    let public_id = graph_public_id(point_id, identity.authorization)?;
+    let point = if with_payload {
+        collection.try_resolve_in_read_state(visibility, point_id)?
+    } else {
+        None
+    };
+    identity.charge_output(point.as_ref().map(|p| &p.payload))?;
+    let payload = point
+        .map(|point| {
+            identity.authorization.map_or_else(
+                || Ok(point.payload.clone()),
+                |context| {
+                    context
+                        .project(&public_id, &point.payload, false)
+                        .map_err(GaussError::from)
+                },
+            )
+        })
+        .transpose()?;
+    Ok(GraphTraversalNodeRow {
+        id: public_id,
         depth,
-        payload: with_payload
-            .then(|| {
-                collection
-                    .resolve_in_read_state(visibility, point_id)
-                    .map(|point| point.payload.clone())
-            })
-            .flatten(),
-    }
+        payload,
+    })
+}
+
+fn graph_public_id(
+    physical: &str,
+    authorization: Option<&crate::security::AccessContext>,
+) -> Result<String> {
+    authorization.map_or_else(
+        || Ok(physical.to_owned()),
+        |context| {
+            Ok(context
+                .authorize_physical(
+                    uuid::Uuid::parse_str(physical)
+                        .map_err(|_| crate::security::SecurityError::Unavailable)?,
+                )?
+                .key
+                .id)
+        },
+    )
 }
 
 fn graph_edge_row(
@@ -5264,7 +5413,7 @@ fn graph_edge_row(
     resolver: &crate::graph_resolver::PointIncarnationResolver,
     edge: crate::graph_traversal::TraversalEdgeVisit,
     with_payload: bool,
-    database_id: uuid::Uuid,
+    identity: &GraphQueryIdentity<'_>,
 ) -> Result<GraphTraversalEdgeRow> {
     let source = resolver.live_point_id(edge.source).ok_or_else(|| {
         GaussError::InvalidRequest(
@@ -5276,11 +5425,13 @@ fn graph_edge_row(
             "live graph edge target disappeared from the pinned state".to_string(),
         )
     })?;
+    let public_source = graph_public_id(source, identity.authorization)?;
+    let public_target = graph_public_id(target, identity.authorization)?;
     if collection
-        .resolve_in_read_state(visibility, source)
+        .try_resolve_in_read_state(visibility, source)?
         .is_none()
         || collection
-            .resolve_in_read_state(visibility, target)
+            .try_resolve_in_read_state(visibility, target)?
             .is_none()
     {
         return Err(GaussError::InvalidRequest(
@@ -5296,21 +5447,19 @@ fn graph_edge_row(
         .name
         .clone();
     let properties = if with_payload {
-        Some(
-            mutable
-                .edge_properties(edge.edge_id)?
-                .ok_or_else(|| {
-                    GaussError::InvalidRequest("live graph edge has no properties".to_string())
-                })?
-                .into_owned(),
-        )
+        let properties = mutable.edge_properties(edge.edge_id)?.ok_or_else(|| {
+            GaussError::InvalidRequest("live graph edge has no properties".to_string())
+        })?;
+        identity.charge_output(Some(&properties))?;
+        Some(properties.into_owned())
     } else {
+        identity.charge_output(None)?;
         None
     };
     Ok(GraphTraversalEdgeRow {
-        id: crate::edge_token::encode(database_id, edge.edge_id)?,
-        source: source.to_string(),
-        target: target.to_string(),
+        id: crate::edge_token::encode(identity.database_id, edge.edge_id)?,
+        source: public_source,
+        target: public_target,
         edge_type,
         properties,
     })

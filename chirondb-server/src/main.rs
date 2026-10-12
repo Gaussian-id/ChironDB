@@ -3,7 +3,7 @@ use std::{
     io::IsTerminal,
     net::SocketAddr,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, bail};
@@ -111,6 +111,12 @@ struct Args {
     /// session is only meant to look.
     #[arg(long, value_enum, default_value_t = ConsoleRole::ReadWrite)]
     console_role: ConsoleRole,
+    /// Private catalog API key for an attached protected console.
+    #[arg(long, requires = "console")]
+    console_api_key_file: Option<PathBuf>,
+    /// New private file for console ISSUE/ROTATE API KEY output.
+    #[arg(long, requires = "console")]
+    console_key_out: Option<PathBuf>,
     /// Pre-set the console's session collection, as if `USE <name>` had run.
     #[arg(long)]
     collection: Option<String>,
@@ -403,24 +409,29 @@ fn validate_listener_security(
 
 /// M4-003: latency-tuned Tokio runtime. SPEC Section VIII.A — one worker
 /// thread per *physical* core (not logical) to keep SIMD distance kernels
-/// fed without HT contention. Override with `GAUSSDB_WORKER_THREADS=<n>`.
+/// fed without HT contention. The compatibility override may narrow the pool,
+/// but cannot oversubscribe the effective host or cgroup CPU budget.
 fn select_worker_threads(env_override: Option<&str>, physical_cores: usize) -> usize {
+    let available = physical_cores.max(1);
     if let Some(raw) = env_override
         && let Ok(n) = raw.parse::<usize>()
         && n >= 1
     {
-        return n;
+        return n.min(available);
     }
-    physical_cores.max(1)
+    available
 }
 
 fn main() -> anyhow::Result<()> {
+    let detected_profile =
+        chirondb_core::resource_profile::ResourceProfile::detect(num_cpus::get_physical());
+    let profile = *chirondb_core::resource_profile::install(detected_profile);
     let env_raw = compatible_env("CHIRONDB_WORKER_THREADS", "GAUSSDB_WORKER_THREADS");
-    let workers = select_worker_threads(env_raw.as_deref(), num_cpus::get_physical());
+    let workers = select_worker_threads(env_raw.as_deref(), profile.effective_cores);
 
     // PD-3: cap the rayon global pool to half the Tokio worker count so rayon's
     // compute threads don't compete with Tokio's I/O threads at high concurrency.
-    let rayon_threads = (workers / 2).max(2);
+    let rayon_threads = profile.background_workers.min(workers).max(1);
     rayon::ThreadPoolBuilder::new()
         .num_threads(rayon_threads)
         .build_global()
@@ -433,7 +444,52 @@ fn main() -> anyhow::Result<()> {
         .build()
         .map_err(|error| anyhow::anyhow!("failed to build tokio runtime: {error}"))?;
 
-    runtime.block_on(async_main())
+    let result = runtime.block_on(async_main());
+    // A cancelled `spawn_blocking` task cannot be pre-empted by Tokio. The
+    // engine shutdown deadline has already established a recovery-safe
+    // boundary, so do not let runtime destruction reintroduce an unbounded
+    // wait after the server reports finalization complete.
+    runtime.shutdown_background();
+    result
+}
+
+const PROCESS_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(12);
+const PROTOCOL_DRAIN_DEADLINE: Duration = Duration::from_secs(5);
+const FINALIZATION_RESERVE: Duration = Duration::from_secs(2);
+
+fn install_shutdown_signals() -> anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<()>> {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(|error| anyhow::anyhow!("install SIGTERM handler: {error}"))?;
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .map_err(|error| anyhow::anyhow!("install SIGINT handler: {error}"))?;
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    signal = terminate.recv() => if signal.is_none() { break; },
+                    signal = interrupt.recv() => if signal.is_none() { break; },
+                }
+                if sender.send(()).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::spawn(async move {
+            loop {
+                if tokio::signal::ctrl_c().await.is_err() || sender.send(()).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    Ok(receiver)
 }
 
 #[cfg(test)]
@@ -451,8 +507,8 @@ mod worker_thread_selection {
     }
 
     #[test]
-    fn env_override_wins_when_valid() {
-        assert_eq!(select_worker_threads(Some("12"), 4), 12);
+    fn env_override_can_narrow_but_not_oversubscribe() {
+        assert_eq!(select_worker_threads(Some("12"), 4), 4);
         assert_eq!(select_worker_threads(Some("1"), 32), 1);
     }
 
@@ -469,9 +525,14 @@ async fn async_main() -> anyhow::Result<()> {
     // whether log lines go to stdout (default, unchanged) or stderr, and the
     // subscriber can only be installed once.
     let args = Args::parse();
+    // Install process signal handlers before opening storage or listeners so
+    // SIGTERM cannot land in the small startup window with the OS default.
+    let mut shutdown_signals = install_shutdown_signals()?;
     let console_requested = args.console;
     let console_role: Role = args.console_role.into();
     let console_collection = args.collection.clone();
+    let console_key_file = args.console_api_key_file.clone();
+    let console_key_out = args.console_key_out.clone();
     let tenant_enforcement: TenantEnforcement = args.tenant_enforcement.into();
     let log_target = if console_requested {
         observability::LogTarget::Stderr
@@ -481,6 +542,14 @@ async fn async_main() -> anyhow::Result<()> {
     let tracing_guard = observability::init_tracing_to(log_target)
         .map_err(|error| anyhow::anyhow!("failed to initialize tracing: {error}"))?;
     let config = effective_config(args)?;
+    let initialized_installation =
+        chirondb::security::onboarding::requires_protected_startup(&config.data_dir);
+    if initialized_installation {
+        chirondb::security::onboarding::validate_ready(&config.data_dir)?;
+        if config.allow_insecure_non_loopback {
+            bail!("initialized installations cannot enable insecure bypass flags");
+        }
+    }
     let _ = observability::init_metrics();
     let rbac_config_path = config.rbac_config_file.clone().or_else(|| {
         compatible_env_os("CHIRONDB_RBAC_CONFIG_FILE", "GAUSSDB_RBAC_CONFIG_FILE")
@@ -502,6 +571,11 @@ async fn async_main() -> anyhow::Result<()> {
         }),
     )
     .with_rate_limit(rate_limit_per_second(config.rate_limit_per_second)?);
+    if initialized_installation && (auth.is_enabled() || rbac_configured) {
+        bail!(
+            "initialized installations use catalog credentials; remove legacy API key and RBAC configuration"
+        );
+    }
     let require_stable_principal_ids = !config.listen_http.ip().is_loopback()
         || !config.listen_grpc.ip().is_loopback()
         || !config.listen_wire.ip().is_loopback();
@@ -517,7 +591,14 @@ async fn async_main() -> anyhow::Result<()> {
     let public_listener = !config.listen_http.ip().is_loopback()
         || !config.listen_grpc.ip().is_loopback()
         || !config.listen_wire.ip().is_loopback();
-    let secure_profile = public_listener && !config.allow_insecure_non_loopback;
+    let secure_profile =
+        initialized_installation || public_listener && !config.allow_insecure_non_loopback;
+    if secure_profile && tenant_enforcement != TenantEnforcement::Enforced {
+        bail!("production listeners require --tenant-enforcement enforced after tenant migration");
+    }
+    if secure_profile && config.cluster.is_some() {
+        bail!("production security profile supports a single node; cluster/Raft is not available");
+    }
     if let Some(keyring_file) = config.encryption_keyring_file.as_deref() {
         validate_external_keyring_path(&config.data_dir, keyring_file)?;
     }
@@ -529,11 +610,11 @@ async fn async_main() -> anyhow::Result<()> {
         .context("failed to load encryption keyring")?;
     validate_listener_security(
         &config,
-        public_listener,
+        public_listener || initialized_installation,
         secure_profile,
         tls.is_some(),
-        auth.is_enabled(),
-        rbac_configured,
+        auth.is_enabled() || initialized_installation,
+        rbac_configured || initialized_installation,
         encryption_keyring.is_some(),
     )?;
     if public_listener && config.allow_insecure_non_loopback {
@@ -581,6 +662,9 @@ async fn async_main() -> anyhow::Result<()> {
         .as_ref()
         .map(|tls| tls.spawn_reloader(db.clone()));
     if secure_profile {
+        db.validate_protected_admission().context(
+            "production admission requires durable identity and verified protected collections",
+        )?;
         chirondb::audit::verify_hash_chain(&config.data_dir)
             .context("secure startup refused an invalid audit chain")?;
     }
@@ -716,13 +800,40 @@ async fn async_main() -> anyhow::Result<()> {
     // whole time the console waits at a prompt, and `\q` stops the server.
     if console_requested {
         if std::io::stdin().is_terminal() {
+            let protected_console = db.identity_authority().is_some();
+            let console_key = console_key_file
+                .as_deref()
+                .map(chirondb::chironql_credentials::read_key)
+                .transpose()
+                .context("cannot read protected console credential")?;
+            let console_identity = if protected_console {
+                let key = console_key
+                    .as_deref()
+                    .context("protected console requires --console-api-key-file")?;
+                let identity = db
+                    .identity_authority()
+                    .context("authority unavailable")?
+                    .authenticate(key)
+                    .context("invalid protected console credential")?;
+                format!(
+                    "authenticated as {}{}",
+                    identity.user_name(),
+                    if identity.allows_installation(chirondb::security::Action::IdentityManage) {
+                        " (security administration)"
+                    } else {
+                        ""
+                    }
+                )
+            } else {
+                console_role_name(console_role).into()
+            };
             let console_db = db.clone();
             let banner = chirondb::branding::banner(&format!(
                 "ChironDB {} · ChironQL {} · console attached ({}) · logs → stderr\n\
                  \\h for help · \\q or Ctrl-D to stop the server",
                 env!("CARGO_PKG_VERSION"),
                 chirondb::chironql_parser::LANGUAGE_VERSION,
-                console_role_name(console_role),
+                console_identity,
             ));
             tracing::info!(
                 role = console_role_name(console_role),
@@ -733,6 +844,9 @@ async fn async_main() -> anyhow::Result<()> {
                 .spawn(move || {
                     let mut sink = LocalSink::new(console_db, console_role)
                         .with_collection(console_collection);
+                    if let Some(key) = console_key {
+                        sink = sink.with_credential(key, console_key_out);
+                    }
                     let options = ReplOptions {
                         interactive: true,
                         banner: Some(banner),
@@ -741,11 +855,16 @@ async fn async_main() -> anyhow::Result<()> {
                     // Separate history file from the `chironql` client, so a
                     // local operator session and a remote client session do not
                     // interleave each other's recall.
-                    let history = std::env::var_os("HOME")
+                    let history = (!protected_console)
+                        .then(|| std::env::var_os("HOME"))
+                        .flatten()
                         .map(|home| PathBuf::from(home).join(".chironql_console_history"));
                     let outcome = chironql_repl::run_interactive(&mut sink, options, history);
                     if let Err(error) = outcome {
                         tracing::warn!(%error, "chironql console ended");
+                        if protected_console {
+                            return;
+                        }
                     }
 
                     // Leaving the console ends the process.
@@ -774,7 +893,8 @@ async fn async_main() -> anyhow::Result<()> {
 
     let http_db = db.clone();
     let grpc_db = db.clone();
-    let wire_db = db;
+    let wire_db = db.clone();
+    let shutdown_db = db;
     let http_auth = auth.clone();
     let grpc_auth = auth.clone();
     let wire_auth = auth;
@@ -786,67 +906,105 @@ async fn async_main() -> anyhow::Result<()> {
         cors_origins: config.cors_origins.clone(),
         storage_policy: storage_policy.clone(),
     };
-    tokio::try_join!(
-        async {
-            match http_tls {
-                Some(tls) => api::serve_tls_config_with_options(
-                    http_db,
-                    http_auth,
-                    config.listen_http,
-                    tls,
-                    http_options,
-                )
-                .await
-                .context("https server failed"),
-                None => {
-                    api::serve_with_options(http_db, http_auth, config.listen_http, http_options)
-                        .await
-                        .context("http server failed")
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let http_shutdown = shutdown.clone();
+    let grpc_shutdown = shutdown.clone();
+    let wire_shutdown = shutdown.clone();
+    let servers = async {
+        tokio::try_join!(
+            async {
+                match http_tls {
+                    Some(tls) => api::serve_tls_config_with_options_until(
+                        http_db,
+                        http_auth,
+                        config.listen_http,
+                        tls,
+                        http_options,
+                        http_shutdown,
+                        PROTOCOL_DRAIN_DEADLINE,
+                    )
+                    .await
+                    .context("https server failed"),
+                    None => api::serve_with_options_until(
+                        http_db,
+                        http_auth,
+                        config.listen_http,
+                        http_options,
+                        http_shutdown,
+                    )
+                    .await
+                    .context("http server failed"),
+                }
+            },
+            async {
+                match grpc_tls {
+                    Some(tls) => grpc::serve_tls_config_with_options_until(
+                        grpc_db,
+                        grpc_auth,
+                        config.listen_grpc,
+                        tls,
+                        grpc_options,
+                        grpc_shutdown,
+                    )
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error))
+                    .context("grpc tls server failed"),
+                    None => grpc::serve_with_options_until(
+                        grpc_db,
+                        grpc_auth,
+                        config.listen_grpc,
+                        grpc_options,
+                        grpc_shutdown,
+                    )
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error))
+                    .context("grpc server failed"),
+                }
+            },
+            async {
+                match wire_tls {
+                    Some(tls) => wire::serve_tls_config_with_auth_and_policy_until(
+                        wire_db,
+                        wire_auth,
+                        config.listen_wire,
+                        tls,
+                        storage_policy,
+                        wire_shutdown,
+                    )
+                    .await
+                    .context("GaussWire TLS server failed"),
+                    None => wire::serve_with_auth_and_policy_until(
+                        wire_db,
+                        wire_auth,
+                        config.listen_wire,
+                        storage_policy,
+                        wire_shutdown,
+                    )
+                    .await
+                    .context("GaussWire server failed"),
                 }
             }
-        },
-        async {
-            match grpc_tls {
-                Some(tls) => grpc::serve_tls_config_with_options(
-                    grpc_db,
-                    grpc_auth,
-                    config.listen_grpc,
-                    tls,
-                    grpc_options,
-                )
-                .await
-                .map_err(|error| anyhow::anyhow!(error))
-                .context("grpc tls server failed"),
-                None => {
-                    grpc::serve_with_options(grpc_db, grpc_auth, config.listen_grpc, grpc_options)
-                        .await
-                        .map_err(|error| anyhow::anyhow!(error))
-                        .context("grpc server failed")
-                }
-            }
-        },
-        async {
-            match wire_tls {
-                Some(tls) => wire::serve_tls_config_with_auth_and_policy(
-                    wire_db,
-                    wire_auth,
-                    config.listen_wire,
-                    tls,
-                    storage_policy,
-                )
-                .await
-                .context("GaussWire TLS server failed"),
-                None => wire::serve_with_auth_and_policy(
-                    wire_db,
-                    wire_auth,
-                    config.listen_wire,
-                    storage_policy,
-                )
-                .await
-                .context("GaussWire server failed"),
-            }
+        )
+    };
+    tokio::pin!(servers);
+    let process_deadline = tokio::select! {
+        result = &mut servers => {
+            result?;
+            return Err(anyhow::anyhow!("all public listeners stopped unexpectedly"));
         }
-    )?;
+        _ = shutdown_signals.recv() => {
+            let deadline = Instant::now() + PROCESS_SHUTDOWN_DEADLINE;
+            shutdown_db.begin_shutdown();
+            metrics::gauge!("chirondb_shutdown_inflight_requests")
+                .set(shutdown_db.search_inflight() as f64);
+            shutdown.cancel();
+            deadline
+        }
+    };
+    tracing::info!(
+        deadline_seconds = 12,
+        "shutdown signal received; draining listeners"
+    );
     if let Some(auto_compaction) = auto_compaction {
         auto_compaction.abort();
     }
@@ -856,6 +1014,45 @@ async fn async_main() -> anyhow::Result<()> {
     if let Some(tls_reloader) = tls_reloader {
         tls_reloader.abort();
     }
+    let protocol_drain = tokio::time::timeout(PROTOCOL_DRAIN_DEADLINE, &mut servers);
+    tokio::pin!(protocol_drain);
+    tokio::select! {
+        result = &mut protocol_drain => match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "public listener failed while draining"),
+            Err(_) => tracing::warn!(
+                "protocol drain exceeded five seconds; cancelling remaining connections"
+            ),
+        },
+        _ = shutdown_signals.recv() => {
+            tracing::warn!(
+                "second shutdown signal received; skipping the remaining protocol drain"
+            );
+        }
+    }
+    shutdown_db.cancel_shutdown_work();
+    let finalization_deadline = process_deadline
+        .checked_sub(FINALIZATION_RESERVE)
+        .unwrap_or(process_deadline);
+    let remaining = finalization_deadline.saturating_duration_since(Instant::now());
+    let finalizer =
+        tokio::task::spawn_blocking(move || shutdown_db.shutdown(finalization_deadline));
+    let report = match tokio::time::timeout(remaining, finalizer).await {
+        Ok(Ok(report)) => report,
+        Ok(Err(error)) => {
+            eprintln!("shutdown finalizer panicked: {error}");
+            std::process::exit(2);
+        }
+        Err(_) => {
+            eprintln!("shutdown exceeded the 12 second deadline; restart recovery is required");
+            std::process::exit(2);
+        }
+    };
+    if report.fallback_required {
+        eprintln!("shutdown finalization was incomplete: {report:?}");
+        std::process::exit(2);
+    }
+    tracing::info!(?report, "ChironDB shutdown completed");
     Ok(())
 }
 
@@ -1541,6 +1738,8 @@ cors_origin = ["http://127.0.0.1:3000"]
 
         let config = effective_config(Args {
             console: false,
+            console_api_key_file: None,
+            console_key_out: None,
             console_role: super::ConsoleRole::ReadWrite,
             tenant_enforcement: super::TenantMode::Disabled,
             collection: None,
@@ -1620,6 +1819,8 @@ auto_compact_interval_secs = 2
 
         let config = effective_config(Args {
             console: false,
+            console_api_key_file: None,
+            console_key_out: None,
             console_role: super::ConsoleRole::ReadWrite,
             tenant_enforcement: super::TenantMode::Disabled,
             collection: None,

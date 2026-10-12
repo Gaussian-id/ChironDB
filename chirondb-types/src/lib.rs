@@ -4,10 +4,12 @@ pub mod error;
 pub mod filter;
 pub mod graph;
 pub mod model;
+pub mod relational;
+pub mod security;
 
 pub use chironql::{
-    ChironQlError, ChironQlKind, ChironQlRequest, ChironQlResponse, ChironQlStats, QueryTrace,
-    StageOutcome, TraceStage,
+    ChironQlError, ChironQlKind, ChironQlRequest, ChironQlResponse, ChironQlStats, ExecutionDomain,
+    QueryTrace, StageOutcome, TraceStage,
 };
 pub use distance::DistanceMetric;
 pub use error::{GaussError, Result};
@@ -26,4 +28,10 @@ pub use graph::{
     GraphTraversalRows, GraphWarning, Nid, RelateMutation, RelateRequest, RelateResult,
     TraversalBudget, TraversalResult, TraversalStats, TraversalTruncationReason, TraversalVisit,
     TypeId, UnrelateMutation, UpdateEdgeRequest,
+};
+pub use relational::{
+    CheckConstraintDefinition, ForeignKeyAction, ForeignKeyDefinition, ForeignKeyMatch, RecordRef,
+    ReferencedKeyKind, RelationalColumn, RelationalType, RelationalValue, ScalarIndexDefinition,
+    SqlExecutionRequest, SqlExecutionResponse, SqlOutcome, SqlResult, SqlStatementRequest,
+    SqlTransactionHandleResponse, SqlTransactionState, TableDefinition, UniqueConstraint,
 };

@@ -51,11 +51,126 @@ service ChironDb {
   // than deepening the legacy gaussdb.v1 package; the legacy GaussDb service
   // is frozen at the surface it shipped with and does not get this rpc.
   rpc ExecuteQuery(ChironQlRequest) returns (ChironQlResponse);
+
+  // Native relational SQL. The legacy gaussdb.v1 service remains frozen.
+  rpc ExecuteSql(SqlExecutionRequest) returns (SqlExecutionResponse);
+  rpc BeginSqlTransaction(BeginSqlTransactionRequest) returns (SqlTransactionHandleResponse);
+  rpc ExecuteSqlTransaction(SqlTransactionExecuteRequest) returns (SqlExecutionResponse);
+  rpc CommitSqlTransaction(SqlTransactionHandleRequest) returns (SqlExecutionResponse);
+  rpc RollbackSqlTransaction(SqlTransactionHandleRequest) returns (SqlTransactionHandleResponse);
 }
 
-// One ChironQL statement. One statement per request: there are no
-// transactions to give a multi-statement body coherent partial-failure
-// semantics.
+message BeginSqlTransactionRequest {}
+
+message SqlTransactionHandleRequest {
+  string handle = 1;
+}
+
+message SqlTransactionExecuteRequest {
+  string handle = 1;
+  SqlExecutionRequest request = 2;
+}
+
+enum SqlTransactionState {
+  SQL_TRANSACTION_STATE_UNSPECIFIED = 0;
+  SQL_TRANSACTION_STATE_ACTIVE = 1;
+  SQL_TRANSACTION_STATE_ABORTED = 2;
+  SQL_TRANSACTION_STATE_COMMITTED = 3;
+  SQL_TRANSACTION_STATE_ROLLED_BACK = 4;
+  SQL_TRANSACTION_STATE_EXPIRED = 5;
+  SQL_TRANSACTION_STATE_OUTCOME_UNKNOWN = 6;
+}
+
+message SqlTransactionHandleResponse {
+  string handle = 1;
+  uint64 snapshot = 2;
+  SqlTransactionState state = 3;
+  // Reserved at BEGIN and reused by the durable COMMIT decision.
+  optional string transaction_id = 4;
+}
+
+message SqlExecutionRequest {
+  repeated SqlStatement statements = 1;
+  optional string retry_id = 2;
+  optional string idempotency_key = 3;
+}
+
+message SqlStatement {
+  string sql = 1;
+  repeated SqlValue parameters = 2;
+}
+
+message SqlVector {
+  repeated float values = 1;
+}
+
+message SqlNull {}
+
+message SqlRecordRef {
+  string namespace = 1;
+  string id = 2;
+}
+
+message SqlValue {
+  oneof value {
+    SqlNull null = 1;
+    bool boolean = 2;
+    sint64 integer = 3;
+    double floating = 4;
+    string decimal = 5;
+    string text = 6;
+    string timestamp_utc = 7;
+    string uuid = 8;
+    SqlVector vector = 9;
+    SqlRecordRef record_ref = 10;
+    bytes bytes_value = 11;
+    string date = 12;
+    string jsonb = 13;
+  }
+}
+
+message SqlExecutionResponse {
+  optional string transaction_id = 1;
+  uint64 snapshot = 2;
+  bool committed = 3;
+  repeated SqlResult results = 4;
+  string outcome = 5;
+  optional uint64 commit_sequence = 6;
+  bool retryable = 7;
+}
+
+message SqlResult {
+  oneof result {
+    SqlDefinitionResult definition = 1;
+    SqlMutationResult mutation = 2;
+    SqlRowsResult rows = 3;
+    SqlExplainResult explain = 4;
+  }
+}
+
+message SqlDefinitionResult {
+  uint64 affected_objects = 1;
+}
+
+message SqlMutationResult {
+  uint64 affected_rows = 1;
+}
+
+message SqlRow {
+  repeated SqlValue values = 1;
+}
+
+message SqlRowsResult {
+  repeated string columns = 1;
+  repeated SqlRow rows = 2;
+  repeated string column_types_json = 3;
+}
+
+message SqlExplainResult {
+  repeated string plan = 1;
+}
+
+// One ChironQL statement, including a typed atomic TRANSACTION block.
 message ChironQlRequest {
   string query = 1;
   // Session collection, as `USE <name>` would set. A collection named in the
@@ -66,6 +181,9 @@ message ChironQlRequest {
   // Proceed with a statement that would otherwise stop and ask, such as
   // `DELETE ... WHERE`.
   bool confirm = 4;
+  repeated SqlValue parameters = 5;
+  optional string retry_id = 6;
+  optional string idempotency_key = 7;
 }
 
 // Rows, stats and trace travel as JSON strings: payloads are arbitrary JSON
@@ -82,6 +200,13 @@ message ChironQlResponse {
   // Correlates this result with the server's own log line for it.
   string query_id = 6;
   optional string trace_json = 7;
+  // Explicit ISSUE/ROTATE output, separate from ordinary rows and diagnostics.
+  optional string credential_json = 8;
+  repeated string column_types_json = 9;
+  repeated string domains = 10;
+  optional string snapshot_id = 11;
+  optional string transaction_id = 12;
+  optional bool committed = 13;
 }
 
 message GraphLifecycleRequest {

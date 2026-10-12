@@ -86,9 +86,13 @@ unrun checks as passed. Maintainers record delivered changes and benchmark
 evidence in the project's private engineering knowledge base; external
 contributors do not need access to it.
 
-Before merge, both [CI](.github/workflows/ci.yml) and the
-[cross-platform matrix](.github/workflows/cross-platform-ci.yml) must pass.
+Before merge, [CI](.github/workflows/ci.yml), the
+[cross-platform matrix](.github/workflows/cross-platform-ci.yml), and
+[security gates](.github/workflows/security.yml) must pass.
 Linux and macOS on x86-64 and ARM64 are required; Windows is best-effort.
+Security requires both installation/recovery and deployment verification.
+They run in separate jobs so cold container builds cannot exhaust the
+installation/recovery job's time budget. Cancelled or skipped checks fail the gate.
 
 Performance claims need an appropriate industry-standard workload: official
 ann-benchmarks datasets such as SIFT, GloVe, Deep, or GIST; BEIR/MTEB tasks for

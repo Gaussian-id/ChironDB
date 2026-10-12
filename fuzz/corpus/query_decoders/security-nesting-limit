@@ -1,0 +1,1 @@
+CREATE POINTS INTO docs USING TEMPLATE t {vector:[1],payload:{x:[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}} REQUEST r;

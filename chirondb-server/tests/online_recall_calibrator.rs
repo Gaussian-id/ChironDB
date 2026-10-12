@@ -13,6 +13,11 @@ use chirondb::{CollectionConfig, Db, DistanceMetric, Point, SearchRequest};
 use serde_json::json;
 use tempfile::TempDir;
 
+// Independent calibration fixtures share the process-wide storage quota.
+// Serialize only setup, retaining each original atomic bulk request and oracle.
+// Calibration/search and dedicated writer concurrency tests remain concurrent.
+static FIXTURE_LOAD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn lcg_vector(seed: u64, dim: usize) -> Vec<f32> {
     let mut state = seed ^ 0x517c_c1b7_2722_0a95;
     (0..dim)
@@ -27,6 +32,7 @@ fn lcg_vector(seed: u64, dim: usize) -> Vec<f32> {
 }
 
 fn build(n: usize, dim: usize) -> (TempDir, Db, &'static str) {
+    let _load = FIXTURE_LOAD.lock().expect("fixture load lock");
     let dir = TempDir::new().expect("tempdir");
     let db = Db::open(dir.path()).expect("open db");
     let coll = "pc3_calibrate";

@@ -10,10 +10,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chirondb_core::{CollectionConfig, Db, DistanceMetric, Point};
+use chirondb_core::{
+    CollectionConfig, Db, DistanceMetric, Point, TransactionState,
+    audit::{AUDIT_LOG_FILE, AuditContext, AuditEvent, AuditWriter},
+};
 use serde_json::json;
 
 const SAFETY_MARKER: &str = ".chirondb-enospc-test-device";
+const AUDIT_CHILD_ENV: &str = "CHIRONDB_ENOSPC_AUDIT_CHILD";
 
 #[test]
 #[ignore = "requires CHIRONDB_ENOSPC_ROOT on a dedicated marked filesystem"]
@@ -36,7 +40,7 @@ fn real_enospc_rejects_unacknowledged_write_and_reopens_acknowledged_state() {
 
     fill_until_enospc(&filler);
     let mut acknowledged = vec!["acknowledged".to_string()];
-    let rejected = (0..100_000)
+    let (rejected, unknown_transaction_id) = (0..100_000)
         .find_map(|attempt| {
             let id = format!("enospc-{attempt:06}");
             match db.upsert("docs", vec![point(&id)]) {
@@ -44,7 +48,16 @@ fn real_enospc_rejects_unacknowledged_write_and_reopens_acknowledged_state() {
                     acknowledged.push(id);
                     None
                 }
-                Err(_) => Some(id),
+                Err(error) => {
+                    eprintln!("first rejected write {id}: {error}");
+                    let transaction_id = match error {
+                        chirondb_core::GaussError::CommitOutcomeUnknown { transaction_id } => {
+                            Some(transaction_id)
+                        }
+                        _ => None,
+                    };
+                    Some((id, transaction_id))
+                }
             }
         })
         .expect("wait=true writes never reached a durable ENOSPC rejection");
@@ -61,19 +74,36 @@ fn real_enospc_rejects_unacknowledged_write_and_reopens_acknowledged_state() {
         .into_iter()
         .map(|point| point.id)
         .collect::<HashSet<_>>();
-    assert_eq!(reopened_ids.len(), acknowledged.len());
+    let reconciled_state = unknown_transaction_id
+        .as_deref()
+        .map(|transaction_id| reopened.transaction_status(transaction_id).unwrap());
+    let unknown_committed = reconciled_state
+        .as_ref()
+        .is_some_and(|status| status.state == TransactionState::Committed);
+    assert_eq!(
+        reopened_ids.len(),
+        acknowledged.len() + usize::from(unknown_committed)
+    );
     assert!(
         acknowledged.iter().all(|id| reopened_ids.contains(id)),
         "an acknowledged wait=true write was lost after restart"
     );
-    assert!(
-        !reopened_ids.contains(&rejected),
-        "the rejected write became visible after restart"
-    );
+    assert_eq!(reopened_ids.contains(&rejected), unknown_committed);
+    if let Some(status) = &reconciled_state {
+        assert!(matches!(
+            status.state,
+            TransactionState::Committed | TransactionState::Rejected
+        ));
+        if status.state == TransactionState::Committed {
+            assert!(status.storage_projected);
+            assert!(status.audit_projected);
+        }
+    }
 
     if let Some(path) = std::env::var_os("CHIRONDB_ENOSPC_EVIDENCE") {
         let evidence = json!({
             "schema_version": 2,
+            "test_case": "wal_write_recovery",
             "verdict": "passed",
             "fault": "real-enospc-loopback",
             "tested_sha": std::env::var("GITHUB_SHA").ok(),
@@ -83,10 +113,126 @@ fn real_enospc_rejects_unacknowledged_write_and_reopens_acknowledged_state() {
             "acknowledged_points_after_restart": acknowledged.len(),
             "acknowledged_writes_preserved": true,
             "first_rejected_point": rejected,
-            "rejected_write_absent_after_restart": true,
+            "unknown_transaction_id": unknown_transaction_id,
+            "unknown_reconciled_state": reconciled_state.map(|status| status.state),
+            "rejected_write_absent_after_restart": !unknown_committed,
         });
         fs::write(path, serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
     }
+}
+
+#[test]
+#[ignore = "requires CHIRONDB_ENOSPC_ROOT on a dedicated marked filesystem"]
+fn real_enospc_recovers_committed_audit_projection_exactly_once() {
+    let root = enospc_root();
+    let data_dir = root.join("audit-data");
+    if std::env::var_os(AUDIT_CHILD_ENV).is_some() {
+        let db = Db::open(&data_dir).unwrap();
+        db.upsert("docs", vec![point("committed-during-enospc")])
+            .expect("durable COMMIT must not become a rejected response");
+        assert!(!db.durability_ready());
+        fs::write(
+            std::env::var_os("CHIRONDB_ENOSPC_AUDIT_CHILD_RESULT").unwrap(),
+            b"committed-degraded\n",
+        )
+        .unwrap();
+        return;
+    }
+
+    {
+        let db = Db::open(&data_dir).unwrap();
+        db.create_collection(collection_config()).unwrap();
+        db.upsert("docs", vec![point("stable")]).unwrap();
+    }
+    align_audit_for_next_upsert_enospc(&data_dir);
+
+    let control_root =
+        std::env::temp_dir().join(format!("chirondb-enospc-audit-{}", std::process::id()));
+    if control_root.exists() {
+        fs::remove_dir_all(&control_root).unwrap();
+    }
+    fs::create_dir_all(&control_root).unwrap();
+    let marker = control_root.join("audit.marker");
+    let release = control_root.join("release.marker");
+    let child_result = control_root.join("child.result");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "real_enospc_recovers_committed_audit_projection_exactly_once",
+            "--nocapture",
+        ])
+        .env("CHIRONDB_ENOSPC_ROOT", &root)
+        .env(AUDIT_CHILD_ENV, "1")
+        .env("CHIRONDB_ENOSPC_AUDIT_CHILD_RESULT", &child_result)
+        .env(
+            "CHIRONDB_FAILPOINT",
+            "pause:transaction.before_audit_projection",
+        )
+        .env("CHIRONDB_FAILPOINT_MARKER", &marker)
+        .env("CHIRONDB_FAILPOINT_RELEASE", &release)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    wait_for_marker_or_child_exit(&marker, &mut child);
+
+    let filler = root.join("audit-fill.bin");
+    fill_until_enospc(&filler);
+    fs::write(&release, b"continue").unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success(), "ENOSPC audit child failed: {status}");
+    assert_eq!(fs::read(&child_result).unwrap(), b"committed-degraded\n");
+
+    fs::remove_file(&filler).unwrap();
+    File::open(&root).unwrap().sync_all().unwrap();
+    let journal = chirondb_core::transaction_journal::TransactionJournal::open(&data_dir).unwrap();
+    let transaction_id = journal
+        .committed()
+        .unwrap()
+        .last()
+        .unwrap()
+        .prepare
+        .transaction_id
+        .to_string();
+    drop(journal);
+
+    let reopened = Db::open(&data_dir).unwrap();
+    assert_eq!(reopened.count("docs", None).unwrap().count, 2);
+    let reconciled = reopened.transaction_status(&transaction_id).unwrap();
+    assert_eq!(reconciled.state, TransactionState::Committed);
+    assert!(reconciled.storage_projected);
+    assert!(reconciled.audit_projected);
+    chirondb_core::audit::verify_hash_chain(&data_dir).unwrap();
+    drop(reopened);
+    let audit_path = data_dir.join(chirondb_core::audit::AUDIT_LOG_FILE);
+    let recovered_audit = fs::read(&audit_path).unwrap();
+
+    drop(Db::open(&data_dir).unwrap());
+    assert_eq!(fs::read(&audit_path).unwrap(), recovered_audit);
+    chirondb_core::audit::verify_hash_chain(&data_dir).unwrap();
+
+    if let Some(path) = std::env::var_os("CHIRONDB_ENOSPC_EVIDENCE") {
+        let evidence = json!({
+            "schema_version": 2,
+            "test_case": "committed_audit_projection_recovery",
+            "verdict": "passed",
+            "fault": "real-enospc-loopback-after-commit",
+            "tested_sha": std::env::var("GITHUB_SHA").ok(),
+            "core_tree_hash": std::env::var("CHIRONDB_CORE_TREE_HASH").ok(),
+            "server_tree_hash": std::env::var("CHIRONDB_SERVER_TREE_HASH").ok(),
+            "actions_run_id": std::env::var("GITHUB_RUN_ID").ok(),
+            "transaction_id": transaction_id,
+            "committed_response_before_space_returned": true,
+            "degraded_before_space_returned": true,
+            "storage_projected_after_restart": true,
+            "audit_projected_after_restart": true,
+            "audit_projection_exactly_once": true,
+            "points_after_restart": 2,
+        });
+        fs::write(path, serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+    }
+    fs::remove_dir_all(control_root).unwrap();
 }
 
 #[test]
@@ -210,14 +356,15 @@ fn real_enospc_preserves_build_checkpoint_and_resumes_after_space_returns() {
     if let Some(path) = std::env::var_os("CHIRONDB_ENOSPC_EVIDENCE") {
         let evidence = json!({
             "schema_version": 2,
+            "test_case": "build_checkpoint_resume",
             "verdict": "passed",
             "fault": "real-enospc-loopback",
             "tested_sha": std::env::var("GITHUB_SHA").ok(),
             "core_tree_hash": std::env::var("CHIRONDB_CORE_TREE_HASH").ok(),
             "server_tree_hash": std::env::var("CHIRONDB_SERVER_TREE_HASH").ok(),
             "actions_run_id": std::env::var("GITHUB_RUN_ID").ok(),
-            "wal_unacknowledged_write_gate": true,
             "build_cell_checkpoint_observed": true,
+            "build_cell_checkpoint_reused": true,
             "build_resumed_after_space_returned": true,
             "points_after_restart": 256,
         });
@@ -254,6 +401,66 @@ fn wait_for_marker_or_child_exit(marker: &Path, child: &mut std::process::Child)
     }
 }
 
+fn align_audit_for_next_upsert_enospc(data_dir: &Path) {
+    const BLOCK_BYTES: u64 = 4096;
+    const AFTER_INTENT_TARGET: u64 = BLOCK_BYTES - 32;
+
+    let audit_path = data_dir.join(AUDIT_LOG_FILE);
+    let writer = AuditWriter::open(data_dir).unwrap();
+    let before_intent = fs::metadata(&audit_path).unwrap().len();
+    let intent = writer
+        .begin("upsert", Some("docs"), AuditContext::embedded())
+        .unwrap();
+    let predicted_intent_bytes = fs::metadata(&audit_path).unwrap().len() - before_intent;
+    writer
+        .finish(&intent, "success", None, json!({"calibration": true}))
+        .unwrap();
+
+    for _ in 0..4 {
+        let before_probe = fs::metadata(&audit_path).unwrap().len();
+        writer
+            .record(AuditEvent {
+                category: "security",
+                operation: "enospc_test_alignment",
+                outcome: "success",
+                collection: None,
+                context: &AuditContext::embedded(),
+                error_code: None,
+                details: json!({"padding": ""}),
+                durable: true,
+            })
+            .unwrap();
+        let empty_record_bytes = fs::metadata(&audit_path).unwrap().len() - before_probe;
+        let current = fs::metadata(&audit_path).unwrap().len();
+        let before_child_intent_target = (AFTER_INTENT_TARGET + BLOCK_BYTES
+            - predicted_intent_bytes % BLOCK_BYTES)
+            % BLOCK_BYTES;
+        let padding_bytes = (before_child_intent_target + BLOCK_BYTES
+            - (current + empty_record_bytes) % BLOCK_BYTES)
+            % BLOCK_BYTES;
+        writer
+            .record(AuditEvent {
+                category: "security",
+                operation: "enospc_test_alignment",
+                outcome: "success",
+                collection: None,
+                context: &AuditContext::embedded(),
+                error_code: None,
+                details: json!({"padding": "x".repeat(padding_bytes as usize)}),
+                durable: true,
+            })
+            .unwrap();
+        let after_child_intent =
+            (fs::metadata(&audit_path).unwrap().len() + predicted_intent_bytes) % BLOCK_BYTES;
+        if after_child_intent >= AFTER_INTENT_TARGET {
+            drop(writer);
+            chirondb_core::audit::verify_hash_chain(data_dir).unwrap();
+            return;
+        }
+    }
+    panic!("could not align audit tail for deterministic ENOSPC projection failure");
+}
+
 fn first_build_cell(data_dir: &Path) -> std::path::PathBuf {
     let builds = data_dir.join("collections/docs/searchers/.builds");
     fs::read_dir(builds)
@@ -271,9 +478,11 @@ fn first_build_cell(data_dir: &Path) -> std::path::PathBuf {
 }
 
 fn fill_until_enospc(path: &Path) {
+    use std::os::unix::fs::OpenOptionsExt;
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
+        .custom_flags(libc::O_SYNC)
         .open(path)
         .unwrap();
     let block = vec![0xa5_u8; 1024 * 1024];
@@ -284,7 +493,16 @@ fn fill_until_enospc(path: &Path) {
             Err(error) => panic!("expected ENOSPC, got {error}"),
         }
     }
-    let _ = file.sync_all();
+    // A failed large write can leave a few free blocks. Exhaust those too so
+    // the paused projection encounters ENOSPC even for a small audit record.
+    loop {
+        match file.write_all(&block[..512]) {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(28) => break,
+            Err(error) => panic!("expected ENOSPC, got {error}"),
+        }
+    }
+    file.sync_all().unwrap();
 }
 
 fn point(id: &str) -> Point {

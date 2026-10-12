@@ -136,6 +136,26 @@ fn query(statement: impl Into<String>) -> wire_request::Operation {
         trace: true,
         confirm: false,
         deferred_session_id: None,
+        parameters_json: None,
+        idempotency_key: None,
+        retry_id: None,
+    })
+}
+
+fn query_with_parameters(
+    statement: impl Into<String>,
+    parameters: Vec<chirondb::RelationalValue>,
+    retry_id: Option<&str>,
+) -> wire_request::Operation {
+    wire_request::Operation::Chironql(WireChironQlRequest {
+        query: statement.into(),
+        collection: None,
+        trace: true,
+        confirm: false,
+        deferred_session_id: None,
+        parameters_json: Some(serde_json::to_string(&parameters).expect("parameters")),
+        idempotency_key: None,
+        retry_id: retry_id.map(str::to_owned),
     })
 }
 
@@ -154,6 +174,101 @@ fn row(response: &chirondb::grpc::pb::WireChironQlResponse, index: usize) -> Val
 
 fn stats(response: &chirondb::grpc::pb::WireChironQlResponse) -> Value {
     serde_json::from_str(&response.stats_json).expect("stats json")
+}
+
+#[tokio::test]
+async fn relational_chironql_preserves_typed_parameters_and_metadata() {
+    use chirondb::RelationalValue;
+
+    let harness = Harness::start(false, AuthConfig::disabled()).await;
+    let created = chironql_payload(
+        common::send_wire(
+            &harness.endpoint,
+            1,
+            query("SQL CREATE TABLE notes (id TEXT PRIMARY KEY, title TEXT NOT NULL);"),
+        )
+        .await,
+    );
+    assert_eq!(created.domains, ["relational"]);
+
+    let inserted = chironql_payload(
+        common::send_wire(
+            &harness.endpoint,
+            2,
+            query_with_parameters(
+                "SQL INSERT INTO notes VALUES ($1, $2);",
+                vec![
+                    RelationalValue::Text("n-1".into()),
+                    RelationalValue::Text("ChironWire".into()),
+                ],
+                Some("wire-cql-relational-1"),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(inserted.committed, Some(true));
+    assert!(inserted.transaction_id.is_some());
+
+    let selected = chironql_payload(
+        common::send_wire(
+            &harness.endpoint,
+            3,
+            query_with_parameters(
+                "SQL SELECT id, title FROM notes WHERE id = $1;",
+                vec![RelationalValue::Text("n-1".into())],
+                None,
+            ),
+        )
+        .await,
+    );
+    assert_eq!(selected.domains, ["relational"]);
+    assert_eq!(
+        selected.column_types_json,
+        ["{\"kind\":\"text\"}", "{\"kind\":\"text\"}"]
+    );
+    assert!(selected.snapshot_id.is_some());
+    assert_eq!(
+        row(&selected, 0),
+        json!({"id": "n-1", "title": "ChironWire"})
+    );
+}
+
+#[tokio::test]
+async fn atomic_multimodel_transaction_runs_over_chironwire() {
+    let harness = Harness::start(false, AuthConfig::disabled()).await;
+    chironql_payload(
+        common::send_wire(
+            &harness.endpoint,
+            1,
+            query("SQL CREATE TABLE documents (id TEXT PRIMARY KEY, title TEXT NOT NULL);"),
+        )
+        .await,
+    );
+    let response = chironql_payload(
+        common::send_wire(
+            &harness.endpoint,
+            2,
+            query_with_parameters(
+                r#"TRANSACTION {
+  SQL INSERT INTO documents VALUES ($1, $2);
+  VECTOR UPSERT INTO docs
+      {id: 'wire-chunk', vector: [1,0]},
+      {id: 'wire-source', vector: [0,1]};
+  GRAPH CONNECT docs 'wire-chunk' -> CITES -> 'wire-source' SET {rank: 1};
+};"#,
+                vec![
+                    chirondb::RelationalValue::Text("wire-doc".into()),
+                    chirondb::RelationalValue::Text("Wire atomic".into()),
+                ],
+                Some("wire-multimodel-1"),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(response.committed, Some(true));
+    assert_eq!(response.domains, ["relational", "vector", "graph"]);
+    assert!(response.transaction_id.is_some());
+    assert_eq!(stats(&response)["affected"], json!(4));
 }
 
 #[tokio::test]
@@ -243,14 +358,20 @@ async fn graph_chironql_round_trip_preserves_receipts_tokens_trace_and_errors() 
 
 #[tokio::test]
 async fn deferred_session_token_is_bound_outside_the_language() {
-    let harness = Harness::start(true, AuthConfig::disabled()).await;
+    let auth = graph_rbac();
+    let owner = auth
+        .permission_for(Some(ACME_KEY))
+        .expect("owner principal");
+    let owner_scope = owner.tenant_scope(owner.id.clone());
+    let harness = Harness::start(true, auth).await;
     let opened = harness
         .db
-        .open_deferred_graph_session_scoped(COLLECTION, true, &TenantScope::system())
+        .open_deferred_graph_session_scoped(COLLECTION, true, &owner_scope)
         .expect("open deferred session");
     let statement = "RELATE docs late-source -> CITES -> late-target WITH DEFERRED ENDPOINTS;";
 
-    let missing = common::send_wire_with_key(&harness.endpoint, 10, "", query(statement)).await;
+    let missing =
+        common::send_wire_with_key(&harness.endpoint, 10, ACME_KEY, query(statement)).await;
     assert_eq!(missing.error_code, "INVALID_ARGUMENT");
     let missing_details: Value = serde_json::from_str(
         missing
@@ -264,18 +385,24 @@ async fn deferred_session_token_is_bound_outside_the_language() {
         json!("chironql.deferred_session_required")
     );
 
-    let accepted = common::send_wire(
-        &harness.endpoint,
-        11,
+    let with_session = || {
         wire_request::Operation::Chironql(WireChironQlRequest {
             query: statement.to_string(),
             collection: None,
             trace: false,
             confirm: false,
             deferred_session_id: Some(opened.session_id.as_str().to_string()),
-        }),
-    )
-    .await;
+            parameters_json: None,
+            idempotency_key: None,
+            retry_id: None,
+        })
+    };
+    let foreign =
+        common::send_wire_with_key(&harness.endpoint, 11, GLOBEX_KEY, with_session()).await;
+    assert_eq!(foreign.error_code, "NOT_FOUND");
+    let accepted =
+        common::send_wire_with_key(&harness.endpoint, 12, ACME_KEY, with_session()).await;
+    assert_eq!(accepted.error_code, "", "{}", accepted.error_message);
     assert_eq!(stats(&chironql_payload(accepted))["affected"], json!(1));
 }
 
@@ -441,4 +568,55 @@ async fn capabilities_tenant_scope_and_denial_audit_apply_to_wire_graph_paths() 
     assert!(audit.contains("chironwire_chironql"), "{audit}");
     assert!(audit.contains("chironwire_graph_authorize"), "{audit}");
     assert!(audit.contains("graph.permission_denied"), "{audit}");
+}
+
+#[tokio::test]
+async fn wire_collection_hnsw_one_is_rejected_and_zero_retains_default_contract() {
+    use chirondb::grpc::pb as compat;
+    let harness = Harness::start(false, AuthConfig::default()).await;
+    let before = harness.db.multimodel_visibility_frontier().unwrap();
+    let error = common::send_wire_with_key(
+        &harness.endpoint,
+        1,
+        "",
+        wire_request::Operation::CreateCollection(compat::CreateCollectionRequest {
+            config: Some(compat::CollectionConfig {
+                name: "invalid_hnsw".into(),
+                vector_dim: 2,
+                metric: "l2".into(),
+                hnsw_m: Some(1),
+                ..Default::default()
+            }),
+        }),
+    )
+    .await;
+    assert_eq!(error.error_code, "INVALID_ARGUMENT");
+    assert!(error.error_message.contains("hnsw_m"));
+    assert_eq!(harness.db.list_collections().len(), 1);
+    assert_eq!(harness.db.multimodel_visibility_frontier().unwrap(), before);
+    common::send_wire(
+        &harness.endpoint,
+        2,
+        wire_request::Operation::CreateCollection(compat::CreateCollectionRequest {
+            config: Some(compat::CollectionConfig {
+                name: "zero_default".into(),
+                vector_dim: 2,
+                metric: "l2".into(),
+                hnsw_m: Some(0),
+                hnsw_ef_construction: Some(0),
+                hnsw_ef_search: Some(0),
+                ..Default::default()
+            }),
+        }),
+    )
+    .await;
+    let config = harness
+        .db
+        .list_collections()
+        .into_iter()
+        .find(|c| c.name == "zero_default")
+        .unwrap();
+    assert_eq!(config.hnsw_m, None);
+    assert_eq!(config.hnsw_ef_construction, None);
+    assert_eq!(config.hnsw_ef_search, None);
 }

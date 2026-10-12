@@ -4,7 +4,10 @@
 //! service is frozen at the surface it shipped with, and this test exists in
 //! part to keep that true.
 
-use chirondb::{CollectionConfig, Db, DistanceMetric, Point, grpc};
+use chirondb::{
+    CollectionConfig, Db, DistanceMetric, Point, graph::ConfigureEdgeTypeRequest, grpc,
+    tenant::TenantScope,
+};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -78,6 +81,9 @@ fn request(query: &str) -> pb::ChironQlRequest {
         collection: None,
         trace: false,
         confirm: false,
+        parameters: Vec::new(),
+        idempotency_key: None,
+        retry_id: None,
     }
 }
 
@@ -153,6 +159,7 @@ async fn the_trace_is_returned_when_asked_for() {
         stages,
         vec![
             "parse",
+            "classify",
             "authorize",
             "resolve_collection",
             "engine_search",
@@ -160,6 +167,147 @@ async fn the_trace_is_returned_when_asked_for() {
         ]
     );
 
+    handle.abort();
+}
+
+#[tokio::test]
+async fn sql_wrapper_preserves_typed_parameters_and_metadata_over_grpc() {
+    use pb::sql_value::Value as SqlValueKind;
+
+    let (_data, url, handle) = start().await;
+    let mut client = ChironDbClient::connect(url).await.expect("connect");
+    client
+        .execute_query(request(
+            "SQL CREATE TABLE notes (id TEXT PRIMARY KEY, title TEXT NOT NULL);",
+        ))
+        .await
+        .expect("create table");
+
+    let inserted = client
+        .execute_query(pb::ChironQlRequest {
+            parameters: vec![
+                pb::SqlValue {
+                    value: Some(SqlValueKind::Text("n-1".into())),
+                },
+                pb::SqlValue {
+                    value: Some(SqlValueKind::Text("gRPC".into())),
+                },
+            ],
+            idempotency_key: None,
+            retry_id: Some("grpc-cql-relational-1".into()),
+            ..request("SQL INSERT INTO notes VALUES ($1, $2);")
+        })
+        .await
+        .expect("insert")
+        .into_inner();
+    assert_eq!(inserted.domains, ["relational"]);
+    assert_eq!(inserted.committed, Some(true));
+    assert!(inserted.transaction_id.is_some());
+
+    let selected = client
+        .execute_query(pb::ChironQlRequest {
+            parameters: vec![pb::SqlValue {
+                value: Some(SqlValueKind::Text("n-1".into())),
+            }],
+            ..request("SQL SELECT id, title FROM notes WHERE id = $1;")
+        })
+        .await
+        .expect("select")
+        .into_inner();
+    assert_eq!(selected.domains, ["relational"]);
+    assert_eq!(
+        selected.column_types_json,
+        ["{\"kind\":\"text\"}", "{\"kind\":\"text\"}"]
+    );
+    assert!(selected.snapshot_id.is_some());
+    let row: Value = serde_json::from_str(&selected.rows_json[0]).expect("row");
+    assert_eq!(row, json!({"id": "n-1", "title": "gRPC"}));
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn atomic_multimodel_transaction_runs_over_grpc() {
+    use pb::sql_value::Value as SqlValueKind;
+
+    let data = TempDir::new().expect("tempdir");
+    let db = Db::open(data.path()).expect("open");
+    db.create_collection(CollectionConfig {
+        name: "chunks".into(),
+        vector_dim: 2,
+        metric: DistanceMetric::L2,
+        shards: 1,
+        replicas: 1,
+        quantization: None,
+        payload_schema: Default::default(),
+        named_vector_dims: Default::default(),
+        hnsw_m: None,
+        hnsw_ef_construction: None,
+        hnsw_ef_search: None,
+        recall_sla: None,
+        index_kind: None,
+        streamer_max_bytes: 0,
+    })
+    .expect("collection");
+    db.set_graph_lifecycle_scoped("chunks", true, true, &TenantScope::system())
+        .expect("graph");
+    db.configure_edge_type_scoped(
+        "chunks",
+        ConfigureEdgeTypeRequest {
+            name: "CITES".into(),
+            weight_property: None,
+        },
+        true,
+        &TenantScope::system(),
+    )
+    .expect("edge type");
+    let addr = {
+        let probe = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        probe.local_addr().expect("addr")
+    };
+    let handle = tokio::spawn(async move {
+        grpc::serve(db, addr).await.expect("serve");
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let mut client = ChironDbClient::connect(format!("http://{addr}"))
+        .await
+        .expect("connect");
+    client
+        .execute_query(request(
+            "SQL CREATE TABLE documents (id TEXT PRIMARY KEY, title TEXT NOT NULL);",
+        ))
+        .await
+        .expect("create table");
+    let response = client
+        .execute_query(pb::ChironQlRequest {
+            parameters: vec![
+                pb::SqlValue {
+                    value: Some(SqlValueKind::Text("grpc-doc".into())),
+                },
+                pb::SqlValue {
+                    value: Some(SqlValueKind::Text("gRPC atomic".into())),
+                },
+            ],
+            idempotency_key: None,
+            retry_id: Some("grpc-multimodel-1".into()),
+            ..request(
+                r#"TRANSACTION {
+  SQL INSERT INTO documents VALUES ($1, $2);
+  VECTOR UPSERT INTO chunks
+      {id: 'grpc-chunk', vector: [1,0]},
+      {id: 'grpc-source', vector: [0,1]};
+  GRAPH CONNECT chunks 'grpc-chunk' -> CITES -> 'grpc-source';
+};"#,
+            )
+        })
+        .await
+        .expect("transaction")
+        .into_inner();
+    assert_eq!(response.committed, Some(true));
+    assert_eq!(response.domains, ["relational", "vector", "graph"]);
+    assert!(response.transaction_id.is_some());
+    let stats: Value = serde_json::from_str(&response.stats_json).expect("stats");
+    assert_eq!(stats["affected"], json!(4));
     handle.abort();
 }
 
@@ -181,7 +329,12 @@ async fn a_reject_becomes_invalid_argument_with_the_full_error_in_the_details() 
     let details: Value = serde_json::from_slice(status.details()).expect("details json");
     assert_eq!(details["code"], json!("chironql.not_sql"));
     assert_eq!(details["position"], json!(0));
-    assert!(details["hint"].as_str().expect("hint").contains("SEARCH"));
+    assert!(
+        details["hint"]
+            .as_str()
+            .expect("hint")
+            .contains("SQL SELECT")
+    );
 
     handle.abort();
 }
@@ -249,5 +402,65 @@ async fn the_session_collection_may_travel_in_the_request() {
     let row: Value = serde_json::from_str(&response.rows_json[0]).expect("row json");
     assert_eq!(row["count"], json!(2));
 
+    handle.abort();
+}
+
+#[tokio::test]
+async fn grpc_collection_hnsw_one_is_rejected_and_zero_retains_default_contract() {
+    use chirondb::grpc::pb as compat;
+    let (_data, url, handle) = start().await;
+    let mut client = ChironDbClient::connect(url).await.unwrap();
+    let error = client
+        .create_collection(compat::CreateCollectionRequest {
+            config: Some(compat::CollectionConfig {
+                name: "invalid_hnsw".into(),
+                vector_dim: 2,
+                metric: "l2".into(),
+                hnsw_m: Some(1),
+                ..Default::default()
+            }),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(error.message().contains("hnsw_m"));
+    assert_eq!(
+        client
+            .list_collections(compat::ListCollectionsRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .collections
+            .len(),
+        1
+    );
+    let config = client
+        .create_collection(compat::CreateCollectionRequest {
+            config: Some(compat::CollectionConfig {
+                name: "zero_default".into(),
+                vector_dim: 2,
+                metric: "l2".into(),
+                hnsw_m: Some(0),
+                hnsw_ef_construction: Some(0),
+                hnsw_ef_search: Some(0),
+                ..Default::default()
+            }),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(config.hnsw_m, None);
+    assert_eq!(config.hnsw_ef_construction, None);
+    assert_eq!(config.hnsw_ef_search, None);
+    assert_eq!(
+        client
+            .list_collections(compat::ListCollectionsRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .collections
+            .len(),
+        2
+    );
     handle.abort();
 }

@@ -29,6 +29,7 @@ use crate::pgvector_parser::{
 };
 use crate::rbac::Permission;
 use crate::{CollectionConfig, DistanceMetric, Filter, GaussError, Point, SearchRequest};
+use chirondb_core::security::{Action, AuthenticatedIdentity, NewPoint};
 
 // =========================================================================
 // Public surface
@@ -59,11 +60,21 @@ pub struct ColumnSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PgType {
     Text,
+    TextArray,
+    BoolArray,
+    Int2Array,
+    Varchar,
+    Bytea,
+    Date,
+    Int2,
     Int4,
     Int8,
     Float4,
     Float8,
     Bool,
+    Numeric,
+    TimestampTz,
+    Uuid,
     Jsonb,
 }
 
@@ -71,20 +82,39 @@ impl PgType {
     pub fn oid(self) -> u32 {
         match self {
             PgType::Text => 25,
+            PgType::TextArray => 1009,
+            PgType::BoolArray => 1000,
+            PgType::Int2Array => 1005,
+            PgType::Varchar => 1043,
+            PgType::Bytea => 17,
+            PgType::Date => 1082,
+            PgType::Int2 => 21,
             PgType::Int4 => 23,
             PgType::Int8 => 20,
             PgType::Float4 => 700,
             PgType::Float8 => 701,
             PgType::Bool => 16,
+            PgType::Numeric => 1700,
+            PgType::TimestampTz => 1184,
+            PgType::Uuid => 2950,
             PgType::Jsonb => 3802,
         }
     }
     pub fn typlen(self) -> i16 {
         match self {
-            PgType::Int4 | PgType::Float4 => 4,
-            PgType::Int8 | PgType::Float8 => 8,
+            PgType::Int2 => 2,
+            PgType::Int4 | PgType::Float4 | PgType::Date => 4,
+            PgType::Int8 | PgType::Float8 | PgType::TimestampTz => 8,
             PgType::Bool => 1,
-            PgType::Text | PgType::Jsonb => -1,
+            PgType::Uuid => 16,
+            PgType::Text
+            | PgType::TextArray
+            | PgType::BoolArray
+            | PgType::Int2Array
+            | PgType::Varchar
+            | PgType::Bytea
+            | PgType::Numeric
+            | PgType::Jsonb => -1,
         }
     }
 }
@@ -93,6 +123,7 @@ impl PgType {
 pub enum ExecError {
     Unsupported { message: String, hint: &'static str },
     InvalidArgument(String),
+    Duplicate(String),
     NotFound(String),
     PermissionDenied(String),
     Unavailable(String),
@@ -104,6 +135,7 @@ impl ExecError {
         match self {
             ExecError::Unsupported { .. } => "0A000",
             ExecError::InvalidArgument(_) => "22023",
+            ExecError::Duplicate(_) => "23505",
             ExecError::NotFound(_) => "42P01",
             ExecError::PermissionDenied(_) => "42501",
             ExecError::Unavailable(_) => "58030",
@@ -114,6 +146,7 @@ impl ExecError {
         match self {
             ExecError::Unsupported { message, .. } => message.clone(),
             ExecError::InvalidArgument(s)
+            | ExecError::Duplicate(s)
             | ExecError::NotFound(s)
             | ExecError::PermissionDenied(s)
             | ExecError::Unavailable(s)
@@ -130,6 +163,19 @@ impl ExecError {
 
 fn exec_error_from_engine(error: GaussError) -> ExecError {
     match error {
+        GaussError::Security(error) => {
+            use chirondb_core::security::SecurityError;
+            match error {
+                SecurityError::Unauthenticated | SecurityError::Forbidden => {
+                    ExecError::PermissionDenied(error.to_string())
+                }
+                SecurityError::NotFound => ExecError::NotFound(error.to_string()),
+                SecurityError::Unavailable => ExecError::Unavailable(error.to_string()),
+                SecurityError::Conflict
+                | SecurityError::Invalid(_)
+                | SecurityError::BudgetExceeded => ExecError::InvalidArgument(error.to_string()),
+            }
+        }
         GaussError::AuditUnavailable(message) => ExecError::Unavailable(message),
         other => ExecError::Engine(other.to_string()),
     }
@@ -169,6 +215,40 @@ pub fn execute_scoped(
     stmt: Statement,
 ) -> Result<QueryResponse, ExecError> {
     execute_inner(db, session, Some(principal), stmt)
+}
+
+/// The PostgreSQL protected profile shares the durable identity authority
+/// with HTTP/gRPC/ChironWire. It must never enter legacy scoped APIs.
+pub fn execute_protected(
+    db: &Db,
+    session: &SessionState,
+    identity: &AuthenticatedIdentity,
+    stmt: Statement,
+) -> Result<QueryResponse, ExecError> {
+    match stmt {
+        Statement::CreateExtensionVector { .. } => {
+            Ok(QueryResponse::CommandTag("CREATE EXTENSION".into()))
+        }
+        Statement::CreateTable(ct) => exec_create_table_protected(db, session, identity, ct),
+        Statement::CreateIndex(ci) => exec_create_index(db, session, ci),
+        Statement::Insert(ins) => exec_insert_protected(db, session, identity, ins),
+        Statement::Select(sel) => exec_select_with_identity(db, session, identity, sel),
+        Statement::Delete(del) => exec_delete_protected(db, identity, del),
+        Statement::DropTable(dt) => exec_drop_table_protected(db, session, identity, dt),
+        Statement::Set { .. } => Ok(QueryResponse::CommandTag("SET".into())),
+        Statement::Show { name } => Ok(QueryResponse::RowSet {
+            columns: vec![ColumnSpec {
+                name: name.clone(),
+                pg_type: PgType::Text,
+            }],
+            rows: vec![vec![Some(show_value(&name))]],
+            tag: "SHOW".into(),
+        }),
+        Statement::TransactionControl(_) => Err(ExecError::Unsupported {
+            message: "pgvector statements are not supported inside a relational transaction".into(),
+            hint: "#transactions",
+        }),
+    }
 }
 
 fn execute_inner(
@@ -298,6 +378,76 @@ fn exec_create_table(
         .map_err(exec_error_from_engine)
 }
 
+fn exec_create_table_protected(
+    db: &Db,
+    session: &SessionState,
+    identity: &AuthenticatedIdentity,
+    ct: CreateTable,
+) -> Result<QueryResponse, ExecError> {
+    if !identity.is_installation_admin() {
+        return Err(ExecError::PermissionDenied(
+            "operation is not permitted".into(),
+        ));
+    }
+    let mut dimension = None;
+    let mut primary_key = None;
+    for column in &ct.columns {
+        if let SqlType::Vector(n) = column.data_type
+            && dimension.replace(n).is_some()
+        {
+            return Err(ExecError::Unsupported {
+                message: "only one vector column is supported".into(),
+                hint: "#ddl",
+            });
+        }
+        if column.primary_key {
+            primary_key = Some(column.name.clone());
+        }
+    }
+    let Some(vector_dim) = dimension else {
+        return Err(ExecError::Unsupported {
+            message: "vector column is required".into(),
+            hint: "#ddl",
+        });
+    };
+    if ct.if_not_exists
+        && db
+            .protected_collection_exists_admin(identity, &ct.name)
+            .map_err(exec_error_from_engine)?
+    {
+        return Ok(QueryResponse::CommandTag("CREATE TABLE".into()));
+    }
+    let config = CollectionConfig {
+        name: ct.name.clone(),
+        vector_dim,
+        metric: DistanceMetric::L2,
+        shards: 1,
+        replicas: 1,
+        quantization: None,
+        payload_schema: HashMap::new(),
+        named_vector_dims: HashMap::new(),
+        hnsw_m: None,
+        hnsw_ef_construction: None,
+        hnsw_ef_search: None,
+        recall_sla: None,
+        index_kind: None,
+        streamer_max_bytes: 0,
+    };
+    let revision = db
+        .catalog_revision_authorized(identity)
+        .map_err(exec_error_from_engine)?;
+    db.create_protected_collection_authorized(identity, revision, config)
+        .map_err(exec_error_from_engine)?;
+    if let Some(primary_key) = primary_key {
+        session
+            .primary_keys
+            .lock()
+            .expect("primary_keys mutex poisoned")
+            .insert(ct.name, primary_key);
+    }
+    Ok(QueryResponse::CommandTag("CREATE TABLE".into()))
+}
+
 // =========================================================================
 // CREATE INDEX
 // =========================================================================
@@ -355,6 +505,43 @@ fn exec_drop_table(
     Ok(QueryResponse::CommandTag("DROP TABLE".to_string()))
 }
 
+fn exec_drop_table_protected(
+    db: &Db,
+    session: &SessionState,
+    identity: &AuthenticatedIdentity,
+    dt: DropTable,
+) -> Result<QueryResponse, ExecError> {
+    if !identity.is_installation_admin() {
+        return Err(ExecError::PermissionDenied(
+            "operation is not permitted".into(),
+        ));
+    }
+    for name in &dt.names {
+        if !db
+            .protected_collection_exists_admin(identity, name)
+            .map_err(exec_error_from_engine)?
+        {
+            if dt.if_exists {
+                continue;
+            }
+            return Err(ExecError::NotFound("relation does not exist".into()));
+        }
+        db.delete_protected_collection_authorized(identity, name)
+            .map_err(exec_error_from_engine)?;
+        session
+            .index_opclass
+            .lock()
+            .expect("index_opclass mutex poisoned")
+            .remove(name);
+        session
+            .primary_keys
+            .lock()
+            .expect("primary_keys mutex poisoned")
+            .remove(name);
+    }
+    Ok(QueryResponse::CommandTag("DROP TABLE".into()))
+}
+
 // =========================================================================
 // INSERT
 // =========================================================================
@@ -365,12 +552,27 @@ fn exec_insert(
     principal: Option<&Permission>,
     ins: Insert,
 ) -> Result<QueryResponse, ExecError> {
+    let points = prepare_insert_points(session, &ins)?;
+    let n = points.len();
+    match principal {
+        Some(principal) => {
+            let scope = principal.tenant_scope(principal.id.clone());
+            db.upsert_scoped(&ins.table, points, true, &scope)
+        }
+        None => db.upsert(&ins.table, points),
+    }
+    .map_err(exec_error_from_engine)?;
+    Ok(QueryResponse::CommandTag(format!("INSERT 0 {n}")))
+}
+
+fn prepare_insert_points(session: &SessionState, ins: &Insert) -> Result<Vec<Point>, ExecError> {
     let pk_col = session
         .primary_keys
         .lock()
         .expect("primary_keys mutex poisoned")
         .get(&ins.table)
-        .cloned();
+        .cloned()
+        .or_else(|| Some("id".into()));
 
     let mut points = Vec::with_capacity(ins.rows.len());
     for row in &ins.rows {
@@ -437,16 +639,43 @@ fn exec_insert(
             payload: serde_json::Value::Object(payload),
         });
     }
-    let n = points.len();
-    match principal {
-        Some(principal) => {
-            let scope = principal.tenant_scope(principal.id.clone());
-            db.upsert_scoped(&ins.table, points, true, &scope)
-        }
-        None => db.upsert(&ins.table, points),
-    }
-    .map_err(exec_error_from_engine)?;
-    Ok(QueryResponse::CommandTag(format!("INSERT 0 {n}")))
+    Ok(points)
+}
+
+fn exec_insert_protected(
+    db: &Db,
+    session: &SessionState,
+    identity: &AuthenticatedIdentity,
+    ins: Insert,
+) -> Result<QueryResponse, ExecError> {
+    let points = prepare_insert_points(session, &ins)?;
+    let count = points.len();
+    let context = db
+        .bind_access(
+            identity,
+            &ins.table,
+            &identity.principal().tenant,
+            Action::Create,
+        )
+        .map_err(exec_error_from_engine)?;
+    let ids: Vec<_> = points.iter().map(|point| point.id.clone()).collect();
+    let content: Vec<_> = points
+        .into_iter()
+        .map(|point| NewPoint {
+            vector: point.vector,
+            vectors: point.vectors.into_iter().collect(),
+            sparse_vector: point.sparse_vector,
+            payload: point.payload,
+        })
+        .collect();
+    db.create_points_with_ids_authorized(&context, "pgvector", content, ids)
+        .map_err(|error| match error {
+            GaussError::DuplicateKey => ExecError::Duplicate("duplicate key".into()),
+            other => exec_error_from_engine(other),
+        })?
+        .publish(|_| ())
+        .map_err(exec_error_from_engine)?;
+    Ok(QueryResponse::CommandTag(format!("INSERT 0 {count}")))
 }
 
 fn uuid_like_id(payload: &serde_json::Map<String, serde_json::Value>) -> String {
@@ -512,6 +741,38 @@ fn exec_delete(
     Ok(QueryResponse::CommandTag(format!("DELETE {n}")))
 }
 
+fn exec_delete_protected(
+    db: &Db,
+    identity: &AuthenticatedIdentity,
+    del: Delete,
+) -> Result<QueryResponse, ExecError> {
+    let predicate = del.where_clause.ok_or_else(|| ExecError::Unsupported {
+        message: "DELETE requires a predicate".into(),
+        hint: "#dml",
+    })?;
+    let context = db
+        .bind_access(
+            identity,
+            &del.table,
+            &identity.principal().tenant,
+            Action::Delete,
+        )
+        .map_err(exec_error_from_engine)?;
+    let count = if let Some(id) = extract_id_eq(&predicate) {
+        db.delete_points_authorized(&context, &[id])
+            .map_err(exec_error_from_engine)?
+            .publish(|count| count)
+            .map_err(exec_error_from_engine)?
+    } else {
+        let filter = expr_to_filter(&predicate)?;
+        db.delete_filter_authorized(&context, filter)
+            .map_err(exec_error_from_engine)?
+            .publish(|count| count)
+            .map_err(exec_error_from_engine)?
+    };
+    Ok(QueryResponse::CommandTag(format!("DELETE {count}")))
+}
+
 fn extract_id_eq(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Compare {
@@ -544,6 +805,25 @@ fn exec_select(
     db: &Db,
     session: &SessionState,
     principal: Option<&Permission>,
+    sel: Select,
+) -> Result<QueryResponse, ExecError> {
+    exec_select_inner(db, session, principal, None, sel)
+}
+
+fn exec_select_with_identity(
+    db: &Db,
+    session: &SessionState,
+    identity: &AuthenticatedIdentity,
+    sel: Select,
+) -> Result<QueryResponse, ExecError> {
+    exec_select_inner(db, session, None, Some(identity), sel)
+}
+
+fn exec_select_inner(
+    db: &Db,
+    session: &SessionState,
+    principal: Option<&Permission>,
+    identity: Option<&AuthenticatedIdentity>,
     sel: Select,
 ) -> Result<QueryResponse, ExecError> {
     let Some(order_by) = &sel.order_by else {
@@ -618,20 +898,39 @@ fn exec_select(
         recall_target: None,
         with_payload: Some(true),
     };
-    let response = match principal {
-        Some(principal) => {
+    let hits = match (principal, identity) {
+        (_, Some(identity)) => {
+            let context = db
+                .bind_access(
+                    identity,
+                    &sel.table,
+                    &identity.principal().tenant,
+                    Action::Search,
+                )
+                .map_err(exec_error_from_engine)?;
+            db.search_authorized(&context, request, None)
+                .map_err(exec_error_from_engine)?
+                .publish(|hits| hits)
+                .map_err(exec_error_from_engine)?
+        }
+        (Some(principal), None) => {
             let scope = principal.tenant_scope(principal.id.clone());
             db.search_scoped(&sel.table, request, &scope)
+                .map_err(exec_error_from_engine)?
+                .hits
         }
-        None => db.search(&sel.table, request),
-    }
-    .map_err(exec_error_from_engine)?;
+        (None, None) => {
+            db.search(&sel.table, request)
+                .map_err(exec_error_from_engine)?
+                .hits
+        }
+    };
 
     // Plan projection columns.
     let projection = plan_projection(&sel.projection, &col)?;
     let columns: Vec<ColumnSpec> = projection.iter().map(|p| p.spec.clone()).collect();
-    let mut rows: Vec<Vec<Option<String>>> = Vec::with_capacity(response.hits.len());
-    for hit in &response.hits {
+    let mut rows: Vec<Vec<Option<String>>> = Vec::with_capacity(hits.len());
+    for hit in &hits {
         let mut row = Vec::with_capacity(projection.len());
         for p in &projection {
             row.push(render_field(&p.source, hit, metric, &col));
@@ -641,7 +940,7 @@ fn exec_select(
     Ok(QueryResponse::RowSet {
         columns,
         rows,
-        tag: format!("SELECT {}", response.hits.len()),
+        tag: format!("SELECT {}", hits.len()),
     })
 }
 
@@ -960,7 +1259,7 @@ fn literal_to_number(expr: &Expr) -> Result<f64, ExecError> {
 // SHOW helpers
 // =========================================================================
 
-fn show_value(name: &str) -> String {
+pub(crate) fn show_value(name: &str) -> String {
     match name.to_ascii_lowercase().as_str() {
         "server_version" => crate::wire_postgres::SERVER_VERSION_STRING.to_string(),
         "client_encoding" | "server_encoding" => "UTF8".to_string(),

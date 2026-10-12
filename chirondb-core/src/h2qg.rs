@@ -1,5 +1,4 @@
 use std::{
-    borrow::Cow,
     cmp::Reverse,
     collections::{BinaryHeap, HashSet},
     fs::{self, File},
@@ -434,29 +433,39 @@ impl Clone for PagedVectors {
 }
 
 impl PagedVectors {
-    pub(crate) fn get(&self, idx: usize) -> Cow<'_, [f32]> {
-        let row_bytes = self.dim.checked_mul(4).expect("validated vector row width");
+    pub(crate) fn try_get(&self, idx: usize) -> Result<crate::index::VectorRead<'_>> {
+        if idx >= self.count {
+            return Err(GaussError::InvalidRequest(
+                "vector ordinal out of range".into(),
+            ));
+        }
+        let row_bytes = self
+            .dim
+            .checked_mul(4)
+            .ok_or_else(|| GaussError::InvalidRequest("vector row width overflow".into()))?;
         let offset = 24_usize
-            .checked_add(idx.checked_mul(row_bytes).expect("validated vector offset"))
-            .expect("validated vector offset");
-        let bytes = self
-            .storage
-            .read_range(offset..offset + row_bytes)
-            .expect("validated paged vector range");
-        match bytes {
-            Cow::Borrowed(bytes) => {
-                // SAFETY: the writer stores aligned little-endian f32 rows
-                // after a 24-byte header, and the file is immutable.
-                Cow::Borrowed(unsafe {
-                    std::slice::from_raw_parts(bytes.as_ptr().cast::<f32>(), self.dim)
-                })
-            }
-            Cow::Owned(bytes) => Cow::Owned(
+            .checked_add(
+                idx.checked_mul(row_bytes)
+                    .ok_or_else(|| GaussError::InvalidRequest("vector offset overflow".into()))?,
+            )
+            .ok_or_else(|| GaussError::InvalidRequest("vector offset overflow".into()))?;
+        let end = offset
+            .checked_add(row_bytes)
+            .ok_or_else(|| GaussError::InvalidRequest("vector range overflow".into()))?;
+        let bytes = self.storage.read_range_admitted(offset..end)?;
+        if let Some(bytes) = bytes.borrowed_bytes() {
+            // SAFETY: the writer stores aligned little-endian f32 rows
+            // after a 24-byte header, and the file is immutable.
+            Ok(crate::index::VectorRead::borrowed(unsafe {
+                std::slice::from_raw_parts(bytes.as_ptr().cast::<f32>(), self.dim)
+            }))
+        } else {
+            crate::index::VectorRead::decode(
+                self.dim,
                 bytes
                     .chunks_exact(4)
-                    .map(|value| f32::from_le_bytes(value.try_into().expect("vector value")))
-                    .collect(),
-            ),
+                    .map(|value| f32::from_le_bytes(value.try_into().expect("vector value"))),
+            )
         }
     }
 
@@ -646,21 +655,28 @@ impl HnswGraph {
     /// `vectors` tail that live inserts append after a paged index is loaded.
     /// This split is what lets a segment's vector data stay on disk (OS page
     /// cache decides residency) while the graph stays writable.
-    fn full_vec(&self, idx: usize) -> Cow<'_, [f32]> {
+    fn full_vec(&self, idx: usize) -> Result<crate::index::VectorRead<'_>> {
         if let Some(paged) = &self.paged_vecs {
             if idx < paged.count {
-                return paged.get(idx);
+                return paged.try_get(idx);
             }
-            return Cow::Borrowed(&self.vectors[idx - paged.count]);
+            return self
+                .vectors
+                .get(idx - paged.count)
+                .map(|v| crate::index::VectorRead::borrowed(v.as_slice()))
+                .ok_or_else(invalid_graph_vector);
         }
-        Cow::Borrowed(&self.vectors[idx])
+        self.vectors
+            .get(idx)
+            .map(|v| crate::index::VectorRead::borrowed(v.as_slice()))
+            .ok_or_else(invalid_graph_vector)
     }
 
     /// Compute distance, reusing a pre-encoded SQ8 query when available.
     /// Caller is responsible for ensuring `q_codes` was encoded against
     /// `self.sq8` of this same graph.
-    fn dist_to_with_codes(&self, query: &[f32], q_codes: Option<&[u8]>, idx: usize) -> f32 {
-        match &self.sq8 {
+    fn dist_to_with_codes(&self, query: &[f32], q_codes: Option<&[u8]>, idx: usize) -> Result<f32> {
+        Ok(match &self.sq8 {
             Some(params) => match q_codes {
                 Some(codes) => params.approx_sq_l2(codes, &self.sq8_codes[idx]),
                 None => {
@@ -668,16 +684,16 @@ impl HnswGraph {
                     params.approx_sq_l2(&encoded, &self.sq8_codes[idx])
                 }
             },
-            None => squared_l2(query, &self.full_vec(idx)),
-        }
+            None => squared_l2(query, &self.full_vec(idx)?),
+        })
     }
 
     /// Compute distance between two stored nodes.
-    fn dist_between(&self, i: usize, j: usize) -> f32 {
-        match &self.sq8 {
+    fn dist_between(&self, i: usize, j: usize) -> Result<f32> {
+        Ok(match &self.sq8 {
             Some(params) => params.approx_sq_l2(&self.sq8_codes[i], &self.sq8_codes[j]),
-            None => squared_l2(&self.full_vec(i), &self.full_vec(j)),
-        }
+            None => squared_l2(&self.full_vec(i)?, &self.full_vec(j)?),
+        })
     }
 
     /// A3 — number of `entry_candidates` a query actually probes (nearest to
@@ -717,14 +733,14 @@ impl HnswGraph {
     /// -- not recomputed on every incremental single-point insert, since one
     /// new point rarely shifts the cluster structure and recomputing it
     /// there would turn an O(1) insert into an O(N) one.
-    fn assign_entry_candidates(&mut self) {
+    fn assign_entry_candidates(&mut self) -> Result<()> {
         self.entry_candidates.clear();
         let Some(entry) = self.entry_point else {
-            return;
+            return Ok(());
         };
         let n = self.node_count();
         if n <= 1 {
-            return;
+            return Ok(());
         }
         let candidates: Vec<usize> = if n <= Self::ENTRY_SAMPLE_EXACT_THRESHOLD {
             (0..n).filter(|&i| i != entry).collect()
@@ -749,7 +765,7 @@ impl HnswGraph {
             out
         };
         if candidates.is_empty() {
-            return;
+            return Ok(());
         }
         // Target ~√N representatives (clamped so a huge N doesn't blow up
         // the per-query O(target) proximity scan in `nprobe_seeds` --
@@ -760,7 +776,7 @@ impl HnswGraph {
         let mut min_dist: Vec<f32> = candidates
             .iter()
             .map(|&c| self.dist_between(entry, c))
-            .collect();
+            .collect::<Result<_>>()?;
         for _ in 0..target {
             let Some((pos, _)) = min_dist
                 .iter()
@@ -772,12 +788,13 @@ impl HnswGraph {
             let picked = candidates[pos];
             self.entry_candidates.push(picked);
             for (i, &c) in candidates.iter().enumerate() {
-                let d = self.dist_between(picked, c);
+                let d = self.dist_between(picked, c)?;
                 if d < min_dist[i] {
                     min_dist[i] = d;
                 }
             }
         }
+        Ok(())
     }
 
     /// A3 — pick the [`Self::NPROBE`] entries in `entry_candidates` nearest
@@ -793,18 +810,21 @@ impl HnswGraph {
     /// the layer-0 beams this feeds into (bench note in the dev log: at
     /// `n=12000` this is ~110 candidates, negligible next to an `ef=128`
     /// beam).
-    fn nprobe_seeds(&self, query: &[f32], q_codes: Option<&[u8]>) -> Vec<usize> {
+    fn nprobe_seeds(&self, query: &[f32], q_codes: Option<&[u8]>) -> Result<Vec<usize>> {
         let mut scored: Vec<(f32, usize)> = self
             .entry_candidates
             .iter()
-            .map(|&idx| (self.dist_to_with_codes(query, q_codes, idx), idx))
-            .collect();
+            .map(|&idx| {
+                self.dist_to_with_codes(query, q_codes, idx)
+                    .map(|d| (d, idx))
+            })
+            .collect::<Result<_>>()?;
         let take = Self::NPROBE.min(scored.len());
         if take > 0 && take < scored.len() {
             scored.select_nth_unstable_by(take - 1, |a, b| a.0.total_cmp(&b.0));
         }
         scored.truncate(take);
-        scored.into_iter().map(|(_, idx)| idx).collect()
+        Ok(scored.into_iter().map(|(_, idx)| idx).collect())
     }
 
     /// True when SQ8 quantisation is active for this graph.
@@ -850,13 +870,13 @@ impl HnswGraph {
     /// node from the f32 store. No-op when SQ8 is active (already a cheaper
     /// proxy than f32) or codes already exist. Reads from `paged_vecs` when
     /// the graph is paged, else from `vectors`.
-    fn ensure_sign_codes(&mut self) {
+    fn ensure_sign_codes(&mut self) -> Result<()> {
         if self.sq8.is_some() || !self.sign_codes.is_empty() {
-            return;
+            return Ok(());
         }
         let n = self.nodes.len();
         if n == 0 {
-            return;
+            return Ok(());
         }
         let dim = if let Some(p) = &self.paged_vecs {
             p.dim
@@ -864,7 +884,7 @@ impl HnswGraph {
             self.vectors.first().map_or(0, |v| v.len())
         };
         if dim == 0 {
-            return;
+            return Ok(());
         }
         let padded_dim = crate::index::next_pow2(dim);
         let wc = crate::index::sign_word_count(padded_dim);
@@ -872,7 +892,7 @@ impl HnswGraph {
         let mut codes = Vec::with_capacity(n);
         let mut norms = Vec::with_capacity(n);
         for i in 0..n {
-            let v = self.full_vec(i);
+            let v = self.full_vec(i)?;
             let rotated = crate::index::rotate_for_cascade(&v);
             codes.push(crate::index::encode_sign_bits(&rotated, wc));
             let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -880,16 +900,17 @@ impl HnswGraph {
         }
         self.sign_codes = codes;
         self.sign_norms = norms;
+        Ok(())
     }
 
     /// W1 — adopt the server-wide cascade flag. If it's currently ON, build the
     /// sign codes eagerly so the read path never needs `&mut self`.
-    fn set_cascade_flag(&mut self, flag: Arc<AtomicBool>) {
-        let on = flag.load(std::sync::atomic::Ordering::Relaxed);
-        self.cascade = flag;
-        if on {
-            self.ensure_sign_codes();
+    fn set_cascade_flag(&mut self, flag: Arc<AtomicBool>) -> Result<()> {
+        if flag.load(std::sync::atomic::Ordering::Relaxed) {
+            self.ensure_sign_codes()?;
         }
+        self.cascade = flag;
+        Ok(())
     }
 
     /// W1 Phase 3 — layer-0 beam guided by the rotation- and norm-corrected
@@ -910,7 +931,7 @@ impl HnswGraph {
         ef: usize,
         oversample: usize,
         filter: Option<&dyn crate::index::FilterPredicate>,
-    ) -> Vec<(f32, usize)> {
+    ) -> Result<Vec<(f32, usize)>> {
         let ef_cascade = ef.saturating_mul(oversample).max(ef);
         // Rotate the query once per call (not per node) — same rotation
         // applied to every stored vector in `ensure_sign_codes`, so the
@@ -962,11 +983,11 @@ impl HnswGraph {
         // Exact rerank: true f32 distance on the widened pool, keep top `ef`.
         let mut exact: Vec<(f32, usize)> = found
             .into_iter()
-            .map(|(_, idx)| (self.dist_to_with_codes(query, None, idx), idx))
-            .collect();
+            .map(|(_, idx)| self.dist_to_with_codes(query, None, idx).map(|d| (d, idx)))
+            .collect::<Result<_>>()?;
         exact.sort_by(|a, b| a.0.total_cmp(&b.0));
         exact.truncate(ef);
-        exact
+        Ok(exact)
     }
 
     /// W1 — full cascade query: exact f32 greedy descent through the upper
@@ -978,25 +999,26 @@ impl HnswGraph {
         ef: usize,
         oversample: usize,
         filter: Option<&dyn crate::index::FilterPredicate>,
-    ) -> Vec<String> {
+    ) -> Result<Vec<String>> {
         let ep = match self.entry_point {
-            None => return Vec::new(),
+            None => return Ok(Vec::new()),
             Some(ep) => ep,
         };
         let mut cur_ep = ep;
         for l in (1..=self.max_layer).rev() {
-            cur_ep = self.search_layer_greedy_from_with_codes(query, None, cur_ep, l, None);
+            cur_ep = self.search_layer_greedy_from_with_codes(query, None, cur_ep, l, None)?;
         }
         // Asymmetric proxy reads the query in full precision; no query sign code needed.
-        self.search_layer0_cascade(query, &[], cur_ep, ef, oversample, filter)
+        Ok(self
+            .search_layer0_cascade(query, &[], cur_ep, ef, oversample, filter)?
             .into_iter()
             .map(|(_, idx)| self.node_ids[idx].clone())
-            .collect()
+            .collect())
     }
 
-    fn insert(&mut self, id: String, vector: Vec<f32>, rng_state: u64) {
-        let plan = self.plan_insert(&vector, rng_state);
-        self.apply_insert(id, vector, plan);
+    fn insert(&mut self, id: String, vector: Vec<f32>, rng_state: u64) -> Result<()> {
+        let plan = self.plan_insert(&vector, rng_state)?;
+        self.apply_insert(id, vector, plan)
     }
 
     /// Read-only half of [`Self::insert`]: picks the new node's level and
@@ -1007,7 +1029,12 @@ impl HnswGraph {
     /// parallel via `rayon`, then apply the resulting plans serially. A
     /// single-point call here followed by [`Self::apply_insert`] is exactly
     /// equivalent to the old monolithic `insert`.
-    fn plan_insert(&self, vector: &[f32], rng_state: u64) -> InsertPlan {
+    fn plan_insert(&self, vector: &[f32], rng_state: u64) -> Result<InsertPlan> {
+        if self.m < 2 || self.ef_construction == 0 {
+            return Err(GaussError::InvalidRequest(
+                "invalid HNSW construction parameters".into(),
+            ));
+        }
         let node_level = hnsw_random_level(rng_state, self.m);
         let mut layer_candidates = Vec::new();
         if let Some(ep) = self.entry_point {
@@ -1018,58 +1045,83 @@ impl HnswGraph {
             // appear as a neighbor regardless.
             let mut cur_ep = ep;
             for l in ((node_level + 1)..=self.max_layer).rev() {
-                cur_ep = self.search_layer_greedy_from(vector, cur_ep, l, None);
+                cur_ep = self.search_layer_greedy_from(vector, cur_ep, l, None)?;
             }
 
             // Phase 2: beam search at each layer down to 0.
             for l in (0..=node_level.min(self.max_layer)).rev() {
                 let ef = self.ef_construction;
-                let candidates = self.search_layer(vector, cur_ep, ef, l, None);
+                let candidates = self.search_layer(vector, cur_ep, ef, l, None)?;
                 if let Some(&(_, best)) = candidates.first() {
                     cur_ep = best;
                 }
                 layer_candidates.push((l, candidates));
             }
         }
-        InsertPlan {
+        Ok(InsertPlan {
             node_level,
             layer_candidates,
-        }
+        })
     }
 
     /// Write-only half of [`Self::insert`]: stores the point and applies
     /// the connections found by [`Self::plan_insert`]. Must run serially
     /// per point (mutates shared node/connection state), in the same order
     /// the caller wants node indices assigned.
-    fn apply_insert(&mut self, id: String, vector: Vec<f32>, plan: InsertPlan) {
+    fn apply_insert(&mut self, id: String, vector: Vec<f32>, plan: InsertPlan) -> Result<()> {
         let InsertPlan {
             node_level,
             layer_candidates,
         } = plan;
         let node_idx = self.nodes.len();
-
-        let node = HnswNode {
+        let mut node = HnswNode {
             connections: vec![Vec::new(); node_level + 1],
         };
-
+        let new_codes = self.sq8.as_ref().map(|params| params.encode(&vector));
+        let mut rewrites = Vec::new();
+        // Selection and pruning may read paged vectors. Complete those reads
+        // before changing nodes, IDs, vector tails or reciprocal connections.
+        for (l, candidates) in layer_candidates {
+            let m_max = if l == 0 { self.m0 } else { self.m };
+            let neighbors = self.select_diverse_neighbors(&candidates, m_max)?;
+            node.connections[l] = neighbors.clone();
+            for nb in neighbors {
+                let mut connections = self.nodes[nb].connections[l].clone();
+                connections.push(node_idx);
+                if connections.len() > m_max {
+                    let mut with_dist = connections
+                        .into_iter()
+                        .map(|other| {
+                            let distance = if other == node_idx {
+                                match (&self.sq8, &new_codes) {
+                                    (Some(params), Some(codes)) => {
+                                        params.approx_sq_l2(&self.sq8_codes[nb], codes)
+                                    }
+                                    _ => squared_l2(&self.full_vec(nb)?, &vector),
+                                }
+                            } else {
+                                self.dist_between(nb, other)?
+                            };
+                            Ok((distance, other))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    with_dist.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    with_dist.truncate(m_max);
+                    connections = with_dist.into_iter().map(|(_, idx)| idx).collect();
+                }
+                rewrites.push((nb, l, connections));
+            }
+        }
         self.nodes.push(node);
         self.node_ids.push(id);
-        // Store in the appropriate format.
-        if let Some(params) = &self.sq8 {
-            self.sq8_codes.push(params.encode(&vector));
+        if let Some(codes) = new_codes {
+            self.sq8_codes.push(codes);
         } else {
-            // Paged build: rows `< paged.count` already live in the mmap
-            // sidecar — pushing them into the heap tail would double-store
-            // and shift the tail offset. Only post-build live inserts append.
+            // The paged prefix is already stored; only live tail rows are retained.
             let paged_count = self.paged_vecs.as_ref().map_or(0, |p| p.count);
             if node_idx >= paged_count {
                 self.vectors.push(vector.clone());
             }
-            // W1 Phase 3: keep sign codes + norm scales in sync once they're
-            // being maintained (i.e. the cascade was enabled and
-            // `ensure_sign_codes` ran). Building them only-if-non-empty
-            // avoids paying the cost for collections that never enable the
-            // cascade.
             if !self.sign_codes.is_empty() {
                 let padded_dim = crate::index::next_pow2(vector.len());
                 let wc = crate::index::sign_word_count(padded_dim);
@@ -1080,31 +1132,14 @@ impl HnswGraph {
                 self.sign_norms.push(norm / (padded_dim as f32).sqrt());
             }
         }
-
-        if self.entry_point.is_none() {
-            self.entry_point = Some(node_idx);
-            self.max_layer = node_level;
-            return;
+        for (nb, l, connections) in rewrites {
+            self.nodes[nb].connections[l] = connections;
         }
-
-        for (l, candidates) in layer_candidates {
-            let m_max = if l == 0 { self.m0 } else { self.m };
-            let neighbors = self.select_diverse_neighbors(&candidates, m_max);
-
-            self.nodes[node_idx].connections[l] = neighbors.clone();
-
-            for &nb in &neighbors {
-                self.nodes[nb].connections[l].push(node_idx);
-                if self.nodes[nb].connections[l].len() > m_max {
-                    self.prune_connections(nb, l, m_max);
-                }
-            }
-        }
-
-        if node_level > self.max_layer {
+        if self.entry_point.is_none() || node_level > self.max_layer {
             self.entry_point = Some(node_idx);
             self.max_layer = node_level;
         }
+        Ok(())
     }
 
     /// Greedy descent starting from `start` at `layer`.
@@ -1115,7 +1150,7 @@ impl HnswGraph {
         start: usize,
         layer: usize,
         exclude: Option<usize>,
-    ) -> usize {
+    ) -> Result<usize> {
         self.search_layer_greedy_from_with_codes(query, None, start, layer, exclude)
     }
 
@@ -1126,9 +1161,9 @@ impl HnswGraph {
         start: usize,
         layer: usize,
         exclude: Option<usize>,
-    ) -> usize {
+    ) -> Result<usize> {
         let mut cur = start;
-        let mut cur_dist = self.dist_to_with_codes(query, q_codes, cur);
+        let mut cur_dist = self.dist_to_with_codes(query, q_codes, cur)?;
         loop {
             let mut improved = false;
             if let Some(connections) = self.nodes[cur].connections.get(layer) {
@@ -1136,7 +1171,7 @@ impl HnswGraph {
                     if exclude == Some(nb) {
                         continue;
                     }
-                    let d = self.dist_to_with_codes(query, q_codes, nb);
+                    let d = self.dist_to_with_codes(query, q_codes, nb)?;
                     if d < cur_dist {
                         cur = nb;
                         cur_dist = d;
@@ -1148,7 +1183,7 @@ impl HnswGraph {
                 break;
             }
         }
-        cur
+        Ok(cur)
     }
 
     /// Beam search at `layer` starting from `ep`; returns up to `ef` results sorted
@@ -1161,7 +1196,7 @@ impl HnswGraph {
         ef: usize,
         layer: usize,
         exclude: Option<usize>,
-    ) -> Vec<(f32, usize)> {
+    ) -> Result<Vec<(f32, usize)>> {
         let intra_parallel = self
             .intra_query_parallel
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -1196,7 +1231,7 @@ impl HnswGraph {
         exclude: Option<usize>,
         intra_parallel: bool,
         filter: Option<&dyn crate::index::FilterPredicate>,
-    ) -> Vec<(f32, usize)> {
+    ) -> Result<Vec<(f32, usize)>> {
         self.search_layer_from_seeds_with_codes(
             query,
             q_codes,
@@ -1223,10 +1258,10 @@ impl HnswGraph {
         exclude: Option<usize>,
         intra_parallel: bool,
         filter: Option<&dyn crate::index::FilterPredicate>,
-    ) -> Vec<(f32, usize)> {
+    ) -> Result<Vec<(f32, usize)>> {
         debug_assert!(!intra_parallel || layer == 0);
         if seeds.is_empty() || ef == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         // B1 (Phase 1): replace O(n) `Vec::remove(0)` + `partition_point` insert
         // with heap-backed beam search. Candidates = min-heap (pop nearest);
@@ -1243,7 +1278,7 @@ impl HnswGraph {
             if seed >= self.nodes.len() || !visited.insert(seed) {
                 continue;
             }
-            let seed_dist = self.dist_to_with_codes(query, q_codes, seed);
+            let seed_dist = self.dist_to_with_codes(query, q_codes, seed)?;
             // P2F: every entry point remains a navigator even when it does
             // not pass the result filter, matching the single-source path.
             candidates.push(Reverse((OrdF32(seed_dist), seed)));
@@ -1318,18 +1353,18 @@ impl HnswGraph {
                 // W3: run on the dedicated search pool, not rayon's
                 // global pool, so this doesn't contend with concurrent
                 // compaction/batch-upsert work for rayon worker slots.
-                let v: Vec<(f32, usize)> = crate::search_pool::SEARCH_POOL.install(|| {
+                let v: Result<Vec<(f32, usize)>> = crate::search_pool::SEARCH_POOL.install(|| {
                     unvisited
                         .par_iter()
-                        .map(|&nb| (self.dist_to_with_codes(query, q_codes, nb), nb))
+                        .map(|&nb| self.dist_to_with_codes(query, q_codes, nb).map(|d| (d, nb)))
                         .collect()
                 });
-                smallvec::SmallVec::from_vec(v)
+                smallvec::SmallVec::from_vec(v?)
             } else {
                 unvisited
                     .iter()
-                    .map(|&nb| (self.dist_to_with_codes(query, q_codes, nb), nb))
-                    .collect()
+                    .map(|&nb| self.dist_to_with_codes(query, q_codes, nb).map(|d| (d, nb)))
+                    .collect::<Result<_>>()?
             };
 
             for (d, nb) in scored {
@@ -1345,11 +1380,11 @@ impl HnswGraph {
         }
 
         // Drain max-heap into ascending Vec (nearest first), matching prior contract.
-        found
+        Ok(found
             .into_sorted_vec()
             .into_iter()
             .map(|(OrdF32(d), i)| (d, i))
-            .collect()
+            .collect())
     }
 
     /// P2F — filter-aware beam search wrapper around [`Self::search_layer_with_codes`].
@@ -1367,29 +1402,34 @@ impl HnswGraph {
         layer: usize,
         exclude: Option<usize>,
         filter: Option<&dyn crate::index::FilterPredicate>,
-    ) -> Vec<(f32, usize)> {
+    ) -> Result<Vec<(f32, usize)>> {
         self.search_layer_with_codes(query, q_codes, ep, ef, layer, exclude, false, filter)
     }
 
-    fn prune_connections(&mut self, node_idx: usize, layer: usize, m_max: usize) {
+    fn prune_connections(&mut self, node_idx: usize, layer: usize, m_max: usize) -> Result<()> {
         let conns = self.nodes[node_idx].connections[layer].clone();
         if conns.len() <= m_max {
-            return;
+            return Ok(());
         }
         let mut with_dist: Vec<(f32, usize)> = conns
             .into_iter()
-            .map(|nb| (self.dist_between(node_idx, nb), nb))
-            .collect();
+            .map(|nb| self.dist_between(node_idx, nb).map(|d| (d, nb)))
+            .collect::<Result<_>>()?;
         with_dist.sort_by(|a, b| a.0.total_cmp(&b.0));
         with_dist.truncate(m_max);
         self.nodes[node_idx].connections[layer] =
             with_dist.into_iter().map(|(_, idx)| idx).collect();
+        Ok(())
     }
 
     /// Selects up to `m_max` diverse neighbors from sorted `candidates` using the
     /// HNSW heuristic (Algorithm 4): a candidate is kept only if no already-selected
     /// neighbor is closer to it than the query node is.
-    fn select_diverse_neighbors(&self, candidates: &[(f32, usize)], m_max: usize) -> Vec<usize> {
+    fn select_diverse_neighbors(
+        &self,
+        candidates: &[(f32, usize)],
+        m_max: usize,
+    ) -> Result<Vec<usize>> {
         let mut selected: Vec<(f32, usize)> = Vec::with_capacity(m_max);
         let mut discarded: Vec<usize> = Vec::new();
 
@@ -1397,9 +1437,13 @@ impl HnswGraph {
             if selected.len() >= m_max {
                 break;
             }
-            let covered = selected
-                .iter()
-                .any(|&(_, sel)| self.dist_between(e, sel) < d_q_e);
+            let mut covered = false;
+            for &(_, sel) in &selected {
+                if self.dist_between(e, sel)? < d_q_e {
+                    covered = true;
+                    break;
+                }
+            }
             if covered {
                 discarded.push(e);
             } else {
@@ -1414,13 +1458,13 @@ impl HnswGraph {
             selected.push((0.0, e));
         }
 
-        selected.into_iter().map(|(_, idx)| idx).collect()
+        Ok(selected.into_iter().map(|(_, idx)| idx).collect())
     }
 
     /// Search the graph using the given raw query vector, returning up to `ef` node IDs
     /// sorted nearest-first.
     #[allow(dead_code)] // Convenience wrapper kept for the un-filtered contract; callers use the `_with_filter` variant.
-    fn search_query(&self, query: &[f32], ef: usize) -> Vec<String> {
+    fn search_query(&self, query: &[f32], ef: usize) -> Result<Vec<String>> {
         self.search_query_with_filter(query, ef, None)
     }
 
@@ -1434,11 +1478,12 @@ impl HnswGraph {
         query: &[f32],
         ef: usize,
         filter: Option<&dyn crate::index::FilterPredicate>,
-    ) -> Vec<String> {
-        self.search_query_multi_entry(query, ef, filter)
+    ) -> Result<Vec<String>> {
+        Ok(self
+            .search_query_multi_entry(query, ef, filter)?
             .into_iter()
             .map(|(_, idx)| self.node_ids[idx].clone())
-            .collect()
+            .collect())
     }
 
     /// A3 — the actual multi-entry search: descends from the primary entry
@@ -1460,9 +1505,9 @@ impl HnswGraph {
         query: &[f32],
         ef: usize,
         filter: Option<&dyn crate::index::FilterPredicate>,
-    ) -> Vec<(f32, usize)> {
+    ) -> Result<Vec<(f32, usize)>> {
         if self.entry_point.is_none() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         // Encode the SQ8 query codes once per request, not once per distance call.
@@ -1476,12 +1521,13 @@ impl HnswGraph {
             .intra_query_parallel
             .load(std::sync::atomic::Ordering::Relaxed);
 
-        let nprobe = self.nprobe_seeds(query, q_codes);
+        let nprobe = self.nprobe_seeds(query, q_codes)?;
         let mut layer_zero_seeds = Vec::with_capacity(1 + nprobe.len());
         for seed in std::iter::once(self.entry_point.unwrap()).chain(nprobe) {
             let mut cur_ep = seed;
             for l in (1..=self.max_layer).rev() {
-                cur_ep = self.search_layer_greedy_from_with_codes(query, q_codes, cur_ep, l, None);
+                cur_ep =
+                    self.search_layer_greedy_from_with_codes(query, q_codes, cur_ep, l, None)?;
             }
             if !layer_zero_seeds.contains(&cur_ep) {
                 layer_zero_seeds.push(cur_ep);
@@ -1526,9 +1572,9 @@ impl HnswGraph {
     /// only (`self.vectors`) -- SQ8 backends skip it, a documented gap
     /// consistent with row 150's "RaBitQ/SQ8 metric-blindness not audited
     /// here" precedent.
-    fn repair_entry_candidate_connectivity(&mut self) {
+    fn repair_entry_candidate_connectivity(&mut self) -> Result<()> {
         if self.sq8.is_some() {
-            return;
+            return Ok(());
         }
         let m0 = self.m0;
         let n = self.nodes.len();
@@ -1539,11 +1585,11 @@ impl HnswGraph {
             }
             // Owned copy so the scan below can borrow `self` for full_vec
             // (which reads mmap-paged and in-heap storage transparently).
-            let query = self.full_vec(idx).into_owned();
+            let query = self.full_vec(idx)?.into_owned_read()?;
             let mut scored: Vec<(f32, usize)> = (0..n)
                 .filter(|&i| i != idx)
-                .map(|i| (squared_l2(&query, &self.full_vec(i)), i))
-                .collect();
+                .map(|i| self.full_vec(i).map(|v| (squared_l2(&query, &v), i)))
+                .collect::<Result<_>>()?;
             let take = m0.min(scored.len());
             if take > 0 && take < scored.len() {
                 scored.select_nth_unstable_by(take - 1, |a, b| a.0.total_cmp(&b.0));
@@ -1556,13 +1602,14 @@ impl HnswGraph {
                 self.nodes[idx].connections[0].push(nb);
                 self.nodes[nb].connections[0].push(idx);
                 if self.nodes[idx].connections[0].len() > m0 {
-                    self.prune_connections(idx, 0, m0);
+                    self.prune_connections(idx, 0, m0)?;
                 }
                 if self.nodes[nb].connections[0].len() > m0 {
-                    self.prune_connections(nb, 0, m0);
+                    self.prune_connections(nb, 0, m0)?;
                 }
             }
         }
+        Ok(())
     }
 
     fn node_count(&self) -> usize {
@@ -1785,8 +1832,12 @@ impl H2qgIndex {
             points,
             vector_dim,
             false,
-            hnsw_m.map(|x| x as usize).unwrap_or(HNSW_M),
+            hnsw_m
+                .filter(|x| *x != 0)
+                .map(|x| x as usize)
+                .unwrap_or(HNSW_M),
             hnsw_ef_construction
+                .filter(|x| *x != 0)
                 .map(|x| x as usize)
                 .unwrap_or(HNSW_EF_CONSTRUCTION),
             metric,
@@ -1821,8 +1872,12 @@ impl H2qgIndex {
             points,
             vector_dim,
             true,
-            hnsw_m.map(|x| x as usize).unwrap_or(HNSW_M),
+            hnsw_m
+                .filter(|x| *x != 0)
+                .map(|x| x as usize)
+                .unwrap_or(HNSW_M),
             hnsw_ef_construction
+                .filter(|x| *x != 0)
                 .map(|x| x as usize)
                 .unwrap_or(HNSW_EF_CONSTRUCTION),
             metric,
@@ -1860,8 +1915,12 @@ impl H2qgIndex {
             points,
             vector_dim,
             use_sq8,
-            hnsw_m.map(|x| x as usize).unwrap_or(HNSW_M),
+            hnsw_m
+                .filter(|x| *x != 0)
+                .map(|x| x as usize)
+                .unwrap_or(HNSW_M),
             hnsw_ef_construction
+                .filter(|x| *x != 0)
                 .map(|x| x as usize)
                 .unwrap_or(HNSW_EF_CONSTRUCTION),
             metric,
@@ -2005,7 +2064,9 @@ impl H2qgIndex {
             {
                 return None;
             }
-            graph.insert(id.to_string(), vector.clone(), *rng);
+            graph
+                .insert(id.to_string(), vector.clone(), *rng)
+                .expect("in-memory graph vectors are available");
         }
         graph
             .intra_query_parallel
@@ -2018,8 +2079,12 @@ impl H2qgIndex {
         if cancelled.is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Acquire)) {
             return None;
         }
-        graph.assign_entry_candidates();
-        graph.repair_entry_candidate_connectivity();
+        graph
+            .assign_entry_candidates()
+            .expect("in-memory graph vectors are available");
+        graph
+            .repair_entry_candidate_connectivity()
+            .expect("in-memory graph vectors are available");
         Some(Self::from_payload(H2qgPayload {
             vector_dim,
             nprobe: 0,
@@ -2047,7 +2112,18 @@ impl H2qgIndex {
         ef_construction: usize,
         metric: DistanceMetric,
         paged: PagedVectors,
-    ) -> Self {
+    ) -> Result<Self> {
+        if !(2..=usize::MAX / 2).contains(&m) || ef_construction == 0 {
+            return Err(GaussError::InvalidRequest(
+                "invalid HNSW construction parameters".into(),
+            ));
+        }
+        if paged.count != ids.len() || paged.dim != vector_dim {
+            return Err(GaussError::InvalidRequest(
+                "paged vector header does not match ids/config".into(),
+            ));
+        }
+
         let seed = 0x9e37_79b9_7f4a_7c15_u64 ^ vector_dim as u64;
         let mut graph = HnswGraph::new(m, ef_construction);
         graph.paged_vecs = Some(paged);
@@ -2063,16 +2139,16 @@ impl H2qgIndex {
                 .paged_vecs
                 .as_ref()
                 .expect("paged build always has paged_vecs")
-                .get(i)
+                .try_get(i)?
                 .to_vec();
-            graph.insert(id.clone(), vector, rng);
+            graph.insert(id.clone(), vector, rng)?;
         }
         graph
             .intra_query_parallel
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        graph.assign_entry_candidates();
-        graph.repair_entry_candidate_connectivity();
-        Self::from_payload(H2qgPayload {
+        graph.assign_entry_candidates()?;
+        graph.repair_entry_candidate_connectivity()?;
+        Ok(Self::from_payload(H2qgPayload {
             vector_dim,
             nprobe: 0,
             mode: H2qgMode::Hnsw,
@@ -2080,7 +2156,7 @@ impl H2qgIndex {
             cells: Vec::new(),
             hnsw: Some(graph),
             metric,
-        })
+        }))
     }
 
     pub fn build_for_vector_name(
@@ -2137,6 +2213,7 @@ impl H2qgIndex {
         filter: Option<&dyn crate::index::FilterPredicate>,
     ) -> Vec<String> {
         self.candidate_ids_with_ef_filter_controlled(query, k, ef_search, filter, None)
+            .unwrap_or_default()
     }
 
     fn candidate_ids_with_ef_filter_controlled(
@@ -2146,36 +2223,44 @@ impl H2qgIndex {
         ef_search: Option<usize>,
         filter: Option<&dyn crate::index::FilterPredicate>,
         cancelled: Option<&AtomicBool>,
-    ) -> Vec<String> {
+    ) -> Result<Vec<String>> {
         if query.len() != self.payload.vector_dim {
-            return Vec::new();
+            return Err(GaussError::DimensionMismatch {
+                expected: self.payload.vector_dim,
+                actual: query.len(),
+            });
+        }
+        if !query.iter().all(|value| value.is_finite()) {
+            return Err(GaussError::InvalidRequest(
+                "query vector must be finite".into(),
+            ));
         }
         let is_cancelled =
             || cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
         if is_cancelled() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         match self.payload.mode {
             H2qgMode::Flat => {
                 if self.payload.cells.is_empty() {
-                    return Vec::new();
+                    return Ok(Vec::new());
                 }
                 let mut candidates = Vec::new();
                 for cell in &self.payload.cells {
                     for posting in &cell.postings {
                         if is_cancelled() {
-                            return candidates;
+                            return Ok(candidates);
                         }
                         candidates.push(posting.id.clone());
                     }
                 }
-                candidates
+                Ok(candidates)
             }
             H2qgMode::Ivf => {
                 // Legacy IVF path kept for backward-compatible reading of old artifacts.
                 if self.payload.cells.is_empty() {
-                    return Vec::new();
+                    return Ok(Vec::new());
                 }
                 let mut cells = self
                     .payload
@@ -2186,7 +2271,7 @@ impl H2qgIndex {
                     .map(|(index, cell)| (index, squared_l2(query, &cell.centroid)))
                     .collect::<Vec<_>>();
                 if is_cancelled() {
-                    return Vec::new();
+                    return Ok(Vec::new());
                 }
                 cells.sort_by(|left, right| {
                     left.1
@@ -2200,14 +2285,14 @@ impl H2qgIndex {
                 let mut candidates = Vec::new();
                 for (cell_index, _) in cells.into_iter().take(self.payload.nprobe) {
                     if is_cancelled() {
-                        return candidates.into_iter().map(|(id, _)| id).collect();
+                        return Ok(candidates.into_iter().map(|(id, _)| id).collect());
                     }
                     let cell = &self.payload.cells[cell_index];
                     let query_signature =
                         binary_signature(query, &cell.centroid, &self.payload.quantization);
                     for posting in &cell.postings {
                         if is_cancelled() {
-                            return candidates.into_iter().map(|(id, _)| id).collect();
+                            return Ok(candidates.into_iter().map(|(id, _)| id).collect());
                         }
                         candidates.push((
                             posting.id.clone(),
@@ -2218,11 +2303,11 @@ impl H2qgIndex {
                 candidates
                     .sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
                 candidates.truncate(keep);
-                candidates.into_iter().map(|(id, _)| id).collect()
+                Ok(candidates.into_iter().map(|(id, _)| id).collect())
             }
             H2qgMode::Hnsw => {
                 let Some(hnsw) = &self.payload.hnsw else {
-                    return Vec::new();
+                    return Ok(Vec::new());
                 };
                 let ef = ef_search.unwrap_or_else(|| {
                     default_ef_search(k, self.indexed_points(), self.payload.vector_dim)
@@ -2316,9 +2401,18 @@ impl H2qgIndex {
     /// graph. Adopting an ON flag eagerly builds the sign codes so the read
     /// path stays `&self`. No-op for Flat / IVF graphs.
     pub fn set_cascade(&mut self, flag: Arc<AtomicBool>) {
-        if let Some(hnsw) = self.payload.hnsw.as_mut() {
-            hnsw.set_cascade_flag(flag);
+        if let Err(error) = self.try_set_cascade(flag) {
+            tracing::warn!(%error, "could not prepare H2QG cascade vectors");
         }
+    }
+
+    /// Prepare cascade codes before publishing the flag; read errors leave the
+    /// previous flag and codes intact. Legacy callers may use `set_cascade`.
+    pub fn try_set_cascade(&mut self, flag: Arc<AtomicBool>) -> Result<()> {
+        if let Some(hnsw) = self.payload.hnsw.as_mut() {
+            hnsw.set_cascade_flag(flag)?;
+        }
+        Ok(())
     }
 
     /// W1 — clone of the current cascade flag (so callers can flip it without
@@ -2337,7 +2431,7 @@ impl H2qgIndex {
         oversample: usize,
     ) -> Vec<String> {
         match self.payload.hnsw.as_ref() {
-            Some(h) => h.search_query_cascade(query, ef, oversample, None),
+            Some(h) => h.search_query_cascade(query, ef, oversample, None).unwrap(),
             None => Vec::new(),
         }
     }
@@ -2381,6 +2475,15 @@ impl H2qgIndex {
                 Ok(())
             }
             H2qgMode::Hnsw => {
+                if point.vector.len() != self.payload.vector_dim {
+                    return Err(GaussError::DimensionMismatch {
+                        expected: self.payload.vector_dim,
+                        actual: point.vector.len(),
+                    });
+                }
+                if !point.vector.iter().all(|value| value.is_finite()) {
+                    return Err(GaussError::InvalidRequest("vector must be finite".into()));
+                }
                 let metric = self.payload.metric;
                 let graph = self.payload.hnsw.as_mut().ok_or_else(|| {
                     GaussError::InvalidRequest("HNSW index has no graph".to_string())
@@ -2397,7 +2500,7 @@ impl H2qgIndex {
                 } else {
                     point.vector.clone()
                 };
-                graph.insert(point.id.clone(), vector, rng_seed);
+                graph.insert(point.id.clone(), vector, rng_seed)?;
                 self.indexed_ids.insert(point.id.clone());
                 Ok(())
             }
@@ -2440,6 +2543,7 @@ pub fn write_index_with_params(
     hnsw_ef_construction: Option<u32>,
     metric: DistanceMetric,
 ) -> Result<H2qgWrite> {
+    validate_hnsw_params(hnsw_m)?;
     let index =
         H2qgIndex::build_with_params(points, vector_dim, hnsw_m, hnsw_ef_construction, metric);
     write_payload(path, &index)
@@ -2477,6 +2581,7 @@ pub fn write_named_index_with_params(
     hnsw_ef_construction: Option<u32>,
     metric: DistanceMetric,
 ) -> Result<H2qgWrite> {
+    validate_hnsw_params(hnsw_m)?;
     let named_points = points
         .iter()
         .filter_map(|point| {
@@ -2494,6 +2599,32 @@ pub fn write_named_index_with_params(
         metric,
     );
     write_payload(path, &index)
+}
+
+#[cfg(test)]
+pub(crate) fn write_test_paged_graph(
+    dir: &Path,
+    points: &[Point],
+    metric: DistanceMetric,
+) -> Result<()> {
+    let dim = points[0].vector.len();
+    let mut index =
+        H2qgIndex::build_mutable_hnsw_with_params(points, dim, Some(4), Some(16), metric, false);
+    let graph = index.payload.hnsw.as_mut().expect("forced HNSW fixture");
+    write_hnsw_vecs(&dir.join(HNSW_VECS_FILE), &graph.vectors)?;
+    graph.vectors.clear();
+    write_payload(&dir.join(INDEX_FILE), &index)?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn build_test_paged_graph(
+    ids: &[String],
+    dim: usize,
+    metric: DistanceMetric,
+    paged: PagedVectors,
+) -> Result<H2qgIndex> {
+    H2qgIndex::build_hnsw_index_paged(ids, dim, 4, 16, metric, paged)
 }
 
 /// Load an existing h2qg index, insert `new_points`, and write back atomically.
@@ -2584,7 +2715,7 @@ pub fn read_hnsw_vecs(path: &Path) -> Result<PagedVectors> {
     if storage.len() < 24 {
         return Err(corrupt(path, "hnsw vecs file shorter than header"));
     }
-    let header = storage.read_range(0..24)?;
+    let header = storage.read_range_admitted(0..24)?;
     if &header[0..8] != HNSW_VECS_MAGIC {
         return Err(corrupt(path, "bad hnsw vecs magic"));
     }
@@ -2637,6 +2768,7 @@ pub fn write_index_paged_with_params(
     hnsw_ef_construction: Option<u32>,
     metric: DistanceMetric,
 ) -> Result<H2qgWrite> {
+    validate_hnsw_params(hnsw_m)?;
     let vecs_path = dir.join(HNSW_VECS_FILE);
     if !points.is_empty() && points.len() >= HNSW_THRESHOLD {
         // HNSW-scale: write the (normalized) vectors to the mmap sidecar
@@ -2654,13 +2786,17 @@ pub fn write_index_paged_with_params(
         let index = H2qgIndex::build_hnsw_index_paged(
             &ids,
             vector_dim,
-            hnsw_m.map(|x| x as usize).unwrap_or(HNSW_M),
+            hnsw_m
+                .filter(|x| *x != 0)
+                .map(|x| x as usize)
+                .unwrap_or(HNSW_M),
             hnsw_ef_construction
+                .filter(|x| *x != 0)
                 .map(|x| x as usize)
                 .unwrap_or(HNSW_EF_CONSTRUCTION),
             metric,
             paged,
-        );
+        )?;
         write_payload(&dir.join(INDEX_FILE), &index)
     } else {
         // Flat (sub-threshold) index: no graph vectors to page out. Remove
@@ -2685,6 +2821,7 @@ pub(crate) fn write_index_paged_from_ids(
     hnsw_ef_construction: Option<u32>,
     metric: DistanceMetric,
 ) -> Result<H2qgWrite> {
+    validate_hnsw_params(hnsw_m)?;
     let paged = read_hnsw_vecs(&dir.join(HNSW_VECS_FILE))?;
     if paged.count != ids.len() || paged.dim != vector_dim {
         return Err(GaussError::InvalidRequest(format!(
@@ -2698,24 +2835,30 @@ pub(crate) fn write_index_paged_from_ids(
         H2qgIndex::build_hnsw_index_paged(
             ids,
             vector_dim,
-            hnsw_m.map(|x| x as usize).unwrap_or(HNSW_M),
+            hnsw_m
+                .filter(|x| *x != 0)
+                .map(|x| x as usize)
+                .unwrap_or(HNSW_M),
             hnsw_ef_construction
+                .filter(|x| *x != 0)
                 .map(|x| x as usize)
                 .unwrap_or(HNSW_EF_CONSTRUCTION),
             metric,
             paged,
-        )
+        )?
     } else {
         let centroid = vec![0.0; vector_dim];
         let quantization = QuantizationPlan::for_dim(vector_dim);
         let postings = ids
             .iter()
             .enumerate()
-            .map(|(row, id)| QuantizedPosting {
-                id: id.clone(),
-                signature: binary_signature(&paged.get(row), &centroid, &quantization),
+            .map(|(row, id)| {
+                Ok(QuantizedPosting {
+                    id: id.clone(),
+                    signature: binary_signature(&paged.try_get(row)?, &centroid, &quantization),
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         H2qgIndex::from_payload(H2qgPayload {
             vector_dim,
             nprobe: 1,
@@ -2736,6 +2879,12 @@ pub fn read_index_paged(dir: &Path) -> Result<H2qgIndex> {
     if vecs_path.exists() {
         let paged = read_hnsw_vecs(&vecs_path)?;
         if let Some(g) = index.payload.hnsw.as_mut() {
+            if paged.count != g.nodes.len() || paged.dim != index.payload.vector_dim {
+                return Err(corrupt(
+                    &vecs_path,
+                    "paged vectors do not match H2QG graph count/dimension",
+                ));
+            }
             g.paged_vecs = Some(paged);
         }
     }
@@ -2798,7 +2947,7 @@ pub fn read_index(path: &Path) -> Result<H2qgIndex> {
     if file.len() < HEADER_LEN {
         return Err(corrupt(path, "index shorter than header"));
     }
-    let header = file.read_range(0..HEADER_LEN)?;
+    let header = file.read_range_admitted(0..HEADER_LEN)?;
     if &header[0..8] != MAGIC {
         return Err(corrupt(path, "bad index magic"));
     }
@@ -2929,6 +3078,20 @@ pub(crate) unsafe fn prefetch_l1_read(addr: *const u8) {
     }
 }
 
+/// Reject parameters whose graph construction has undefined level/beam geometry.
+pub(crate) fn validate_hnsw_params(m: Option<u32>) -> Result<()> {
+    if m == Some(1) {
+        return Err(GaussError::InvalidRequest(
+            "hnsw_m must be at least 2".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_graph_vector() -> GaussError {
+    GaussError::InvalidRequest("H2QG graph vector ordinal out of bounds".into())
+}
+
 fn corrupt(path: &Path, message: &str) -> GaussError {
     GaussError::SegmentCorruption {
         path: path.display().to_string(),
@@ -2968,6 +3131,72 @@ impl crate::index::IndexBackend for H2qgIndex {
         cancelled: &AtomicBool,
     ) -> Vec<String> {
         self.candidate_ids_with_ef_filter_controlled(query, k, ef_search, filter, Some(cancelled))
+            .unwrap_or_default()
+    }
+
+    fn try_candidate_ids_with_ef(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: Option<usize>,
+    ) -> Result<Vec<String>> {
+        self.candidate_ids_with_ef_filter_controlled(query, k, ef_search, None, None)
+    }
+    fn try_candidate_ids_with_ef_filter(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: Option<usize>,
+        filter: Option<&dyn crate::index::FilterPredicate>,
+    ) -> Result<Vec<String>> {
+        self.candidate_ids_with_ef_filter_controlled(query, k, ef_search, filter, None)
+    }
+    fn try_candidate_ids_with_recall_target(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: Option<usize>,
+        _recall: f32,
+        filter: Option<&dyn crate::index::FilterPredicate>,
+    ) -> Result<Vec<String>> {
+        self.candidate_ids_with_ef_filter_controlled(query, k, ef_search, filter, None)
+    }
+    fn try_candidate_ids_with_recall_target_cancellable(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: Option<usize>,
+        _recall: f32,
+        filter: Option<&dyn crate::index::FilterPredicate>,
+        cancelled: &AtomicBool,
+    ) -> Result<Vec<String>> {
+        self.candidate_ids_with_ef_filter_controlled(query, k, ef_search, filter, Some(cancelled))
+    }
+    fn try_candidate_ids_with_recall_target_ordinal_filter(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: Option<usize>,
+        recall: f32,
+        filter: Option<&dyn crate::index::FilterPredicate>,
+        _ordinal: Option<&dyn crate::index::OrdinalFilterPredicate>,
+    ) -> Result<Vec<String>> {
+        self.try_candidate_ids_with_recall_target(query, k, ef_search, recall, filter)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn try_candidate_ids_with_recall_target_ordinal_filter_cancellable(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: Option<usize>,
+        recall: f32,
+        filter: Option<&dyn crate::index::FilterPredicate>,
+        _ordinal: Option<&dyn crate::index::OrdinalFilterPredicate>,
+        cancelled: &AtomicBool,
+    ) -> Result<Vec<String>> {
+        self.try_candidate_ids_with_recall_target_cancellable(
+            query, k, ef_search, recall, filter, cancelled,
+        )
     }
 
     fn insert_point(&mut self, point: &Point, vector_dim: usize) -> Result<()> {
@@ -3016,6 +3245,373 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::{h2qg, model::Point};
+
+    #[test]
+    fn invalid_hnsw_writer_parameters_leave_existing_files_untouched() {
+        let dir = TempDir::new().unwrap();
+        let index_path = dir.path().join(h2qg::INDEX_FILE);
+        let vector_path = dir.path().join(h2qg::HNSW_VECS_FILE);
+        std::fs::write(&index_path, b"metadata unchanged").unwrap();
+        std::fs::write(&vector_path, b"vectors unchanged").unwrap();
+        let points = (0..16)
+            .map(|i| make_point(&format!("p{i}"), vec![i as f32, 1.0]))
+            .collect::<Vec<_>>();
+        let ids = points.iter().map(|p| p.id.clone()).collect::<Vec<_>>();
+        {
+            let (m, ef) = (Some(1), None::<u32>);
+            for result in [
+                h2qg::write_index_with_params(
+                    &index_path,
+                    &points,
+                    2,
+                    m,
+                    ef,
+                    crate::DistanceMetric::L2,
+                ),
+                h2qg::write_named_index_with_params(
+                    &index_path,
+                    &points,
+                    2,
+                    "image",
+                    m,
+                    ef,
+                    crate::DistanceMetric::L2,
+                ),
+                h2qg::write_index_paged_with_params(
+                    dir.path(),
+                    &points,
+                    2,
+                    m,
+                    ef,
+                    crate::DistanceMetric::L2,
+                ),
+                h2qg::write_index_paged_from_ids(
+                    dir.path(),
+                    &ids,
+                    2,
+                    m,
+                    ef,
+                    crate::DistanceMetric::L2,
+                ),
+            ] {
+                assert!(matches!(result, Err(crate::GaussError::InvalidRequest(_))));
+            }
+            assert_eq!(std::fs::read(&index_path).unwrap(), b"metadata unchanged");
+            assert_eq!(std::fs::read(&vector_path).unwrap(), b"vectors unchanged");
+        }
+    }
+
+    #[test]
+    fn invalid_hnsw_geometry_is_rejected_before_catalog_or_graph_mutation() {
+        let dir = TempDir::new().unwrap();
+        let db = crate::Db::open(dir.path()).unwrap();
+        let before = db.multimodel_visibility_frontier().unwrap();
+        {
+            let (m, ef) = (Some(1), None::<u32>);
+            let config=serde_json::from_value(json!({"name":"invalid","vector_dim":2,"metric":"l2","hnsw_m":m,"hnsw_ef_construction":ef})).unwrap();
+            assert!(matches!(
+                db.create_collection(config),
+                Err(crate::GaussError::InvalidRequest(_))
+            ));
+            assert!(db.list_collections().is_empty());
+            assert_eq!(db.multimodel_visibility_frontier().unwrap(), before);
+        }
+        for (m, ef) in [(0, 8), (1, 8), (2, 0)] {
+            let mut graph = h2qg::HnswGraph::new(m, ef);
+            let before = serde_json::to_value(&graph).unwrap();
+            assert!(matches!(
+                graph.insert("new".into(), vec![1.0, 2.0], 7),
+                Err(crate::GaussError::InvalidRequest(_))
+            ));
+            assert_eq!(serde_json::to_value(&graph).unwrap(), before);
+        }
+        let config=serde_json::from_value(json!({"name":"defaults","vector_dim":2,"metric":"l2","hnsw_m":0,"hnsw_ef_construction":0,"hnsw_ef_search":0})).unwrap();
+        let normalized = db.create_collection(config).unwrap();
+        assert_eq!(normalized.hnsw_m, None);
+        assert_eq!(normalized.hnsw_ef_construction, None);
+        assert_eq!(normalized.hnsw_ef_search, None);
+        let points = (0..16)
+            .map(|i| make_point(&format!("p{i}"), vec![i as f32, 1.0]))
+            .collect::<Vec<_>>();
+        let zero = h2qg::H2qgIndex::build_mutable_hnsw_with_params(
+            &points,
+            2,
+            Some(0),
+            Some(0),
+            crate::DistanceMetric::L2,
+            false,
+        );
+        let defaults = h2qg::H2qgIndex::build_mutable_hnsw_with_params(
+            &points,
+            2,
+            None,
+            None,
+            crate::DistanceMetric::L2,
+            false,
+        );
+        assert_eq!(
+            serde_json::to_value(zero.payload.hnsw.unwrap()).unwrap(),
+            serde_json::to_value(defaults.payload.hnsw.unwrap()).unwrap()
+        );
+        let config=serde_json::from_value(json!({"name":"valid","vector_dim":2,"metric":"l2","hnsw_m":2,"hnsw_ef_construction":1})).unwrap();
+        db.create_collection(config).unwrap();
+        assert_eq!(db.list_collections().len(), 2);
+        drop(db);
+        assert_eq!(
+            crate::Db::open(dir.path())
+                .unwrap()
+                .list_collections()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn failed_neighbor_scoring_aborts_serial_parallel_and_cascade_beams() {
+        let mut graph = h2qg::HnswGraph::new(32, 64);
+        graph.nodes = (0..65)
+            .map(|i| h2qg::HnswNode {
+                connections: vec![if i == 0 { (1..65).collect() } else { vec![] }],
+            })
+            .collect();
+        graph.node_ids = (0..65).map(|i| format!("p{i}")).collect();
+        let vectors = (0..65).map(|i| vec![i as f32, 1.0]).collect::<Vec<_>>();
+        graph.vectors = vectors.clone();
+        graph.ensure_sign_codes().unwrap();
+        graph.vectors.truncate(1);
+        let query = [0.0, 1.0];
+        for parallel in [false, true] {
+            let result =
+                graph.search_layer_with_codes(&query, None, 0, 64, 0, None, parallel, None);
+            assert!(
+                matches!(result,Err(crate::GaussError::InvalidRequest(message)) if message.contains("ordinal"))
+            );
+        }
+        assert!(
+            matches!(graph.search_layer0_cascade(&query,&[],0,64,2,None),Err(crate::GaussError::InvalidRequest(message)) if message.contains("ordinal"))
+        );
+        graph.vectors = vectors;
+        let serial = graph
+            .search_layer_with_codes(&query, None, 0, 64, 0, None, false, None)
+            .unwrap();
+        assert_eq!(
+            graph
+                .search_layer_with_codes(&query, None, 0, 64, 0, None, true, None)
+                .unwrap(),
+            serial
+        );
+        assert_eq!(
+            graph
+                .search_layer0_cascade(&query, &[], 0, 64, 2, None)
+                .unwrap(),
+            serial
+        );
+    }
+
+    #[test]
+    fn paged_sidecar_must_match_graph_count_and_dimension() {
+        let dir = TempDir::new().unwrap();
+        let points = (0..16)
+            .map(|i| make_point(&format!("p{i}"), vec![i as f32, 1.0]))
+            .collect::<Vec<_>>();
+        h2qg::write_test_paged_graph(dir.path(), &points, crate::DistanceMetric::L2).unwrap();
+        let path = dir.path().join(h2qg::HNSW_VECS_FILE);
+        for rows in [vec![vec![1.0, 2.0]; 15], vec![vec![1.0]; 16]] {
+            h2qg::write_hnsw_vecs(&path, &rows).unwrap();
+            assert!(
+                matches!(h2qg::read_index_paged(dir.path()),Err(crate::GaussError::SegmentCorruption {message,..}) if message.contains("count/dimension"))
+            );
+        }
+    }
+
+    #[test]
+    fn insert_pruning_read_failure_leaves_all_graph_state_intact() {
+        let mut graph = h2qg::HnswGraph::new(2, 8);
+        for i in 0..8 {
+            graph
+                .insert(format!("p{i}"), vec![i as f32, 1.0], h2qg::splitmix64(i))
+                .unwrap();
+        }
+        let missing = 3;
+        // All rows needed by selection exist. The reciprocal adjacency also
+        // contains a valid old row whose vector becomes unavailable during pruning.
+        let vector = vec![0.5, 1.0];
+        graph.nodes[0].connections[0] = vec![1, missing, 2, 4];
+        let plan = h2qg::InsertPlan {
+            node_level: 0,
+            layer_candidates: vec![(0, vec![(0.25, 0)])],
+        };
+        let vectors = graph.vectors.clone();
+        graph.vectors.truncate(missing);
+        let before = serde_json::to_value(&graph).unwrap();
+        let sign_codes = graph.sign_codes.clone();
+        let sign_norms = graph.sign_norms.clone();
+        assert!(
+            matches!(graph.apply_insert("new".into(),vector.clone(),plan),Err(crate::GaussError::InvalidRequest(message)) if message.contains("ordinal"))
+        );
+        assert_eq!(serde_json::to_value(&graph).unwrap(), before);
+        assert_eq!(graph.sign_codes, sign_codes);
+        assert_eq!(graph.sign_norms, sign_norms);
+        graph.vectors = vectors;
+        let plan = h2qg::InsertPlan {
+            node_level: 0,
+            layer_candidates: vec![(0, vec![(0.25, 0)])],
+        };
+        graph.apply_insert("new".into(), vector, plan).unwrap();
+        assert_eq!(graph.node_ids.last().unwrap(), "new");
+        assert_eq!(graph.nodes.len(), 9);
+    }
+
+    #[test]
+    fn staged_insert_matches_previous_adjacency_for_heap_sq8_and_paged_tail() {
+        let points = (0..32)
+            .map(|i| {
+                make_point(
+                    &format!("p{i}"),
+                    vec![(i % 4) as f32, (i % 7) as f32, 1.0, 2.0],
+                )
+            })
+            .collect::<Vec<_>>();
+        for mode in 0..3 {
+            let mut index = h2qg::H2qgIndex::build_mutable_hnsw_with_params(
+                &points,
+                4,
+                Some(4),
+                Some(16),
+                crate::DistanceMetric::L2,
+                mode == 1,
+            );
+            let graph = index.payload.hnsw.as_mut().unwrap();
+            let dir = TempDir::new().unwrap();
+            if mode == 2 {
+                let path = dir.path().join(h2qg::HNSW_VECS_FILE);
+                h2qg::write_hnsw_vecs(&path, &graph.vectors).unwrap();
+                graph.paged_vecs = Some(h2qg::read_hnsw_vecs(&path).unwrap());
+                graph.vectors.clear();
+            }
+            graph
+                .set_cascade_flag(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                    true,
+                )))
+                .unwrap();
+            let mut previous = graph.clone();
+            for i in 32..48 {
+                let vector = vec![(i % 4) as f32, (i % 7) as f32, 1.0, 2.0];
+                let seed = h2qg::splitmix64(i);
+                let old_plan = previous.plan_insert(&vector, seed).unwrap();
+                apply_previous_insert(&mut previous, format!("p{i}"), vector.clone(), old_plan);
+                graph.insert(format!("p{i}"), vector, seed).unwrap();
+                assert_eq!(
+                    serde_json::to_value(&graph).unwrap(),
+                    serde_json::to_value(&previous).unwrap(),
+                    "mode {mode}, row {i}"
+                );
+                assert_eq!(graph.sign_codes, previous.sign_codes);
+                assert_eq!(graph.sign_norms, previous.sign_norms);
+            }
+        }
+    }
+
+    // Previous publication/pruning order, copied from the pre-change source.
+    fn apply_previous_insert(
+        graph: &mut h2qg::HnswGraph,
+        id: String,
+        vector: Vec<f32>,
+        plan: h2qg::InsertPlan,
+    ) {
+        let h2qg::InsertPlan {
+            node_level,
+            layer_candidates,
+        } = plan;
+        let node_idx = graph.nodes.len();
+
+        let node = h2qg::HnswNode {
+            connections: vec![Vec::new(); node_level + 1],
+        };
+
+        graph.nodes.push(node);
+        graph.node_ids.push(id);
+        // Store in the appropriate format.
+        if let Some(params) = &graph.sq8 {
+            graph.sq8_codes.push(params.encode(&vector));
+        } else {
+            // Paged build: rows `< paged.count` already live in the mmap
+            // sidecar — pushing them into the heap tail would double-store
+            // and shift the tail offset. Only post-build live inserts append.
+            let paged_count = graph.paged_vecs.as_ref().map_or(0, |p| p.count);
+            if node_idx >= paged_count {
+                graph.vectors.push(vector.clone());
+            }
+            // W1 Phase 3: keep sign codes + norm scales in sync once they're
+            // being maintained (i.e. the cascade was enabled and
+            // `ensure_sign_codes` ran). Building them only-if-non-empty
+            // avoids paying the cost for collections that never enable the
+            // cascade.
+            if !graph.sign_codes.is_empty() {
+                let padded_dim = crate::index::next_pow2(vector.len());
+                let wc = crate::index::sign_word_count(padded_dim);
+                let rotated = crate::index::rotate_for_cascade(&vector);
+                graph
+                    .sign_codes
+                    .push(crate::index::encode_sign_bits(&rotated, wc));
+                let norm: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+                graph.sign_norms.push(norm / (padded_dim as f32).sqrt());
+            }
+        }
+
+        if graph.entry_point.is_none() {
+            graph.entry_point = Some(node_idx);
+            graph.max_layer = node_level;
+            return;
+        }
+
+        for (l, candidates) in layer_candidates {
+            let m_max = if l == 0 { graph.m0 } else { graph.m };
+            let neighbors = graph.select_diverse_neighbors(&candidates, m_max).unwrap();
+
+            graph.nodes[node_idx].connections[l] = neighbors.clone();
+
+            for &nb in &neighbors {
+                graph.nodes[nb].connections[l].push(node_idx);
+                if graph.nodes[nb].connections[l].len() > m_max {
+                    graph.prune_connections(nb, l, m_max).unwrap();
+                }
+            }
+        }
+
+        if node_level > graph.max_layer {
+            graph.entry_point = Some(node_idx);
+            graph.max_layer = node_level;
+        }
+    }
+
+    #[test]
+    fn fallible_paged_read_checks_ordinals_width_and_offset_overflow() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(h2qg::HNSW_VECS_FILE);
+        h2qg::write_hnsw_vecs(&path, &[vec![1.25, -3.5], vec![0.0, 2.0]]).unwrap();
+        let mut paged = h2qg::read_hnsw_vecs(&path).unwrap();
+        assert!(paged.try_get(1).unwrap().is_borrowed());
+        assert_eq!(paged.try_get(1).unwrap().as_ref(), &[0.0, 2.0]);
+        for ordinal in [2, usize::MAX] {
+            assert!(
+                matches!(paged.try_get(ordinal), Err(crate::GaussError::InvalidRequest(message)) if message == "vector ordinal out of range")
+            );
+        }
+        paged.dim = usize::MAX;
+        assert!(
+            matches!(paged.try_get(0), Err(crate::GaussError::InvalidRequest(message)) if message == "vector row width overflow")
+        );
+        paged.dim = 1;
+        paged.count = usize::MAX;
+        assert!(
+            matches!(paged.try_get(usize::MAX - 1), Err(crate::GaussError::InvalidRequest(message)) if message == "vector offset overflow")
+        );
+        paged.dim = (usize::MAX - 24) / 4;
+        assert!(
+            matches!(paged.try_get(1), Err(crate::GaussError::InvalidRequest(message)) if message == "vector range overflow")
+        );
+    }
 
     #[test]
     fn builds_persists_and_queries_candidates() {

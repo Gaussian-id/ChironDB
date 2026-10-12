@@ -337,8 +337,11 @@ fn restore_cut(
 }
 
 fn cut(db: &Db, wal: &Path, id: EdgeId) -> (u64, u64, serde_json::Value) {
+    // Drop the temporary read guard before state() takes another collection
+    // lock: a queued WAL-flush writer otherwise blocks the recursive read.
+    let wal_lsn = db.get_coll("docs").unwrap().read().wal.len().unwrap();
     (
-        db.get_coll("docs").unwrap().read().wal.len().unwrap(),
+        wal_lsn,
         Wal::load(wal).unwrap().last().unwrap().unix_ms,
         state(db, id),
     )

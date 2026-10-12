@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chirondb-client"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 description = "Python HTTP client for the ChironDB vector database"
 license = { text = "AGPL-3.0-only" }
 requires-python = ">=3.10"

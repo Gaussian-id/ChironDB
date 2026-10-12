@@ -64,7 +64,9 @@ impl ReloadingTlsConfig {
             None => builder.with_no_client_auth(),
         };
         let mut config = builder.with_cert_resolver(resolver.clone());
-        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        // PostgreSQL 17+ libpq offers the `postgresql` ALPN identifier during
+        // SSLRequest negotiation. This TLS config is shared with HTTP/gRPC.
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"postgresql".to_vec()];
         config.max_early_data_size = 0;
         Ok(Self {
             config: Arc::new(config),
@@ -173,9 +175,11 @@ pub async fn server_config(
         }
         None => builder.with_no_client_auth(),
     };
-    builder
+    let mut config = builder
         .with_single_cert(certs, key)
-        .map_err(std::io::Error::other)
+        .map_err(std::io::Error::other)?;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"postgresql".to_vec()];
+    Ok(config)
 }
 
 async fn load_certified_key(

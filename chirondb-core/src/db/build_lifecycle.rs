@@ -54,9 +54,13 @@ impl BuildLifecycle {
         self.cancelled.load(Ordering::Acquire)
     }
 
-    pub(super) fn cancel_and_drain(&self, timeout: Duration) -> bool {
+    pub(super) fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
         super::build_admission::notify_waiters();
+    }
+
+    pub(super) fn cancel_and_drain(&self, timeout: Duration) -> bool {
+        self.cancel();
 
         let deadline = Instant::now() + timeout;
         let mut state = self

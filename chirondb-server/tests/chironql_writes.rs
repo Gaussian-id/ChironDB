@@ -89,6 +89,9 @@ fn run_as(
         allowed_collections: None,
         want_trace: true,
         confirm,
+        parameters: Vec::new(),
+        idempotency_key: None,
+        retry_id: None,
         tenant: TenantScope::system(),
     };
     chirondb::chironql_exec::execute(&mut ctx, query)

@@ -8,7 +8,9 @@
 //! branch dispatch has a second pool because a branch can hold a collection
 //! read guard while its search fans out internally. Scheduling both layers on
 //! one writer-preferring pool can deadlock when the WAL flusher queues a write
-//! between those two layers.
+//! between those two layers. Pool separation alone is insufficient: Rayon can
+//! steal work from the calling pool while waiting for another pool. Multi-search
+//! therefore pins its collection once, before dispatching any branch.
 //!
 //! Sizing mirrors the global pool's existing policy exactly (half the
 //! worker-thread count, floor 2, overridable via `CHIRONDB_WORKER_THREADS`
@@ -23,18 +25,15 @@ fn configured_workers() -> usize {
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|workers| *workers >= 1)
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|value| value.get())
-                .unwrap_or(1)
-        })
+        .map(|workers| workers.min(crate::resource_profile::current().effective_cores))
+        .unwrap_or(crate::resource_profile::current().effective_cores)
 }
 
 /// Dedicated pool for search-path `par_iter` calls: HNSW beam neighbor
 /// scoring (`h2qg.rs`) and post-search candidate rescore / multi-search
 /// branch fan-out (`db.rs`).
 pub static SEARCH_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
-    let threads = (configured_workers() / 2).max(2);
+    let threads = configured_workers().div_ceil(2).max(1);
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .thread_name(|i| format!("chirondb-search-{i}"))
@@ -46,7 +45,7 @@ pub static SEARCH_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
 /// remains on `SEARCH_POOL`, so a queued collection writer cannot strand all
 /// scoring workers behind branch jobs waiting for a new read guard.
 pub static MULTI_SEARCH_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
-    let threads = (configured_workers() / 2).max(2);
+    let threads = configured_workers().div_ceil(2).max(1);
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .thread_name(|i| format!("chirondb-multi-search-{i}"))

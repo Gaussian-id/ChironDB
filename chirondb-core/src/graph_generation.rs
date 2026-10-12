@@ -218,7 +218,7 @@ impl GraphGeneration {
                 SegmentStore::V4(Arc::clone(vectors)),
                 tombstones,
                 ordinals,
-            ));
+            )?);
         }
         Ok(searchers)
     }
@@ -520,9 +520,7 @@ impl GraphGeneration {
                             None => continue,
                         },
                     };
-                    let point = vectors
-                        .get_ordinal_for_aux_indexes(ordinal)
-                        .ok_or_else(|| corrupt(dir, "missing vector point for recovery"))?;
+                    let point = vectors.get_ordinal_for_aux_indexes(ordinal)?;
                     let tenant = point
                         .payload
                         .get(crate::tenant::TENANT_FIELD)

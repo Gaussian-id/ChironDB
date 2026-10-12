@@ -34,6 +34,7 @@ pub mod encryption;
 pub mod failpoint;
 pub mod fs_util;
 pub(crate) mod graph_admission;
+pub mod security;
 // G1 freezes and validates these formats before the complete graph segment
 // group becomes publication-authoritative in the later marker/manifest slice.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -78,6 +79,9 @@ pub mod ordinal;
 pub(crate) mod overlay;
 pub mod payload_index;
 pub mod query_arena;
+pub mod relational;
+pub mod resource_profile;
+pub mod response_buffer;
 pub(crate) mod restore_journal;
 pub mod seal;
 pub mod search;
@@ -91,12 +95,24 @@ pub mod storage_layout;
 pub mod streamer;
 pub mod structural_embedding;
 pub mod tenant;
+pub mod transaction_journal;
 pub mod wal;
 pub mod wal_archive;
 pub mod wal_replication;
 
 // Crate-root re-exports (matching the original lib.rs)
-pub use db::Db;
+pub use chirondb_types::relational::{
+    CheckConstraintDefinition, ForeignKeyAction, ForeignKeyDefinition, ForeignKeyMatch,
+    IdentityGeneration, RecordRef, ReferencedKeyKind, RelationalColumn, RelationalType,
+    RelationalValue, ScalarIndexDefinition, SqlExecutionRequest, SqlExecutionResponse, SqlOutcome,
+    SqlResult, SqlStatementRequest, SqlTransactionHandleResponse, SqlTransactionState,
+    TableDefinition, UniqueConstraint,
+};
+pub use db::{
+    Db, MultiModelInsertRequest, MultiModelReadSnapshot, MultiModelResponse,
+    MultiModelTransactionRequest, MultiModelTransactionResponse, NewRecord, NewRelation,
+    RecordEndpoint, ShutdownReport,
+};
 pub use index::{IndexBackend, IndexKind, IndexParams};
 pub use model::{
     CollectionConfig, CountResponse, DeleteByFilterRequest, DeleteByFilterResponse,
@@ -107,5 +123,10 @@ pub use model::{
     WalArchivePruneResponse,
 };
 pub use ordinal::SegmentOrdinalSet;
+pub use relational::{
+    RelationalBatch, RelationalEngine, SqlResponse, SqlStatementAnalysis, SqlStatementClass,
+    SqlStatementKind,
+};
 pub use segment::{SoASegmentCache, SoAVectorStorage};
 pub use structural_embedding::StructuralUpsertReceipt;
+pub use transaction_journal::{TransactionId, TransactionState, TransactionStatus};
