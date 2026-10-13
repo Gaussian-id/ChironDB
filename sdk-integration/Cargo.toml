@@ -10,7 +10,7 @@ license = "AGPL-3.0-only"
 
 [dependencies]
 chirondb = { path = "../chirondb-server" }
-chirondb-client = { git = "https://github.com/Gaussian-id/chirondb-rust", rev = "7b3deacee61286bfe7e3275769fe939e65f7355b", version = "=0.1.0-beta.2" }
+chirondb-client = { git = "https://github.com/Gaussian-id/chirondb-rust", rev = "dbbd5924c97380265d041fbefde09ce7809ebf6c", version = "=0.1.0-beta.2" }
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
 chirondb-types = { path = "../chirondb-types" }
 axum = "0.8"

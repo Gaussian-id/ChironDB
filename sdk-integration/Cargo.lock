@@ -429,7 +429,7 @@ dependencies = [
 [[package]]
 name = "chirondb-client"
 version = "0.1.0-beta.2"
-source = "git+https://github.com/Gaussian-id/chirondb-rust?rev=7b3deacee61286bfe7e3275769fe939e65f7355b#7b3deacee61286bfe7e3275769fe939e65f7355b"
+source = "git+https://github.com/Gaussian-id/chirondb-rust?rev=dbbd5924c97380265d041fbefde09ce7809ebf6c#dbbd5924c97380265d041fbefde09ce7809ebf6c"
 dependencies = [
  "base64 0.22.1",
  "percent-encoding",
