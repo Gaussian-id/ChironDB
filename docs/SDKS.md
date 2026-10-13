@@ -1,11 +1,131 @@
 # ChironDB SDKs
 
+Rust/Python source examples below run from their standalone SDK checkouts.
+Rust wire DTO names and JSON representations are unchanged, but SDK and
+embedded-engine structs are distinct Rust types. Compare or convert through
+serialization when crossing that boundary.
+
+## One client, three models
+
+`client.vector()`, `client.graph()`, and `client.relational()` share one HTTP pool,
+credentials and timeout. Existing direct methods remain available. Python view
+construction is synchronous even for an async client; await its operations.
+
+| View | Application operations |
+| --- | --- |
+| `vector()` | Collection config, points/structural points, dense/sparse/text/hybrid retrieval, count/scroll, compact |
+| `graph()` | Lifecycle/types, edges, traversal, deferred ingestion, typed ChironQL query |
+| `relational()` | Parameterized SQL, atomic statement batches, explicit interactive transactions, transaction status |
+| `protected().vector()` | Server-ID create, existing-ID update, authorized reads/dense/text retrieval and deletes |
+| `protected().graph()` | ChironQL query; protected traversal and graph stages use this language route |
+| `protected().relational()` | The same SQL/transaction contract under current table and reference authority |
+
+`query()` exposes ChironQL `SQL`, bounded read-only `PIPELINE`, and atomic
+`TRANSACTION`. It accepts typed positional values; it does not interpolate SQL or
+construct a second query language. See [the supported subset](CHIRONQL.md).
+Protected pipelines return graph nodes only; standalone protected traversal also
+supports edges/paths. Paths require `LIMIT`. Legacy graph REST calls remain
+unavailable on protected installations. SQL-only interactive handles cannot stage
+separate vector/graph HTTP calls into their transaction; use one ChironQL block.
+
+```python
+from chirondb_client import ChironDbClient, RelationalValue, SqlStatementRequest
+
+with ChironDbClient("http://127.0.0.1:7401", timeout=30) as client:
+    relational = client.relational()
+    # documents is provisioned by the application/admin first.
+    result = relational.sql("SELECT id, title FROM documents WHERE id=$1",
+                            [RelationalValue("text", "doc-1")])
+    for row in result.results[0].rows:
+        print([cell.value for cell in row])
+    tx = relational.begin()
+    decision_id = tx.transaction_id  # Persist before COMMIT.
+    tx.execute([SqlStatementRequest("UPDATE documents SET title=$1 WHERE id=$2",
+        (RelationalValue("text", "Updated"), RelationalValue("text", "doc-1")))])
+    receipt = tx.commit()  # Explicit. tx.rollback() discards private writes.
+    status = relational.transaction_status(decision_id)
+```
+
+Python `relational()` and `query()` return typed contracts with `to_dict()` and
+`from_dict()`. Existing `sql()/execute_sql()/chironql()` methods retain dictionary
+responses and tagged-dictionary input. A `SqlExecutionRequest` or `ChironQlRequest`
+can carry its complete options; do not combine one with separate request options.
+Rust exports SDK-owned `RecordRef`, `RelationalType`, `RelationalValue`,
+`SqlOutcome` and request/result types. `TransactionStatus` has `transaction_id`,
+`state`, `commit_sequence`, `storage_projected`, and `audit_projected`.
+
+Use explicit Python `RelationalValue(tag, value)` tags: `null`, `boolean`,
+`integer`, `float`, `decimal`, `text`, `bytes`, `date`, `timestamp_utc`, `uuid`,
+`json`, `vector`, and `record_ref`. Null has no value; JSON null is
+`RelationalValue("json", None)`. Decimal uses an exact string, bytes a byte array,
+integer an i64, and record references `RecordRef(namespace, id)`. JSON and vector
+arrays are distinguished explicitly. Non-finite numbers reject before IO.
+These native parameter values preserve large i64 values; the protected CREATE
+POINTS literal helper still has the separate exact-f64 limitation described below.
+
+```rust
+use chirondb_client::{ChironDbClient, RelationalValue};
+
+let client = ChironDbClient::new("http://127.0.0.1:7401");
+let tx = client.relational().begin().await?;
+let decision_id = tx.transaction_id.clone().expect("reserved at BEGIN");
+tx.sql("UPDATE documents SET title=$1 WHERE id=$2", vec![
+    RelationalValue::Text("Updated".into()), RelationalValue::Text("doc-1".into()),
+]).await?;
+let receipt = tx.commit().await?;
+assert_eq!(receipt.transaction_id.as_deref(), Some(decision_id.as_str()));
+let status = client.transaction_status(&decision_id).await?;
+```
+
+Dropping a transaction performs no network IO or implicit commit/rollback. Its
+`opened` response describes BEGIN, rather than cached current authority/state.
+The server enforces handle lifetime and current permissions. Retain the original
+handle and transaction ID across disconnects. An explicit repeat of `commit()`
+reconciles that same decision without resubmitting statements. Native SQL batches
+and ChironQL atomic blocks can use a caller-owned idempotency key; preserve the
+same content/key. `retry_id` is audit correlation. No mutation retries automatically.
+On timeout/cancellation or lost acknowledgement, query transaction status or
+explicitly reconcile the original handle/key. Receipt expiry or revoked access
+never authorizes a new mutation under a consumed key. A read-only interactive
+execute can have `committed=false` and no commit sequence; do not infer rollback.
+
+Run these against separate fresh disposable legacy installations; each leaves
+`sdk_chunks` and `sdk_documents` available for inspection:
+
+```bash
+python examples/multimodel_sync.py http://127.0.0.1:7401
+python examples/multimodel_async.py http://127.0.0.1:7401
+cargo run --locked -p chirondb-client --example sdk_multimodel -- http://127.0.0.1:7401
+```
+
+For protected use, provision `docs`, graph type `cites`, ingest template `finance`,
+and SQL table `documents(id TEXT PRIMARY KEY, title TEXT, chunk RECORD_REF('docs'),
+source RECORD_REF('docs'))`. Complete required offline table/scopes migrations
+through the administrator CLI. Grant current SQL data actions, collection
+Create/Read/Ingest/GraphWrite and endpoint object rights; graph reads also need
+GraphRead. The SDK neither provisions authority nor upgrades installations.
+
+```bash
+python examples/multimodel_protected.py --url https://localhost:7401 \
+  --api-key-file ./secrets/application.key --ca-cert ./secrets/ca.pem \
+  --request-id document-import-1
+```
+
+This example atomically stores SQL metadata, server-allocated vector points and
+their graph relation, then reconciles its decision. Reusing the same request ID
+and input returns the same allocation rows. General query credential responses
+are excluded from the Python typed result's representation; store explicit
+issuance responses privately rather than logging/exporting them.
+
+The SDK remains independently source-distributed beta.2. This interface does not certify
+production relational/resource acceptance or engine benchmark improvements.
+
 ## Native relational SQL preview
 
 The Rust and Python HTTP clients call `/v1/sql`, whose request body is the
-atomic transaction boundary. Rust re-exports `SqlExecutionRequest`,
+atomic transaction boundary. The Rust SDK exports SDK-owned `SqlExecutionRequest`,
 `SqlStatementRequest`, `RelationalValue`, `SqlExecutionResponse`, and
-`SqlResult` from `chirondb-types`:
+`SqlResult` with the existing JSON representations:
 
 ```rust
 use chirondb_client::{
@@ -474,9 +594,12 @@ queries remain open compatibility work.
 Protected user/role/key syntax, every statement example, revision semantics and
 working TLS/API recipes: [ChironQL security reference](CHIRONQL_SECURITY.md).
 
-The beta includes synchronous Python and asynchronous Rust clients for the HTTP
-API. They are source-distributed in this repository and are not yet published
-to PyPI or crates.io.
+The beta includes synchronous/async Python and asynchronous Rust clients for the HTTP
+API. SDK implementations now live in independent private repositories:
+[chirondb-rust](https://github.com/Gaussian-id/chirondb-rust),
+[chirondb-py](https://github.com/Gaussian-id/chirondb-py), and
+[chirondb-js](https://github.com/Gaussian-id/chirondb-js). Registry publication
+remains a separate release step. Ordinary server builds need no SDK access.
 
 Start a server using [Getting started](GETTING_STARTED.md#1-build-and-start).
 Each language's starter creates `products`; use an unused collection name or
@@ -489,11 +612,11 @@ need both `phone` and `book`. Re-running an upsert restores either point.
 Python `3.10+` is required. From an existing checkout, skip the first two commands.
 
 ```bash
-git clone https://github.com/Gaussian-id/ChironDB.git
-cd ChironDB
+git clone https://github.com/Gaussian-id/chirondb-py.git
+cd chirondb-py
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install ./clients/python
+python -m pip install .
 ```
 
 Create a collection, insert points, and search:
@@ -566,7 +689,10 @@ while page["next_offset"] is not None:
 
 HTTP error responses raise `ChironDbError`, which exposes `status` and
 `message`. A stopped server raises `requests.ConnectionError`; a request
-that times out raises `requests.Timeout`. The client does not start a server.
+that times out raises `requests.Timeout`. Error fields retain `status` and the original
+`message`, plus optional `code`, `item_index`, `retry_after_ms`, `hint`, `query_id`,
+`transaction_id`, `retryable`, and `position`. Async transport exceptions come from
+HTTPX. The client does not start a server.
 Check `/health` and the configured address before retrying.
 
 ### Structural nodes and zero-vector safety
@@ -701,14 +827,15 @@ between 0 and 1 to promote there.
 
 Create a Rust application next to your checkout (`cargo new chiron-example`),
 then add these dependencies to its `Cargo.toml`. The path below assumes sibling
-directories named `chiron-example` and `ChironDB`; adjust it to your checkout.
+directories named `chiron-example` and `gauss-db`; adjust it to your checkout.
 Paste the complete starter into `src/main.rs` and run `cargo run` from the
 application directory. Insert advanced snippets before the starter's `Ok(())`;
 wrap each snippet in its own `{ ... }` block to keep repeated imports scoped.
 
 ```toml
 [dependencies]
-chirondb-client = { path = "../ChironDB/clients/rust" }
+chirondb-client = { git = "https://github.com/Gaussian-id/chirondb-rust" }
+# Pin a qualified full `rev` for reproducible applications.
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -777,7 +904,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 The Rust client also provides `health`, `list_collections`,
 `delete_collection`, `get_points`, `delete`, `set_payload`,
 `delete_by_filter`, `count`, and `scroll`. Call `.with_api_key(key)` when the
-server requires authentication. Connection failures return a client error;
+server requires authentication. `Error::Api { status, message }` keeps its shape;
+`api_details()` reads optional structured fields and returns `None` for non-JSON.
+Connection failures return a client error;
 start the server separately and verify its address before retrying.
 
 ### Structural nodes and zero-vector safety
@@ -819,9 +948,9 @@ one unsafe reason.
 
 ### Property graph and constrained retrieval
 
-The Rust SDK re-exports the canonical graph request/result types from
-`chirondb-types`. This keeps EdgeId opaque and makes the HTTP, gRPC,
-ChironWire, and SDK JSON contract share one schema:
+The Rust SDK owns its graph request/result types and preserves their public
+names and JSON contracts. EdgeId stays opaque. SDK and embedded-engine structs
+have distinct Rust type identities:
 
 ```rust
 use chirondb_client::{
@@ -1051,14 +1180,14 @@ See [row preconditions](CHIRONQL.md#sql-row-preconditions).
 
 ## SDK scope
 
-- Both SDKs call the JSON HTTP API on port `7401`.
+- All three SDKs call the JSON HTTP API on port `7401`.
 - Generated gRPC clients are not published; see [the gRPC guide](GRPC_API.md).
 - The clients do not manage server lifecycle, TLS certificates, backups, or
   data-directory upgrades.
-- Keep `wait=true` for durable writes: success then means the WAL and required
-  filesystem metadata are synchronized. With `wait=false`, the server still
-  returns `202 Accepted` and flushes in the background every 200 ms, but a crash
-  may lose the recent unflushed suffix.
+- The installation transaction journal durably decides mutations before WAL/audit
+  projections. Legacy `wait=false` returns `202 Accepted` with a durable commit
+  decision; recovery completes projections. Protected guarded mutations require
+  `wait=true`. A lost response needs reconciliation, not an assumed rollback.
 - Public deployments require server TLS, RBAC/API credential Secrets, and an
   external encryption keyring. SDK `401`/`403` responses distinguish invalid
   credentials from a principal denied by policy; `503` means the fail-closed
@@ -1066,11 +1195,12 @@ See [row preconditions](CHIRONQL.md#sql-row-preconditions).
 
 ## Disposable graph + vector preview
 
-Run the complete local walkthrough without configuring a data directory or
-external service:
+The server repository preserves the mixed embedded-engine/SDK walkthrough in
+its separate authenticated integration harness. Fetch the pinned SDK dependencies
+with authorized access, then run without configuring a data directory:
 
 ```bash
-cargo run --locked -p chirondb --example graph_vector_preview
+cargo run --locked --manifest-path sdk-integration/Cargo.toml --example graph_vector_preview
 ```
 
 The example binds only an ephemeral loopback port and stores data in a
@@ -1126,9 +1256,9 @@ See [the complete terminal/API contract](HTTP_API.md#protected-chironql-administ
 
 ## Native text hybrid SDK methods
 
-These methods use the legacy RBAC/tenant surface and are rejected on protected
-installations. Use the protected dense/ChironQL subset described above for
-collections provisioned through `CREATE PROTECTED COLLECTION`.
+These methods work on the legacy surface and the protected text-retrieval profile.
+Use `client.protected().vector().text_hybrid_search(...)` for a protected hits-only
+response. Collection/object Search and field Query permissions define its corpus.
 
 The new operation takes both the question text and its embedding. It reads BM25
 terms from a top-level string field and does not require `sparse_vector`:
@@ -1289,13 +1419,13 @@ point and a point owned by another tenant both return `not_found`. Tool failures
 are audited as failures even when the protocol response uses HTTP 200.
 
 To populate a fresh `sop` collection, run the complete
-[Python ingestion example](../clients/python/examples/mcp_ingest.py) after
+[Python ingestion example](https://github.com/Gaussian-id/chirondb-py/blob/main/examples/mcp_ingest.py) after
 installing the Python client above:
 
 ```bash
 export CHIRONDB_URL=http://127.0.0.1:7401
 export CHIRONDB_EMBEDDING_ENDPOINT=http://127.0.0.1:8000/v1/embeddings
-python clients/python/examples/mcp_ingest.py
+python examples/mcp_ingest.py
 ```
 
 Provide the server key through `CHIRONDB_API_KEY`; set
@@ -1307,3 +1437,230 @@ sparse vectors.
 Protocol references: [Build an MCP server](https://modelcontextprotocol.io/docs/2026-07-28/develop/build-server),
 [Streamable HTTP](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http),
 and [MCP authorization](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization).
+
+## Async Python and connection lifetime
+
+Install the optional async transport; ordinary sync installations still use `requests`:
+
+```bash
+python -m pip install '.[async]'
+```
+
+`AsyncChironDbClient` has the same operation arguments and result shapes as the
+sync client. Each operation is awaited; `scroll_all` is an async iterator:
+
+```python
+from chirondb_client import AsyncChironDbClient, GraphConstraint
+
+async def retrieve(base_url, api_key):
+    async with AsyncChironDbClient(base_url, api_key=api_key, timeout=30) as db:
+        result = await db.search(
+            "products", vector=[0.0, 0.0, 1.0], k=5,
+            graph=GraphConstraint(anchors=("phone",), edge_types=("related_to",)),
+        )
+        async for point in db.scroll_all("products", page_size=100):
+            print(point["id"])
+        return result
+```
+
+Keep a client alive across requests to reuse its connection pool, following the
+[HTTPX async client lifecycle](https://www.python-httpx.org/async/). Use `with` or
+`close()` for sync Python, and `async with` or `await aclose()` for async Python.
+Async transport errors are HTTPX exceptions, including `httpx.ConnectError` and
+`httpx.TimeoutException`; sync transport errors remain `requests` exceptions.
+Canceling an async task cancels the HTTP request; it does not promise rollback
+of a server mutation. Inspect/reconcile the original request identity before
+resubmitting an ambiguous write. Closing the client does not commit or abort an
+open deferred graph session.
+
+Both Python clients accept `ca_cert="/path/to/ca.pem"` for a private CA and retain
+certificate verification. Empty CA paths and boolean values are rejected. Rust uses `.with_ca_certificate(&pem_bytes)?`,
+`.with_timeout(Duration::from_secs(30))`, or `.with_http_client(configured_client)`.
+Supplying a CA replaces the Rust HTTP client; configure a custom client and inject
+it when several transport options are needed. SDK-owned Rust requests default to
+30 seconds, including requests made through an injected client. Python timeouts
+use the transport's connection/read/write semantics rather than a promised total
+wall-clock deadline. SDK-owned transports disable automatic retries. An injected
+Rust HTTP client retains the caller's transport policy: configure it with
+`.retry(reqwest::retry::never())` to keep the same no-retry contract.
+Dynamic route identifiers are encoded as individual URL segments; dot segments
+are rejected. Encoding does not relax server identifier rules.
+
+## Typed graph evidence in Python
+
+Existing graph dictionary results remain unchanged. Decode a result when typed
+access is useful:
+
+```python
+from chirondb_client import (
+    GraphDispatchTrace, GraphMutationReceipt, GraphTraversalQueryResult,
+    TraversalBudget, ColdTraversalBudget,
+)
+
+edge = db.relate("products", "phone", "book", "related_to")
+page = db.traverse("products", anchors=["phone"], returns="edges", limit=100)
+traversal = GraphTraversalQueryResult.from_dict(page)
+for row in traversal.result.rows:
+    print(row.id)  # EdgeToken: persist/pass unchanged to unrelate or property updates
+
+receipt = GraphMutationReceipt.from_dict(db.merge_edge_properties(
+    "products", edge.edge_id, {"source": "catalog"},
+))
+print(receipt.operation_lsn, receipt.durable, receipt.replayed)
+db.unrelate("products", edge.edge_id)
+```
+
+Node, edge, and path rows have distinct typed decoders. Traversal results retain
+stats, epoch, warnings and truncation. `GraphDispatchTrace.from_dict(result["graph"])`
+preserves the server's planner evidence for constrained search; it does not infer
+achieved recall. Typed decoders ignore future unknown fields and preserve warning
+strings. `TraversalBudget` accepts the canonical limits and an optional
+`ColdTraversalBudget`; pass it to `GraphConstraint` or `traverse` wherever a budget
+dictionary was accepted. An explicit `TraversalBudget()` defaults to depth 5;
+omitting a constrained-search budget keeps the server's depth-1 default.
+Path traversal requires an explicit `limit`; this caps returned rows separately
+from traversal work limits.
+
+## Collection recall and named vectors
+
+Both SDKs accept `recall_sla` and `named_vector_dims` at collection creation and
+retain them when decoding collection configuration:
+
+```python
+db.create_collection(
+    "documents", vector_dim=3, metric="cosine", recall_sla=0.95,
+    named_vector_dims={"title": 2},
+)
+```
+
+The Rust `CollectionConfig` has matching fields, and `SearchQuery::default().k`
+is 10. Existing exhaustive `CollectionConfig` literals must supply the new fields
+or use `..Default::default()`. Exhaustive error matches must handle the new
+`InvalidInput` validation variant; the `Api { status, message }` pattern stays
+unchanged. `compact` is available in both SDKs. A collection SLA, a per-query
+`recall_target`, and measured recall are separate concepts: request fields are
+not measurements and SDK results do not manufacture achieved recall. Non-finite
+recall values are rejected before a request is sent, rather than becoming `null`
+and silently dropping the contract. In Rust this is a serialization/builder
+`Http` error; Python raises `ValueError`.
+
+## Protected application operations
+
+Use `db.protected()` only against an installation already provisioned by the
+administrator. It shares the parent's connection pool and credentials and offers
+`whoami`, `create_points`, `update_points`, `get_points`, `count`, `scroll`, dense
+`search`, `delete`, and `delete_by_filter`. Authentication/authorization is checked
+by the server on every request; the SDK does not cache a permission decision.
+An administrator key does not automatically grant document access.
+
+The following example assumes a provisioned two-dimensional `docs` collection,
+a `finance` ingest template that permits `/text` and its dense representation,
+and an application credential with Create/Ingest/Read/Search/Update/Delete authority:
+
+```python
+import os
+from chirondb_client import ChironDbClient
+
+with ChironDbClient(
+    os.environ["CHIRONDB_URL"], api_key=os.environ["CHIRONDB_API_KEY"],
+    ca_cert=os.environ.get("CHIRONDB_CA_CERT"),
+) as db:
+    app = db.protected()
+    points = [{"vector": [1.0, 0.0], "payload": {"text": "refund policy"}}]
+    ids = app.create_points(
+        "docs", template="finance", points=points,
+        request_id="refund-policy-import-v1",
+    )
+    assert app.create_points("docs", "finance", points, "refund-policy-import-v1") == ids
+    print(app.search("docs", [1.0, 0.0], k=5)["hits"])
+    app.update_points("docs", [{
+        "id": ids[0], "vector": [0.0, 1.0], "payload": {"text": "updated policy"},
+    }], wait=True)
+```
+
+With `AsyncChironDbClient`, use `async with` and await these same methods.
+Python returns `list[str]` from create, integer counts from update/delete, and
+`{"hits": [...]}` from protected search. Rust returns `Vec<String>`, `u64`, and
+`ProtectedSearchResponse { hits }`; its protected search request type is
+`ProtectedSearchQuery` and creation accepts canonical `NewPoint` values:
+
+```rust
+use chirondb_client::{NewPoint, ProtectedSearchQuery};
+
+let app = db.protected();
+let points = vec![NewPoint {
+    vector: vec![1.0, 0.0],
+    vectors: Default::default(),
+    sparse_vector: None,
+    payload: serde_json::json!({"text": "refund policy"}),
+}];
+let ids = app.create_points("docs", "finance", points, "refund-policy-import-v1").await?;
+let result = app.search("docs", ProtectedSearchQuery {
+    vector: vec![1.0, 0.0], k: 5, ..Default::default()
+}).await?;
+println!("{} {}", ids[0], result.hits[0].id);
+```
+
+Protected creation requires a caller-supplied nonempty request ID and 1–1024
+points without client IDs. Persist the original input and request ID: exact replay
+returns the same allocated IDs; changed input conflicts. The current replay path
+also requires Read authority. Creation is durable and exposes no `wait=false`
+option. The helper escapes strings and recursively serializes ChironQL literals,
+including nested payloads; non-finite numbers and integers outside the exact-f64
+range (absolute value greater than 2^53) are rejected before network I/O.
+The server's ChironQL parser uses f64 numbers; callers needing larger exact
+integers should store strings or use an appropriate existing HTTP operation.
+
+`update_points` updates existing IDs; legacy `upsert` is not protected creation.
+Protected update requires `wait=true`; `wait=false` is rejected before mutation. Protected delete
+operations use the main server's durable contract without a `wait` argument.
+Protected search publishes only hits, not graph traces, elapsed/candidate metrics,
+or achieved recall. `whoami.identity_revision` is absent unless the caller has
+identity-management authority. Unsupported operations fail closed.
+
+Protected SQL and interactive transactions are available through `relational()`.
+Protected traversal, read pipelines and atomic SQL/vector/graph transactions run
+through `query()`. Protected graph REST/deferred endpoints and numeric sparse
+hybrid remain unavailable. User/role/key administration helpers are outside the
+application SDK. No credentials are cached or substituted.
+
+Run the async examples against the corresponding server configuration:
+
+```bash
+# Legacy graph server; choose a fresh collection name.
+python examples/graph_app.py --collection sdk_graph_demo
+
+# Protected server: supply application credentials and CA through the environment.
+python examples/protected_app.py --request-id refund-policy-import-v1
+```
+
+The examples create application records and leave them available for inspection.
+They do not initialize authority or issue credentials.
+
+## Node.js / TypeScript
+
+The [Node SDK](https://github.com/Gaussian-id/chirondb-js) provides camelCase
+methods for the same HTTP contracts, with ESM/CommonJS exports and TypeScript
+declarations. Install a qualified local npm tarball until a registry release
+is explicitly published. Request/response DTO fields keep server snake_case.
+
+```js
+import { ChironDbClient } from 'chirondb-client';
+const db = new ChironDbClient('http://127.0.0.1:7401', {
+  apiKey: process.env.CHIRONDB_API_KEY, timeoutMs: 30000,
+});
+try {
+  const rows = await db.relational().sql('SELECT $1', [
+    {type: 'integer', value: 9223372036854775807n},
+  ]);
+  console.log(rows.results);
+} finally { db.close(); }
+```
+
+Use `bigint` for large integer inputs and strings for typed SQL decimals.
+Supply trusted PEM via `caCertificate` for custom CAs. A final `{signal}`
+argument cancels a request; `close()` disposes pooled connections and pending
+requests. Mutations have no automatic retries. Reconcile an uncertain COMMIT
+using the original BEGIN transaction ID with `transactionStatus()` or the
+transaction object's `reconcile()`. See each SDK repository's release guide
+for package qualification and manual publication instructions.

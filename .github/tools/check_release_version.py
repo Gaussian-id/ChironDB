@@ -15,9 +15,6 @@ MANIFESTS = (
     "chirondb-core/Cargo.toml",
     "chirondb-server/Cargo.toml",
     "chirondb-ui-server/Cargo.toml",
-    "clients/rust/Cargo.toml",
-    "clients/rust-compat/Cargo.toml",
-    "clients/python/pyproject.toml",
 )
 
 

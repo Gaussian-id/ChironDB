@@ -1,7 +1,7 @@
 //! Disposable local graph+vector preview.
 //!
 //! Run with:
-//! `cargo run --locked -p chirondb --example graph_vector_preview`
+//! `cargo run --locked --manifest-path sdk-integration/Cargo.toml --example graph_vector_preview`
 
 use std::error::Error;
 use std::io;
@@ -25,6 +25,7 @@ struct PreviewServer {
     base_url: String,
     shutdown: oneshot::Sender<()>,
     task: JoinHandle<io::Result<()>>,
+    db: Db,
 }
 
 impl PreviewServer {
@@ -32,8 +33,9 @@ impl PreviewServer {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let (shutdown, wait_for_shutdown) = oneshot::channel();
+        let server_db = db.clone();
         let task = tokio::spawn(async move {
-            axum::serve(listener, api::router(db))
+            axum::serve(listener, api::router(server_db))
                 .with_graceful_shutdown(async {
                     let _ = wait_for_shutdown.await;
                 })
@@ -43,16 +45,22 @@ impl PreviewServer {
             base_url: format!("http://{address}"),
             shutdown,
             task,
+            db,
         })
     }
 
     async fn stop(self) -> Result<(), Box<dyn Error>> {
         let _ = self.shutdown.send(());
-        match self.task.await {
-            Err(error) => Err(error.into()),
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(error.into()),
-        }
+        self.task.await??;
+        // Drain background storage owners before reopening this data directory.
+        let report = self
+            .db
+            .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(30));
+        require(
+            !report.fallback_required,
+            "preview shutdown requires recovery",
+        )?;
+        Ok(())
     }
 }
 

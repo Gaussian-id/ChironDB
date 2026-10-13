@@ -104,24 +104,16 @@ jobs:
             ${{ runner.temp }}/reference-migration.json
             ${{ runner.temp }}/reference-enospc.json
           if-no-files-found: error
-      - name: MCP Python SDK and stdio interoperability
-        run: |
-          python3 -m venv "$RUNNER_TEMP/mcp-venv"
-          "$RUNNER_TEMP/mcp-venv/bin/pip" install -r chirondb-server/tests/mcp_requirements.txt
-          "$RUNNER_TEMP/mcp-venv/bin/python" chirondb-server/tests/mcp_interop.py --bins target/release
-      - name: Traditional ML worker and real protocol/SDK scenarios
-        run: |
-          python3 -m venv "$RUNNER_TEMP/chirondb-ml-python"
-          ml_python="$RUNNER_TEMP/chirondb-ml-python/bin/python"
-          "$ml_python" -m pip install -r ml-worker/requirements-traditional.txt requests==2.34.2 protobuf==7.36.2
-          PYTHONPATH=ml-worker "$ml_python" -m unittest -v test_worker
-          PYTHONPATH=clients/python "$ml_python" -m unittest -v test_ml_sdk
-          export CHIRONDB_ML_WORKER_PYTHON="$ml_python"
-          export CHIRONDB_ML_SDK_PYTHON="$ml_python"
-          export CHIRONDB_ML_WORKER_SCRIPT="$GITHUB_WORKSPACE/ml-worker/chirondb_ml_worker.py"
-          cargo test -p chirondb --test ml_materialize --locked -j 2 traditional_models_materialize_and_refresh_through_http_and_sdks -- --ignored --exact
-          cargo test -p chirondb --test ml_materialize --locked -j 2 grpc_and_chironwire_share_ml_materialization -- --ignored --exact
-          CHIRONDB_ML_WORKER_SCRIPT="$GITHUB_WORKSPACE/ml-worker/delayed_worker.py" cargo test -p chirondb --test ml_materialize --locked -j 2 job_uses_submission_snapshot_and_serializes_refreshes -- --ignored --exact
+      - name: Upload candidate binaries for external SDK qualification
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: sdk-candidate-binaries
+          path: |
+            target/release/chirondb
+            target/release/chironctl
+            target/release/chironql
+            target/release/chironmcp
+          if-no-files-found: error
       - name: WAL recovery durability gate (100K × 128D)
         run: >-
           target/release/chirondrill
@@ -137,6 +129,85 @@ jobs:
         run: python3 .github/tools/scale_gate.py --points 1000 --dim 64 --batch-size 100 --searches 25 --k 10 --target-points 1000000000 --max-projected-gib 4096
       - name: Recall regression gate
         run: python3 .github/tools/recall_gate.py --points 200 --dim 32 --queries 20 --k 10 --min-recall 0.95
+
+  sdk-integration:
+    name: Authenticated standalone SDK integration
+    needs: [trust-boundary, rust]
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@87eb139fed4b08a67bd1fa429a21d1f5d523e03e
+        with:
+          toolchain: 1.92.0
+          components: rustfmt, clippy
+      - name: Install fixture dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler openssl python3-venv
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: sdk-candidate-binaries
+          path: ${{ runner.temp }}/sdk-bins
+      - name: Restore executable fixture permissions
+        run: |
+          chmod +x "$RUNNER_TEMP/sdk-bins"/*
+          echo "CHIRONDB_BIN_DIR=$RUNNER_TEMP/sdk-bins" >> "$GITHUB_ENV"
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Install pinned standalone SDK packages
+        env:
+          SDK_REPOS_READ_TOKEN: ${{ secrets.SDK_REPOS_READ_TOKEN }}
+        run: |
+          python3 -m venv "$RUNNER_TEMP/sdk-venv"
+          "$RUNNER_TEMP/sdk-venv/bin/python" .github/tools/install_standalone_sdks.py
+          echo "$RUNNER_TEMP/sdk-venv/bin" >> "$GITHUB_PATH"
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '22'
+      - name: Standalone Rust, Python and Node contracts against this server
+        env:
+          CHIRONDB_ML_WORKER_SCRIPT: ${{ github.workspace }}/ml-worker/chirondb_ml_worker.py
+        run: |
+          python3 -m venv "$RUNNER_TEMP/sdk-ml"
+          "$RUNNER_TEMP/sdk-ml/bin/python" -m pip install -r ml-worker/requirements-traditional.txt
+          export CHIRONDB_ML_WORKER_PYTHON="$RUNNER_TEMP/sdk-ml/bin/python"
+          cargo fmt --manifest-path sdk-integration/Cargo.toml -- --check
+          cargo clippy --offline --locked --manifest-path sdk-integration/Cargo.toml --all-targets -- -D warnings
+          cargo test --offline --locked --manifest-path sdk-integration/Cargo.toml
+          (cd "$CHIRONDB_SDK_RUST_ROOT" && python3 scripts/test_fixture_startup.py)
+          cargo test --offline --locked --manifest-path "$CHIRONDB_SDK_RUST_ROOT/Cargo.toml"
+          (cd "$CHIRONDB_SDK_RUST_ROOT" && cargo package -p chirondb-client --offline --locked && python3 scripts/package_compat.py)
+          cargo test --offline --locked --manifest-path "$CHIRONDB_SDK_RUST_ROOT/target/package/chirondb-client-0.1.0-beta.2/Cargo.toml"
+          cargo run --offline --locked --manifest-path sdk-integration/Cargo.toml --example graph_vector_preview
+          python3 -m pytest "$CHIRONDB_SDK_PYTHON_ROOT/tests" -q
+          npm --prefix "$CHIRONDB_SDK_NODE_ROOT" ci
+          npm --prefix "$CHIRONDB_SDK_NODE_ROOT" test
+          npm --prefix "$CHIRONDB_SDK_NODE_ROOT" run test:integration
+          (cd "$CHIRONDB_SDK_NODE_ROOT" && npm pack && node scripts/test_package.mjs)
+      - name: MCP Python SDK and stdio interoperability
+        run: |
+          python3 -m venv "$RUNNER_TEMP/mcp-venv"
+          "$RUNNER_TEMP/mcp-venv/bin/pip" install -r chirondb-server/tests/mcp_requirements.txt
+          "$RUNNER_TEMP/mcp-venv/bin/pip" install "$(ls "$CHIRONDB_SDK_PYTHON_ROOT"/dist/*.whl)"
+          "$RUNNER_TEMP/mcp-venv/bin/python" chirondb-server/tests/mcp_interop.py --bins "$RUNNER_TEMP/sdk-bins"
+      - name: Traditional ML worker and real protocol/SDK scenarios
+        run: |
+          python3 -m venv "$RUNNER_TEMP/chirondb-ml-python"
+          ml_python="$RUNNER_TEMP/chirondb-ml-python/bin/python"
+          "$ml_python" -m pip install -r ml-worker/requirements-traditional.txt requests==2.34.2 protobuf==7.36.2
+          PYTHONPATH=ml-worker "$ml_python" -m unittest -v test_worker
+          "$ml_python" -m pip install "$(ls "$CHIRONDB_SDK_PYTHON_ROOT"/dist/*.whl)[async,dev]"
+          "$ml_python" -m pytest "$CHIRONDB_SDK_PYTHON_ROOT/tests/test_ml_sdk.py" -q
+          export CHIRONDB_ML_WORKER_PYTHON="$ml_python"
+          export CHIRONDB_ML_SDK_PYTHON="$ml_python"
+          export CHIRONDB_ML_WORKER_SCRIPT="$GITHUB_WORKSPACE/ml-worker/chirondb_ml_worker.py"
+          cargo test --offline --manifest-path sdk-integration/Cargo.toml --test ml_materialize --locked -j 2 traditional_models_materialize_and_refresh_through_http_and_sdks -- --ignored --exact
+          cargo test --offline --manifest-path sdk-integration/Cargo.toml --test ml_materialize --locked -j 2 grpc_and_chironwire_share_ml_materialization -- --ignored --exact
+          CHIRONDB_ML_WORKER_SCRIPT="$GITHUB_WORKSPACE/ml-worker/delayed_worker.py" cargo test --offline --manifest-path sdk-integration/Cargo.toml --test ml_materialize --locked -j 2 job_uses_submission_snapshot_and_serializes_refreshes -- --ignored --exact
 
   docker:
     name: Docker deployment smoke
@@ -156,7 +227,7 @@ jobs:
   required:
     name: ci-required
     if: always()
-    needs: [trust-boundary, rust, docker]
+    needs: [trust-boundary, rust, docker, sdk-integration]
     runs-on: ubuntu-24.04
     steps:
       - name: Require CI and deployment smoke
@@ -164,4 +235,5 @@ jobs:
           RUST_RESULT: ${{ needs.rust.result }}
           DOCKER_RESULT: ${{ needs.docker.result }}
           TRUST_RESULT: ${{ needs.trust-boundary.result }}
-        run: test "$TRUST_RESULT" = success && test "$RUST_RESULT" = success && test "$DOCKER_RESULT" = success
+          SDK_RESULT: ${{ needs.sdk-integration.result }}
+        run: test "$TRUST_RESULT" = success && test "$RUST_RESULT" = success && test "$DOCKER_RESULT" = success && test "$SDK_RESULT" = success

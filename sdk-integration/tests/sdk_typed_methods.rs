@@ -103,6 +103,177 @@ impl Drop for Harness {
     }
 }
 
+#[tokio::test]
+async fn model_views_preserve_typed_sql_transactions_and_values() {
+    use chirondb_client::{
+        RecordRef, RelationalValue as V, SqlExecutionRequest, SqlOutcome, SqlResult,
+        SqlStatementRequest, TransactionState,
+    };
+    let h = Harness::start().await;
+    let sql = h.client.relational();
+    sql.sql("CREATE TABLE sdk_values (id BIGINT PRIMARY KEY, b BOOLEAN, f DOUBLE PRECISION, d DECIMAL(20,4), t TEXT, raw BYTEA, dt DATE, ts TIMESTAMP WITH TIME ZONE, u UUID, j JSONB, v VECTOR(3), r RECORD_REF('products'), n TEXT)", vec![]).await.unwrap();
+    let values = vec![
+        V::Integer(i64::MAX),
+        V::Boolean(true),
+        V::Float(1.25),
+        V::Decimal("100.2500".into()),
+        V::Text("'雪\\; DROP TABLE sdk_values".into()),
+        V::Bytes(vec![0, 127, 255]),
+        V::Date("2026-10-12".into()),
+        V::TimestampUtc("2026-10-12T00:00:00Z".into()),
+        V::Uuid("123e4567-e89b-12d3-a456-426614174000".parse().unwrap()),
+        V::Json(json!({"nested":[null,true,"'\\雪"]})),
+        V::Vector(vec![1., 0., 0.]),
+        V::RecordRef(RecordRef {
+            namespace: COLLECTION.into(),
+            id: "phone".into(),
+        }),
+        V::Null,
+    ];
+    let request = SqlExecutionRequest {
+        statements: vec![SqlStatementRequest {
+            sql: format!(
+                "INSERT INTO sdk_values VALUES ({}) RETURNING *",
+                (1..=13)
+                    .map(|i| format!("${i}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            parameters: values.clone(),
+        }],
+        idempotency_key: Some("typed-sdk-values".into()),
+        retry_id: None,
+    };
+    let first = sql.execute(&request).await.unwrap();
+    assert_eq!(first, sql.execute(&request).await.unwrap());
+    assert_eq!(first.outcome, SqlOutcome::Committed);
+    let SqlResult::Rows { rows, .. } = &first.results[0] else {
+        panic!("expected typed rows")
+    };
+    for i in [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12] {
+        assert_eq!(rows[0][i], values[i]);
+    }
+    let tx = sql.begin().await.unwrap();
+    tx.sql("SAVEPOINT saved", vec![]).await.unwrap();
+    tx.sql(
+        "UPDATE sdk_values SET t=$1",
+        vec![V::Text("private".into())],
+    )
+    .await
+    .unwrap();
+    let outside = sql.sql("SELECT t FROM sdk_values", vec![]).await.unwrap();
+    assert!(matches!(&outside.results[0], SqlResult::Rows {rows,..} if rows[0][0] == values[4]));
+    tx.sql("ROLLBACK TO SAVEPOINT saved", vec![]).await.unwrap();
+    tx.sql(
+        "UPDATE sdk_values SET t=$1",
+        vec![V::Text("committed".into())],
+    )
+    .await
+    .unwrap();
+    let receipt = tx.commit().await.unwrap();
+    assert_eq!(receipt.transaction_id, tx.transaction_id);
+    assert_eq!(
+        receipt.transaction_id,
+        tx.commit().await.unwrap().transaction_id
+    );
+    let status = sql
+        .transaction_status(tx.transaction_id.as_deref().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(status.state, TransactionState::Committed);
+    assert!(status.storage_projected && status.audit_projected);
+    let discarded = sql.begin().await.unwrap();
+    discarded
+        .sql("DELETE FROM sdk_values", vec![])
+        .await
+        .unwrap();
+    discarded.rollback().await.unwrap();
+    assert_eq!(h.client.vector().count(COLLECTION, None).await.unwrap(), 3);
+    for bad in [V::Float(f64::NAN), V::Vector(vec![f32::INFINITY])] {
+        assert!(matches!(
+            sql.sql("SELECT $1", vec![bad]).await,
+            Err(chirondb_client::Error::InvalidInput(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn sdk_query_commits_three_models_and_guards_sibling_writes() {
+    use chirondb_client::{ChironQlRequest, RelationalValue as V, SqlResult};
+    let h = Harness::start().await;
+    h.client
+        .graph()
+        .enable_graph(COLLECTION, true)
+        .await
+        .unwrap();
+    h.client
+        .graph()
+        .configure_edge_type(COLLECTION, "cites", None, true)
+        .await
+        .unwrap();
+    h.client.relational().sql("CREATE TABLE documents (id TEXT PRIMARY KEY, title TEXT, chunk RECORD_REF('products'), source RECORD_REF('products'))", vec![]).await.unwrap();
+    let create = ChironQlRequest { query: "TRANSACTION { SQL INSERT INTO documents VALUES ($1,$2,RECORD_REF('products','phone'),RECORD_REF('products','laptop')); EXPECT SQL ROWS 1; VECTOR UPSERT INTO products {id:'phone',vector:[1,0,0]}; GRAPH CONNECT products 'phone' -> cites -> 'laptop'; };".into(),
+        parameters: vec![V::Text("doc".into()),V::Text("雪'\\".into())], idempotency_key: Some("sdk-atomic-create".into()), ..Default::default() };
+    let first = h.client.query(&create).await.unwrap();
+    let replay = h.client.query(&create).await.unwrap();
+    assert_eq!(first.rows, replay.rows);
+    assert_eq!(first.transaction_id, replay.transaction_id);
+    assert_eq!(replay.stats.replayed, Some(true));
+    let pipeline = ChironQlRequest { query: "PIPELINE\n VECTOR v { SEARCH products NEAR $1 LIMIT 1 }\n GRAPH g { TRAVERSE products FROM v.record_ref VIA cites DEPTH 1 RETURN NODES LIMIT 20 }\n RELATIONAL r { SQL SELECT id, title, chunk, source FROM documents LIMIT 20 }\n INNER JOIN r ON r.chunk = v.record_ref\n LEFT JOIN g ON g.record_ref = r.source\n RETURN r.id, r.title, v.score, g.depth\n LIMIT 10;".into(), parameters: vec![V::Vector(vec![1.,0.,0.])], ..Default::default() };
+    let result = h.client.graph().query(&pipeline).await.unwrap();
+    assert_eq!(result.rows[0]["id"], "doc");
+    let direct: chirondb_client::ChironQlResponse = reqwest::Client::new()
+        .post(format!("{}/v1/chironql", h.base_url))
+        .json(&pipeline)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(result.rows, direct.rows);
+    let edge = first.rows[0]["edge_id"].as_str().unwrap();
+    let mut update = ChironQlRequest {
+        query: format!(
+            "TRANSACTION {{ SQL UPDATE documents SET title=$1 WHERE id='doc'; EXPECT SQL ROWS 2; VECTOR UPSERT INTO products {{id:'phone',vector:[0,1,0]}}; GRAPH UPDATE products EDGE '{edge}' SET PROPERTIES {{kind:'updated'}} REPLACE; }};"
+        ),
+        parameters: vec![V::Text("updated".into())],
+        ..Default::default()
+    };
+    assert_eq!(
+        h.client
+            .query(&update)
+            .await
+            .unwrap_err()
+            .api_details()
+            .unwrap()
+            .code
+            .as_deref(),
+        Some("chironql.sql_row_precondition_failed")
+    );
+    let unchanged = h
+        .client
+        .relational()
+        .sql("SELECT title FROM documents", vec![])
+        .await
+        .unwrap();
+    assert!(
+        matches!(&unchanged.results[0], SqlResult::Rows {rows,..} if rows[0][0] == V::Text("雪'\\".into()))
+    );
+    update.query = update.query.replace("ROWS 2", "ROWS 1");
+    update.idempotency_key = Some("sdk-atomic-update".into());
+    assert_eq!(h.client.query(&update).await.unwrap().committed, Some(true));
+    let delete = ChironQlRequest {
+        query: format!(
+            "TRANSACTION {{ SQL DELETE FROM documents WHERE id='doc'; EXPECT SQL ROWS 1; VECTOR DELETE FROM products POINTS 'phone'; GRAPH UNRELATE products EDGE '{edge}'; }};"
+        ),
+        idempotency_key: Some("sdk-atomic-delete".into()),
+        ..Default::default()
+    };
+    assert_eq!(h.client.query(&delete).await.unwrap().committed, Some(true));
+    assert_eq!(h.client.vector().count(COLLECTION, None).await.unwrap(), 2);
+}
+
 #[test]
 fn structural_sdk_rejects_zero_without_network_io() {
     let error = ClientStructuralPoint::new(chirondb_client::Point {
@@ -862,4 +1033,193 @@ async fn http_collection_hnsw_one_is_rejected_and_zero_retains_default_contract(
     assert_eq!(config.hnsw_ef_construction, None);
     assert_eq!(config.hnsw_ef_search, None);
     assert_eq!(harness.client.list_collections().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn sdk_collection_recall_contract_and_default_query_match_http() {
+    let harness = Harness::start().await;
+    for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let result = harness
+            .client
+            .create_collection(chirondb_client::CollectionConfig {
+                name: "invalid-recall".into(),
+                vector_dim: 3,
+                metric: "cosine".into(),
+                recall_sla: Some(value),
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(result, Err(chirondb_client::Error::Http(error)) if error.is_builder()));
+        let result = harness
+            .client
+            .search(
+                COLLECTION,
+                SearchQuery {
+                    vector: vec![1., 0., 0.],
+                    recall_target: Some(value),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(chirondb_client::Error::Http(error)) if error.is_builder()));
+    }
+    assert!(
+        !harness
+            .client
+            .list_collections()
+            .await
+            .unwrap()
+            .iter()
+            .any(|c| c.name == "invalid-recall")
+    );
+    let name = "named";
+    let config = harness
+        .client
+        .create_collection(chirondb_client::CollectionConfig {
+            name: name.into(),
+            vector_dim: 3,
+            metric: "cosine".into(),
+            recall_sla: Some(0.95),
+            named_vector_dims: [("title".into(), 2)].into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(config.recall_sla, Some(0.95));
+    assert_eq!(config.named_vector_dims["title"], 2);
+    let listed = harness.client.list_collections().await.unwrap();
+    assert_eq!(
+        listed.iter().find(|c| c.name == name).unwrap().recall_sla,
+        Some(0.95)
+    );
+    let query = SearchQuery {
+        vector: vec![1., 0., 0.],
+        recall_target: Some(0.95),
+        ..Default::default()
+    };
+    assert_eq!(query.k, 10);
+    let raw: serde_json::Value = reqwest::Client::new()
+        .post(format!(
+            "{}/collections/{COLLECTION}/search",
+            harness.base_url
+        ))
+        .json(&query)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let typed = harness.client.search(COLLECTION, query).await.unwrap();
+    let raw_hits: Vec<chirondb_client::SearchHit> =
+        serde_json::from_value(raw["hits"].clone()).unwrap();
+    assert_eq!(
+        serde_json::to_value(typed.hits).unwrap(),
+        serde_json::to_value(raw_hits).unwrap()
+    );
+    assert!(raw.get("achieved_recall").is_none());
+    assert!(harness.client.compact(COLLECTION).await.is_ok());
+}
+
+#[tokio::test]
+async fn sdk_preserves_graph_budget_and_missing_endpoint_errors() {
+    let harness = Harness::start().await;
+    harness.client.enable_graph(COLLECTION, true).await.unwrap();
+    harness
+        .client
+        .configure_edge_type(COLLECTION, "cites", None, true)
+        .await
+        .unwrap();
+    let error = harness
+        .client
+        .relate(COLLECTION, relate_request("phone", "absent", "cites"), true)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.api_details().unwrap().code.as_deref(),
+        Some("graph.endpoint_not_found")
+    );
+    let mut constraint = graph_constraint("phone", "cites");
+    constraint.budget.max_memory_bytes = 1;
+    let error = harness
+        .client
+        .search(
+            COLLECTION,
+            SearchQuery {
+                vector: vec![1., 0., 0.],
+                graph: Some(constraint),
+                recall_target: Some(0.95),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.api_details().unwrap().code.as_deref(),
+        Some("graph.slo_unavailable")
+    );
+}
+
+#[tokio::test]
+async fn sdk_encodes_route_segments_and_retains_non_json_failures() {
+    use axum::{
+        Router,
+        http::{StatusCode, Uri},
+        routing::get,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = Router::new()
+        .route(
+            "/health",
+            get(|| async { (StatusCode::BAD_GATEWAY, "gateway unavailable") }),
+        )
+        .fallback(|uri: Uri| async move { (StatusCode::BAD_REQUEST, uri.to_string()) });
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let client = ChironDbClient::new(format!("http://{address}"));
+    let error = client.list_edge_types("a/b?# 日本語").await.unwrap_err();
+    let chirondb_client::Error::Api { status, message } = error else {
+        panic!("API error required")
+    };
+    assert_eq!(status, 400);
+    assert_eq!(
+        message,
+        "/collections/a%2Fb%3F%23%20%E6%97%A5%E6%9C%AC%E8%AA%9E/graph/types"
+    );
+    let error = client.health().await.unwrap_err();
+    assert!(error.api_details().is_none());
+    assert!(
+        matches!(error, chirondb_client::Error::Api { status:502, ref message } if message == "gateway unavailable")
+    );
+    assert!(matches!(
+        client.delete_collection("..").await,
+        Err(chirondb_client::Error::InvalidInput(_))
+    ));
+    server.abort();
+}
+
+#[tokio::test]
+async fn sdk_timeout_is_applied_to_injected_transport() {
+    use axum::{Router, routing::get};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = Router::new().route(
+        "/health",
+        get(|| async {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            axum::Json(json!({"status":"ok"}))
+        }),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let client = ChironDbClient::new(format!("http://{address}"))
+        .with_http_client(reqwest::Client::new())
+        .with_timeout(std::time::Duration::from_millis(20));
+    assert!(
+        matches!(client.health().await, Err(chirondb_client::Error::Http(error)) if error.is_timeout())
+    );
+    server.abort();
 }
