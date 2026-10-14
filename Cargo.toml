@@ -1,5 +1,5 @@
 [workspace]
-members = ["chirondb-types", "chirondb-core", "chirondb-server", "chirondb-ui-server", "clients/rust", "clients/rust-compat"]
+members = ["chirondb-types", "chirondb-core", "chirondb-server", "chirondb-ui-server"]
 resolver = "2"
 
 [profile.release]

@@ -43,6 +43,8 @@ jobs:
         run: cargo deny check
       - name: CI dependency pinning policy
         run: python3 .github/tools/check_ci_pinning.py
+      - name: SDK fetch credential isolation
+        run: python3 .github/tools/test_install_standalone_sdks.py
       - name: Secret regression scan
         run: bash .github/tools/secret_scan.sh
       - name: Deterministic crash-consistency suite
@@ -198,6 +200,10 @@ jobs:
           sudo apt-get install -y protobuf-compiler openssl python3-venv ripgrep
           python3 -m venv "$RUNNER_TEMP/install-python"
           "$RUNNER_TEMP/install-python/bin/pip" install -r chirondb-server/tests/security_chironql_requirements.txt
+      - name: Install pinned Python SDK for installation contracts
+        env:
+          SDK_REPOS_READ_TOKEN: ${{ secrets.SDK_REPOS_READ_TOKEN }}
+        run: '"$RUNNER_TEMP/install-python/bin/python" .github/tools/install_standalone_sdks.py'
       - name: Empty installation, five profiles and administrator recovery
         run: |
           cargo build -p chirondb --bin chirondb --bin chironql --bin chironctl --locked
@@ -239,6 +245,10 @@ jobs:
           sudo apt-get install -y protobuf-compiler openssl python3-venv ripgrep
           python3 -m venv "$RUNNER_TEMP/install-python"
           "$RUNNER_TEMP/install-python/bin/pip" install -r chirondb-server/tests/security_chironql_requirements.txt
+      - name: Install pinned Python SDK for deployment contracts
+        env:
+          SDK_REPOS_READ_TOKEN: ${{ secrets.SDK_REPOS_READ_TOKEN }}
+        run: '"$RUNNER_TEMP/install-python/bin/python" .github/tools/install_standalone_sdks.py'
       - name: Build clients for deployment verification
         run: cargo build -p chirondb --bin chirondb --bin chironql --bin chironctl --locked
       - name: Compose and actual Linux systemd integration
