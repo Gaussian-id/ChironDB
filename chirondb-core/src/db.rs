@@ -1077,6 +1077,14 @@ impl crate::search::PointResolver for Collection {
         candidate_reads::resolve(self, None, id)
     }
 
+    fn resolve_vector(
+        &self,
+        id: &str,
+        name: Option<&str>,
+    ) -> Result<Option<crate::index::VectorRead<'_>>> {
+        candidate_reads::vector(self, None, id, name)
+    }
+
     fn resolve_point(&self, id: &str) -> Result<Option<Cow<'_, Point>>> {
         self.try_resolve(id)
     }
@@ -1094,6 +1102,14 @@ struct CollectionReadResolver<'a> {
 impl crate::search::PointResolver for CollectionReadResolver<'_> {
     fn resolve_candidate(&self, id: &str) -> Result<Option<crate::search::CandidatePoint<'_>>> {
         candidate_reads::resolve(self.collection, Some(self.state), id)
+    }
+
+    fn resolve_vector(
+        &self,
+        id: &str,
+        name: Option<&str>,
+    ) -> Result<Option<crate::index::VectorRead<'_>>> {
+        candidate_reads::vector(self.collection, Some(self.state), id, name)
     }
 
     fn resolve_point(&self, id: &str) -> Result<Option<Cow<'_, Point>>> {
@@ -1395,9 +1411,8 @@ impl Db {
     }
 
     /// PA-2c — set the server-side default for `SearchRequest.with_payload`
-    /// when callers leave it `None`. `false` skips the per-hit
-    /// `serde_json::Value` clone in the hot scoring loop — significant p99
-    /// win on payload-heavy schemas (e.g. VectorDBBench, ann-benchmarks).
+    /// when callers leave it `None`. `false` skips payload hydration for the
+    /// final dense top-k projection; candidate scoring never constructs hits.
     /// Existing API contract is preserved for callers that explicitly send
     /// `Some(true)` or `Some(false)`.
     pub fn set_default_with_payload(&self, value: bool) {
@@ -6139,10 +6154,6 @@ impl Db {
         let with_payload = request
             .with_payload
             .unwrap_or_else(|| self.default_with_payload());
-        // PA-4: pre-size hits Vec to roughly the maximum we may push before
-        // top-k truncation. Saves a few mid-loop grow allocations.
-        let mut hits: Vec<SearchHit> = Vec::with_capacity(request.k.saturating_mul(2).max(16));
-        let mut searched = 0;
         let mut degraded = false;
         let payload_candidates = {
             let _span = tracing::info_span!(
@@ -6158,6 +6169,21 @@ impl Db {
                 .as_ref()
                 .is_none_or(|candidates| collection.payload_candidate_contains(candidates, id))
         };
+
+        let mut ranker = crate::search::DenseRanker::new(crate::search::DenseSearchParams {
+            query: &request.vector,
+            vector_name: request.vector_name.as_deref(),
+            metric: collection.config.metric,
+            k: request.k,
+            filter: request.filter.as_ref(),
+            excluded,
+            eligible: &payload_string_filter,
+            should_stop: &should_stop,
+            parallel: budget.is_none(),
+            payload_free: request.filter.is_none()
+                || (payload_candidates.is_some()
+                    && crate::search::indexed_filter_is_exact(request.filter.as_ref())),
+        });
 
         // Scale k upward when the filter is restrictive so the ANN fetches enough
         // candidates to still return k valid results after post-filtering.
@@ -6199,41 +6225,14 @@ impl Db {
             )
             .entered();
             let candidates_set = payload_candidates.as_ref().unwrap();
-            for point in collection.iter_payload_candidates(&visibility, candidates_set) {
-                let point = point?;
-                if excluded.contains(&point.id) {
-                    continue;
-                }
-                if should_stop() {
-                    degraded = true;
-                    break;
-                }
-                if request
-                    .filter
-                    .as_ref()
-                    .is_some_and(|filter| !filter.matches(&point.payload))
-                {
-                    continue;
-                }
-                searched += 1;
-                let Some(point_vector) = point_vector(&point, request.vector_name.as_deref())
-                else {
-                    continue;
-                };
-                let score = collection
-                    .config
-                    .metric
-                    .score(&request.vector, point_vector)?;
-                hits.push(SearchHit {
-                    id: point.id.clone(),
-                    score,
-                    payload: if with_payload {
-                        point.payload.clone()
-                    } else {
-                        Value::Null
-                    },
-                });
-            }
+            ranker.force_serial();
+            candidate_reads::visit_payload_candidates(
+                collection,
+                &visibility,
+                candidates_set,
+                &resolver,
+                &mut |id, source| ranker.visit(id, source),
+            )?;
         } else {
             // Recommendation queries exclude their positive/negative seed
             // IDs after ANN selection. Over-fetch by that exact count so
@@ -6288,7 +6287,7 @@ impl Db {
                     Some(ef)
                 });
 
-            let candidates = crate::search::fan_out_candidates(
+            crate::search::visit_fan_out_candidates(
                 collection.global_backend(),
                 &collection.streamer,
                 collection.sealing.as_deref(),
@@ -6317,121 +6316,26 @@ impl Db {
                     .as_ref()
                     .map(|set| &set.sealed as &dyn crate::index::OrdinalFilterPredicate),
                 cancelled,
+                &mut |id, source| ranker.visit(id, source),
             )?;
             if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
                 degraded = true;
             }
-
-            // M4-002 / PA-3: data-parallel candidate scoring via rayon when
-            // the candidate set is wide enough to amortise the work-stealing
-            // setup cost (~5-10 µs). Below the threshold serial scoring wins.
-            // With a budget, fall back to serial so we can respect it per-
-            // candidate. Acceptance test: `rayon_parallel_scoring`.
-            //
-            // PA-3 (2026-06-12): threshold lowered 256 → 128. After M3-004
-            // SIMD distance kernels and PA-2 slim hits, per-candidate cost
-            // dropped to ~0.5-0.8 µs, so the crossover point shifts down.
-            const PARALLEL_RESCORE_THRESHOLD: usize = 128;
-            let parallel = budget.is_none() && candidates.len() >= PARALLEL_RESCORE_THRESHOLD;
-
-            if parallel {
-                let vector_name = request.vector_name.as_deref();
-                let filter = request.filter.as_ref();
-                let metric = collection.config.metric;
-                let query = request.vector.as_slice();
-
-                // W3: dedicated search pool, not rayon's global pool — see
-                // `search_pool` module doc.
-                let scored: Vec<SearchHit> = crate::search_pool::SEARCH_POOL.install(|| {
-                    candidates
-                        .par_iter()
-                        .filter_map(|point| {
-                            if excluded.contains(&point.id) {
-                                return None;
-                            }
-                            if payload_candidates.as_ref().is_some_and(|candidates| {
-                                !collection.payload_candidate_contains(candidates, &point.id)
-                            }) {
-                                return None;
-                            }
-                            if filter.is_some_and(|f| !f.matches(&point.payload)) {
-                                return None;
-                            }
-                            let pv = point_vector(point, vector_name)?;
-                            let score = metric.score(query, pv).ok()?;
-                            Some(SearchHit {
-                                id: point.id.clone(),
-                                score,
-                                payload: if with_payload {
-                                    point.payload.clone()
-                                } else {
-                                    Value::Null
-                                },
-                            })
-                        })
-                        .collect()
-                });
-                searched += scored.len();
-                hits.extend(scored);
-            } else {
-                for point in candidates {
-                    if excluded.contains(&point.id) {
-                        continue;
-                    }
-                    if should_stop() {
-                        degraded = true;
-                        break;
-                    }
-                    if payload_candidates.as_ref().is_some_and(|candidates| {
-                        !collection.payload_candidate_contains(candidates, &point.id)
-                    }) {
-                        continue;
-                    }
-                    if request
-                        .filter
-                        .as_ref()
-                        .is_some_and(|filter| !filter.matches(&point.payload))
-                    {
-                        continue;
-                    }
-                    searched += 1;
-                    let Some(point_vector) = point_vector(&point, request.vector_name.as_deref())
-                    else {
-                        continue;
-                    };
-                    let score = collection
-                        .config
-                        .metric
-                        .score(&request.vector, point_vector)?;
-                    hits.push(SearchHit {
-                        id: point.id.clone(),
-                        score,
-                        payload: if with_payload {
-                            point.payload.clone()
-                        } else {
-                            Value::Null
-                        },
-                    });
-                }
-            }
         }
 
-        {
-            let _span = tracing::info_span!(
-                "gaussdb.search.topk",
-                collection = collection_name,
-                scored = hits.len(),
-                k = request.k
-            )
-            .entered();
-            hits.sort_by(|left, right| {
-                right
-                    .score
-                    .total_cmp(&left.score)
-                    .then_with(|| left.id.cmp(&right.id))
-            });
-            hits.truncate(request.k);
-        }
+        let topk_span = tracing::info_span!(
+            "gaussdb.search.topk",
+            collection = collection_name,
+            scored = tracing::field::Empty,
+            k = request.k
+        );
+        let _topk = topk_span.enter();
+        let (ranked, searched, scored, ranking_degraded) = ranker.finish()?;
+        topk_span.record("scored", scored);
+        degraded |= ranking_degraded;
+        let (hits, _output_admission, projection_degraded) =
+            crate::search::dense_hits(&resolver, ranked, with_payload, &should_stop)?;
+        degraded |= projection_degraded;
         Ok(SearchResponse {
             hits,
             degraded,
@@ -14162,6 +14066,7 @@ fn should_hard_link_snapshot_file(root: &Path, path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    mod dense_streaming;
     mod encryption_lifecycle;
     mod graph_archive;
     mod graph_compaction;

@@ -206,6 +206,11 @@ impl VectorSource for IvfVectorStore {
 }
 
 impl IvfSegmentIndex {
+    /// Index-local ordinals differ from primary rows when a named field is sparse.
+    pub(crate) fn id_at(&self, ordinal: u32) -> Option<&str> {
+        self.store.id(ordinal as usize)
+    }
+
     pub fn open(
         dir: &Path,
         store: Arc<crate::seal::V4Store>,
@@ -839,16 +844,27 @@ impl IvfSegmentIndex {
         if cancellation_requested(cancelled) {
             return Ok((Vec::new(), 0));
         }
+        let mut rescore_memory = crate::relational::wal_decode::MetadataCharge::default();
         let mut rescored: Vec<(f32, usize)> = if let Some(diskann) = &self.diskann {
-            let vectors = diskann.try_vectors_admitted(&rerank_ordinals)?;
-            vectors
-                .iter()
-                .zip(rerank_ordinals)
-                .map(|(vector, ordinal)| {
-                    self.distance_to_vector(query, vector)
-                        .map(|distance| (distance, ordinal))
-                })
-                .collect::<Result<_>>()?
+            let mut scores = Vec::new();
+            let bytes = rerank_ordinals
+                .len()
+                .checked_mul(std::mem::size_of::<(f32, usize)>())
+                .and_then(|bytes| bytes.checked_add(256))
+                .ok_or_else(|| {
+                    GaussError::ResourceExhausted("rerank scores memory is full".into())
+                })?;
+            rescore_memory.prepare(bytes as u64)?;
+            scores
+                .try_reserve_exact(rerank_ordinals.len())
+                .map_err(|_| {
+                    GaussError::ResourceExhausted("rerank scores memory is full".into())
+                })?;
+            diskann.try_visit_vectors(&rerank_ordinals, |ordinal, vector| {
+                scores.push((self.distance_to_vector(query, vector)?, ordinal));
+                Ok(())
+            })?;
+            scores
         } else {
             rerank_ordinals
                 .into_iter()
@@ -926,6 +942,16 @@ impl IvfSegmentIndex {
             .as_ref()
             .ok_or_else(|| GaussError::InvalidRequest("segment has no DiskANN artifact".into()))?
             .try_vector(ordinal)
+    }
+
+    pub(crate) fn diskann_vector_read(
+        &self,
+        ordinal: usize,
+    ) -> Result<crate::index::VectorRead<'_>> {
+        self.diskann
+            .as_ref()
+            .ok_or_else(|| GaussError::InvalidRequest("segment has no DiskANN artifact".into()))?
+            .try_vector_admitted(ordinal)
     }
 
     pub(crate) fn uses_diskann(&self) -> bool {
