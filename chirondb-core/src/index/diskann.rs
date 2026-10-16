@@ -681,6 +681,27 @@ impl DiskAnnArtifact {
         })
     }
 
+    /// Decode a bounded page-prefetched batch at a time, in frontier order.
+    /// Callers retain scores privately until every read has succeeded.
+    pub(crate) fn try_visit_vectors(
+        &self,
+        ordinals: &[usize],
+        mut visit: impl FnMut(usize, &[f32]) -> Result<()>,
+    ) -> Result<()> {
+        if ordinals.iter().any(|ordinal| *ordinal >= self.count) {
+            return Err(GaussError::InvalidRequest(
+                "DiskANN ordinal out of range".into(),
+            ));
+        }
+        for batch in ordinals.chunks(128) {
+            let vectors = self.try_vectors_admitted(batch)?;
+            for (&ordinal, vector) in batch.iter().zip(vectors.iter()) {
+                visit(ordinal, vector)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Batch page acquisition for the final rerank set. Unique pages are
     /// issued once, then individual records resolve from the bounded cache.
     pub fn vectors(&self, ordinals: &[usize]) -> Vec<Option<Vec<f32>>> {
@@ -1545,6 +1566,40 @@ mod tests {
             artifact.stats().physical_page_reads,
             before.physical_page_reads + 1
         );
+    }
+
+    #[test]
+    fn streaming_rerank_bounds_decoding_and_preserves_frontier_order() {
+        let (_temp, segment) = build(128, 1024);
+        let artifact = DiskAnnArtifact::open(&segment.join(DISKANN_FILE), 1024, 128).unwrap();
+        let ordinals = (0..1024).rev().chain([20, 0, 20]).collect::<Vec<_>>();
+        let expected = artifact.try_vectors(&ordinals).unwrap();
+        artifact.reset_stats();
+        crate::relational::wal_decode::with_test_storage_pool(512 * 1024, |_| {
+            let before = artifact.stats().physical_page_reads;
+            assert!(matches!(
+                artifact.try_vectors_admitted(&ordinals),
+                Err(crate::GaussError::ResourceExhausted(_))
+            ));
+            assert_eq!(artifact.stats().physical_page_reads, before);
+            let mut position = 0;
+            artifact
+                .try_visit_vectors(&ordinals, |ordinal, vector| {
+                    assert_eq!(ordinal, ordinals[position]);
+                    assert_eq!(vector, expected[position].as_slice());
+                    position += 1;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(position, ordinals.len());
+            let before = artifact.stats().physical_page_reads;
+            assert!(
+                artifact
+                    .try_visit_vectors(&[0, 1024], |_, _| Ok(()))
+                    .is_err()
+            );
+            assert_eq!(artifact.stats().physical_page_reads, before);
+        });
     }
 
     #[test]

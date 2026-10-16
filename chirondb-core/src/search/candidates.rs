@@ -187,6 +187,20 @@ impl Deref for CandidatePoint<'_> {
     }
 }
 impl<'a> CandidatePoint<'a> {
+    pub(crate) fn vector_read(
+        self,
+        name: Option<&str>,
+    ) -> Result<Option<crate::index::VectorRead<'a>>> {
+        match self {
+            Self::Borrowed(point) => {
+                Ok(super::point_vector(point, name).map(crate::index::VectorRead::borrowed))
+            }
+            Self::Owned(point) => super::point_vector(&point, name)
+                .map(crate::index::VectorRead::copy)
+                .transpose(),
+        }
+    }
+
     pub(super) fn from_compat(point: Cow<'a, Point>) -> Result<Self> {
         match point {
             Cow::Borrowed(point) => Ok(Self::Borrowed(point)),
