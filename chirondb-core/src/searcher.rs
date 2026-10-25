@@ -430,6 +430,32 @@ impl SegmentSearcher {
         self.read_point_admitted(id)
     }
 
+    pub(crate) fn vector_visible(
+        &self,
+        id: &str,
+        tombstones: Option<&RoaringBitmap>,
+        name: Option<&str>,
+    ) -> crate::Result<Option<crate::index::VectorRead<'_>>> {
+        if !self.contains_visible(id, tombstones) {
+            return Ok(None);
+        }
+        if name.is_none()
+            && let SegmentStore::V4(store) = &self.store
+        {
+            let ordinal = store.ordinal(id).expect("visible ID has a store ordinal");
+            if let SegmentIndex::Ivf(index) = &self.index
+                && index.uses_diskann()
+            {
+                return index.diskann_vector_read(ordinal).map(Some);
+            }
+            return store.vector_cow(ordinal).map(Some);
+        }
+        match self.read_point_admitted(id)? {
+            Some(point) => point.vector_read(name),
+            None => Ok(None),
+        }
+    }
+
     fn read_point_admitted(
         &self,
         id: &str,

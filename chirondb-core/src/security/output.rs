@@ -136,6 +136,10 @@ pub(crate) struct Hits {
     admission: OutputAdmission,
 }
 impl Hits {
+    pub(crate) fn into_parts(self) -> (Vec<SearchHit>, OutputAdmission) {
+        (self.values, self.admission)
+    }
+
     pub(crate) fn push(
         &mut self,
         id: &str,

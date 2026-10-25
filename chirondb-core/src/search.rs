@@ -18,6 +18,8 @@ use crate::{
 
 mod candidates;
 pub(crate) use candidates::{AdmittedVec, CandidatePoint};
+mod dense;
+pub(crate) use dense::{DenseRanker, DenseSearchParams, dense_hits, indexed_filter_is_exact};
 mod ranking;
 pub(crate) use ranking::{BorrowedMap, RankedHeap, Rankings};
 
@@ -56,6 +58,17 @@ pub(crate) trait PointResolver {
         self.resolve_point(id)?
             .map(CandidatePoint::from_compat)
             .transpose()
+    }
+
+    fn resolve_vector(
+        &self,
+        id: &str,
+        name: Option<&str>,
+    ) -> Result<Option<crate::index::VectorRead<'_>>> {
+        match self.resolve_candidate(id)? {
+            Some(point) => point.vector_read(name),
+            None => Ok(None),
+        }
     }
 
     /// Test read-state visibility without hydrating vector or payload data.
@@ -265,8 +278,103 @@ pub(crate) fn fan_out_candidates<'a>(
     ordinal_filter: Option<&dyn crate::index::OrdinalFilterPredicate>,
     cancelled: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<AdmittedVec<CandidatePoint<'a>>> {
+    let mut ordered = AdmittedVec::default();
+    visit_fan_out_candidates(
+        global_backend,
+        streamer,
+        sealing,
+        searchers,
+        visibility,
+        resolver,
+        total_live,
+        query,
+        k,
+        vector_name,
+        ef_search,
+        recall_target,
+        filter,
+        ordinal_filter,
+        cancelled,
+        &mut |id, source| {
+            if let Some(point) = source.resolve(id)? {
+                ordered.push(point)?;
+            }
+            Ok(true)
+        },
+    )?;
+    Ok(ordered)
+}
+
+/// A candidate's pinned source, without owning its vector or payload.
+#[derive(Clone, Copy)]
+pub(crate) enum CandidateRead<'a> {
+    Point(&'a Point),
+    Resolver(&'a dyn PointResolver),
+    Store(&'a crate::seal::V4Store),
+    Searcher(
+        &'a crate::searcher::SegmentSearcher,
+        Option<&'a roaring::RoaringBitmap>,
+    ),
+}
+impl<'a> CandidateRead<'a> {
+    pub(crate) fn vector(
+        self,
+        id: &str,
+        name: Option<&str>,
+    ) -> Result<Option<crate::index::VectorRead<'a>>> {
+        match self {
+            Self::Point(point) => CandidatePoint::Borrowed(point).vector_read(name),
+            Self::Resolver(resolver) => resolver.resolve_vector(id, name),
+            Self::Store(store) => {
+                if name.is_none() {
+                    return store
+                        .ordinal(id)
+                        .map(|ordinal| store.vector_cow(ordinal))
+                        .transpose();
+                }
+                match store.try_get_admitted(id)? {
+                    Some(point) => CandidatePoint::Owned(point).vector_read(name),
+                    None => Ok(None),
+                }
+            }
+            Self::Searcher(searcher, tombstones) => searcher.vector_visible(id, tombstones, name),
+        }
+    }
+
+    pub(crate) fn resolve(self, id: &str) -> Result<Option<CandidatePoint<'a>>> {
+        match self {
+            Self::Point(point) => Ok(Some(CandidatePoint::Borrowed(point))),
+            Self::Resolver(resolver) => resolver.resolve_candidate(id),
+            Self::Store(store) => store
+                .try_get_admitted(id)
+                .map(|point| point.map(CandidatePoint::Owned)),
+            Self::Searcher(searcher, tombstones) => searcher.get_visible_admitted(id, tombstones),
+        }
+    }
+}
+
+/// Visit the same candidate IDs in tier order; false stops the read.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn visit_fan_out_candidates<'a>(
+    global_backend: Option<&dyn crate::index::IndexBackend>,
+    streamer: &'a crate::streamer::Streamer,
+    sealing: Option<&'a crate::streamer::Streamer>,
+    searchers: &'a [crate::searcher::SegmentSearcher],
+    visibility: &'a crate::overlay::OverlayReadState,
+    resolver: &'a dyn PointResolver,
+    total_live: usize,
+    query: &[f32],
+    k: usize,
+    vector_name: Option<&str>,
+    ef_search: Option<usize>,
+    recall_target: f32,
+    filter: Option<&dyn crate::index::FilterPredicate>,
+    ordinal_filter: Option<&dyn crate::index::OrdinalFilterPredicate>,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+    visit: &mut dyn FnMut(&str, CandidateRead<'a>) -> Result<bool>,
+) -> Result<()> {
     if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
-        return Ok(AdmittedVec::default());
+        return Ok(());
     }
     if let Some(global) = global_backend {
         // Whole-collection backend: candidates resolved via the global ID
@@ -291,19 +399,19 @@ pub(crate) fn fan_out_candidates<'a>(
             )?
         })?;
         let mut seen = candidates::Seen::<String>::default();
-        let mut ordered = AdmittedVec::default();
         for id in cand_ids.iter() {
             if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
                 break;
             }
             if seen.insert(id)?
-                && let Some(point) = resolver.resolve_candidate(id.as_str())?
+                && resolver.contains_point(id)
+                && !visit(id, CandidateRead::Resolver(resolver))?
             {
-                ordered.push(point)?;
+                return Ok(());
             }
         }
         if global.indexed_points() < total_live {
-            let backfilled_before = ordered.len();
+            let mut backfilled = 0;
             for id in streamer
                 .points
                 .keys()
@@ -321,19 +429,19 @@ pub(crate) fn fan_out_candidates<'a>(
                 if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
                     break;
                 }
-                if !global.contains(id)
-                    && seen.insert(id)?
-                    && let Some(point) = resolver.resolve_candidate(id)?
-                {
-                    ordered.push(point)?;
+                if !global.contains(id) && seen.insert(id)? && resolver.contains_point(id) {
+                    backfilled += 1;
+                    if !visit(id, CandidateRead::Resolver(resolver))? {
+                        crate::observability::observe_index_backfill_scan(backfilled);
+                        return Ok(());
+                    }
                 }
             }
-            let backfilled = ordered.len() - backfilled_before;
             if backfilled > 0 {
                 crate::observability::observe_index_backfill_scan(backfilled);
             }
         }
-        return Ok(ordered);
+        return Ok(());
     }
 
     // Streamer leg: existing single-map candidate selection, including the
@@ -354,11 +462,12 @@ pub(crate) fn fan_out_candidates<'a>(
         filter,
         cancelled,
     )?;
-    let mut ordered = AdmittedVec::default();
     let mut seen = candidates::Seen::<String>::default();
     for point in streamer_candidates {
         seen.insert(&point.id)?;
-        ordered.push(CandidatePoint::Borrowed(point))?;
+        if !visit(&point.id, CandidateRead::Point(point))? {
+            return Ok(());
+        }
     }
     if let Some(sealing) = sealing {
         // A frozen leg may still contain IDs superseded by the active
@@ -390,9 +499,10 @@ pub(crate) fn fan_out_candidates<'a>(
                 break;
             }
             if seen.insert(&point.id)?
-                && let Some(point) = resolver.resolve_candidate(&point.id)?
+                && resolver.contains_point(&point.id)
+                && !visit(&point.id, CandidateRead::Resolver(resolver))?
             {
-                ordered.push(point)?;
+                return Ok(());
             }
         }
     }
@@ -425,6 +535,12 @@ pub(crate) fn fan_out_candidates<'a>(
             segment_id: &searcher.id,
             tombstones: &searcher.tombstone_ordinals,
             overlay_tombstones: visibility.point_tombstones(searcher_index),
+            named_ordinals: vector_name
+                .and_then(|name| searcher.named_index.get(name))
+                .and_then(|index| match index {
+                    crate::searcher::SegmentIndex::Ivf(index) => Some((index.as_ref(), searcher)),
+                    _ => None,
+                }),
         };
         match searcher.backend_for(vector_name) {
             Some(index) => {
@@ -453,11 +569,12 @@ pub(crate) fn fan_out_candidates<'a>(
                     {
                         break;
                     }
-                    if let Some(point) = searcher
-                        .get_visible_admitted(&id, visibility.point_tombstones(searcher_index))?
-                        && seen.insert(&point.id)?
+                    let tombstones = visibility.point_tombstones(searcher_index);
+                    if searcher.contains_visible(&id, tombstones)
+                        && seen.insert(&id)?
+                        && !visit(&id, CandidateRead::Searcher(searcher, tombstones))?
                     {
-                        ordered.push(point)?;
+                        return Ok(());
                     }
                 }
             }
@@ -471,16 +588,21 @@ pub(crate) fn fan_out_candidates<'a>(
                         break;
                     }
                     if seen.insert(id)?
-                        && let Some(point) = searcher
-                            .get_visible_admitted(id, visibility.point_tombstones(searcher_index))?
+                        && !visit(
+                            id,
+                            CandidateRead::Searcher(
+                                searcher,
+                                visibility.point_tombstones(searcher_index),
+                            ),
+                        )?
                     {
-                        ordered.push(point)?;
+                        return Ok(());
                     }
                 }
             }
         }
     }
-    Ok(ordered)
+    Ok(())
 }
 
 struct SegmentFilterPredicate<'a> {
@@ -509,10 +631,26 @@ struct SegmentOrdinalFilterPredicate<'a> {
     segment_id: &'a str,
     tombstones: &'a roaring::RoaringBitmap,
     overlay_tombstones: Option<&'a roaring::RoaringBitmap>,
+    named_ordinals: Option<(
+        &'a crate::index::ivf_segment::IvfSegmentIndex,
+        &'a crate::searcher::SegmentSearcher,
+    )>,
+}
+
+impl SegmentOrdinalFilterPredicate<'_> {
+    fn primary_ordinal(&self, ordinal: u32) -> Option<u32> {
+        match self.named_ordinals {
+            Some((index, searcher)) => index.id_at(ordinal).and_then(|id| searcher.ordinal(id)),
+            None => Some(ordinal),
+        }
+    }
 }
 
 impl crate::index::OrdinalFilterPredicate for SegmentOrdinalFilterPredicate<'_> {
     fn matches_ordinal(&self, segment: &str, ordinal: u32) -> bool {
+        let Some(ordinal) = self.primary_ordinal(ordinal) else {
+            return false;
+        };
         segment == self.segment_id
             && !self.tombstones.contains(ordinal)
             && self
@@ -524,6 +662,9 @@ impl crate::index::OrdinalFilterPredicate for SegmentOrdinalFilterPredicate<'_> 
     }
 
     fn navigable_ordinal(&self, segment: &str, ordinal: u32) -> bool {
+        let Some(ordinal) = self.primary_ordinal(ordinal) else {
+            return false;
+        };
         segment == self.segment_id
             && !self.tombstones.contains(ordinal)
             && self
@@ -1054,6 +1195,7 @@ mod tests {
             segment_id: "segment-a",
             tombstones: &tombstones,
             overlay_tombstones: Some(&overlay_tombstones),
+            named_ordinals: None,
         };
 
         assert!(filter.matches_ordinal("segment-a", 7));
