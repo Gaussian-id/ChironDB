@@ -1124,6 +1124,13 @@ without a fused result.
 
 ### Create and restore a snapshot
 
+New snapshots use deterministic configuration checksums in marker version 3.
+Existing v1/v2 snapshots retain strict validation; ambiguous legacy map checksums
+can be verified against their retained transaction journal and converted into a
+separate copy with `chironctl security convert-snapshot`. See
+[snapshot compatibility and conversion](SNAPSHOTS.md) before upgrading readers
+or restoring an older backup. Existing live-data formats are unchanged.
+
 Snapshots are disabled until a root is configured. Stop the source-built
 server, then restart the same database with a separate backup directory:
 

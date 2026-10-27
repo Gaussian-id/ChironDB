@@ -17,6 +17,7 @@ use crate::{
 
 const SNAPSHOT_MAGIC: &[u8; 8] = b"GAUSSSN1";
 const GRAPH_SNAPSHOT_MAGIC: &[u8; 8] = b"GAUSSSN2";
+const CANONICAL_SNAPSHOT_MAGIC: &[u8; 8] = b"GAUSSSN3";
 const HEADER_LEN: usize = 20;
 pub const SNAPSHOT_FILE: &str = "snapshot.gdx";
 
@@ -72,14 +73,9 @@ impl SnapshotGraph {
 impl SnapshotMarker {
     pub fn new(collections: Vec<SnapshotCollection>) -> Self {
         Self {
-            version: if collections
-                .iter()
-                .any(|collection| collection.graph.is_some())
-            {
-                2
-            } else {
-                1
-            },
+            // The checksum algorithm is part of the persisted format. Older
+            // readers must refuse it rather than apply the unordered v1/v2 CRC.
+            version: 3,
             created_unix_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -95,7 +91,7 @@ impl SnapshotMarker {
             .any(|collection| collection.graph.is_some());
         match (self.version, has_graph) {
             (1, false) => Ok(SNAPSHOT_MAGIC),
-            (2, true) => {
+            (2, true) | (3, _) => {
                 for graph in self
                     .collections
                     .iter()
@@ -106,7 +102,11 @@ impl SnapshotMarker {
                         graph.enabled,
                     )?;
                 }
-                Ok(GRAPH_SNAPSHOT_MAGIC)
+                Ok(if self.version == 3 {
+                    CANONICAL_SNAPSHOT_MAGIC
+                } else {
+                    GRAPH_SNAPSHOT_MAGIC
+                })
             }
             _ => Err(GaussError::InvalidRequest(
                 "snapshot version disagrees with graph binding".into(),
@@ -129,10 +129,28 @@ impl SnapshotCollection {
             wal_lsn,
             points,
             segment_id,
-            config_crc: checksum(&serde_json::to_vec(config)?),
+            config_crc: config_crc(config, 3)?,
             graph: None,
         })
     }
+}
+
+pub(crate) fn config_crc(config: &CollectionConfig, version: u32) -> Result<u32> {
+    if version >= 3 {
+        Ok(checksum(&canonical_config_bytes(config)?))
+    } else {
+        Ok(checksum(&serde_json::to_vec(config)?))
+    }
+}
+
+pub(crate) fn canonical_config_bytes(
+    config: &CollectionConfig,
+) -> Result<crate::relational::wal_decode::Encoded> {
+    crate::relational::wal_decode::json(config)?.consume(|mut value| {
+        // Explicit sorting also covers embedders enabling preserve_order.
+        value.sort_all_objects();
+        crate::relational::wal_decode::encode(&value)
+    })
 }
 
 pub fn snapshot_marker_path(root: &Path) -> PathBuf {
@@ -167,7 +185,10 @@ pub fn read_snapshot_marker(root: &Path) -> Result<Option<SnapshotMarker>> {
         });
     }
     let header = file.read_range_admitted(0..HEADER_LEN)?;
-    if &header[0..8] != SNAPSHOT_MAGIC && &header[0..8] != GRAPH_SNAPSHOT_MAGIC {
+    if &header[0..8] != SNAPSHOT_MAGIC
+        && &header[0..8] != GRAPH_SNAPSHOT_MAGIC
+        && &header[0..8] != CANONICAL_SNAPSHOT_MAGIC
+    {
         return Err(GaussError::SegmentCorruption {
             path: path.display().to_string(),
             message: "bad snapshot marker magic".to_string(),
@@ -249,9 +270,12 @@ mod tests {
             index_kind: None,
             streamer_max_bytes: 0,
         };
-        let marker = snapshot::SnapshotMarker::new(vec![
+        let mut marker = snapshot::SnapshotMarker::new(vec![
             SnapshotCollection::new(&config, 2, 128, 7, Some("sg-00000001".to_string())).unwrap(),
         ]);
+        // Retain a real v1 framing/serialization regression fixture.
+        marker.version = 1;
+        marker.collections[0].config_crc = snapshot::config_crc(&config, 1).unwrap();
 
         snapshot::write_snapshot_marker(temp.path(), &marker).unwrap();
         assert_eq!(marker.version, 1);
@@ -286,6 +310,34 @@ mod tests {
     }
 
     #[test]
+    fn canonical_marker_binds_version_length_and_payload_crc() {
+        let temp = TempDir::new().unwrap();
+        let marker = snapshot::SnapshotMarker::new(Vec::new());
+        snapshot::write_snapshot_marker(temp.path(), &marker).unwrap();
+        let path = snapshot::snapshot_marker_path(temp.path());
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.starts_with(b"GAUSSSN3"));
+        assert_eq!(
+            snapshot::read_snapshot_marker(temp.path()).unwrap(),
+            Some(marker)
+        );
+        for case in ["old_magic", "future_magic", "payload", "length"] {
+            let mut changed = bytes.clone();
+            match case {
+                "old_magic" => changed[..8].copy_from_slice(b"GAUSSSN1"),
+                "future_magic" => changed[..8].copy_from_slice(b"GAUSSSN4"),
+                "payload" => *changed.last_mut().unwrap() ^= 1,
+                _ => changed.push(0),
+            }
+            std::fs::write(&path, changed).unwrap();
+            assert!(
+                snapshot::read_snapshot_marker(temp.path()).is_err(),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
     fn graph_marker_roundtrip_and_version_binding_refuse_downgrade() {
         use super::*;
         let temp = TempDir::new().unwrap();
@@ -302,7 +354,8 @@ mod tests {
                 manifest_sha256: Some([3; 32]),
             }),
         };
-        let marker = SnapshotMarker::new(vec![marked]);
+        let mut marker = SnapshotMarker::new(vec![marked]);
+        marker.version = 2;
         assert_eq!(marker.version, 2);
         write_snapshot_marker(temp.path(), &marker).unwrap();
         assert_eq!(
@@ -316,7 +369,7 @@ mod tests {
             !bytes.starts_with(SNAPSHOT_MAGIC),
             "legacy readers must reject graph snapshots"
         );
-        for version in [0, 1, 3] {
+        for version in [0, 1, 4] {
             let mut invalid = marker.clone();
             invalid.version = version;
             assert!(write_snapshot_marker(temp.path(), &invalid).is_err());
