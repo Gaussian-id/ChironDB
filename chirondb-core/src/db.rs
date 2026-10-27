@@ -47,7 +47,7 @@ use crate::{
         ColdMaterializeScope, ColdObjectStoreConfig, SoASegmentCache,
         materialize_missing_cold_segments_from_object_store,
     },
-    snapshot::{SnapshotCollection, SnapshotMarker, read_snapshot_marker, write_snapshot_marker},
+    snapshot::{SnapshotMarker, read_snapshot_marker, write_snapshot_marker},
     snapshot_journal::{self, SnapshotJournal, SnapshotPhase},
     transaction_journal::{
         CommittedTransaction, ProjectionKind, TransactionAudit, TransactionId, TransactionJournal,
@@ -98,7 +98,9 @@ mod security_lifecycle;
 mod security_retrieval;
 mod security_runtime;
 mod security_text;
+mod snapshot_compat;
 mod snapshot_control;
+pub use snapshot_compat::{SnapshotConversionReceipt, convert_legacy_snapshot};
 mod transaction_recovery;
 #[cfg(test)]
 use transaction_recovery::recover_transaction_storage_projections;
@@ -10054,7 +10056,7 @@ fn validate_snapshot_marker(
             ))
         })?;
         let collection = arc_coll.read();
-        if marker.version == 2 && marked.graph != collection.snapshot_graph()? {
+        if marker.version >= 2 && marked.graph != collection.snapshot_graph()? {
             return Err(GaussError::InvalidRequest(format!(
                 "snapshot marker graph binding mismatch for collection '{}'",
                 marked.collection
@@ -10078,16 +10080,7 @@ fn validate_snapshot_marker(
                 marked.collection
             )));
         }
-        if marked.config_crc
-            != SnapshotCollection::new(
-                &collection.config,
-                collection.schema_epoch,
-                marked.wal_lsn,
-                marked.points,
-                marked.segment_id.clone(),
-            )?
-            .config_crc
-        {
+        if marked.config_crc != crate::snapshot::config_crc(&collection.config, marker.version)? {
             return Err(GaussError::InvalidRequest(format!(
                 "snapshot marker config checksum mismatch for collection '{}'",
                 marked.collection

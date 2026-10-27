@@ -150,7 +150,10 @@ async fn live_server_supports_collection_ingest_search_and_snapshot() {
             shards: 1,
             replicas: 1,
             quantization: Some("rabitq2".to_string()),
-            payload_schema: Default::default(),
+            payload_schema: serde_json::from_value(json!({
+                "category": "string", "price": "number"
+            }))
+            .unwrap(),
             named_vector_dims: Default::default(),
             hnsw_m: None,
             hnsw_ef_construction: None,
@@ -1195,7 +1198,10 @@ async fn gausswire_supports_admin_and_query_operation_set() {
                 shards: 1,
                 replicas: 1,
                 quantization: String::new(),
-                payload_schema: Default::default(),
+                payload_schema: HashMap::from([
+                    ("tenant".into(), "string".into()),
+                    ("category".into(), "optional_string".into()),
+                ]),
                 hnsw_m: None,
                 hnsw_ef_construction: None,
                 hnsw_ef_search: None,

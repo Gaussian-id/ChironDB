@@ -200,6 +200,15 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum SecurityCommand {
+    /// Verify a legacy snapshot against its retained journal and publish a new copy.
+    ConvertSnapshot {
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        destination: PathBuf,
+        #[arg(long)]
+        keyring: Option<PathBuf>,
+    },
     /// Export a fenced protected content backup while the server is stopped.
     Backup {
         #[arg(long)]
@@ -860,6 +869,17 @@ async fn main() -> anyhow::Result<()> {
 
 fn run_security_command(command: &SecurityCommand) -> anyhow::Result<()> {
     match command {
+        SecurityCommand::ConvertSnapshot {
+            source,
+            destination,
+            keyring,
+        } => {
+            if let Some(keyring) = keyring {
+                encryption::install_process_keyring(encryption::Keyring::load(keyring)?, false)?;
+            }
+            let receipt = chirondb::db::convert_legacy_snapshot(source, destination)?;
+            println!("{}", serde_json::to_string_pretty(&receipt)?);
+        }
         SecurityCommand::Backup {
             data_dir,
             destination,

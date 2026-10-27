@@ -776,6 +776,9 @@ Use this message with `PruneWalArchive`:
 ```
 
 Snapshot and restore need the [snapshot root setup](HTTP_API.md#create-and-restore-a-snapshot).
+New snapshots use marker version 3 with deterministic configuration checksums.
+See [reader compatibility and legacy conversion](SNAPSHOTS.md) before restoring
+v1/v2 backups or downgrading a binary. RPC request schemas are unchanged.
 The name below is relative to that root. Create the snapshot first, and restore
 only when you intend to replace the live database with its saved state.
 
