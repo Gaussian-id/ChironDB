@@ -243,7 +243,7 @@ Report vulnerabilities privately using [SECURITY.md](SECURITY.md).
 ChironDB is licensed under the **GNU Affero General Public License v3.0 only**
 ([AGPL-3.0-only](LICENSE)). If you modify ChironDB and let users interact with
 that version over a network, Section 13 requires an offer of its Corresponding
-Source. See [NOTICE](NOTICE) for source and historical licensing information.
+Source. See [NOTICE](NOTICE) for source and licensing information.
 [TRADEMARKS.md](TRADEMARKS.md) governs the names and brand assets separately.
 
 <p align="center">

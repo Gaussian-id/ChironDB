@@ -112,7 +112,7 @@ jobs:
             done
             cp "$source/proto/chirondb/v1/chirondb.proto" "$stage/proto/chirondb/v1/"
             cp "$source/proto/chirondb/v1/compat.proto" "$stage/proto/chirondb/v1/"
-            cp "$source/LICENSE" "$source/LICENSE-APACHE-2.0" "$source/NOTICE" "$source/TRADEMARKS.md" "$stage/"
+            cp "$source/LICENSE" "$source/NOTICE" "$source/TRADEMARKS.md" "$stage/"
             while IFS= read -r -d '' sbom; do
               cp "$sbom" "$stage/sbom/$(basename "$sbom")"
             done < <(find "$source" -name '*.cdx.json' -not -path '*/target/*' -print0)
