@@ -328,7 +328,7 @@ jobs:
           cp proto/chirondb/v1/compat.proto "$out/proto/chirondb/v1/"
           mkdir -p "$out/sbom"
           find . -name '*.cdx.json' -not -path './target/*' -not -path './fuzz/target/*' -exec cp {} "$out/sbom/" \;
-          cp LICENSE LICENSE-APACHE-2.0 NOTICE TRADEMARKS.md "$out/"
+          cp LICENSE NOTICE TRADEMARKS.md "$out/"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             7z a "${out}.zip" "$out" > /dev/null
             echo "path=${out}.zip" >> "$GITHUB_OUTPUT"

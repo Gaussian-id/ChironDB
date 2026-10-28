@@ -33,7 +33,7 @@ RUN mkdir -p /etc/chirondb/secrets /run/chirondb-bootstrap \
     && chown 10001:10001 /etc/chirondb/secrets /run/chirondb-bootstrap \
     && chmod 0700 /etc/chirondb/secrets /run/chirondb-bootstrap
 COPY --from=build /app/release/ /usr/local/bin/
-COPY LICENSE LICENSE-APACHE-2.0 NOTICE TRADEMARKS.md /usr/share/licenses/chirondb/
+COPY LICENSE NOTICE TRADEMARKS.md /usr/share/licenses/chirondb/
 COPY --chmod=755 deploy/docker-entrypoint.sh /usr/local/bin/chirondb-entrypoint
 USER chirondb
 VOLUME ["/var/lib/chirondb"]
