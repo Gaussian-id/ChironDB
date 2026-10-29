@@ -42,8 +42,15 @@ async fn http_grpc_and_chironwire_share_the_same_sql_receipt() {
     );
     let sql = "INSERT INTO receipt_rows (id) VALUES (1) RETURNING id";
     let mutation = request(sql, Some("same-key"));
-    let sdk = chirondb_client::ChironDbClient::new(format!("http://{http_address}"));
-    let first = sdk.execute_sql(&mutation).await.unwrap();
+    let first: SqlExecutionResponse = client
+        .post(&url)
+        .json(&mutation)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let mut grpc_client = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             match chiron_pb::chiron_db_client::ChironDbClient::connect(format!(
@@ -109,7 +116,13 @@ async fn http_grpc_and_chironwire_share_the_same_sql_receipt() {
         trace: true,
         ..Default::default()
     };
-    let sdk_result = sdk.execute_chironql(&wrapped).await.unwrap();
+    let sdk_result: chirondb_types::ChironQlResponse = post_json(
+        &client,
+        format!("http://{http_address}/v1/chironql"),
+        &wrapped,
+    )
+    .await
+    .unwrap();
     assert_eq!(sdk_result.transaction_id, first.transaction_id);
     let language_grpc = grpc_client
         .execute_query(chiron_pb::ChironQlRequest {
@@ -154,11 +167,15 @@ async fn http_grpc_and_chironwire_share_the_same_sql_receipt() {
     ] {
         assert!(chirondb::chironql_parser::parse(query).is_ok());
         assert!(
-            sdk.execute_chironql(&chirondb_types::chironql::ChironQlRequest {
-                query: query.into(),
-                idempotency_key: Some("unsupported-key".into()),
-                ..Default::default()
-            })
+            post_json::<chirondb_types::ChironQlResponse>(
+                &client,
+                format!("http://{http_address}/v1/chironql"),
+                &chirondb_types::chironql::ChironQlRequest {
+                    query: query.into(),
+                    idempotency_key: Some("unsupported-key".into()),
+                    ..Default::default()
+                }
+            )
             .await
             .is_err()
         );
@@ -194,21 +211,37 @@ async fn http_grpc_and_chironwire_share_the_same_sql_receipt() {
         matches!(&result.results[0], chirondb::SqlResult::Rows { rows, .. }
         if rows == &vec![vec![chirondb::RelationalValue::Integer(1)]])
     );
-    let transaction = sdk.begin_sql_transaction().await.unwrap();
+    let transaction: chirondb::SqlTransactionHandleResponse = post_json(
+        &client,
+        format!("http://{http_address}/v1/sql/transactions"),
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         transaction.transaction_id.as_deref(),
         Some(transaction.handle.as_str())
     );
-    sdk.execute_sql_transaction(
-        &transaction.handle,
+    let _: SqlExecutionResponse = post_json(
+        &client,
+        format!(
+            "http://{http_address}/v1/sql/transactions/{}/execute",
+            transaction.handle
+        ),
         &request("INSERT INTO receipt_rows (id) VALUES (3)", None),
     )
     .await
     .unwrap();
-    let receipt = sdk
-        .commit_sql_transaction(&transaction.handle)
-        .await
-        .unwrap();
+    let receipt: SqlExecutionResponse = post_json(
+        &client,
+        format!(
+            "http://{http_address}/v1/sql/transactions/{}/commit",
+            transaction.handle
+        ),
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
     assert_eq!(receipt.transaction_id, transaction.transaction_id);
     let grpc_receipt = grpc_client
         .commit_sql_transaction(chiron_pb::SqlTransactionHandleRequest {
@@ -262,10 +295,13 @@ async fn http_grpc_and_chironwire_share_the_same_sql_receipt() {
         .unwrap();
     assert_eq!(status["state"], "committed");
     assert_eq!(status["transaction_id"], transaction.handle);
-    let rows = sdk
-        .execute_sql(&request("SELECT id FROM receipt_rows ORDER BY id", None))
-        .await
-        .unwrap();
+    let rows: SqlExecutionResponse = post_json(
+        &client,
+        &url,
+        &request("SELECT id FROM receipt_rows ORDER BY id", None),
+    )
+    .await
+    .unwrap();
     assert!(
         matches!(&rows.results[0], chirondb::SqlResult::Rows { rows, .. }
         if rows == &vec![vec![chirondb::RelationalValue::Integer(1)], vec![chirondb::RelationalValue::Integer(3)]])
@@ -288,15 +324,18 @@ async fn http_grpc_and_chironwire_share_the_same_sql_receipt() {
     )
     .unwrap();
     let multi = "TRANSACTION { SQL INSERT INTO receipt_rows VALUES (10); VECTOR UPSERT INTO mm {id: 'a', vector: [1,0], payload: {}}, {id: 'b', vector: [0,1], payload: {}}; GRAPH CONNECT mm 'a' -> CITES -> 'b'; };";
-    let first_mm = sdk
-        .execute_chironql(&chirondb_types::chironql::ChironQlRequest {
+    let first_mm: chirondb_types::ChironQlResponse = post_json(
+        &client,
+        format!("http://{http_address}/v1/chironql"),
+        &chirondb_types::chironql::ChironQlRequest {
             query: multi.into(),
             confirm: true,
             idempotency_key: Some("protocol-multi".into()),
             ..Default::default()
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await
+    .unwrap();
     let grpc_mm = grpc_client
         .execute_query(chiron_pb::ChironQlRequest {
             query: multi.into(),
@@ -585,4 +624,19 @@ fn interactive_commit_reconciles_after_process_kill_with_the_begin_identity() {
             status.state
         );
     }
+}
+
+async fn post_json<R: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    url: impl AsRef<str>,
+    body: &impl serde::Serialize,
+) -> reqwest::Result<R> {
+    client
+        .post(url.as_ref())
+        .json(body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await
 }

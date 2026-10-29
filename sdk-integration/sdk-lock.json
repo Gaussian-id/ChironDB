@@ -1,0 +1,14 @@
+{
+  "rust": {
+    "repository": "Gaussian-id/chirondb-rust",
+    "revision": "dbbd5924c97380265d041fbefde09ce7809ebf6c"
+  },
+  "python": {
+    "repository": "Gaussian-id/chirondb-py",
+    "revision": "b1171136c34d77a68d4ff2032fbdefef7ebd7305"
+  },
+  "node": {
+    "repository": "Gaussian-id/chirondb-js",
+    "revision": "445a9fc15e40fab1b792a9c9ffa44063372fdb72"
+  }
+}

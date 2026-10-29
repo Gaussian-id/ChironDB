@@ -81,9 +81,10 @@ only when their artifacts are available and verified.
 
 Single-node use is the evaluation path. The graph overlay is implemented;
 comprehensive graph acceptance remains open. Kubernetes and the web UI are
-previews, and distributed graph traversal is outside the beta scope. Python
-and Rust clients are distributed from source. The MCP surface is configuration
-gated and read-only. Windows support is best-effort.
+previews, and distributed graph traversal is outside the beta scope. Python,
+Rust and Node.js clients are maintained in standalone SDK repositories; see
+[SDK installation](docs/SDKS.md). The MCP surface is configuration gated and
+read-only. Windows support is best-effort.
 
 ChironDB complements PostgreSQL/pgvector for vector retrieval. Its legacy
 pgvector profile accepts six vector-only SQL shapes and still rejects features
@@ -217,7 +218,7 @@ For Docker, HTTP requests, hybrid search, MCP, SDKs, and restart instructions, f
 | [ChironQL](docs/CHIRONQL.md) | Interactive queries, writes, graph traversal, filters, and errors |
 | [HTTP API](docs/HTTP_API.md) | REST requests, authentication, graph operations, and administration |
 | [gRPC API](docs/GRPC_API.md) | RPCs, reflection, TLS, and generated clients |
-| [Python, Rust, and MCP clients](docs/SDKS.md) | Source installation, application examples, and MCP configuration |
+| [Python, Rust, Node.js, and MCP clients](docs/SDKS.md) | Source installation, application examples, and MCP configuration |
 | [Tenant isolation](docs/TENANT_ISOLATION.md) | Ownership, migration, and enforcement |
 | [Beta release notes](docs/releases/0.1.0-beta.2.md) | Relational preview, model availability, and evaluation limits |
 

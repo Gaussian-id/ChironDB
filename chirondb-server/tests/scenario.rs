@@ -1136,41 +1136,6 @@ async fn generated_python_protobuf_compatibility_smoke() {
 }
 
 #[tokio::test]
-async fn python_http_client_smoke() {
-    let data = TempDir::new().unwrap();
-    let db = Db::open(data.path()).unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        api::serve_listener(db, listener).await.unwrap();
-    });
-
-    let script = std::env::current_dir()
-        .unwrap()
-        .join("tests/http_python_client_smoke.py");
-    let output = tokio::task::spawn_blocking(move || {
-        Command::new("python3")
-            .arg(script)
-            .arg(format!("http://{addr}"))
-            .output()
-            .unwrap()
-    })
-    .await
-    .unwrap();
-
-    assert!(
-        output.status.success(),
-        "python HTTP client smoke failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(response["python_http_client"], "ok");
-
-    server.abort();
-}
-
-#[tokio::test]
 async fn gausswire_supports_admin_and_query_operation_set() {
     let data = TempDir::new().unwrap();
     let snapshot_root = TempDir::new().unwrap();

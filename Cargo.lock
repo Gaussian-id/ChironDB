@@ -411,7 +411,6 @@ dependencies = [
  "axum",
  "axum-server",
  "base64 0.22.1",
- "chirondb-client",
  "chirondb-core",
  "chirondb-types",
  "chrono",
@@ -455,18 +454,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
-]
-
-[[package]]
-name = "chirondb-client"
-version = "0.1.0-beta.2"
-dependencies = [
- "base64 0.22.1",
- "chirondb-types",
- "reqwest 0.13.4",
- "serde",
- "serde_json",
- "thiserror",
 ]
 
 [[package]]
@@ -1066,13 +1053,6 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "slab",
-]
-
-[[package]]
-name = "gaussdb-client"
-version = "0.1.0-beta.2"
-dependencies = [
- "chirondb-client",
 ]
 
 [[package]]
@@ -2755,7 +2735,6 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
- "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
