@@ -35,6 +35,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler python3-requests python3-protobuf ripgrep
       - name: Release version consistency
         run: python3 .github/tools/check_release_version.py
+      - name: Release retry source isolation
+        run: python3 .github/tools/test_release_context.py
       - name: Format
         run: cargo fmt --all -- --check
       - name: Test

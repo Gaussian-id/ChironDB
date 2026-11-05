@@ -10,9 +10,15 @@ name: release
 # not block the release.
 
 on:
-  # Qualify the selected commit with official SIFT before creating a tag.
-  # Publication jobs below run only on tag pushes.
-  workflow_dispatch: {}
+  # Empty input qualifies the selected commit only. A default-branch retry
+  # publishes an existing immutable version tag after the same release gates.
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing version tag to retry; leave empty for qualification only'
+        type: string
+        default: ''
+        required: false
   push:
     tags:
       - "v*.*.*"
@@ -28,13 +34,49 @@ env:
   IMAGE_NAME: ghcr.io/gaussian-id/chirondb
 
 jobs:
+  source:
+    name: Resolve immutable release source
+    runs-on: ubuntu-24.04
+    outputs:
+      publish: ${{ steps.source.outputs.publish }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
+      source_short_sha: ${{ steps.source.outputs.source_short_sha }}
+      release_tag: ${{ steps.source.outputs.release_tag }}
+      version: ${{ steps.source.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Resolve and validate source
+        id: source
+        env:
+          RELEASE_EVENT: ${{ github.event_name }}
+          RELEASE_REF: ${{ github.ref }}
+          RELEASE_SHA: ${{ github.sha }}
+          RETRY_RELEASE_TAG: ${{ inputs.release_tag }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: python3 .github/tools/release_context.py
+
   wal-release-gate:
     name: WAL official SIFT-128 release gate
+    needs: source
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      SOURCE_SHA: ${{ needs.source.outputs.source_sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.source.outputs.source_sha }}
+
+      - name: Install Python for the pinned SIFT converter
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@87eb139fed4b08a67bd1fa429a21d1f5d523e03e # 1.92.0
@@ -47,7 +89,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler python3-venv
           python3 -m venv .venv
-          .venv/bin/pip install h5py==3.14.0
+          .venv/bin/pip install --only-binary=:all: h5py==3.14.0
 
       - name: Cache pinned official SIFT corpus
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -91,7 +133,7 @@ jobs:
             --k 10 \
             --recall-target 0.95 \
             --output "$RUNNER_TEMP/sift-report.json" \
-            --git-sha "$GITHUB_SHA"
+            --git-sha "$SOURCE_SHA"
           du -sb "$RUNNER_TEMP/chirondb-sift-db" | cut -f1 > "$RUNNER_TEMP/sift-plaintext-bytes.txt"
           python3 -c 'import json, os; report=json.load(open(os.environ["RUNNER_TEMP"] + "/sift-report.json")); recall=report["pareto"][0]["recall_at_10"]; assert recall is not None and recall >= 0.95, f"recall@10 {recall} is below 0.95"'
 
@@ -134,7 +176,7 @@ jobs:
             --k 10 \
             --recall-target 0.95 \
             --output "$RUNNER_TEMP/sift-encrypted-report.json" \
-            --git-sha "$GITHUB_SHA"
+            --git-sha "$SOURCE_SHA"
           du -sb "$RUNNER_TEMP/chirondb-sift-encrypted-db" | cut -f1 > "$RUNNER_TEMP/sift-encrypted-bytes.txt"
           target/release/chirondrill \
             --encryption-keyring-file "$RUNNER_TEMP/sift-keyring.json" \
@@ -179,7 +221,7 @@ jobs:
           report = {
               "schema_version": 1,
               "dataset_sha256": "d9eb5c85b274efd3cd221a49d82ed8a577737fae9bec9074bc17a341c442ca04",
-              "git_sha": os.environ["GITHUB_SHA"],
+              "git_sha": os.environ["SOURCE_SHA"],
               "points": plain["n_train"],
               "queries": plain["n_test"],
               "plaintext": {
@@ -222,9 +264,12 @@ jobs:
 
   build:
     name: build (${{ matrix.label }})
-    if: github.event_name == 'push'
-    needs: wal-release-gate
+    if: needs.source.outputs.publish == 'true'
+    needs: [source, wal-release-gate]
     runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_TAG: ${{ needs.source.outputs.release_tag }}
+      SOURCE_SHA: ${{ needs.source.outputs.source_sha }}
     continue-on-error: ${{ matrix.best_effort == true }}
     strategy:
       fail-fast: false
@@ -258,6 +303,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.source.outputs.source_sha }}
 
       - name: Install Python for release validation
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
@@ -323,7 +370,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          out="chirondb-${{ github.ref_name }}-${{ matrix.target }}"
+          out="chirondb-${RELEASE_TAG}-${{ matrix.target }}"
           mkdir -p "$out"
           ext=""
           if [[ "${{ runner.os }}" == "Windows" ]]; then
@@ -338,6 +385,7 @@ jobs:
           mkdir -p "$out/sbom"
           find . -name '*.cdx.json' -not -path './target/*' -not -path './fuzz/target/*' -exec cp {} "$out/sbom/" \;
           cp LICENSE NOTICE TRADEMARKS.md "$out/"
+          python3 -c 'import json, os, sys; json.dump({"tag": os.environ["RELEASE_TAG"], "source_sha": os.environ["SOURCE_SHA"], "workflow_sha": os.environ["GITHUB_SHA"], "workflow_ref": os.environ["GITHUB_WORKFLOW_REF"]}, open(sys.argv[1], "w"), indent=2)' "$out/RELEASE_SOURCE.json"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             7z a "${out}.zip" "$out" > /dev/null
             echo "path=${out}.zip" >> "$GITHUB_OUTPUT"
@@ -372,12 +420,14 @@ jobs:
 
   publish-container:
     name: publish + sign container
-    if: github.event_name == 'push'
-    needs: build
+    if: needs.source.outputs.publish == 'true'
+    needs: [source, build]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.source.outputs.source_sha }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
@@ -399,9 +449,11 @@ jobs:
           images: ${{ env.IMAGE_NAME }}
           flavor: latest=false
           tags: |
-            type=semver,pattern={{version}}
-            type=raw,value=beta,enable=${{ contains(github.ref_name, '-beta.') && !contains(github.ref_name, '-rc.') }}
-            type=sha,prefix=sha-
+            type=semver,pattern={{version}},value=${{ needs.source.outputs.release_tag }}
+            type=raw,value=beta,enable=${{ contains(needs.source.outputs.release_tag, '-beta.') && !contains(needs.source.outputs.release_tag, '-rc.') }}
+            type=raw,value=sha-${{ needs.source.outputs.source_short_sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ needs.source.outputs.source_sha }}
 
       - name: Build and push multi-platform image
         id: image
@@ -413,23 +465,31 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            CHIRONDB_VERSION=${{ steps.meta.outputs.version }}
-            VCS_REF=${{ github.sha }}
+            CHIRONDB_VERSION=${{ needs.source.outputs.version }}
+            VCS_REF=${{ needs.source.outputs.source_sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Make the GHCR package public
+      - name: Require anonymous GHCR access
         env:
-          GH_TOKEN: ${{ github.token }}
+          IMAGE_VERSION: ${{ needs.source.outputs.version }}
         run: |
-          gh api --method PATCH \
-            -H "Accept: application/vnd.github+json" \
-            "/orgs/${{ github.repository_owner }}/packages/container/chirondb" \
-            -f visibility=public
+          set -euo pipefail
+          anonymous_config=$(mktemp -d)
+          trap 'rm -rf "$anonymous_config"' EXIT
+          echo "Waiting for anonymous image access; first publication requires public visibility in GHCR package settings."
+          for _attempt in {1..60}; do
+            if DOCKER_CONFIG="$anonymous_config" docker manifest inspect "${IMAGE_NAME}:${IMAGE_VERSION}" > /dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::Image is not anonymously accessible. Set the package visibility to public, then rerun the failed jobs."
+          exit 1
 
       - name: Verify both platforms and the published runtime
         env:
-          IMAGE_VERSION: ${{ steps.meta.outputs.version }}
+          IMAGE_VERSION: ${{ needs.source.outputs.version }}
         run: |
           set -euo pipefail
           docker buildx imagetools inspect "${IMAGE_NAME}:${IMAGE_VERSION}"
@@ -467,12 +527,17 @@ jobs:
 
   sign-and-publish:
     name: sign + publish release
-    if: github.event_name == 'push'
-    needs: [build, publish-container]
+    if: needs.source.outputs.publish == 'true'
+    needs: [source, build, publish-container]
     runs-on: ubuntu-latest
+    env:
+      SOURCE_SHA: ${{ needs.source.outputs.source_sha }}
+      RELEASE_TAG: ${{ needs.source.outputs.release_tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.source.outputs.source_sha }}
 
       - name: Download all archives
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -509,13 +574,16 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
+          git fetch --no-tags origin "refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$SOURCE_SHA"
           prerelease=()
           if [[ "$RELEASE_TAG" == *-* ]]; then
             prerelease+=(--prerelease)
           fi
           gh release create "$RELEASE_TAG" \
+            --verify-tag \
             --title "$RELEASE_TAG" \
             --generate-notes \
             "${prerelease[@]}" \
