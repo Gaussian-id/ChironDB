@@ -125,6 +125,58 @@ impl Drop for Harness {
 }
 
 #[tokio::test]
+async fn relation_batches_are_atomic_and_replay_on_both_route_prefixes() {
+    let harness = Harness::start(graph_rbac()).await;
+    harness
+        .db
+        .set_graph_lifecycle_scoped(COLLECTION, true, true, &TenantScope::system())
+        .unwrap();
+    harness
+        .db
+        .configure_edge_type_scoped(
+            COLLECTION,
+            ConfigureEdgeTypeRequest {
+                name: "cites".into(),
+                weight_property: None,
+            },
+            true,
+            &TenantScope::system(),
+        )
+        .unwrap();
+    let body = json!({"edges": [{"source_point_id": "a", "target_point_id": "b", "edge_type": "cites"}], "idempotency_key": "batch-http"});
+    let (status, first) = harness
+        .send(
+            Method::POST,
+            "/collections/docs/edges/batch",
+            Some("graph-writer-key"),
+            Some(body.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["edge_ids"].as_array().unwrap().len(), 1);
+    let (status, replay) = harness
+        .send(
+            Method::POST,
+            "/v1/collections/docs/edges/batch",
+            Some("graph-writer-key"),
+            Some(body.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    assert_eq!(first["edge_ids"], replay["edge_ids"]);
+    assert_eq!(replay["receipt"]["replayed"], true);
+    let (status, _) = harness
+        .send(
+            Method::POST,
+            "/v1/collections/docs/edges/batch",
+            Some("point-admin-key"),
+            Some(body),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn legacy_and_v1_share_graph_lifecycle_crud_traversal_and_search() {
     let harness = Harness::start(AuthConfig::disabled()).await;
 
@@ -443,6 +495,17 @@ async fn graph_capabilities_roles_and_collection_allowlists_are_independent() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
     assert_eq!(denied["code"], json!("graph.permission_denied"));
 
+    let (status, denied_batch) = harness
+        .send(
+            Method::POST,
+            "/v1/collections/docs/edges/batch",
+            Some("graph-reader-key"),
+            Some(json!({"edges": [{"source_point_id": "a", "target_point_id": "b", "edge_type": "knows"}]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{denied_batch}");
+    assert_eq!(denied_batch["code"], json!("graph.permission_denied"));
+
     let (status, enabled) = harness
         .send(
             Method::PUT,
@@ -660,6 +723,18 @@ async fn tenant_scope_rejects_cross_tenant_edges_without_explicit_cross_write() 
         !denied.to_string().contains("tenant"),
         "the scoped rejection must not disclose the hidden owner: {denied}"
     );
+
+    let (status, denied_batch) = harness
+        .send(
+            Method::POST,
+            "/v1/collections/docs/edges/batch",
+            Some("tenant-a-key"),
+            Some(json!({"edges": [{"source_point_id": "a-node", "target_point_id": "b-node", "edge_type": "shared"}]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{denied_batch}");
+    assert_eq!(denied_batch["code"], json!("graph.endpoint_not_found"));
+    assert!(!denied_batch.to_string().contains("tenant"));
 
     let (status, related) = harness
         .send(

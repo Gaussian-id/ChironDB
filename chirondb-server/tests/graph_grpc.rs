@@ -3,6 +3,9 @@
 //! Graph RPCs are exposed only by `chirondb.v1.ChironDb`; shared search
 //! messages retain their `gaussdb.v1` package and gain additive graph fields.
 
+#[allow(dead_code)]
+mod common;
+
 use std::path::Path;
 
 use chiron_pb::chiron_db_client::ChironDbClient;
@@ -73,7 +76,7 @@ struct Harness {
     data: TempDir,
     db: Db,
     url: String,
-    server: tokio::task::JoinHandle<()>,
+    servers: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl Harness {
@@ -95,7 +98,7 @@ impl Harness {
             data,
             db,
             url: format!("http://{addr}"),
-            server,
+            servers: vec![server],
         }
     }
 
@@ -108,7 +111,9 @@ impl Harness {
 
 impl Drop for Harness {
     fn drop(&mut self) {
-        self.server.abort();
+        for server in &self.servers {
+            server.abort();
+        }
     }
 }
 
@@ -139,6 +144,96 @@ fn relate(source: &str, target: &str, edge_type: &str) -> chiron_pb::GraphRelate
         idempotency_key: None,
         no_wait: false,
     }
+}
+
+#[tokio::test]
+async fn relation_batch_rpc_reuses_one_durable_receipt_and_retry_identity() {
+    let mut harness = Harness::start(true, AuthConfig::disabled()).await;
+    let mut client = harness.client().await;
+    client.enable_graph(lifecycle(false)).await.unwrap();
+    client
+        .configure_edge_type(chiron_pb::ConfigureEdgeTypeRequest {
+            collection: COLLECTION.into(),
+            name: "cites".into(),
+            weight_property: None,
+            no_wait: false,
+        })
+        .await
+        .unwrap();
+    let request = chiron_pb::GraphRelateBatchRequest {
+        collection: COLLECTION.into(),
+        edges: (0..50)
+            .map(|ordinal| chiron_pb::GraphRelateBatchEdge {
+                source_point_id: "a".into(),
+                target_point_id: "b".into(),
+                edge_type: "cites".into(),
+                properties_json: json!({"ordinal": ordinal}).to_string(),
+                scope: "local".into(),
+            })
+            .collect(),
+        idempotency_key: Some("grpc-batch".into()),
+        no_wait: false,
+    };
+    let first = client
+        .relate_batch(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first.edge_ids.len(), 50);
+    assert!(first.receipt.as_ref().unwrap().durable);
+    let replay = client.relate_batch(request).await.unwrap().into_inner();
+    assert_eq!(first.edge_ids, replay.edge_ids);
+    assert!(replay.receipt.unwrap().replayed);
+
+    // A transport switch after an ambiguous ACK must reconcile the same core
+    // batch, including its ordered IDs and default local relation scope.
+    let body = json!({"edges": (0..50).map(|ordinal| json!({
+        "source_point_id": "a", "target_point_id": "b", "edge_type": "cites",
+        "properties": {"ordinal": ordinal},
+    })).collect::<Vec<_>>(), "idempotency_key": "grpc-batch"});
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_addr = listener.local_addr().unwrap();
+    let db = harness.db.clone();
+    harness.servers.push(tokio::spawn(async move {
+        chirondb::api::serve_listener(db, listener).await.unwrap();
+    }));
+    let http = reqwest::Client::new();
+    for prefix in ["", "/v1"] {
+        let response = http
+            .post(format!(
+                "http://{http_addr}{prefix}/collections/docs/edges/batch"
+            ))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let result: Value = response.json().await.unwrap();
+        assert_eq!(result["edge_ids"], json!(first.edge_ids));
+        assert_eq!(result["receipt"]["replayed"], true);
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap().to_string();
+    let db = harness.db.clone();
+    harness.servers.push(tokio::spawn(async move {
+        chirondb::wire::serve_listener(db, listener).await.unwrap();
+    }));
+    let response = common::send_wire(
+        &endpoint,
+        1,
+        pb::wire_request::Operation::RelateBatch(pb::WireGraphRelateBatchRequest {
+            collection: COLLECTION.into(),
+            request_json: body.to_string(),
+            no_wait: false,
+        }),
+    )
+    .await;
+    let Some(pb::wire_response::Payload::RelateBatch(result)) = response.payload else {
+        panic!("missing batch receipt");
+    };
+    let result: Value = serde_json::from_str(&result.response_json).unwrap();
+    assert_eq!(result["edge_ids"], json!(first.edge_ids));
+    assert_eq!(result["receipt"]["replayed"], true);
 }
 
 #[tokio::test]
@@ -517,6 +612,58 @@ async fn graph_capabilities_tenant_scope_and_denial_audit_are_enforced() {
         .expect("same tenant relate")
         .into_inner();
     assert_eq!(related.edge_id.len(), 39);
+
+    let mut batch = chiron_pb::GraphRelateBatchRequest {
+        collection: COLLECTION.into(),
+        edges: vec![chiron_pb::GraphRelateBatchEdge {
+            source_point_id: "a".into(),
+            target_point_id: "b".into(),
+            edge_type: "knows".into(),
+            properties_json: "{}".into(),
+            scope: "local".into(),
+        }],
+        idempotency_key: None,
+        no_wait: false,
+    };
+    let denied_batch = client
+        .relate_batch(bearer(batch.clone(), "point-admin-key"))
+        .await
+        .expect_err("batch requires an explicit graph write grant");
+    assert_eq!(denied_batch.code(), tonic::Code::PermissionDenied);
+    let allowed_batch = client
+        .relate_batch(bearer(batch.clone(), "acme-key"))
+        .await
+        .expect("scoped graph writer can commit a batch")
+        .into_inner();
+    assert_eq!(allowed_batch.edge_ids.len(), 1);
+    batch.edges.push(chiron_pb::GraphRelateBatchEdge {
+        target_point_id: "g".into(),
+        ..batch.edges[0].clone()
+    });
+    let cross_batch = client
+        .relate_batch(bearer(batch, "acme-key"))
+        .await
+        .expect_err("batch must hide a foreign endpoint");
+    assert_eq!(cross_batch.code(), tonic::Code::NotFound);
+    let edges = client
+        .traverse(bearer(
+            chiron_pb::GraphTraverseRequest {
+                collection: COLLECTION.into(),
+                request_json:
+                    json!({"anchors": ["a"], "edge_types": ["knows"], "returns": "edges"})
+                        .to_string(),
+            },
+            "acme-key",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let edges: Value = serde_json::from_str(&edges.result_json).unwrap();
+    assert_eq!(
+        edges["result"]["rows"].as_array().unwrap().len(),
+        2,
+        "failed batch published an edge"
+    );
 
     let cross = client
         .relate(bearer(relate("a", "g", "knows"), "acme-key"))

@@ -1,14 +1,12 @@
 """Smoke test for the GaussDB Python HTTP client.
 
-Invoked by the Rust scenario test with the server URL as argv[1].
+Invoked by the external Rust SDK harness with the server URL as argv[1].
 Prints JSON result to stdout so the Rust test can assert on it.
 """
 import json
 import sys
-import os
 
-# Allow running against a bundled copy of the client module.
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "clients", "python"))
+# Import the installed standalone compatibility package.
 from gaussdb_client import GaussDbClient, GraphConstraint
 
 url = sys.argv[1]

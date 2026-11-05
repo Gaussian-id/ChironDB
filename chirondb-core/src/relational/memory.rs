@@ -222,9 +222,9 @@ impl Charge {
             return Ok(());
         }
         if let Some(lease) = self.lease.as_mut().and_then(Arc::get_mut) {
-            if bytes >= lease.bytes {
+            if bytes > lease.bytes {
                 lease.pool.acquire(bytes - lease.bytes)?;
-            } else {
+            } else if bytes < lease.bytes {
                 lease.pool.release(lease.bytes - bytes);
             }
             lease.bytes = bytes;
@@ -394,13 +394,17 @@ pub(super) fn with_storage_pool<T>(capacity: u64, f: impl FnOnce(Arc<Pool>) -> T
 
 #[cfg(test)]
 pub(super) fn with_pool<T>(capacity: u64, f: impl FnOnce(Arc<Pool>) -> T) -> T {
+    with_pool_handle(Arc::new(Pool::new(capacity)), f)
+}
+
+#[cfg(test)]
+pub(super) fn with_pool_handle<T>(pool: Arc<Pool>, f: impl FnOnce(Arc<Pool>) -> T) -> T {
     struct Restore(Option<Arc<Pool>>);
     impl Drop for Restore {
         fn drop(&mut self) {
             TEST_POOL.with(|p| *p.borrow_mut() = self.0.take());
         }
     }
-    let pool = Arc::new(Pool::new(capacity));
     let _restore = Restore(TEST_POOL.with(|p| p.replace(Some(Arc::clone(&pool)))));
     f(pool)
 }

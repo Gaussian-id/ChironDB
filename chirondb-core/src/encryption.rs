@@ -250,6 +250,29 @@ pub fn encryption_enforced() -> bool {
     ENCRYPTION_ENFORCED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+pub(crate) fn require_rotation_complete(root: &Path) -> Result<()> {
+    let journal = root.join(".key-rotation.json");
+    match fs::symlink_metadata(&journal) {
+        Ok(_) => Err(GaussError::InvalidRequest(format!(
+            "pending key rotation at {}; resume offline with chironctl security rotate-key --data-dir {} --keyring <complete-keyring> before starting the server",
+            journal.display(),
+            root.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn verify_process_tree(root: &Path) -> Result<()> {
+    if encryption_enforced() && root.try_exists()? {
+        let keyring = PROCESS_KEYRING
+            .get()
+            .ok_or_else(|| corruption("encryption keyring is missing"))?;
+        verify_tree(keyring, root)?;
+    }
+    Ok(())
+}
+
 /// Bind rebuildable verified-byte caches to the complete decryption context.
 /// Changing or removing a historical key must force normal authenticated reads.
 pub(crate) fn recovery_context_fingerprint() -> Result<[u8; 32]> {
@@ -1896,6 +1919,15 @@ pub fn migrate_plain_tree_in_place(keyring: &Keyring, root: &Path) -> Result<u64
     let mut migrated = u64::from(crate::wal::Wal::migrate_transaction_journal_for_encryption(
         root, keyring,
     )?);
+    migrated = migrated.saturating_add(migrate_plain_generation_in_place(keyring, root)?);
+    Ok(migrated)
+}
+
+/// Content generations can retain legacy journal copies. These are immutable
+/// rollback bytes, not the installation's live journal: wrapping whole files
+/// preserves their embedded LSNs and the generation's logical identity.
+pub(crate) fn migrate_plain_generation_in_place(keyring: &Keyring, root: &Path) -> Result<u64> {
+    let mut migrated = 0_u64;
     walk_files(root, &mut |path| {
         let bytes = fs::read(path)?;
         match classify_persisted_file(path, &bytes)? {

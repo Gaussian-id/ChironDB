@@ -16,8 +16,7 @@ use sha2::{Digest, Sha256};
 use crate::{GaussError, Point, Result, transaction_journal::TransactionAudit, wal::WalEntry};
 
 use super::{
-    Collection, Db, GraphBatchCommitReceipt, audit_context, build_admission, insert_sparse_point,
-    remove_sparse_point,
+    Collection, Db, GraphBatchCommitReceipt, audit_context, build_admission, remove_sparse_point,
 };
 
 /// Keep lazy migration below the fixed 16 MiB GraphBatch cap even when every
@@ -36,6 +35,29 @@ pub(super) struct MultiModelGraphMutations {
     pub relations: Vec<crate::graph::RelateRequest>,
     pub edge_deletes: Vec<crate::graph::EdgeToken>,
     pub edge_updates: Vec<(crate::graph::EdgeToken, crate::graph::UpdateEdgeRequest)>,
+}
+
+pub(super) type GraphBatchClaim<'a> = (
+    &'a crate::transaction_journal::IdempotencyGuard,
+    crate::relational::wal_decode::Owned<serde_json::Value>,
+);
+
+pub(super) struct GraphBatchCommitContext<'a> {
+    pub audit: &'a crate::audit::AuditContext,
+    pub decision_started: Option<&'a AtomicBool>,
+    pub claim: Option<GraphBatchClaim<'a>>,
+}
+
+/// Journal receipts outlive edge deletion/compaction. Retain the original
+/// namespaces to recheck current permissions without resurrecting topology.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct RelateBatchReceipt {
+    version: u8,
+    collection: String,
+    graph_epoch: crate::graph::GraphEpoch,
+    edge_ids: Vec<crate::graph::EdgeToken>,
+    namespaces: HashSet<crate::graph::GraphNamespace>,
 }
 
 impl Collection {
@@ -340,6 +362,9 @@ impl Db {
             .collect::<Vec<_>>();
         points.reverse();
 
+        // Authenticate existing rows before a durable decision, even without
+        // deferred bindings. The apply path must not discover corruption only
+        // after the transaction has committed.
         let old_points = points
             .iter()
             .map(|point| {
@@ -450,11 +475,9 @@ impl Db {
             decision,
         )?;
 
-        for (point, old_point) in points.iter().zip(old_points) {
-            if let Some(old_point) = old_point {
-                remove_sparse_point(&mut collection.sparse_index, &old_point);
-            }
-            insert_sparse_point(&mut collection.sparse_index, point);
+        // The committed GraphBatch already published sparse/text and payload
+        // projections. Only the mutable ANN backends need incremental updates.
+        for point in &points {
             if h2qg_present_before
                 && let Some(h2qg) = collection.streamer.hnsw.as_mut()
                 && !h2qg.contains(&point.id)
@@ -953,7 +976,7 @@ impl Db {
                 "state": "open",
             }),
         );
-        self.refresh_metrics();
+        self.refresh_storage_metrics();
         Ok(crate::graph::GraphDeferredSessionResult {
             session_id: crate::graph::GraphDeferredSessionId::from_encoded(session_id),
             state: crate::graph::GraphDeferredSessionState::Open,
@@ -1108,7 +1131,7 @@ impl Db {
                         "idempotency_replay": true,
                 }),
             );
-            self.refresh_metrics();
+            self.refresh_storage_metrics();
             return Ok(crate::graph::RelateResult { edge_id, receipt });
         }
 
@@ -1228,7 +1251,7 @@ impl Db {
                 "idempotency_replay": false,
             }),
         );
-        self.refresh_metrics();
+        self.refresh_storage_metrics();
         Ok(crate::graph::RelateResult { edge_id, receipt })
     }
 
@@ -1330,7 +1353,7 @@ impl Db {
                         "replayed": true,
                 }),
             );
-            self.refresh_metrics();
+            self.refresh_storage_metrics();
             return Ok(crate::graph::GraphDeferredSessionResult {
                 session_id: session_id.clone(),
                 state: target,
@@ -1378,7 +1401,7 @@ impl Db {
                 "replayed": false,
             }),
         );
-        self.refresh_metrics();
+        self.refresh_storage_metrics();
         Ok(crate::graph::GraphDeferredSessionResult {
             session_id: session_id.clone(),
             state: target,
@@ -1455,7 +1478,7 @@ impl Db {
                 "changed": !unchanged,
             }),
         );
-        self.refresh_metrics();
+        self.refresh_storage_metrics();
         Ok(crate::graph::ConfigureEdgeTypeResult {
             edge_type: crate::graph::GraphEdgeType {
                 name: request.name,
@@ -1553,7 +1576,7 @@ impl Db {
                         "idempotency_replay": true,
                 }),
             );
-            self.refresh_metrics();
+            self.refresh_storage_metrics();
             return Ok(crate::graph::RelateResult { edge_id, receipt });
         }
 
@@ -1658,10 +1681,199 @@ impl Db {
                 "idempotency_replay": false,
             }),
         );
-        self.refresh_metrics();
+        self.refresh_storage_metrics();
         Ok(crate::graph::RelateResult {
             edge_id: token,
             receipt: public_receipt,
+        })
+    }
+
+    /// Commit one bounded relation batch with a single identity reservation
+    /// and WAL decision. Validation and publication reuse the multi-model path.
+    pub fn relate_batch_scoped(
+        &self,
+        collection_name: &str,
+        request: crate::graph::RelateBatchRequest,
+        wait: bool,
+        scope: &crate::tenant::TenantScope,
+    ) -> Result<crate::graph::RelateBatchResult> {
+        if request.edges.is_empty() || request.edges.len() > crate::graph::MAX_GRAPH_EDGES_PER_BATCH
+        {
+            return Err(GaussError::InvalidRequest(format!(
+                "RELATE batch requires 1..={} edges",
+                crate::graph::MAX_GRAPH_EDGES_PER_BATCH
+            )));
+        }
+        if let Some(key) = request.idempotency_key.as_deref() {
+            validate_public_graph_key("idempotency key", key)?;
+        }
+        let encoded = crate::response_buffer::ResponseBuffer::json_native(
+            &request,
+            crate::graph::MAX_GRAPH_BATCH_BYTES,
+        )?;
+        let request_sha256: [u8; 32] = Sha256::digest(encoded.as_ref()).into();
+        drop(encoded);
+        let scoped_key = request
+            .idempotency_key
+            .as_deref()
+            .map(|key| scoped_idempotency_key(scope, collection_name, "relate_batch", key))
+            .transpose()?;
+        let _lifecycle = self.lifecycle_gate.read();
+        self.ensure_storage_mutations_available()?;
+        self.require_sync_durability(wait)?;
+        let context = audit_context(scope);
+        let audit_operation = self.audit_operation_with_context(
+            "graph_relate_batch",
+            Some(collection_name),
+            context.clone(),
+        )?;
+        let coll = self.get_coll(collection_name)?;
+        let claim = if let Some(key) = scoped_key.as_deref() {
+            use crate::transaction_journal::IdempotencyAdmission;
+            match self.transaction_journal.begin_idempotent(
+                key,
+                &context,
+                "graph_relate_batch",
+                &request_sha256,
+                || self.ensure_request_admission(),
+            )? {
+                IdempotencyAdmission::Execute(claim) => Some(claim),
+                IdempotencyAdmission::Replay(receipt) => {
+                    let result = self.replay_relate_batch(
+                        receipt,
+                        collection_name,
+                        request.edges.len(),
+                        scope,
+                    )?;
+                    self.finish_committed_legacy_audit(
+                        audit_operation,
+                        serde_json::json!({
+                            "edge_count": result.edge_ids.len(), "idempotency_replay": true,
+                        }),
+                    );
+                    return Ok(result);
+                }
+            }
+        } else {
+            None
+        };
+        let _admission = self.maintenance_barrier.read();
+        let mut collection = coll.write();
+        let (batch, edge_ids) = self.build_multimodel_graph_batch_locked(
+            &collection,
+            MultiModelGraphMutations {
+                points: Vec::new(),
+                point_deletes: Vec::new(),
+                relations: request.edges,
+                edge_deletes: Vec::new(),
+                edge_updates: Vec::new(),
+            },
+            scope,
+        )?;
+        let stored = RelateBatchReceipt {
+            version: 1,
+            collection: collection_name.into(),
+            graph_epoch: batch.graph_epoch,
+            edge_ids,
+            namespaces: batch
+                .edge_mutations
+                .iter()
+                .filter_map(|mutation| match mutation {
+                    crate::graph::EdgeMutation::Relate(edge) => Some(edge.namespace.clone()),
+                    _ => None,
+                })
+                .collect(),
+        };
+        let claim = claim
+            .as_ref()
+            .map(|claim| {
+                crate::relational::wal_decode::json(&stored).map(|response| (claim, response))
+            })
+            .transpose()?;
+        let committed = self.commit_graph_batch_context_locked(
+            &mut collection,
+            batch,
+            wait,
+            None,
+            GraphBatchCommitContext {
+                audit: &context,
+                decision_started: None,
+                claim,
+            },
+        )?;
+        let receipt = public_receipt(committed, false);
+        drop(collection);
+        self.finish_committed_legacy_audit(
+            audit_operation,
+            serde_json::json!({
+                "edge_count": stored.edge_ids.len(), "graph_epoch": receipt.graph_epoch.raw(),
+                "operation_lsn": receipt.operation_lsn, "idempotency_replay": false,
+            }),
+        );
+        self.refresh_storage_metrics();
+        Ok(crate::graph::RelateBatchResult {
+            edge_ids: stored.edge_ids,
+            receipt,
+        })
+    }
+
+    fn replay_relate_batch(
+        &self,
+        receipt: crate::transaction_journal::IdempotencyReceipt,
+        collection: &str,
+        edge_count: usize,
+        scope: &crate::tenant::TenantScope,
+    ) -> Result<crate::graph::RelateBatchResult> {
+        use crate::transaction_journal::TransactionState;
+        if receipt.expired {
+            return Err(GaussError::InvalidRequest(
+                "idempotency receipt expired; key remains consumed".into(),
+            ));
+        }
+        let transaction_id = receipt.status.transaction_id.to_string();
+        match receipt.status.state {
+            TransactionState::Committed => {}
+            TransactionState::OutcomeUnknown => {
+                return Err(GaussError::CommitOutcomeUnknown { transaction_id });
+            }
+            TransactionState::Rejected => {
+                return Err(GaussError::CommitRejected { transaction_id });
+            }
+            TransactionState::Expired => {
+                return Err(GaussError::InvalidRequest(
+                    "consumed key has no decision".into(),
+                ));
+            }
+        }
+        let encoded = receipt.response.as_ref().ok_or_else(|| {
+            GaussError::WalUnavailable("committed graph receipt is missing".into())
+        })?;
+        crate::relational::wal_decode::borrowed::<RelateBatchReceipt>(encoded)?.consume(|stored| {
+            if stored.version != 1
+                || stored.collection != collection
+                || stored.edge_ids.len() != edge_count
+                || stored.namespaces.is_empty()
+                || stored.namespaces.len() > edge_count
+            {
+                return Err(GaussError::WalUnavailable(
+                    "invalid committed graph receipt".into(),
+                ));
+            }
+            for namespace in &stored.namespaces {
+                authorize_edge_mutation(namespace, scope, self.tenant_enforcement())?;
+            }
+            for id in &stored.edge_ids {
+                crate::edge_token::decode(self.graph_database_id(), id)?;
+            }
+            Ok(crate::graph::RelateBatchResult {
+                edge_ids: stored.edge_ids,
+                receipt: crate::graph::GraphMutationReceipt {
+                    graph_epoch: stored.graph_epoch,
+                    operation_lsn: None,
+                    durable: true,
+                    replayed: true,
+                },
+            })
         })
     }
 
@@ -1764,7 +1976,7 @@ impl Db {
                 "edge_count": edge_count,
             }),
         );
-        self.refresh_metrics();
+        self.refresh_storage_metrics();
         Ok((receipt, edge_count))
     }
 
@@ -1837,7 +2049,7 @@ impl Db {
                 "edge_count": 1,
             }),
         );
-        self.refresh_metrics();
+        self.refresh_storage_metrics();
         Ok(receipt)
     }
 
@@ -1970,7 +2182,7 @@ impl Db {
         if enabled && receipt.backfill_in_progress {
             self.start_graph_handle_backfill(collection_name);
         }
-        self.refresh_metrics();
+        self.refresh_storage_metrics();
         Ok(receipt)
     }
 
@@ -2135,7 +2347,7 @@ impl Db {
                 "remaining": has_more,
             }),
         );
-        self.refresh_metrics();
+        self.refresh_storage_metrics();
         Ok(!has_more)
     }
 }

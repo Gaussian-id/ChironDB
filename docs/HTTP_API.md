@@ -999,6 +999,40 @@ replaces the complete property document. `DELETE` removes the edge and takes
 `wait` as a query parameter. All edge mutations require a write-capable role
 plus `graph:write`.
 
+Create several edges atomically with
+`POST /v1/collections/{name}/edges/batch` (also `/collections/{name}/edges/batch`):
+
+```bash
+curl --fail http://127.0.0.1:7401/v1/collections/products/edges/batch \
+  -H "Authorization: Bearer $CHIRONDB_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"edges":[{"source_point_id":"phone","target_point_id":"book","edge_type":"related_to","properties":{"source":"catalog"}}],"idempotency_key":"catalog-edges-1","wait":true}'
+```
+
+The response contains `edge_ids` in input order and one `receipt`. A request
+accepts 1–4,096 edges within the existing 16 MiB GraphBatch limit; HTTP body and
+process admission limits also apply. Every endpoint, type and tenant scope is
+validated before publishing any edge. The batch has one commit decision and
+requires the same graph write capability as single-edge creation. Per-edge
+idempotency keys are rejected; supply one batch key. Replaying the same key and
+payload under the same principal/tenant returns the original IDs with
+`receipt.replayed:true`; a changed payload is rejected. Retain the key and
+payload for ambiguous responses. The transaction journal retains batch receipts
+through edge deletion, compaction and restart; replay returns the prior IDs
+without recreating deleted edges. Current namespace permissions are rechecked.
+Batch receipts expire after 24 hours; their keys remain consumed and reject
+rather than silently creating another batch.
+
+The existing `wait`/durable-decision contract applies. A legacy `wait:false`
+request returns `202`, while its commit decision is still durable. Protected
+installations retain their existing ChironQL mutation surface. For bounded
+JSONL loading and restart reconciliation, see [bulk loading](BULK_LOADING.md).
+
+`GET /v1/collections/{name}/index_status` reports background index builds and
+segment sealing through `build_in_flight`. Wait for it to become false and
+verify application queries before serving loaded data. Small collections can
+use exact live search while `indexed_points` is below `total_points`.
+
 Traverse with one bounded request:
 
 ```bash
@@ -1448,6 +1482,7 @@ Every path below is also served without the `/v1` prefix during the beta.
 | `GET` | `/v1/collections/{name}/graph/types` | List edge types |
 | `PUT` | `/v1/collections/{name}/graph/types/{type}` | Configure an edge type |
 | `POST` | `/v1/collections/{name}/edges` | Create an edge |
+| `POST` | `/v1/collections/{name}/edges/batch` | Atomically create ordered edges |
 | `PATCH`, `PUT`, `DELETE` | `/v1/collections/{name}/edges/{edge_id}` | Merge/replace properties or remove an edge |
 | `POST` | `/v1/collections/{name}/graph/traverse` | Run bounded exact traversal |
 | `POST` | `/v1/collections/{name}/graph/deferred-sessions` | Open a deferred endpoint session |

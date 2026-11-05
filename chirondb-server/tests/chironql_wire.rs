@@ -177,6 +177,41 @@ fn stats(response: &chirondb::grpc::pb::WireChironQlResponse) -> Value {
 }
 
 #[tokio::test]
+async fn native_relation_batch_frame_preserves_order_and_idempotency() {
+    let harness = Harness::start(true, AuthConfig::disabled()).await;
+    let request = json!({"edges": (0..50).map(|ordinal| json!({
+        "source_point_id": "root", "target_point_id": "child", "edge_type": "CITES",
+        "properties": {"ordinal": ordinal},
+    })).collect::<Vec<_>>(), "idempotency_key": "wire-batch"})
+    .to_string();
+    let mut first = None;
+    for id in 1..=2 {
+        let response = common::send_wire(
+            &harness.endpoint,
+            id,
+            wire_request::Operation::RelateBatch(chirondb::grpc::pb::WireGraphRelateBatchRequest {
+                collection: COLLECTION.into(),
+                request_json: request.clone(),
+                no_wait: false,
+            }),
+        )
+        .await;
+        assert!(response.error_code.is_empty(), "{}", response.error_message);
+        let Some(wire_response::Payload::RelateBatch(result)) = response.payload else {
+            panic!("missing batch receipt");
+        };
+        let result: Value = serde_json::from_str(&result.response_json).unwrap();
+        assert_eq!(result["edge_ids"].as_array().unwrap().len(), 50);
+        if let Some(first) = &first {
+            assert_eq!(*first, result["edge_ids"]);
+            assert_eq!(result["receipt"]["replayed"], true);
+        } else {
+            first = Some(result["edge_ids"].clone());
+        }
+    }
+}
+
+#[tokio::test]
 async fn relational_chironql_preserves_typed_parameters_and_metadata() {
     use chirondb::RelationalValue;
 

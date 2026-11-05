@@ -210,7 +210,7 @@ pub fn migrate_encryption(data_dir: &Path, keyring: &Keyring) -> Result<Encrypti
             keyring.active_key_id(),
             &logical_digest,
         )?;
-        migrated_files = encryption::migrate_plain_tree_in_place(keyring, &staging)?;
+        migrated_files = encryption::migrate_plain_generation_in_place(keyring, &staging)?;
         rebuilt_archive_manifests = rebuilt_archive_manifests.saturating_add(
             crate::wal::refresh_archive_manifests_for_encryption(&staging, keyring)?,
         );
@@ -360,6 +360,7 @@ fn copy_legacy_contents(source: &Path, destination: &Path) -> Result<()> {
                     | MIGRATION_JOURNAL
                     | GRAPH_IDENTITY_FILE
                     | "audit"
+                    | "transactions"
             )
         ) {
             continue;

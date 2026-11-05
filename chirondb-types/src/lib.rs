@@ -25,9 +25,9 @@ pub use graph::{
     GraphProbeTrace, GraphQueryWarning, GraphRelationScope, GraphRetrievalPlan,
     GraphSpecificityInterval, GraphTraversalEdgeRow, GraphTraversalNodeRow, GraphTraversalPathRow,
     GraphTraversalQueryRequest, GraphTraversalQueryResult, GraphTraversalReturn,
-    GraphTraversalRows, GraphWarning, Nid, RelateMutation, RelateRequest, RelateResult,
-    TraversalBudget, TraversalResult, TraversalStats, TraversalTruncationReason, TraversalVisit,
-    TypeId, UnrelateMutation, UpdateEdgeRequest,
+    GraphTraversalRows, GraphWarning, Nid, RelateBatchRequest, RelateBatchResult, RelateMutation,
+    RelateRequest, RelateResult, TraversalBudget, TraversalResult, TraversalStats,
+    TraversalTruncationReason, TraversalVisit, TypeId, UnrelateMutation, UpdateEdgeRequest,
 };
 pub use relational::{
     CheckConstraintDefinition, ForeignKeyAction, ForeignKeyDefinition, ForeignKeyMatch, RecordRef,

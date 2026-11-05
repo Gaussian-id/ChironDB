@@ -218,7 +218,6 @@ class InstallationLab:
     def protected_retrieval(self, expected, users=None):
         """Text native/ChironQL parity through TLS, including closed legacy routes."""
         tls = ssl.create_default_context(cafile=str(self.root / 'ca.pem'))
-        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'clients/python'))
         from chirondb_client import ChironDbClient
         os.environ['REQUESTS_CA_BUNDLE'] = str(self.root / 'ca.pem')
         def check_hits(label, hits, golden):

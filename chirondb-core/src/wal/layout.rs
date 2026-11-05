@@ -190,6 +190,28 @@ pub(super) fn wal_segments(dir: &Path) -> Result<WalSegments> {
             return Err(wal_corruption(&segment.path, &message));
         }
     }
+    if let Some(last) = wal_base.last_segment {
+        let required = last.max(wal_base.first_segment);
+        if segments
+            .last()
+            .is_none_or(|segment| segment.index < required)
+        {
+            return Err(wal_corruption(
+                dir,
+                &format!("missing required WAL suffix segment {required}"),
+            ));
+        }
+        for segment in segments.iter().filter(|segment| segment.index > required) {
+            // A crash may publish an empty successor before its frontier. No
+            // mutation may enter that successor before the frontier is durable.
+            if fs::metadata(&segment.path)?.len() != 0 {
+                return Err(wal_corruption(
+                    &segment.path,
+                    "WAL data is ahead of its durable segment frontier",
+                ));
+            }
+        }
+    }
     Ok(segments)
 }
 
@@ -387,6 +409,7 @@ mod tests {
             let before = WalBase {
                 lsn: 19,
                 first_segment: 3,
+                last_segment: Some(3),
             };
             write_wal_base(temp.path(), before).unwrap();
             let path = temp.path().join(WAL_BASE_FILE);
@@ -400,7 +423,8 @@ mod tests {
                     temp.path(),
                     WalBase {
                         lsn: 99,
-                        first_segment: 9
+                        first_segment: 9,
+                        last_segment: Some(9),
                     }
                 ),
                 Err(GaussError::ResourceExhausted(_))
@@ -422,6 +446,7 @@ mod tests {
             let end = wal.append(&WalEntry::Delete { id: "one".into() }).unwrap();
             let path = wal.path().to_path_buf();
             let bytes = fs::read(&path).unwrap();
+            let base_bytes = fs::read(temp.path().join(WAL_BASE_FILE)).unwrap();
             let mut pressure = MetadataCharge::default();
             pressure
                 .prepare(capacity - used() - crate::relational::wal_decode::lease_root_bytes())
@@ -429,7 +454,10 @@ mod tests {
             assert!(matches!(wal.reset(), Err(GaussError::ResourceExhausted(_))));
             assert_eq!(wal.len().unwrap(), end);
             assert_eq!(fs::read(&path).unwrap(), bytes);
-            assert!(!temp.path().join(WAL_BASE_FILE).exists());
+            assert_eq!(
+                fs::read(temp.path().join(WAL_BASE_FILE)).unwrap(),
+                base_bytes
+            );
             drop(pressure);
             assert!(wal.append(&WalEntry::Delete { id: "two".into() }).unwrap() > end);
             wal.reset().unwrap();

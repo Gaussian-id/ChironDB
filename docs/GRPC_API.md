@@ -526,7 +526,7 @@ query. Sparse `indices` and `values` must have equal lengths.
 
 Graph RPCs exist only on `chirondb.v1.ChironDb`; the deprecated
 `gaussdb.v1.GaussDb` service remains frozen. The primary service exposes
-`EnableGraph`, `DropGraph`, `ListEdgeTypes`, `ConfigureEdgeType`, `Relate`,
+`EnableGraph`, `DropGraph`, `ListEdgeTypes`, `ConfigureEdgeType`, `Relate`, `RelateBatch`,
 `Unrelate`, `UpdateEdge`, `Traverse`, and the five explicit deferred-session
 operations. All call the same scoped engine as HTTP and ChironQL.
 
@@ -564,6 +564,27 @@ to `UpdateEdge` or `Unrelate`; do not parse, sort, or infer topology from it.
 Mutation receipts carry the actual `graphEpoch`, optional `operationLsn`,
 `durable`, and `replayed` values. As elsewhere in the gRPC API,
 `noWait:false` is the durable default.
+
+`RelateBatch` creates an atomic batch in one collection:
+
+```json
+{
+  "collection":"products",
+  "edges":[{"sourcePointId":"phone","targetPointId":"book","edgeType":"references","propertiesJson":"{\"strength\":0.8}","scope":"local"}],
+  "idempotencyKey":"catalog-edges-1",
+  "noWait":false
+}
+```
+
+`edgeIds` preserves input order and `receipt` describes the single commit.
+The core admits 1–4,096 edges within 16 MiB, with endpoint/type/tenant validation
+before publication. The optional batch key replays the same logical request and
+IDs for its 24-hour retention; conflicting payloads and expired keys reject.
+These are additive primary-service messages; the frozen legacy service is
+unchanged. ChironWire exposes the same operation through `WireRequest.relate_batch`
+(tag 35), with collection, tagged request JSON and `no_wait`, and
+`WireResponse.relate_batch` (tag 28) carrying `response_json`. Both façades call
+the same core as [HTTP batch edges](HTTP_API.md#property-graph-overlay).
 
 `Traverse.requestJson` contains one JSON-encoded
 `GraphTraversalQueryRequest`, preserving the HTTP/ChironQL fields and caps:

@@ -10,6 +10,9 @@ name: release
 # not block the release.
 
 on:
+  # Qualify the selected commit with official SIFT before creating a tag.
+  # Publication jobs below run only on tag pushes.
+  workflow_dispatch: {}
   push:
     tags:
       - "v*.*.*"
@@ -219,6 +222,7 @@ jobs:
 
   build:
     name: build (${{ matrix.label }})
+    if: github.event_name == 'push'
     needs: wal-release-gate
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.best_effort == true }}
@@ -227,13 +231,13 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
             use_cross: false
             best_effort: false
             label: linux-x86_64
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            use_cross: true
+            os: ubuntu-24.04-arm
+            use_cross: false
             best_effort: false
             label: linux-aarch64
           - target: x86_64-apple-darwin
@@ -254,6 +258,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Python for release validation
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
 
       - name: Release version consistency
         run: python3 .github/tools/check_release_version.py
@@ -337,6 +346,18 @@ jobs:
             echo "path=${out}.tar.gz" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Smoke the extracted release archive
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          ARCHIVE: ${{ steps.archive.outputs.path }}
+        run: |
+          set -euo pipefail
+          smoke_root="$RUNNER_TEMP/release-archive-smoke"
+          mkdir -p "$smoke_root"
+          tar -xzf "$ARCHIVE" -C "$smoke_root"
+          python3 .github/tools/smoke_binary.py --bin-dir "$smoke_root/$(basename "$ARCHIVE" .tar.gz)"
+
       - name: Upload archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -351,6 +372,7 @@ jobs:
 
   publish-container:
     name: publish + sign container
+    if: github.event_name == 'push'
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -445,6 +467,7 @@ jobs:
 
   sign-and-publish:
     name: sign + publish release
+    if: github.event_name == 'push'
     needs: [build, publish-container]
     runs-on: ubuntu-latest
     steps:
@@ -460,7 +483,7 @@ jobs:
 
       - name: Generate checksums
         working-directory: dist
-        run: sha256sum * > SHA256SUMS
+        run: sha256sum -- * > SHA256SUMS
 
       - name: Install cosign
         uses: sigstore/cosign-installer@f713795cb21599bc4e5c4b58cbad1da852d7eeb9 # v3
@@ -486,13 +509,14 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           prerelease=()
-          if [[ "${{ github.ref_name }}" == *-* ]]; then
+          if [[ "$RELEASE_TAG" == *-* ]]; then
             prerelease+=(--prerelease)
           fi
-          gh release create "${{ github.ref_name }}" \
-            --title "${{ github.ref_name }}" \
+          gh release create "$RELEASE_TAG" \
+            --title "$RELEASE_TAG" \
             --generate-notes \
             "${prerelease[@]}" \
             dist/*
