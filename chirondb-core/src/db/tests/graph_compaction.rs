@@ -31,9 +31,10 @@ fn graph_compaction_plan_freezes_degree_bfs_and_external_merge() {
         }
         return;
     };
-    let root = PathBuf::from(env::var_os(ROOT).unwrap());
+    let fixture = PathBuf::from(env::var_os(ROOT).unwrap());
+    let root = fixture.join("data");
     if mode == "encrypted" {
-        let keyring = root.join("keyring.json");
+        let keyring = fixture.join("keyring.json");
         fs::write(
             &keyring,
             serde_json::json!({
@@ -282,19 +283,23 @@ fn assert_plan(
 #[test]
 fn graph_compaction_keeps_post_cut_wal_and_topology_tail() {
     const CHILD: &str = "CHIRONDB_GRAPH_COMPACTION_TAIL_CHILD";
+    const STAGE: &str = "CHIRONDB_GRAPH_COMPACTION_TAIL_STAGE";
     const TEST: &str =
         "db::tests::graph_compaction::graph_compaction_keeps_post_cut_wal_and_topology_tail";
     let Some(root) = env::var_os(CHILD) else {
-        let root = TempDir::new().unwrap();
-        assert!(
-            Command::new(env::current_exe().unwrap())
-                .args(["--exact", TEST, "--nocapture"])
-                .env(CHILD, root.path())
-                .status()
-                .unwrap()
-                .success(),
-            "graph compaction tail child failed"
-        );
+        for stage in ["initial-seal", "compaction", "offline-migration"] {
+            let root = TempDir::new().unwrap();
+            assert!(
+                Command::new(env::current_exe().unwrap())
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(CHILD, root.path())
+                    .env(STAGE, stage)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "graph compaction tail child failed at {stage}"
+            );
+        }
         return;
     };
     let root = PathBuf::from(root);
@@ -341,16 +346,30 @@ fn graph_compaction_keeps_post_cut_wal_and_topology_tail() {
         .unwrap()
     };
     relate(&db, "a", "b");
-    let seal = prepare_forced_graph_vector_seal(&db, &root, "docs");
-    run_segment_seal(&seal).unwrap();
-    drop(seal);
+    let stage = env::var(STAGE).unwrap();
+    if stage == "compaction" {
+        let seal = prepare_forced_graph_vector_seal(&db, &root, "docs");
+        run_segment_seal(&seal).unwrap();
+        drop(seal);
+    }
 
     let marker = root.join("compaction-paused");
     let release = root.join("compaction-release");
-    let _failpoint_guard =
-        crate::failpoint::test_env("pause:graph_compaction.after_stage", &marker, &release);
+    let pause = if stage != "compaction" {
+        "pause:seal.after_vamana_cell"
+    } else {
+        "pause:graph_compaction.after_stage"
+    };
+    let _failpoint_guard = crate::failpoint::test_env(pause, &marker, &release);
     let compact_db = db.clone();
-    let compact = std::thread::spawn(move || compact_db.compact_collection("docs"));
+    let offline = stage == "offline-migration";
+    let compact = std::thread::spawn(move || {
+        if offline {
+            compact_db.prepare_encryption_migration()
+        } else {
+            compact_db.compact_collection("docs").map(|_| ())
+        }
+    });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while !marker.exists() {
         assert!(
@@ -361,7 +380,19 @@ fn graph_compaction_keeps_post_cut_wal_and_topology_tail() {
     }
     relate(&db, "b", "c");
     fs::write(&release, b"release").unwrap();
-    compact.join().unwrap().unwrap();
+    let outcome = compact.join().unwrap();
+    if offline {
+        let error = outcome.unwrap_err().to_string();
+        assert!(
+            error.contains("WAL is not empty after encryption preparation"),
+            "offline migration must still refuse a concurrent WAL tail: {error}"
+        );
+        // Once the concurrent writer is quiescent, retry seals that tail.
+        db.prepare_encryption_migration().unwrap();
+        assert!(db.get_coll("docs").unwrap().read().wal.is_empty().unwrap());
+    } else {
+        outcome.unwrap();
+    }
     let live = db.prepare_graph_compaction_plan("docs").unwrap().unwrap();
     assert_eq!(live.source_edge_records, 2);
     assert_eq!(live.live_edge_records, 2);

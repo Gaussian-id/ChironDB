@@ -16,7 +16,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CARGO_BUILD_JOBS: 2
+  # Bound ASAN compiler memory: serialize crates and split LLVM code generation.
+  CARGO_BUILD_JOBS: 1
   CARGO_PROFILE_DEV_DEBUG: '0'
   CARGO_PROFILE_TEST_DEBUG: '0'
   CARGO_TERM_COLOR: always
@@ -38,7 +39,9 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       RUSTUP_TOOLCHAIN: nightly-2025-12-08
-    timeout-minutes: 15
+    # Cold ASAN compilation exceeded 30 minutes on a standard hosted runner.
+    # The fuzz execution budgets below stay fixed.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -71,7 +74,7 @@ jobs:
 
       - name: Replay deterministic corpus with bounded mutations
         run: >-
-          cargo fuzz run ${{ matrix.target }}
+          cargo fuzz run --codegen-units 16 ${{ matrix.target }}
           fuzz/corpus/${{ matrix.target }} --
           -seed=1
           -runs=256
@@ -98,7 +101,8 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       RUSTUP_TOOLCHAIN: nightly-2025-12-08
-    timeout-minutes: 30
+    # Cold serial ASAN compilation plus the full 15-minute soak.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -131,7 +135,7 @@ jobs:
 
       - name: Run bounded nightly fuzz soak
         run: >-
-          cargo fuzz run ${{ matrix.target }}
+          cargo fuzz run --codegen-units 16 ${{ matrix.target }}
           fuzz/corpus/${{ matrix.target }} --
           -max_total_time=900
           -timeout=10

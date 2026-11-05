@@ -9,6 +9,36 @@ pub(crate) struct CheckpointPause {
 }
 
 impl RelationalEngine {
+    /// Let an active checkpoint install its captured roots before admitting
+    /// another write snapshot under overlay pressure. Otherwise a continuous
+    /// writer can keep every capture stale until conservative COW reservations
+    /// exhaust the retained pool. Reads and durable receipt replay bypass this.
+    pub(super) fn wait_for_checkpoint_headroom(&self) -> Result<()> {
+        let deadline = Instant::now() + INTENT_WAIT_TIMEOUT;
+        loop {
+            check_sql_cancelled()?;
+            let active = self
+                .checkpoint_worker
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished());
+            if !active
+                || self.checkpoint_cancel.load(AtomicOrdering::Acquire)
+                || self.state.read().retained_bytes() < memory::flush_threshold()
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(GaussError::ResourceExhausted(
+                    "relational checkpoint is still relieving memory pressure; retry after checkpoint"
+                        .into(),
+                ));
+            }
+            std::thread::sleep(SQL_WAIT_CHECK_INTERVAL);
+        }
+    }
+
     pub(super) fn drain_background_checkpoint(
         &self,
         mut checkpoint: CapturedRelationalCheckpoint,
@@ -97,6 +127,123 @@ mod tests {
             engine.wal.lock().unwrap().len().unwrap(),
         );
         engine.checkpoint_after_commit(captured, "maintenance-test");
+    }
+
+    fn pressured_checkpoint_writer(cancel_pending: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        memory::with_pool(16 * 1024 * 1024, |pool| {
+            let engine =
+                RelationalEngine::open(temp.path(), TransactionJournal::open(temp.path()).unwrap())
+                    .unwrap();
+            engine
+                .execute(request(
+                    "CREATE TABLE items (id BIGINT PRIMARY KEY, text TEXT)",
+                ))
+                .unwrap();
+            engine.enable_background_checkpoints(Arc::new(()));
+            let marker = temp.path().join("marker");
+            let release = temp.path().join("release");
+            let env = crate::failpoint::test_env(
+                "pause:relational_checkpoint.after_segments",
+                &marker,
+                &release,
+            );
+            let values = (0..384)
+                .map(|id| format!("({id},'{}')", "x".repeat(512)))
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut seed = request(&format!("INSERT INTO items VALUES {values}"));
+            seed.idempotency_key = Some("pressure-seed".into());
+            let first = engine.execute(seed.clone()).unwrap().response;
+            assert!(first.committed, "durable ACK must not wait for checkpoint");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !marker.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let reached = marker.exists();
+            let pressure = engine.state.read().retained_bytes() >= memory::flush_threshold();
+            let replay = engine.execute(seed).unwrap().response;
+            let read = engine
+                .execute(request("SELECT COUNT(*) FROM items"))
+                .unwrap()
+                .response;
+            let sequence = engine.state.read().sequence;
+            let watermark = engine.wal.lock().unwrap().len().unwrap();
+            let cancellation = Arc::new(AtomicBool::new(false));
+            let pending_cancel = Arc::clone(&cancellation);
+            let pending_engine = Arc::clone(&engine);
+            let (send, receive) = std::sync::mpsc::channel();
+            let writer = std::thread::spawn(move || {
+                memory::with_pool_handle(pool, |_| {
+                    let result = pending_engine.execute_with_audit_cancellable(
+                        request("INSERT INTO items VALUES (999, 'next')"),
+                        &AuditContext::embedded(),
+                        pending_cancel,
+                    );
+                    send.send(result).unwrap();
+                });
+            });
+            let early = receive.recv_timeout(Duration::from_millis(150)).ok();
+            let was_waiting = early.is_none();
+            let untouched = engine.state.read().sequence == sequence
+                && engine.wal.lock().unwrap().len().unwrap() == watermark;
+            let result = if cancel_pending {
+                cancellation.store(true, AtomicOrdering::Release);
+                early.or_else(|| receive.recv_timeout(Duration::from_secs(2)).ok())
+            } else {
+                fs::write(&release, b"continue").unwrap();
+                early.or_else(|| receive.recv_timeout(Duration::from_secs(10)).ok())
+            };
+            // Always release the paused worker before any assertion can unwind.
+            fs::write(&release, b"continue").unwrap();
+            writer.join().unwrap();
+            assert!(engine.cancel_and_drain_checkpoint(Instant::now() + Duration::from_secs(10)));
+            drop(env);
+            assert!(
+                reached && pressure,
+                "fixture did not pause a pressured checkpoint"
+            );
+            assert_eq!(replay.transaction_id, first.transaction_id);
+            assert!(matches!(&read.results[0], SqlResult::Rows { rows, .. }
+                if rows == &vec![vec![RelationalValue::Integer(384)]]));
+            assert!(
+                was_waiting && untouched,
+                "new write bypassed checkpoint pressure"
+            );
+            let result = result.expect("pending writer did not finish");
+            if cancel_pending {
+                assert!(
+                    result
+                        .err()
+                        .expect("write should cancel")
+                        .to_string()
+                        .contains("cancel")
+                );
+                assert_eq!(engine.state.read().sequence, sequence);
+                assert_eq!(engine.wal.lock().unwrap().len().unwrap(), watermark);
+            } else {
+                assert!(result.unwrap().response.committed);
+            }
+        });
+        let reopened =
+            RelationalEngine::open(temp.path(), TransactionJournal::open(temp.path()).unwrap())
+                .unwrap();
+        let count = reopened
+            .execute(request("SELECT COUNT(*) FROM items"))
+            .unwrap()
+            .response;
+        assert!(matches!(&count.results[0], SqlResult::Rows { rows, .. }
+            if rows == &vec![vec![RelationalValue::Integer(if cancel_pending {384} else {385})]]));
+    }
+
+    #[test]
+    fn pressured_checkpoint_admits_reads_replays_and_releases_the_next_writer() {
+        pressured_checkpoint_writer(false);
+    }
+
+    #[test]
+    fn pressured_checkpoint_writer_cancels_before_any_commit() {
+        pressured_checkpoint_writer(true);
     }
 
     #[test]

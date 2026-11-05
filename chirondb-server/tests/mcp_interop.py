@@ -248,7 +248,6 @@ async def exercise(args, directory, process, ports, provider):
                         assert_ranking(result["hits"], expected)
             assert "panic" not in stderr_path.read_text()
 
-        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "clients/python"))
         from chirondb_client import ChironDbClient
         sdk = ChironDbClient(base, api_key=ALICE)
         sdk_result = await asyncio.to_thread(sdk.text_hybrid_search, "docs", [1, 0], "refund policy", "text", 5)
@@ -320,8 +319,8 @@ async def exercise(args, directory, process, ports, provider):
                 native = await write("POST", "/collections/real/text_hybrid_search", {"vector": Provider.last_vector, "query": data["queries"][0]["text"], "text_field": "text", "k": 5})
                 assert_ranking(result["hits"], [(hit["id"], hit["score"]) for hit in native["hits"]])
                 real_timing = result["timing_ms"]
-                example_env = {**os.environ, "PYTHONPATH": str(repo / "clients/python"), "CHIRONDB_URL": base, "CHIRONDB_API_KEY": ALICE, "CHIRONDB_MCP_MODEL": "real-minilm", "CHIRONDB_EMBEDDING_API_KEY": EMBEDDING_KEY, "CHIRONDB_EMBEDDING_ENDPOINT": f"http://127.0.0.1:{provider.server_port}/v1/embeddings"}
-                completed = await asyncio.to_thread(subprocess.run, [sys.executable, str(repo / "clients/python/examples/mcp_ingest.py")], env=example_env, capture_output=True, text=True)
+                example_env = {**os.environ, "CHIRONDB_URL": base, "CHIRONDB_API_KEY": ALICE, "CHIRONDB_MCP_MODEL": "real-minilm", "CHIRONDB_EMBEDDING_API_KEY": EMBEDDING_KEY, "CHIRONDB_EMBEDDING_ENDPOINT": f"http://127.0.0.1:{provider.server_port}/v1/embeddings"}
+                completed = await asyncio.to_thread(subprocess.run, [sys.executable, str(Path(os.environ["CHIRONDB_SDK_PYTHON_ROOT"]) / "examples/mcp_ingest.py")], env=example_env, capture_output=True, text=True)
                 assert completed.returncode == 0, completed.stderr
                 assert json.loads(completed.stdout)["hits"][0]["id"] == "retur-001-chunk-01"
 

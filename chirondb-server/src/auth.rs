@@ -14,6 +14,10 @@ use axum::{
 use subtle::ConstantTimeEq;
 use tonic::{Request as GrpcRequest, Status, service::Interceptor};
 
+mod work;
+use work::WorkLimiter;
+pub use work::WorkPermit;
+
 use crate::{
     Db,
     rbac::{Action, Permission, RbacConfig, authorize},
@@ -478,7 +482,7 @@ pub async fn require_http_auth(
     // Attach the resolved permission to request extensions so handlers can read it.
     let (mut parts, body) = request.into_parts();
     parts.extensions.insert(principal.clone());
-    let request = Request::from_parts(parts, body);
+    let mut request = Request::from_parts(parts, body);
 
     if auth.allows_principal_request(&principal) {
         // MCP owns admission for each tool, including its blocking work. Taking
@@ -486,7 +490,7 @@ pub async fn require_http_auth(
         let _work_permit = if mcp_route {
             None
         } else {
-            let Some(permit) = auth.try_begin_work(&principal) else {
+            let Some(permit) = auth.work_limiter.acquire(principal.rate_limit_key()).await else {
                 metrics::counter!("gaussdb_work_limited_requests_total", "transport" => "http")
                     .increment(1);
                 audit_http(
@@ -502,8 +506,11 @@ pub async fn require_http_auth(
                 )?;
                 return Err((StatusCode::TOO_MANY_REQUESTS, "server overloaded").into_response());
             };
-            Some(permit)
+            Some(Arc::new(permit))
         };
+        if let Some(permit) = &_work_permit {
+            request.extensions_mut().insert(Arc::clone(permit));
+        }
         let response = next.run(request).await;
         if operation == Action::Read {
             let (outcome, error_code) = if response.status().is_success() {
@@ -723,67 +730,6 @@ struct RateLimiter {
 struct Bucket {
     tokens: f64,
     last_refill: Instant,
-}
-
-#[derive(Clone, Debug)]
-struct WorkLimiter {
-    state: Arc<Mutex<WorkState>>,
-    global_limit: usize,
-    tenant_limit: usize,
-}
-
-#[derive(Debug, Default)]
-struct WorkState {
-    total: usize,
-    per_tenant: HashMap<String, usize>,
-}
-
-#[derive(Debug)]
-pub struct WorkPermit {
-    state: Arc<Mutex<WorkState>>,
-    tenant: String,
-}
-
-impl Default for WorkLimiter {
-    fn default() -> Self {
-        let global_limit = chirondb_core::resource_profile::current().query_workers;
-        Self {
-            state: Arc::new(Mutex::new(WorkState::default())),
-            global_limit,
-            tenant_limit: global_limit.div_ceil(4).max(1),
-        }
-    }
-}
-
-impl WorkLimiter {
-    fn try_acquire(&self, tenant: &str) -> Option<WorkPermit> {
-        let mut state = self.state.lock().ok()?;
-        let tenant_count = state.per_tenant.get(tenant).copied().unwrap_or(0);
-        if state.total >= self.global_limit || tenant_count >= self.tenant_limit {
-            return None;
-        }
-        state.total += 1;
-        *state.per_tenant.entry(tenant.to_string()).or_default() += 1;
-        Some(WorkPermit {
-            state: Arc::clone(&self.state),
-            tenant: tenant.to_string(),
-        })
-    }
-}
-
-impl Drop for WorkPermit {
-    fn drop(&mut self) {
-        let Ok(mut state) = self.state.lock() else {
-            return;
-        };
-        state.total = state.total.saturating_sub(1);
-        if let Some(count) = state.per_tenant.get_mut(&self.tenant) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                state.per_tenant.remove(&self.tenant);
-            }
-        }
-    }
 }
 
 impl RateLimiter {

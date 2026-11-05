@@ -44,6 +44,8 @@ const WAL_BASE_FILE: &str = "wal.base";
 const WAL_BASE_PREVIOUS_FILE: &str = "wal.base.previous";
 const WAL_BASE_MAGIC: &[u8; 8] = b"GAUSSWB1";
 const WAL_BASE_LEN: usize = 28;
+const WAL_BASE_MAGIC_V2: &[u8; 8] = b"GAUSSWB2";
+const WAL_BASE_LEN_V2: usize = 36;
 const WAL_ARCHIVE_MANIFEST_FILE: &str = "wal.manifest.json";
 const WAL_ARCHIVE_MANIFEST_VERSION: u32 = 2;
 /// Hard safety ceiling for a single serialized WAL record. This matches the
@@ -752,6 +754,8 @@ pub struct Wal {
 struct WalBase {
     lsn: u64,
     first_segment: u64,
+    // V1 lacks a suffix frontier. V2 fences rotation before any new ACK.
+    last_segment: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -909,6 +913,20 @@ impl Wal {
         Self::open_with_segment_bytes(dir, DEFAULT_SEGMENT_BYTES)
     }
 
+    /// A catalogued store must retain an active segment, including after reset.
+    /// This check never creates a replacement for missing acknowledged data.
+    pub(crate) fn validate_existing(dir: &Path) -> Result<()> {
+        let metadata = fs::symlink_metadata(dir)
+            .map_err(|error| wal_corruption(dir, &format!("missing WAL directory: {error}")))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(wal_corruption(dir, "WAL requires a regular directory"));
+        }
+        if wal_segments(dir)?.is_empty() {
+            return Err(wal_corruption(dir, "missing active WAL segment"));
+        }
+        Ok(())
+    }
+
     /// Open a control journal with the production segment size even when a
     /// collection-WAL fault test overrides its segment threshold globally.
     /// Transaction-journal rotation has its own decision-boundary tests; a
@@ -920,6 +938,11 @@ impl Wal {
 
     fn open_with_segment_bytes(dir: &Path, segment_bytes: u64) -> Result<Self> {
         let memory = layout::root(dir, std::mem::size_of::<Self>())?;
+        if dir.join(WAL_ARCHIVE_MANIFEST_FILE).try_exists()? {
+            return Err(GaussError::InvalidRequest(
+                "immutable WAL archives cannot be opened for writes; use WAL scan/load".into(),
+            ));
+        }
         let dir_created = !dir.exists();
         fs::create_dir_all(dir)?;
         if dir_created && let Some(parent) = dir.parent() {
@@ -951,6 +974,15 @@ impl Wal {
         if created {
             file.sync_all()?;
             sync_directory(dir)?;
+        }
+        if wal_base.last_segment != Some(active_index) {
+            write_wal_base(
+                dir,
+                WalBase {
+                    last_segment: Some(active_index),
+                    ..wal_base
+                },
+            )?;
         }
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -1275,6 +1307,7 @@ impl Wal {
             WalBase {
                 lsn: reset_lsn,
                 first_segment: successor_index,
+                last_segment: Some(successor_index),
             },
         )?;
 
@@ -1385,6 +1418,19 @@ impl Wal {
             metrics::counter!("chirondb_wal_corruption_total").increment(1);
         }
         result
+    }
+
+    /// Inspect the complete recovery prefix without creating files or repairing
+    /// its final torn frame. All sealed-frame, CRC and continuity checks remain.
+    pub(crate) fn inspect_recovery_prefix<F>(
+        dir: &Path,
+        watermark: u64,
+        visitor: F,
+    ) -> Result<WalScanStats>
+    where
+        F: FnMut(WalRecord) -> Result<()>,
+    {
+        scan_records(dir, watermark, TailPolicy::InspectFinalActive, visitor)
     }
 
     pub(crate) fn scan_journal_from(
@@ -1633,6 +1679,7 @@ impl Wal {
             WalBase {
                 lsn: new_base_lsn,
                 first_segment,
+                last_segment: Some(self.active_index),
             },
         )?;
         for segment in segments.into_iter().take(drop_count) {
@@ -1679,6 +1726,15 @@ impl Wal {
                 durable_remove_file(&later.path)?;
             }
             sync_directory(dir)?;
+            if wal_base.last_segment.is_some() {
+                write_wal_base(
+                    dir,
+                    WalBase {
+                        last_segment: Some(segment.index),
+                        ..wal_base
+                    },
+                )?;
+            }
             return Ok(());
         }
 
@@ -1721,6 +1777,14 @@ impl Wal {
         self.file.sync_all()?;
         crate::failpoint::check("wal_rotation.after_new_sync")?;
         sync_directory(&self.dir)?;
+        let base = read_wal_base(&self.dir)?;
+        write_wal_base(
+            &self.dir,
+            WalBase {
+                last_segment: Some(self.active_index),
+                ..base
+            },
+        )?;
         crate::failpoint::check("wal_rotation.after_directory_sync")?;
         #[cfg(any(test, feature = "fault-injection"))]
         crate::fs_util::fault_injection::crash_hook(
@@ -1807,10 +1871,26 @@ impl FrozenWalArchive {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        let base_bytes = match fs::read(&base_path) {
+        let mut base_bytes = match fs::read(&base_path) {
             Ok(bytes) => Some(bytes),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.into()),
+        };
+        // A frozen archive excludes the new empty active segment. Bind the
+        // archive's own final segment rather than copying the live frontier.
+        let base = if base.last_segment.is_some() {
+            let archived = WalBase {
+                last_segment: frozen_segments.last().map(|segment| segment.index),
+                ..base
+            };
+            if archived != base {
+                let (encoded, _admission) = encode_wal_base(archived)?;
+                memory.prepare(descriptor_bytes + 2 * encoded.len() as u64)?;
+                base_bytes = Some(encoded);
+            }
+            archived
+        } else {
+            base
         };
         Ok(Some(Self {
             base,
@@ -1965,6 +2045,7 @@ pub fn prune_archives_older_than(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TailPolicy {
     Strict,
+    InspectFinalActive,
     RepairFinalActive,
 }
 
@@ -2185,6 +2266,11 @@ fn repair_or_reject_torn_tail(
         )));
     }
 
+    if tail_policy == TailPolicy::InspectFinalActive {
+        stats.end_lsn = end_lsn;
+        return Ok(stats);
+    }
+
     let file = OpenOptions::new().write(true).open(&segment.path)?;
     file.set_len(last_good_segment_offset)?;
     file.sync_all()?;
@@ -2256,44 +2342,77 @@ fn read_wal_base(dir: &Path) -> Result<WalBase> {
     let mut admission = crate::relational::wal_decode::FrameAdmission::new()?;
     admission.prepare(encoded_len as usize, false)?;
     let encoded = fs::read(&path)?;
-    let bytes = encryption::decode_persistent_bounded(&encoded, WAL_BASE_LEN)
+    let bytes = encryption::decode_persistent_bounded(&encoded, WAL_BASE_LEN_V2)
         .map_err(|error| wal_corruption(&path, &format!("cannot decode wal.base: {error}")))?;
-    if bytes.len() != WAL_BASE_LEN || &bytes[..8] != WAL_BASE_MAGIC {
+    let payload_end = if bytes.len() == WAL_BASE_LEN && &bytes[..8] == WAL_BASE_MAGIC {
+        24
+    } else if bytes.len() == WAL_BASE_LEN_V2 && &bytes[..8] == WAL_BASE_MAGIC_V2 {
+        32
+    } else {
         return Err(GaussError::WalCorruption {
             path: path.display().to_string(),
             message: "invalid wal.base header".to_string(),
         });
-    }
-    let payload = &bytes[8..24];
-    let expected_crc = u32::from_le_bytes(bytes[24..28].try_into().expect("wal.base crc"));
+    };
+    let payload = &bytes[8..payload_end];
+    let expected_crc = u32::from_le_bytes(bytes[payload_end..].try_into().expect("wal.base crc"));
     if checksum(payload) != expected_crc {
         return Err(GaussError::WalCorruption {
             path: path.display().to_string(),
             message: "wal.base crc mismatch".to_string(),
         });
     }
-    Ok(WalBase {
+    let base = WalBase {
         lsn: u64::from_le_bytes(payload[..8].try_into().expect("wal.base lsn")),
         first_segment: u64::from_le_bytes(
             payload[8..16].try_into().expect("wal.base first segment"),
         ),
-    })
+        last_segment: (payload_end == 32).then(|| {
+            u64::from_le_bytes(payload[16..24].try_into().expect("wal.base last segment"))
+        }),
+    };
+    if base
+        .last_segment
+        .is_some_and(|last| last < base.first_segment)
+    {
+        return Err(wal_corruption(
+            &path,
+            "wal.base segment frontier precedes its retained prefix",
+        ));
+    }
+    Ok(base)
+}
+
+fn encode_wal_base(
+    wal_base: WalBase,
+) -> Result<(Vec<u8>, crate::relational::wal_decode::FrameAdmission)> {
+    let mut admission = crate::relational::wal_decode::FrameAdmission::new()?;
+    admission.prepare(WAL_BASE_LEN_V2, false)?;
+    let mut payload = [0_u8; 24];
+    payload[..8].copy_from_slice(&wal_base.lsn.to_le_bytes());
+    payload[8..16].copy_from_slice(&wal_base.first_segment.to_le_bytes());
+    let (magic, length) = match wal_base.last_segment {
+        Some(last) => {
+            payload[16..].copy_from_slice(&last.to_le_bytes());
+            (WAL_BASE_MAGIC_V2, 24)
+        }
+        None => (WAL_BASE_MAGIC, 16),
+    };
+    let mut plaintext = Vec::with_capacity(WAL_BASE_LEN_V2);
+    plaintext.extend_from_slice(magic);
+    plaintext.extend_from_slice(&payload[..length]);
+    plaintext.extend_from_slice(&checksum(&payload[..length]).to_le_bytes());
+    Ok((
+        encryption::encode_persistent(FileType::Wal, &plaintext)?.into_owned(),
+        admission,
+    ))
 }
 
 fn write_wal_base(dir: &Path, wal_base: WalBase) -> Result<()> {
     let _memory = layout::root(dir, std::mem::size_of::<WalBase>())?;
-    let mut admission = crate::relational::wal_decode::FrameAdmission::new()?;
-    admission.prepare(WAL_BASE_LEN, false)?;
     let path = dir.join(WAL_BASE_FILE);
     let tmp_path = dir.join(format!("{WAL_BASE_FILE}.tmp"));
-    let mut payload = [0_u8; 16];
-    payload[..8].copy_from_slice(&wal_base.lsn.to_le_bytes());
-    payload[8..].copy_from_slice(&wal_base.first_segment.to_le_bytes());
-    let mut plaintext = Vec::with_capacity(WAL_BASE_LEN);
-    plaintext.extend_from_slice(WAL_BASE_MAGIC);
-    plaintext.extend_from_slice(&payload);
-    plaintext.extend_from_slice(&checksum(&payload).to_le_bytes());
-    let encoded = encryption::encode_persistent(FileType::Wal, &plaintext)?;
+    let (encoded, _admission) = encode_wal_base(wal_base)?;
     let mut file = File::create(&tmp_path)?;
     file.write_all(&encoded)?;
     file.sync_all()?;
@@ -2875,6 +2994,125 @@ mod tests {
             GraphTypeConfiguration, Wal, WalEntry, WalRecord, checksum,
         },
     };
+
+    #[test]
+    fn legacy_base_is_upgraded_before_append_but_immutable_archive_is_preserved() {
+        for archive in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let mut wal = Wal::open(temp.path()).unwrap();
+            wal.append(&WalEntry::Delete {
+                id: "legacy".into(),
+            })
+            .unwrap();
+            drop(wal);
+            super::write_wal_base(temp.path(), super::WalBase::default()).unwrap();
+            if archive {
+                super::write_archive_manifest(temp.path()).unwrap();
+            }
+            let before = std::fs::read(temp.path().join(super::WAL_BASE_FILE)).unwrap();
+            assert_eq!(Wal::load(temp.path()).unwrap().len(), 1);
+            if archive {
+                assert!(Wal::open(temp.path()).is_err());
+                assert_eq!(
+                    super::read_wal_base(temp.path()).unwrap().last_segment,
+                    None
+                );
+                assert_eq!(
+                    std::fs::read(temp.path().join(super::WAL_BASE_FILE)).unwrap(),
+                    before
+                );
+                super::verify_archive_manifest_if_present(temp.path()).unwrap();
+            } else {
+                let reopened = Wal::open(temp.path()).unwrap();
+                assert_eq!(
+                    super::read_wal_base(temp.path()).unwrap().last_segment,
+                    Some(0)
+                );
+                drop(reopened);
+            }
+        }
+    }
+
+    #[test]
+    fn rotation_frontier_rejects_deleted_first_middle_and_last_segments() {
+        for removed in 0..3 {
+            let temp = TempDir::new().unwrap();
+            let mut wal = Wal::open_with_segment_bytes(temp.path(), 100).unwrap();
+            for index in 0..3 {
+                wal.append(&WalEntry::Delete {
+                    id: index.to_string(),
+                })
+                .unwrap();
+            }
+            drop(wal);
+            assert_eq!(
+                super::read_wal_base(temp.path()).unwrap().last_segment,
+                Some(2)
+            );
+            std::fs::remove_file(super::segment_path(temp.path(), removed)).unwrap();
+            assert!(Wal::load(temp.path()).is_err());
+            assert!(Wal::open(temp.path()).is_err());
+            assert!(!super::segment_path(temp.path(), removed).exists());
+        }
+    }
+
+    #[test]
+    fn unpublished_empty_successor_is_recoverable_but_data_ahead_of_frontier_is_not() {
+        for has_data in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let mut wal = Wal::open(temp.path()).unwrap();
+            wal.append(&WalEntry::Delete { id: "ack".into() }).unwrap();
+            drop(wal);
+            std::fs::write(
+                super::segment_path(temp.path(), 1),
+                if has_data { &[1][..] } else { &[] },
+            )
+            .unwrap();
+            if has_data {
+                assert!(Wal::open(temp.path()).is_err());
+            } else {
+                let mut reopened = Wal::open(temp.path()).unwrap();
+                assert_eq!(
+                    super::read_wal_base(temp.path()).unwrap().last_segment,
+                    Some(1)
+                );
+                reopened
+                    .append(&WalEntry::Delete { id: "next".into() })
+                    .unwrap();
+                assert_eq!(Wal::load(temp.path()).unwrap().len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn base_frontier_requires_valid_crc_and_retained_range() {
+        let temp = TempDir::new().unwrap();
+        super::write_wal_base(
+            temp.path(),
+            super::WalBase {
+                lsn: 0,
+                first_segment: 2,
+                last_segment: Some(1),
+            },
+        )
+        .unwrap();
+        assert!(
+            super::read_wal_base(temp.path())
+                .unwrap_err()
+                .to_string()
+                .contains("precedes")
+        );
+        let path = temp.path().join(super::WAL_BASE_FILE);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[24] ^= 1;
+        std::fs::write(path, bytes).unwrap();
+        assert!(
+            super::read_wal_base(temp.path())
+                .unwrap_err()
+                .to_string()
+                .contains("crc")
+        );
+    }
 
     #[test]
     fn appends_lsn_records() {
@@ -3554,6 +3792,7 @@ mod tests {
             super::WalBase {
                 lsn: reset_lsn,
                 first_segment: 2,
+                last_segment: Some(2),
             },
         )
         .unwrap();
@@ -3821,6 +4060,7 @@ mod tests {
             super::WalBase {
                 lsn: first_end,
                 first_segment: 1,
+                last_segment: Some(1),
             },
         )
         .unwrap();

@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="docs/releases/0.1.0-beta.2.md"><img alt="Version: 0.1.0-beta.2" src="https://img.shields.io/badge/version-0.1.0--beta.2-1677F0?style=flat-square"></a>
+  <a href="docs/releases/0.1.0-beta.3.md"><img alt="Version: 0.1.0-beta.3" src="https://img.shields.io/badge/version-0.1.0--beta.3-1677F0?style=flat-square"></a>
   <a href="rust-toolchain.toml"><img alt="Rust: 1.92" src="https://img.shields.io/badge/Rust-1.92-0D213B?style=flat-square"></a>
   <a href="LICENSE"><img alt="License: AGPL-3.0-only" src="https://img.shields.io/badge/license-AGPL--3.0--only-1677F0?style=flat-square"></a>
 </p>
@@ -39,7 +39,8 @@ ChironWire, read-only MCP tools, or an interactive ChironQL console.
 
 A single LS-VEC engine manages dense retrieval. The beta also includes a
 single-node property-graph overlay: points become vertices, typed edges connect
-them, and graph constraints narrow dense or hybrid search. Your application
+them, and graph constraints narrow dense or hybrid search. Atomic relation
+batches and a resumable JSONL loader support loading connected data in bulk. Your application
 supplies the embeddings and handles generation; ChironDB stores and retrieves
 the context.
 
@@ -73,7 +74,7 @@ authentication plus RBAC.
 
 ## Status
 
-The current source version is **`0.1.0-beta.2`**. ChironDB is under active beta
+The current source version is **`0.1.0-beta.3`**. ChironDB is under active beta
 development and **is not production ready**. Features are available for evaluation;
 this is not a stable compatibility or uptime SLA. Start with a
 source build. Tagged binary releases and prebuilt images should be used
@@ -81,9 +82,10 @@ only when their artifacts are available and verified.
 
 Single-node use is the evaluation path. The graph overlay is implemented;
 comprehensive graph acceptance remains open. Kubernetes and the web UI are
-previews, and distributed graph traversal is outside the beta scope. Python
-and Rust clients are distributed from source. The MCP surface is configuration
-gated and read-only. Windows support is best-effort.
+previews, and distributed graph traversal is outside the beta scope. Python,
+Rust and Node.js clients are maintained in standalone SDK repositories; see
+[SDK installation](docs/SDKS.md). The MCP surface is configuration gated and
+read-only. Windows support is best-effort.
 
 ChironDB complements PostgreSQL/pgvector for vector retrieval. Its legacy
 pgvector profile accepts six vector-only SQL shapes and still rejects features
@@ -217,9 +219,9 @@ For Docker, HTTP requests, hybrid search, MCP, SDKs, and restart instructions, f
 | [ChironQL](docs/CHIRONQL.md) | Interactive queries, writes, graph traversal, filters, and errors |
 | [HTTP API](docs/HTTP_API.md) | REST requests, authentication, graph operations, and administration |
 | [gRPC API](docs/GRPC_API.md) | RPCs, reflection, TLS, and generated clients |
-| [Python, Rust, and MCP clients](docs/SDKS.md) | Source installation, application examples, and MCP configuration |
+| [Python, Rust, Node.js, and MCP clients](docs/SDKS.md) | Source installation, application examples, and MCP configuration |
 | [Tenant isolation](docs/TENANT_ISOLATION.md) | Ownership, migration, and enforcement |
-| [Beta release notes](docs/releases/0.1.0-beta.2.md) | Relational preview, model availability, and evaluation limits |
+| [Beta release notes](docs/releases/0.1.0-beta.3.md) | Recovery, durable bulk loading, upgrade and evaluation limits |
 
 ## Coming from GaussDB
 

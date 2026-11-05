@@ -9,6 +9,69 @@ use std::{
 
 use crate::error::Result;
 
+/// Only the reserved sibling names emitted by `temporary_sibling` and the WAL
+/// base publisher are disposable. Callers must hold the data-directory lease.
+pub(crate) fn cleanup_atomic_temps(root: &Path) -> Result<()> {
+    if !root.try_exists()? {
+        return Ok(());
+    }
+    // These immutable bundles bind their own file inventory. A factory-shaped
+    // name inside one may be part of that inventory; leave validation and
+    // reclamation to its owner instead of changing it before verification.
+    if [
+        "manifest.gdx",
+        "backup.manifest",
+        "journal.manifest",
+        "wal.manifest.json",
+    ]
+    .iter()
+    .any(|name| root.join(name).exists())
+    {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let atomic_temp = name.to_str().is_some_and(|name| {
+            let Some(stem) = name
+                .strip_prefix('.')
+                .and_then(|name| name.strip_suffix(".tmp"))
+            else {
+                return false;
+            };
+            stem.rsplit_once('.').is_some_and(|(target, id)| {
+                !target.is_empty()
+                    && uuid::Uuid::parse_str(id).is_ok_and(|uuid| {
+                        uuid.get_version() == Some(uuid::Version::Random)
+                            && uuid.hyphenated().to_string() == id
+                    })
+            })
+        });
+        let wal_temp = name == "wal.base.tmp"
+            && root
+                .file_name()
+                .is_some_and(|name| name == "wal" || name == "catalog_wal" || name == "journal");
+        if atomic_temp || wal_temp {
+            if !kind.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "atomic temporary path is not a regular file: {}",
+                        path.display()
+                    ),
+                )
+                .into());
+            }
+            durable_remove_file(&path)?;
+        } else if kind.is_dir() {
+            cleanup_atomic_temps(&path)?;
+        }
+    }
+    Ok(())
+}
+
 /// Deterministic, one-shot faults for durability tests. This module is absent
 /// from normal and release builds unless the non-production feature is
 /// explicitly enabled.

@@ -15,7 +15,8 @@ RUN test "$(uname -m)" = aarch64 \
 FROM source AS lint
 RUN --mount=type=cache,id=frontier-registry-arm64,target=/usr/local/cargo/registry \
     --mount=type=cache,id=frontier-target-arm64,target=/app/target,sharing=locked \
-    cargo --config profile.dev.debug=0 --config profile.test.debug=0 clippy --workspace --all-targets --locked -j 2 -- -D warnings
+    cargo clean -p chirondb -p chirondb-core -p chirondb-types -p chirondb-ui-server \
+    && cargo --config profile.dev.debug=0 --config profile.test.debug=0 clippy --workspace --all-targets --locked -j 2 -- -D warnings
 
 FROM lint AS tests
 RUN --mount=type=cache,id=frontier-registry-arm64,target=/usr/local/cargo/registry \
@@ -25,4 +26,5 @@ RUN --mount=type=cache,id=frontier-registry-arm64,target=/usr/local/cargo/regist
 FROM tests AS release
 RUN --mount=type=cache,id=frontier-registry-arm64,target=/usr/local/cargo/registry \
     --mount=type=cache,id=frontier-target-arm64,target=/app/target,sharing=locked \
-    cargo build --release --locked --bins -j 2
+    cargo clean --release -p chirondb -p chirondb-core -p chirondb-types -p chirondb-ui-server \
+    && cargo build --release --locked --bins -j 2
