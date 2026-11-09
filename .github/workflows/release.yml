@@ -385,6 +385,12 @@ jobs:
           mkdir -p "$out/sbom"
           find . -name '*.cdx.json' -not -path './target/*' -not -path './fuzz/target/*' -exec cp {} "$out/sbom/" \;
           cp LICENSE NOTICE TRADEMARKS.md "$out/"
+          if [[ -d chirondb-temporal ]]; then
+            mkdir -p "$out/chirondb-temporal/verification"
+            cp chirondb-temporal/THIRD_PARTY.md "$out/chirondb-temporal/"
+            cp -R chirondb-temporal/licenses "$out/chirondb-temporal/"
+            cp chirondb-temporal/verification/sources.json "$out/chirondb-temporal/verification/"
+          fi
           python3 -c 'import json, os, sys; json.dump({"tag": os.environ["RELEASE_TAG"], "source_sha": os.environ["SOURCE_SHA"], "workflow_sha": os.environ["GITHUB_SHA"], "workflow_ref": os.environ["GITHUB_WORKFLOW_REF"]}, open(sys.argv[1], "w"), indent=2)' "$out/RELEASE_SOURCE.json"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             7z a "${out}.zip" "$out" > /dev/null

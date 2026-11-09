@@ -22,6 +22,7 @@
 //! engine does not measure one per query.
 
 pub use crate::chironql_output::QueryResult;
+pub(crate) mod temporal;
 use crate::chironql_output::query::{self as receiving, JsonKey, QueryMemory};
 use crate::chironql_output::retrieval;
 use std::cmp::Ordering;
@@ -259,6 +260,28 @@ fn execute_with_parser(
             trace: Some(Box::new(trace)),
         });
     }
+    if matches!(
+        statement,
+        Statement::TemporalAppend { .. } | Statement::TemporalRead(_) | Statement::Pipeline(_)
+    ) {
+        let mut resources = statement.collections();
+        if matches!(&statement,Statement::Pipeline(p) if p.temporal.is_some()) {
+            resources.extend(statement.tables().iter().cloned());
+        }
+        for collection in resources {
+            if !ctx.allows_collection(&collection) {
+                return Err(ChironQlError {
+                    error: "collection is unavailable to this session".into(),
+                    code: "chironql.collection_forbidden".into(),
+                    hint: None,
+                    position: None,
+                    affected_estimate: None,
+                    query_id,
+                    trace: Some(Box::new(trace)),
+                });
+            }
+        }
+    }
     trace.push_ok(stage::AUTHORIZE, micros(authorize_started), None);
 
     if ctx.idempotency_key.is_some()
@@ -302,6 +325,14 @@ fn dispatch(
     memory: &mut QueryMemory,
 ) -> ExecResult {
     let value = match statement {
+        Statement::TemporalRead(_) | Statement::TemporalAppend { .. } => temporal::execute(
+            ctx.db,
+            chirondb_core::db::temporal::TemporalAccess::Scoped(&ctx.tenant),
+            statement,
+            query_id,
+            memory,
+            |e| engine_error(ctx.role, query_id, trace, Instant::now(), e),
+        ),
         Statement::MlMaterialize(definition) => {
             if ctx.db.tenant_enforcement().blocks() {
                 return Err(ChironQlError {
@@ -652,6 +683,56 @@ pub(crate) struct PipelineRows {
     pub(crate) rows: Vec<serde_json::Map<String, Value>>,
 }
 
+pub(crate) fn explain_pipeline(
+    pipeline: &Pipeline,
+    query_id: &str,
+    memory: &mut QueryMemory,
+) -> ExecResult {
+    memory.ql(16384, query_id)?;
+    let mut plan = vec![
+        "operator=multimodel_pipeline".to_string(),
+        "domains=vector,relational".to_string(),
+        format!(
+            "vector_stage={}",
+            pipeline
+                .vector
+                .as_deref()
+                .map_or("none", Statement::kind_name)
+        ),
+        format!("relational_tables={}", pipeline.relational.tables.join(",")),
+        format!("joins={}", pipeline.joins.len()),
+        format!("limit={}", pipeline.limit),
+        "snapshot=multimodel_read".to_string(),
+        "memory=bounded_hash_join".to_string(),
+    ];
+    if pipeline.graph.is_some() {
+        plan[1] = "domains=vector,graph,relational".to_string();
+        plan.push("graph_stage=traverse".to_string());
+    }
+    if let Some(t) = &pipeline.temporal {
+        plan[1] = format!(
+            "domains={}temporal",
+            if pipeline.graph.is_some() {
+                "vector,graph,relational,"
+            } else if pipeline.vector.is_some() {
+                "vector,relational,"
+            } else {
+                "relational,"
+            }
+        );
+        plan.push(format!(
+            "temporal_stage={} per_asset_limit={} total_limit={}",
+            t.alias,
+            t.query.range.map_or(1, |r| r.2),
+            chirondb_core::db::temporal::MAX_HISTORY
+        ));
+    }
+    let rows = plan.into_iter().map(|line| json!({"plan": line})).collect();
+    let mut response = rows_response(query_id, vec!["plan".into()], rows);
+    response.column_types = vec![RelationalType::Text];
+    Ok(response)
+}
+
 fn exec_pipeline(
     ctx: &mut ExecContext<'_>,
     pipeline: &Pipeline,
@@ -660,25 +741,7 @@ fn exec_pipeline(
     memory: &mut QueryMemory,
 ) -> ExecResult {
     if pipeline.explain {
-        memory.ql(16384, query_id)?;
-        let mut plan = vec![
-            "operator=multimodel_pipeline".to_string(),
-            "domains=vector,relational".to_string(),
-            format!("vector_stage={}", pipeline.vector.kind_name()),
-            format!("relational_tables={}", pipeline.relational.tables.join(",")),
-            format!("joins={}", pipeline.joins.len()),
-            format!("limit={}", pipeline.limit),
-            "snapshot=multimodel_read".to_string(),
-            "memory=bounded_hash_join".to_string(),
-        ];
-        if pipeline.graph.is_some() {
-            plan[1] = "domains=vector,graph,relational".to_string();
-            plan.push("graph_stage=traverse".to_string());
-        }
-        let rows = plan.into_iter().map(|line| json!({"plan": line})).collect();
-        let mut response = rows_response(query_id, vec!["plan".into()], rows);
-        response.column_types = vec![RelationalType::Text];
-        return Ok(response);
+        return explain_pipeline(pipeline, query_id, memory);
     }
 
     let snapshot_started = Instant::now();
@@ -705,29 +768,33 @@ fn exec_pipeline(
         ),
     );
 
-    let vector_response = dispatch(ctx, &pipeline.vector, query_id, trace, memory)?;
-    let vector_namespace = pipeline
-        .vector
-        .collection()
-        .map(str::to_owned)
-        .or_else(|| ctx.session.collection.clone())
-        .ok_or_else(|| ChironQlError {
-            error: "VECTOR stage needs a collection".into(),
-            code: "chironql.no_collection".into(),
-            hint: None,
-            position: None,
-            affected_estimate: None,
-            query_id: query_id.into(),
-            trace: None,
-        })?;
-    let vector_rows = qualify_pipeline_rows(
-        &pipeline.vector_alias,
-        vector_response,
-        Some(&vector_namespace),
-        memory,
-    )?;
+    let vector_rows = if let Some(vector) = pipeline.vector.as_deref() {
+        let vector_response = dispatch(ctx, vector, query_id, trace, memory)?;
+        let vector_namespace = vector
+            .collection()
+            .map(str::to_owned)
+            .or_else(|| ctx.session.collection.clone())
+            .ok_or_else(|| ChironQlError {
+                error: "VECTOR stage needs a collection".into(),
+                code: "chironql.no_collection".into(),
+                hint: None,
+                position: None,
+                affected_estimate: None,
+                query_id: query_id.into(),
+                trace: None,
+            })?;
+        Some(qualify_pipeline_rows(
+            &pipeline.vector_alias,
+            vector_response,
+            Some(&vector_namespace),
+            memory,
+        )?)
+    } else {
+        None
+    };
 
     let graph_rows = if let Some(graph) = &pipeline.graph {
+        let vector_rows = vector_rows.as_ref().expect("validated graph source");
         memory.ql(4096 + pipeline.vector_alias.len() as u64, query_id)?;
         let anchor_key = format!("{}.id", pipeline.vector_alias);
         let anchor_bytes = vector_rows
@@ -783,18 +850,33 @@ fn exec_pipeline(
 
     let relational_response = exec_sql(ctx, &pipeline.relational, query_id, trace, memory)?;
     let relational_snapshot = relational_response.snapshot_id.clone();
-    let relational_rows = qualify_pipeline_rows(
-        &pipeline.relational_alias,
-        relational_response,
-        None,
-        memory,
-    )?;
+    let relational_rows = temporal::relational_seed(pipeline, relational_response, memory)?;
 
+    let temporal_rows = temporal::stage_rows(
+        ctx.db,
+        chirondb_core::db::temporal::TemporalAccess::Scoped(&ctx.tenant),
+        pipeline,
+        [
+            vector_rows
+                .as_ref()
+                .map(|r| (pipeline.vector_alias.as_str(), r)),
+            pipeline
+                .graph
+                .as_ref()
+                .zip(graph_rows.as_ref())
+                .map(|(g, r)| (g.alias.as_str(), r)),
+            Some((&pipeline.relational_alias, &relational_rows)),
+        ],
+        query_id,
+        memory,
+        |e| engine_error(ctx.role, query_id, trace, Instant::now(), e),
+    )?;
     let mut response = assemble_pipeline_response(
         pipeline,
         vector_rows,
         graph_rows,
         relational_rows,
+        temporal_rows,
         query_id,
         trace,
         ctx.role,
@@ -821,15 +903,19 @@ fn exec_pipeline(
     );
     let relational_snapshot = relational_snapshot.unwrap_or_else(|| "relational:unknown".into());
     response.snapshot_id = Some(format!("multimodel:{frontier}:{relational_snapshot}"));
+    if pipeline.temporal.is_some() {
+        memory.temporal_snapshot = Some(snapshot);
+    }
     Ok(response)
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn assemble_pipeline_response(
     pipeline: &Pipeline,
-    vector_rows: PipelineRows,
+    vector_rows: Option<PipelineRows>,
     graph_rows: Option<PipelineRows>,
     relational_rows: PipelineRows,
+    temporal_rows: Option<PipelineRows>,
     query_id: &str,
     trace: &mut QueryTrace,
     role: Role,
@@ -844,11 +930,19 @@ pub(crate) fn assemble_pipeline_response(
     sources
         .try_reserve(2)
         .map_err(|_| receiving::error(query_id, receiving::full()))?;
-    sources.insert(pipeline.relational_alias.clone(), relational_rows);
+    let mut joined = if let Some(rows) = vector_rows {
+        sources.insert(pipeline.relational_alias.clone(), relational_rows);
+        rows
+    } else {
+        relational_rows
+    };
+    if let (Some(t), Some(rows)) = (&pipeline.temporal, temporal_rows) {
+        sources.insert(t.alias.clone(), rows);
+    }
     if let (Some(graph), Some(rows)) = (&pipeline.graph, graph_rows) {
         sources.insert(graph.alias.clone(), rows);
     }
-    let mut joined = vector_rows;
+
     for join in &pipeline.joins {
         let join_started = Instant::now();
         let right = sources.remove(&join.alias).ok_or_else(|| ChironQlError {

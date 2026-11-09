@@ -1,0 +1,10 @@
+[package]
+name = "chirondb-temporal"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+publish = false
+license = "AGPL-3.0-only"
+
+[dependencies]
+crc32fast = "1.5.0"

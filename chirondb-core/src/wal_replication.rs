@@ -232,6 +232,11 @@ pub async fn apply_replicated_wal_entry(
                     .to_string(),
             ));
         }
+        WalEntry::TemporalBatch { .. } => {
+            return Err(GaussError::InvalidRequest(
+                "temporal storage requires journal-aware replication".into(),
+            ));
+        }
         WalEntry::ProtectedBatch { .. } => {
             return Err(GaussError::InvalidRequest(
                 "protected collections require single-node operation".into(),

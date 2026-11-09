@@ -1837,7 +1837,7 @@ fn canonical_wal_plaintext(bytes: &[u8], keyring: Option<&Keyring>) -> Result<Ve
     Ok(output)
 }
 
-fn hex_digest(bytes: &[u8]) -> String {
+pub(crate) fn hex_digest(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -1980,7 +1980,7 @@ fn persisted_file_type(path: &Path) -> FileType {
         FileType::Snapshot
     } else if name == crate::graph_identity::GRAPH_IDENTITY_FILE {
         FileType::Metadata
-    } else if name.ends_with(".gdx") {
+    } else if name.ends_with(".gdx") || name.ends_with(".ctsg") {
         FileType::Segment
     } else {
         FileType::Metadata

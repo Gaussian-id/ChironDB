@@ -22,3 +22,7 @@ Trademarks
 ChironDB, GaussDB, their names, and related logos or brand assets are
 trademarks or service marks of Gaussian-id. No trademark permission is
 granted by this notice. See TRADEMARKS.md for the project trademark policy.
+
+The internal temporal crate adapts portions of InfluxDB OSS 2.9.0, Apache
+TsFile 2.5.0 and Apache IoTDB 2.0.11. See chirondb-temporal/THIRD_PARTY.md
+and the accompanying license texts and upstream notices.

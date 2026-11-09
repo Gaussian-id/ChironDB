@@ -302,6 +302,34 @@ pub(super) fn rebuild(source: &Path, staging: &Path, frontier: u64, output: &Pat
 
     let mut wal = Wal::open_control_journal(output)?;
     Wal::scan_journal_from(source, 0, |record| {
+        if let WalEntry::TransactionPrepare { prepare } = &record.entry
+            && prepare.commit_sequence > frontier
+            && matches!(prepare.mutation.as_ref(), WalEntry::TemporalBatch { .. })
+            && decisions.committed(prepare)?
+        {
+            let TransactionTarget::Collection { name } = &prepare.target else {
+                return Err(corrupt("temporal restore targets a non-collection store"));
+            };
+            let prefix = catalog_key(name, 0)?;
+            let mut latest = catalog.prefix_cursor(&prefix[..prefix.len() - 8])?;
+            let retired = if let Some(record) = latest.next().transpose()? {
+                let reference = record.decode::<Reference>()?;
+                let lifecycle = read_prepare(source, &reference)?;
+                prepare.commit_sequence < reference.sequence
+                    || matches!(
+                        lifecycle.mutation.as_ref(),
+                        WalEntry::DropCollection { .. } | WalEntry::DropProtectedCollection { .. }
+                    )
+            } else {
+                false
+            };
+            if !retired {
+                super::super::temporal::prepare_restore_checkpoint(
+                    &collection_dir(&root, name),
+                    prepare.mutation.as_ref(),
+                )?;
+            }
+        }
         if let WalEntry::TransactionProjection { projection } = &record.entry
             && projection.kind == ProjectionKind::Storage
             && !decisions.keep_storage(projection.transaction_id, frontier)?

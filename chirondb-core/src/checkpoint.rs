@@ -14,6 +14,7 @@ use crate::{
 };
 
 const CHECKPOINT_MAGIC: &[u8; 8] = b"GAUSSCP1";
+const TEMPORAL_CHECKPOINT_MAGIC: &[u8; 8] = b"CHRNTCP1";
 const HEADER_LEN: usize = 20;
 pub const CHECKPOINT_FILE: &str = "checkpoint.gdx";
 pub const SEGMENTS_MANIFEST_FILE: &str = "segments.json";
@@ -69,6 +70,13 @@ pub struct CollectionCheckpoint {
     #[serde(default)]
     pub wal_watermark: u64,
     pub schema_crc: u32,
+    /// Present (even if empty) only after activating temporal WAL v1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temporal_runs: Option<Vec<String>>,
+    /// Exclusive WAL cutoff covered by temporal runs. A graph manifest can
+    /// publish its own, later frontier before the collection checkpoint lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temporal_wal_lsn: Option<u64>,
 }
 
 impl CollectionCheckpoint {
@@ -86,6 +94,8 @@ impl CollectionCheckpoint {
             points,
             segment_id,
             segments: None,
+            temporal_runs: None,
+            temporal_wal_lsn: None,
             wal_watermark: 0,
             schema_crc: schema_crc(config)?,
         })
@@ -102,7 +112,11 @@ pub fn write_checkpoint(collection_dir: &Path, checkpoint: &CollectionCheckpoint
     let payload = serde_json::to_vec(checkpoint)?;
     let crc = checksum(&payload);
     let mut bytes = Vec::with_capacity(HEADER_LEN + payload.len());
-    bytes.extend_from_slice(CHECKPOINT_MAGIC);
+    bytes.extend_from_slice(if checkpoint.temporal_runs.is_some() {
+        TEMPORAL_CHECKPOINT_MAGIC
+    } else {
+        CHECKPOINT_MAGIC
+    });
     bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
     bytes.extend_from_slice(&crc.to_le_bytes());
     bytes.extend_from_slice(&payload);
@@ -112,6 +126,9 @@ pub fn write_checkpoint(collection_dir: &Path, checkpoint: &CollectionCheckpoint
 pub fn read_checkpoint(collection_dir: &Path) -> Result<Option<CollectionCheckpoint>> {
     let path = checkpoint_path(collection_dir);
     if !path.exists() {
+        if collection_dir.join("temporal").try_exists()? {
+            return Err(manifest_corruption(&path, "missing temporal checkpoint"));
+        }
         return Ok(None);
     }
 
@@ -123,7 +140,8 @@ pub fn read_checkpoint(collection_dir: &Path) -> Result<Option<CollectionCheckpo
         });
     }
     let header = file.read_range_admitted(0..HEADER_LEN)?;
-    if &header[0..8] != CHECKPOINT_MAGIC {
+    let temporal = &header[0..8] == TEMPORAL_CHECKPOINT_MAGIC;
+    if !temporal && &header[0..8] != CHECKPOINT_MAGIC {
         return Err(GaussError::SegmentCorruption {
             path: path.display().to_string(),
             message: "bad checkpoint magic".to_string(),
@@ -138,7 +156,7 @@ pub fn read_checkpoint(collection_dir: &Path) -> Result<Option<CollectionCheckpo
         message: "checkpoint length exceeds usize".to_string(),
     })?;
     let expected_crc = u32::from_le_bytes(header[16..20].try_into().expect("checkpoint crc"));
-    if file.len() != HEADER_LEN + len {
+    if len.checked_add(HEADER_LEN) != Some(file.len()) {
         return Err(GaussError::SegmentCorruption {
             path: path.display().to_string(),
             message: "checkpoint length mismatch".to_string(),
@@ -156,6 +174,15 @@ pub fn read_checkpoint(collection_dir: &Path) -> Result<Option<CollectionCheckpo
     let checkpoint = serde_json::from_reader::<_, CollectionCheckpoint>(
         file.reader_at(HEADER_LEN)?.take(len as u64),
     )?;
+    if (!temporal && collection_dir.join("temporal").try_exists()?)
+        || temporal != checkpoint.temporal_runs.is_some()
+        || temporal != checkpoint.temporal_wal_lsn.is_some()
+    {
+        return Err(manifest_corruption(
+            &path,
+            "temporal checkpoint version mismatch",
+        ));
+    }
     if collection_dir
         .file_name()
         .and_then(|name| name.to_str())

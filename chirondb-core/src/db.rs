@@ -1,3 +1,4 @@
+pub mod temporal;
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
@@ -605,6 +606,7 @@ struct DbInner {
 
 #[derive(Debug)]
 struct Collection {
+    temporal: temporal::TemporalState,
     security: Option<Arc<crate::security::CollectionAuthority>>,
     config: CollectionConfig,
     /// The mutable streamer: live points + their in-memory dense indexes
@@ -684,7 +686,7 @@ struct Collection {
 
 impl Collection {
     fn checkpoint(
-        &self,
+        &mut self,
         last_applied_lsn: u64,
         points: usize,
         segment_id: Option<String>,
@@ -702,6 +704,10 @@ impl Collection {
                 .map(|searcher| searcher.id.clone())
                 .collect(),
         );
+        checkpoint.temporal_runs = self.temporal.checkpoint()?;
+        if checkpoint.temporal_runs.is_some() {
+            checkpoint.temporal_wal_lsn = Some(self.wal.len()?);
+        }
         checkpoint.wal_watermark = self.wal_watermark;
         Ok(checkpoint)
     }
@@ -3904,6 +3910,7 @@ impl Db {
             (None, None) => {}
             _ => return Err(crate::security::SecurityError::Unavailable.into()),
         }
+        col.temporal = state.temporal;
         col.config = state.config;
         col.schema_epoch = state.schema_epoch;
         col.streamer = state.streamer;
@@ -4163,11 +4170,8 @@ impl Db {
             // before publishing it to readers or advancing the epoch.
             collection.config = candidate.clone();
             collection.schema_epoch = schema_epoch;
-            let checkpoint = match collection.checkpoint(
-                last_applied_lsn,
-                collection.live_points(),
-                collection.last_segment_id.clone(),
-            ) {
+            let (count, id) = (collection.live_points(), collection.last_segment_id.clone());
+            let checkpoint = match collection.checkpoint(last_applied_lsn, count, id) {
                 Ok(checkpoint) => Some(checkpoint),
                 Err(error) => {
                     self.mark_durability_degraded("schema_checkpoint_build", &error);
@@ -8419,6 +8423,7 @@ impl Db {
                     |record| {
                         let (entries, deletes) = match record.entry {
                             WalEntry::Upsert { .. } | WalEntry::SetPayload { .. } => (1, 0),
+                            WalEntry::TemporalBatch { .. } => (0, 0),
                             WalEntry::UpsertBatch { points } => (points.len(), 0),
                             WalEntry::ProtectedBatch { batch } => batch.content.mutation_counts(),
                             WalEntry::Delete { .. } => (1, 1),
@@ -8746,6 +8751,7 @@ impl Db {
 
         let snapshot_marker = read_snapshot_marker(source)?;
         validate_restore_wal_targets(
+            source,
             snapshot_marker.as_ref(),
             target_wal_lsns,
             target_wal_unix_ms,
@@ -9164,6 +9170,7 @@ impl Db {
 
         let snapshot_marker = read_snapshot_marker(source)?;
         validate_restore_wal_targets(
+            source,
             snapshot_marker.as_ref(),
             target_wal_lsns,
             target_wal_unix_ms,
@@ -10123,6 +10130,7 @@ fn validate_snapshot_marker(
 }
 
 fn validate_restore_wal_targets(
+    source: &Path,
     marker: Option<&SnapshotMarker>,
     target_wal_lsns: &HashMap<String, u64>,
     target_wal_unix_ms: &HashMap<String, u64>,
@@ -10136,6 +10144,18 @@ fn validate_restore_wal_targets(
             "target WAL restore requires a snapshot marker".to_string(),
         ));
     };
+    for marked in &marker.collections {
+        if (target_wal_lsns.contains_key(&marked.collection)
+            || target_wal_unix_ms.contains_key(&marked.collection))
+            && read_checkpoint(&collection_dir(source, &marked.collection))?
+                .is_some_and(|cp| cp.temporal_runs.is_some())
+        {
+            return Err(GaussError::InvalidRequest(format!(
+                "targeted WAL restore for temporal collection '{}' requires a time-aware generation manifest",
+                marked.collection
+            )));
+        }
+    }
     for collection in target_wal_lsns.keys() {
         if target_wal_unix_ms.contains_key(collection) {
             return Err(GaussError::InvalidRequest(format!(
@@ -10337,6 +10357,7 @@ fn load_restore_collections(
             },
         )?;
         let LoadedCollectionState {
+            temporal,
             security,
             config,
             schema_epoch,
@@ -10358,6 +10379,7 @@ fn load_restore_collections(
         collections.insert(
             collection_name,
             Arc::new(RwLock::new(Collection {
+                temporal,
                 security,
                 config,
                 streamer,
@@ -10410,12 +10432,13 @@ fn write_restore_metadata(
     write_catalog_state(root, collections, catalog_wal)?;
     if rewrite_restore_metadata {
         for collection in collections.values() {
-            let collection = collection.read();
-            let checkpoint = collection.checkpoint(
+            let mut collection = collection.write();
+            let args = (
                 collection.wal.len()?,
                 collection.live_points(),
                 collection.last_segment_id.clone(),
-            )?;
+            );
+            let checkpoint = collection.checkpoint(args.0, args.1, args.2)?;
             write_checkpoint(&collection_dir(root, &collection.config.name), &checkpoint)?;
         }
     }
@@ -11079,11 +11102,8 @@ fn run_segment_seal(seal: &PendingSeal) -> Result<()> {
     if seal.graph.is_some() {
         crate::failpoint::check("graph_generation.after_install")?;
     }
-    let checkpoint = collection.checkpoint(
-        collection.wal.len()?,
-        collection.live_points(),
-        Some(segment_id.clone()),
-    )?;
+    let (lsn, count) = (collection.wal.len()?, collection.live_points());
+    let checkpoint = collection.checkpoint(lsn, count, Some(segment_id.clone()))?;
     write_checkpoint(&seal.collection_dir, &checkpoint)?;
     if !retain_graph_wal {
         collection.wal.drop_prefix(seal.end_lsn)?;
@@ -12409,6 +12429,7 @@ fn graph_replication_unavailable(collection: &str) -> GaussError {
 }
 
 struct WalReplayIndexes<'a> {
+    temporal: &'a mut temporal::TemporalState,
     protected: bool,
     id_index: &'a mut HashMap<String, crate::searcher::SegLoc>,
     graph_lifecycle: &'a mut crate::graph_lifecycle::GraphLifecycleState,
@@ -12429,6 +12450,12 @@ fn apply_wal_record(
     let record_lsn = record.lsn;
     let entry = match record.entry {
         WalEntry::TransactionApply { entry, .. } => *entry,
+        WalEntry::TemporalBatch { .. } => {
+            return Err(GaussError::WalCorruption {
+                path: config.name.clone(),
+                message: "uncommitted temporal WAL record".into(),
+            });
+        }
         entry => entry,
     };
     let entry = match entry {
@@ -12449,10 +12476,17 @@ fn apply_wal_record(
             generation,
             segments,
         },
+        WalEntry::TemporalBatch { batch } => {
+            if indexes.protected != batch.incarnation.is_some() {
+                return Err(crate::security::SecurityError::Unavailable.into());
+            }
+            WalEntry::TemporalBatch { batch }
+        }
         _ if indexes.protected => return Err(crate::security::SecurityError::Unavailable.into()),
         entry => entry,
     };
     match entry {
+        WalEntry::TemporalBatch { batch } => indexes.temporal.replay(&batch)?,
         WalEntry::Upsert { point } => {
             apply_wal_upsert(
                 streamer,
@@ -12662,6 +12696,7 @@ fn projected_wal_entry(entry: &WalEntry) -> &WalEntry {
 /// independent searchers, WAL tail replayed into the streamer, and the
 /// global indexes over the union.
 struct LoadedCollectionState {
+    temporal: temporal::TemporalState,
     security: Option<Arc<crate::security::CollectionAuthority>>,
     config: CollectionConfig,
     schema_epoch: u64,
@@ -12736,6 +12771,7 @@ fn load_db_root_with_journal(
             journal,
         )?;
         let LoadedCollectionState {
+            temporal,
             security,
             config,
             schema_epoch,
@@ -12765,6 +12801,7 @@ fn load_db_root_with_journal(
         collections.insert(
             collection_name,
             Arc::new(RwLock::new(Collection {
+                temporal,
                 security,
                 config,
                 streamer,
@@ -12922,10 +12959,12 @@ fn load_collection_state_with_journal(
         wal_watermark
     };
     let manifest_generation = manifest.as_ref().map_or(0, |manifest| manifest.generation);
+    let mut checkpoint = read_checkpoint(collection_dir)?;
     let installed_segments = match manifest.as_ref() {
         Some(manifest) => Some(manifest.segments.iter().cloned().collect::<HashSet<_>>()),
-        None => read_checkpoint(collection_dir)?
-            .and_then(|checkpoint| checkpoint.segments)
+        None => checkpoint
+            .as_mut()
+            .and_then(|cp| cp.segments.take())
             .map(|segments| segments.into_iter().collect::<HashSet<_>>()),
     };
     if let Some(installed) = &installed_segments {
@@ -13036,6 +13075,18 @@ fn load_collection_state_with_journal(
             id_index.insert(id.to_string(), crate::searcher::SegLoc::Searcher(i as u32));
         }
     }
+    let temporal_cut = checkpoint.as_ref().and_then(|cp| cp.temporal_wal_lsn);
+    let mut temporal =
+        temporal::TemporalState::load(collection_dir, checkpoint.and_then(|cp| cp.temporal_runs))?;
+    let wal_dir = collection_dir.join("wal");
+    if let Some(cut) = temporal_cut
+        && cut < Wal::retained_base_lsn(&wal_dir)?
+    {
+        return Err(GaussError::WalCorruption {
+            path: wal_dir.display().to_string(),
+            message: "temporal checkpoint cutoff outside retained WAL".into(),
+        });
+    }
     let mut streamer = crate::streamer::Streamer::with_base_lsn(wal_watermark);
     let recovered = graph_generation
         .as_mut()
@@ -13065,7 +13116,26 @@ fn load_collection_state_with_journal(
             .filter(|searcher| searcher.ordinal_payload_index.is_none())
             .flat_map(|searcher| searcher.store.iter_aux_index_points()),
     )?;
-    Wal::recover_from(&collection_dir.join("wal"), wal_watermark, |record| {
+    let replay_start = temporal_cut.map_or(wal_watermark, |cut| cut.min(wal_watermark));
+    let scanned = Wal::recover_from(&wal_dir, replay_start, |record| {
+        let is_temporal = matches!(
+            projected_wal_entry(&record.entry),
+            WalEntry::TemporalBatch { .. }
+        );
+        if is_temporal && !matches!(record.entry, WalEntry::TransactionApply { .. }) {
+            return Err(GaussError::WalCorruption {
+                path: wal_dir.display().to_string(),
+                message: "uncommitted temporal WAL record".into(),
+            });
+        }
+        let covered = if is_temporal {
+            temporal_cut.unwrap_or(wal_watermark)
+        } else {
+            wal_watermark
+        };
+        if record.lsn < covered {
+            return Ok(());
+        }
         if let (
             Some(journal),
             WalEntry::TransactionApply {
@@ -13086,6 +13156,7 @@ fn load_collection_state_with_journal(
             &mut streamer,
             &mut searchers,
             WalReplayIndexes {
+                temporal: &mut temporal,
                 protected,
                 id_index: &mut id_index,
                 graph_lifecycle: &mut graph_lifecycle,
@@ -13096,6 +13167,12 @@ fn load_collection_state_with_journal(
             record,
         )
     })?;
+    if temporal_cut.is_some_and(|cut| cut > scanned.end_lsn) {
+        return Err(GaussError::WalCorruption {
+            path: wal_dir.display().to_string(),
+            message: "temporal checkpoint cutoff exceeds WAL end".into(),
+        });
+    }
     // Overlay records whose originating WAL prefix has already been covered
     // by the checkpoint are not replayed. Remove those final hidden sealed
     // locations now, without removing a later WAL upsert that moved the same
@@ -13173,6 +13250,7 @@ fn load_collection_state_with_journal(
         })
         .transpose()?;
     Ok(LoadedCollectionState {
+        temporal,
         security,
         config,
         schema_epoch,

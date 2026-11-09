@@ -17,7 +17,7 @@ from security_installation_e2e import InstallationLab
 
 REPO = Path(__file__).resolve().parents[2]
 CORPUS = REPO / 'chirondb-server/tests/fixtures/chironql_documentation.json'
-DOCUMENTS = [REPO / 'docs/CHIRONQL_SECURITY.md', REPO / 'docs/CHIRONQL_LEGACY_EXAMPLES.md']
+DOCUMENTS = [REPO / 'docs/CHIRONQL_SECURITY.md', REPO / 'docs/CHIRONQL_LEGACY_EXAMPLES.md', REPO / 'docs/CHIRONQL.md']
 
 
 def enum_variants(path, name):

@@ -582,6 +582,10 @@ fn invalid_graph_batch(message: impl Into<String>) -> GaussError {
 // Schema variant is naturally heavier; payload size is bounded by config size.
 #[allow(clippy::large_enum_variant)]
 pub enum WalEntry {
+    /// Collection-owned, typed temporal observations (v1). The journal decides commit.
+    TemporalBatch {
+        batch: crate::db::temporal::TemporalBatch,
+    },
     Upsert {
         point: Point,
     },
@@ -1063,7 +1067,15 @@ impl Wal {
     fn append_inner(&mut self, entry: &WalEntry, sync: bool) -> Result<u64> {
         self.ensure_available()?;
         match entry {
+            WalEntry::TemporalBatch { .. } => {
+                return Err(GaussError::InvalidRequest(
+                    "temporal batches require a transaction projection".into(),
+                ));
+            }
             WalEntry::TransactionApply { entry, .. } if self.protected => match entry.as_ref() {
+                WalEntry::TemporalBatch { batch } if batch.incarnation.is_some() => {
+                    batch.validate()?
+                }
                 WalEntry::ProtectedBatch { batch } => batch.validate()?,
                 _ => return Err(crate::security::SecurityError::Forbidden.into()),
             },
@@ -1074,6 +1086,14 @@ impl Wal {
             WalEntry::Compact { .. } => {}
             _ if self.protected => return Err(crate::security::SecurityError::Forbidden.into()),
             _ => {}
+        }
+        if let WalEntry::TransactionApply { entry: inner, .. } = entry
+            && let WalEntry::TemporalBatch { batch } = inner.as_ref()
+        {
+            if batch.incarnation.is_some() != self.protected {
+                return Err(crate::security::SecurityError::Forbidden.into());
+            }
+            batch.validate()?;
         }
         if let WalEntry::GraphBatch { batch } = entry {
             batch.validate()?;

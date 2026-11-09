@@ -451,6 +451,11 @@ pub(crate) fn recover_with_journal(
                         )?;
                     }
                     match *entry {
+                        WalEntry::TemporalBatch { batch }
+                            if batch.incarnation == Some(state.checkpoint.incarnation) =>
+                        {
+                            batch.validate()?
+                        }
                         WalEntry::ProtectedBatch { batch } => state.apply(&batch)?,
                         _ => {
                             return Err(invalid(

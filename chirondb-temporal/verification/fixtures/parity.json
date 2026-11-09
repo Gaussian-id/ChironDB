@@ -1,0 +1,50 @@
+{
+  "new-edge": {
+    "input": "7ad5414a79b5431db70e3d5e663b64bafa3b5500f939a12fb7baf3f945adeeea",
+    "tsm": "6860771570b069e143bda264e8e432a0c5f095e4b5e49a23185c63691e734dee"
+  },
+  "new-keylen": {
+    "input": "38f9756159fd55f929ce4be3066f338a53e0a9c6cdb1b99b1604d6d8317bc872",
+    "tsm": "ed6e7031104d9ff3cfa6450da841a56754f0edcf3a9f808ec7210d2d6a6d9240"
+  },
+  "new-main": {
+    "input": "5606c10df903c39c6e4d09bf8452c797c43ab095aa3a525dbd9fa0c785d54ffc",
+    "tsm": "ab72ccfbdac23d6899edaf5b6543e0b74e62f7c4aa1bea73befa3f7ed5702a73"
+  },
+  "new-seed-1": {
+    "input": "ea2d7188ec7bc995b2be49b741ab6ff4f02b62e3ef2a2966ad02bd2e8b643ab6",
+    "tsm": "ce557c0597506d524db5af0cd696a6d430d2faa3b0d5bf1d58aba404225f2303"
+  },
+  "new-seed-2": {
+    "input": "5901ff5546e6c50ff34d9d798cbf35be9f41b7d4a6855d424a9ad7f2bd598464",
+    "tsm": "99818181bb8cc471f15d514eb6480f00ec82ce681855feba8840bdc485557ca1"
+  },
+  "new-seed-3": {
+    "input": "afe60f0b5d6f34cbf6a281e9c1e6fc08584b70a6d680ab90ac382f8e75a5ec67",
+    "tsm": "e10ef1e3e27703b59574f5b91e62708d4925da9afb8ba82aa596f5353ad82a36"
+  },
+  "new-seed-4": {
+    "input": "223b8e65dde4feb6879b8dfe7b3d9bc2056fa63eb9572a7b5a292a5fa2ab00e8",
+    "tsm": "2873986c81d172ad216d321ac9d05a8e5f3323b85d834a3e1edf88a6e40baa0e"
+  },
+  "new-seed-5": {
+    "input": "5710e8d4122a61ad4a13148e661eb66b33b5106af342f8c6ab1465a64e12f2c4",
+    "tsm": "1bd197fad6ea64145cabd1a80491b687b085ada4ef244e44e860fbf930ee5cf0"
+  },
+  "new-seed-6": {
+    "input": "64f7ca90cd5f5b98a44d5c410f2826fa5895333672e7360d3944eb3b9de40fba",
+    "tsm": "c26ff66056a84cdd695549200378b40435cb0bed9719965a01e142e631edd736"
+  },
+  "new-seed-7": {
+    "input": "0238ed86364e4f6feb82f99280e7c0aba5d71dc5d64d78c05ac7ad915253b153",
+    "tsm": "8e82bfb50713e96f112d9dc1cc47a4b6de7c9f8e8410ae558e51972d6ed8272f"
+  },
+  "new-seed-8": {
+    "input": "71a88267f462b93c72332f78dec57c6f03dc2ced700a9b551603db81948fdf55",
+    "tsm": "ccd445f69263951ea73acaa363854d31a5495a6c4722fb55c1c16146be421a78"
+  },
+  "new-seed-9": {
+    "input": "ae9ce4c2529ee7b57eaf381279d2550283426a3aaef4000cb3dc3e76ce817e38",
+    "tsm": "1040dd9b6f36f80bd217c4e005fc0481309dc5d34d06f41db5ec4eecc89813fb"
+  }
+}

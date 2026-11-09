@@ -1,5 +1,7 @@
 # ChironDB HTTP API
 
+ChironQL 1.5 supports durable sensor batches and event-time history on the existing query interface. Exact nanosecond timestamps travel as decimal strings. [Time series examples](CHIRONQL.md#time-series-chironql-15)
+
 Protected user/role/key syntax, every statement example, revision semantics and
 working TLS/API recipes: [ChironQL security reference](CHIRONQL_SECURITY.md).
 
@@ -424,6 +426,20 @@ error. COMMIT freezes the statement set; a later EXECUTE cannot append to that d
 A racing COMMIT and ROLLBACK have one winning terminal operation. Expired idle handles release
 their snapshot pins during subsequent SQL, transaction-handle or checkpoint activity; an
 executing operation is not expired mid-statement.
+
+The isolation level is **snapshot isolation**: a transaction reads its starting
+snapshot plus its own writes. Other transactions cannot read its uncommitted
+writes. Concurrent changes to the same row conflict at commit; disjoint row
+writes can both commit after revalidation of declared constraints. This does
+not provide serializable isolation: two transactions can read the same
+cross-row condition and change different rows, causing write skew. Applications
+must coordinate those decisions or express the invariant with supported
+database constraints. No serializable mode is exposed.
+
+Atomicity covers one SQL request/transaction and the supported SQL/vector/graph
+ChironQL transaction block. Time-series APPEND is atomic within its own batch;
+it cannot join that transaction block or an interactive SQL handle. Separate
+requests across those boundaries are separate commits.
 
 BEGIN returns `transaction_id` equal to the session `handle`; save it before
 sending COMMIT. Execute responses carry that reserved ID without claiming a
@@ -1276,8 +1292,7 @@ API. Delete requires a write-capable API key. ML routes return 403 while
 tenant enforcement is active; this preview does not expose predictions through
 the protected tenant executor.
 
-ChironQL 1.4 is ChironDB's unified vector, graph, and native relational query
-language: one statement per request. The full language reference is
+ChironQL 1.5 supports vector, graph, relational and time-series queries. Send one statement per request. The full language reference is
 [CHIRONQL.md](CHIRONQL.md).
 
 ```bash
@@ -1448,7 +1463,7 @@ curl --fail -X POST http://127.0.0.1:7401/v1/chironql/parse \
 ```
 
 ```json
-{"ok": true, "language_version": "1.4", "kind": "write", "class": "write", "statement": "DELETE", "domains": ["vector"], "resources": {"tables": [], "collections": ["products"]}}
+{"ok": true, "language_version": "1.5", "kind": "write", "class": "write", "statement": "DELETE", "domains": ["vector"], "resources": {"tables": [], "collections": ["products"]}}
 ```
 
 `kind` classifies the statement. Collection DDL — `CREATE COLLECTION` and
