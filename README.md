@@ -25,7 +25,7 @@
 <br>
 
 ChironDB is a self-hosted multi-model database with an implemented native
-relational database, vector search, hybrid retrieval, and a property-graph overlay.
+relational database, vector search, hybrid retrieval, a property graph, and time series.
 Store typed SQL tables alongside embeddings and JSON payloads, combine dense
 search with sparse BM25, and query through HTTP, gRPC,
 ChironWire, read-only MCP tools, or an interactive ChironQL console.
@@ -63,6 +63,8 @@ authentication plus RBAC.
   payload filters, and reciprocal rank or weighted fusion share one storage engine.
 - **Search connected data.** Add typed relationships to existing points, traverse
   a bounded neighbourhood, or search within it using the beta graph overlay.
+- **Read asset history.** ChironQL can append sensor values and join their event-time history
+  to assets selected from a table, vector search, or graph traversal.
 - **Keep retrieval quality visible.** Recall targets, drift monitoring, and audit
   records make retrieval quality something you can inspect. Validate recall
   targets on your own workload.
@@ -73,6 +75,13 @@ authentication plus RBAC.
   with x86-64 and ARM64 as the required platform targets.
 
 ## Status
+
+Current source builds include the **ChironQL 1.5 time-series preview**; the
+published `v0.1.0-beta.3` tag does not include this feature. Temporal writes are
+atomic per batch and are separate from SQL/vector/graph transactions. Collections
+have a 4,096 temporal-run limit, and compaction currently retains existing runs.
+Mixed-load, loaded-recovery and sustained-soak qualification remain open.
+See [time-series usage and limits](docs/CHIRONQL.md#time-series-chironql-15).
 
 The current source version is **`0.1.0-beta.3`**. ChironDB is under active beta
 development and **is not production ready**. Features are available for evaluation;

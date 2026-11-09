@@ -447,6 +447,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "bumpalo",
+ "chirondb-temporal",
  "chirondb-types",
  "chrono",
  "crc-fast",
@@ -502,6 +503,13 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "chirondb-temporal"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
 ]
 
 [[package]]

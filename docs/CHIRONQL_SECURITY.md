@@ -1,4 +1,4 @@
-# ChironQL security reference — language 1.4 local preview
+# ChironQL security reference — language 1.5 local preview
 
 Complete user, role, credential, document-security and protected-query reference for a **single-tenant, single-node** installation. This reference describes builds containing the protected security implementation; the database release version alone does not identify that build. See [deployment](../deploy/protected/README.md), [base language](CHIRONQL.md), [legacy examples](CHIRONQL_LEGACY_EXAMPLES.md), [HTTP](HTTP_API.md) and [gRPC](GRPC_API.md).
 
@@ -1391,6 +1391,24 @@ Vocabulary example only: scope, administrator delegation and feature availabilit
 <!-- chironql-example: action-delete -->
 ```sql
 GRANT DELETE ON COLLECTION docs TO ROLE operations;
+```
+
+### action-temporal_read
+
+Grant access to temporal observations in this collection.
+
+<!-- chironql-example: action-temporal_read -->
+```sql
+GRANT TEMPORAL_READ ON COLLECTION docs TO ROLE operations;
+```
+
+### action-temporal_append
+
+Grant access to temporal observations in this collection.
+
+<!-- chironql-example: action-temporal_append -->
+```sql
+GRANT TEMPORAL_APPEND ON COLLECTION docs TO ROLE operations;
 ```
 
 ### action-graph_read

@@ -1,5 +1,7 @@
 # ChironDB gRPC API
 
+ChironQL 1.5 supports durable sensor batches and event-time history on the existing query interface. Exact nanosecond timestamps travel as decimal strings. [Time series examples](CHIRONQL.md#time-series-chironql-15)
+
 Protected user/role/key syntax, every statement example, revision semantics and
 working TLS/API recipes: [ChironQL security reference](CHIRONQL_SECURITY.md).
 
@@ -285,6 +287,10 @@ operations on one handle serialize, with a 30-second limit when waiting for that
 COMMIT freezes its statements while running; a consumed handle excludes later
 EXECUTE/ROLLBACK. Idle expiry releases
 snapshot pins during subsequent SQL, handle or checkpoint activity.
+
+SQL transactions use snapshot isolation. Disjoint writes can exhibit write skew;
+serializable isolation is not exposed. See the [HTTP transaction contract](HTTP_API.md)
+for isolation and atomicity boundaries, shared by all transports.
 
 If COMMIT fails before PREPARE, including receipt memory admission returning
 `RESOURCE_EXHAUSTED`, the live session keeps its private statements and original
@@ -661,7 +667,7 @@ truncation remains explicit and unchanged.
 
 ### ExecuteQuery (ChironQL)
 
-One top-level ChironQL 1.4 statement per call. A typed `TRANSACTION { ... }`
+Send one top-level ChironQL 1.5 statement per call. A typed `TRANSACTION { ... }`
 block remains one statement and atomically combines SQL DML, vector UPSERT/DELETE or protected CREATE POINTS,
 and graph relations. `parameters` carries typed `$1…$n` values; `retry_id` is
 audit correlation. Optional `idempotency_key` (field 7; ChironWire field 8) uses
@@ -927,9 +933,9 @@ and remains a preview enabled with `--enable-grpc-web` plus explicit allowed
 origins. Do not put a shared server API key in browser JavaScript; use the
 preview BFF or another trusted gateway for browser authentication.
 
-### Protected ChironQL 1.4 local preview
+### Protected ChironQL 1.5 local preview
 
-ChironQL **1.4** also exposes protected collection provisioning and typed policy
+ChironQL also exposes protected collection provisioning and typed policy
 administration through this same RPC. Initialize the first administrator offline
 using the [deployment runbook](../deploy/protected/README.md). Collection creation
 uses `SHOW CATALOG REVISION`; policy updates use the collection security revision.

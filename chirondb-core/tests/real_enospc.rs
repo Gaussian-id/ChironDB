@@ -21,6 +21,100 @@ const AUDIT_CHILD_ENV: &str = "CHIRONDB_ENOSPC_AUDIT_CHILD";
 
 #[test]
 #[ignore = "requires CHIRONDB_ENOSPC_ROOT on a dedicated marked filesystem"]
+fn real_enospc_preserves_atomic_temporal_batches_and_acknowledgments() {
+    use chirondb_core::{
+        db::temporal::{SensorValue, TemporalAccess, TemporalSample},
+        tenant::TenantScope,
+    };
+    let root = enospc_root();
+    let data = root.join("temporal-data");
+    let filler = root.join("temporal-fill.bin");
+    let db = Db::open(&data).unwrap();
+    db.create_collection(collection_config()).unwrap();
+    let tenant = TenantScope::tenant("sensor", "fleet");
+    let access = TemporalAccess::Scoped(&tenant);
+    let sample = |time| {
+        TemporalSample::new(
+            "truck",
+            "temperature",
+            time,
+            SensorValue::Float(time as f64),
+        )
+    };
+    db.append_temporal_batch("docs", access, vec![sample(-1)])
+        .unwrap();
+    fill_until_enospc(&filler);
+    let mut expected = vec![-1];
+    let mut rejected = None;
+    for batch in 0..100 {
+        let times = (batch * 32..batch * 32 + 32).collect::<Vec<_>>();
+        match db.append_temporal_batch("docs", access, times.iter().copied().map(sample).collect())
+        {
+            Ok(32) => expected.extend(times),
+            Ok(other) => panic!("unexpected affected count: {other}"),
+            Err(error) => {
+                let unknown = match error {
+                    chirondb_core::GaussError::CommitOutcomeUnknown { transaction_id } => {
+                        Some(transaction_id)
+                    }
+                    _ => None,
+                };
+                rejected = Some((times, unknown));
+                break;
+            }
+        }
+    }
+    let (times, unknown) = rejected.expect("disk-full batch must refuse or report outcome unknown");
+    drop(db);
+    fs::remove_file(&filler).unwrap();
+    File::open(&root).unwrap().sync_all().unwrap();
+    for round in 0..2 {
+        let db = Db::open(&data).unwrap();
+        if round == 0
+            && let Some(id) = &unknown
+        {
+            let state = db.transaction_status(id).unwrap().state;
+            assert!(matches!(
+                state,
+                TransactionState::Committed | TransactionState::Rejected
+            ));
+            if state == TransactionState::Committed {
+                expected.extend(&times);
+            }
+        }
+        let rows = db
+            .scan_temporal("docs", access, "truck", "temperature", -1..3200, 4096)
+            .unwrap();
+        assert_eq!(rows.iter().map(|p| p.time).collect::<Vec<_>>(), expected);
+        for row in rows {
+            assert_eq!(row.value, SensorValue::Float(row.time as f64));
+        }
+    }
+    if let Some(path) = std::env::var_os("CHIRONDB_ENOSPC_EVIDENCE") {
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": 2,
+                "test_case": "temporal_atomic_batch_recovery",
+                "verdict": "passed",
+                "tested_sha": std::env::var("GITHUB_SHA").ok(),
+                "core_tree_hash": std::env::var("CHIRONDB_CORE_TREE_HASH").ok(),
+                "server_tree_hash": std::env::var("CHIRONDB_SERVER_TREE_HASH").ok(),
+                "actions_run_id": std::env::var("GITHUB_RUN_ID").ok(),
+                "recovered_observations": expected.len(),
+                "unknown_transaction_id": unknown,
+                "reopen_count": 2,
+                "acknowledged_writes_preserved": true,
+                "partial_batches": 0
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+#[ignore = "requires CHIRONDB_ENOSPC_ROOT on a dedicated marked filesystem"]
 fn real_enospc_rejects_unacknowledged_write_and_reopens_acknowledged_state() {
     let root = fs::canonicalize(
         std::env::var_os("CHIRONDB_ENOSPC_ROOT")

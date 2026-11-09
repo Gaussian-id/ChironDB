@@ -655,3 +655,29 @@ async fn wire_collection_hnsw_one_is_rejected_and_zero_retains_default_contract(
     assert_eq!(config.hnsw_ef_construction, None);
     assert_eq!(config.hnsw_ef_search, None);
 }
+
+#[path = "common/temporal.rs"]
+mod temporal_case;
+
+#[tokio::test]
+async fn temporal_wire_returns_exact_history() {
+    let h = Harness::start(false, AuthConfig::disabled()).await;
+    for (idx, s) in temporal_case::statements(COLLECTION).iter().enumerate() {
+        let r = chironql_payload(common::send_wire(&h.endpoint, idx as u64 + 1, query(s)).await);
+        let rows: Vec<Value> = r
+            .rows_json
+            .iter()
+            .map(|v| serde_json::from_str(v).unwrap())
+            .collect();
+        assert_eq!(rows, temporal_case::rows(COLLECTION, idx));
+        assert_eq!(r.domains, ["temporal"]);
+    }
+    let bad = temporal_case::statements(COLLECTION)[1]
+        .replace("1700000000000000002", "9223372036854775808");
+    let r = common::send_wire_with_key(&h.endpoint, 4, "", query(bad)).await;
+    assert!(
+        r.error_details_json
+            .unwrap_or_default()
+            .contains("chironql.invalid_timestamp")
+    );
+}

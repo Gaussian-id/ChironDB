@@ -113,6 +113,12 @@ jobs:
             cp "$source/proto/chirondb/v1/chirondb.proto" "$stage/proto/chirondb/v1/"
             cp "$source/proto/chirondb/v1/compat.proto" "$stage/proto/chirondb/v1/"
             cp "$source/LICENSE" "$source/NOTICE" "$source/TRADEMARKS.md" "$stage/"
+            if [[ -d "$source/chirondb-temporal" ]]; then
+              mkdir -p "$stage/chirondb-temporal/verification"
+              cp "$source/chirondb-temporal/THIRD_PARTY.md" "$stage/chirondb-temporal/"
+              cp -R "$source/chirondb-temporal/licenses" "$stage/chirondb-temporal/"
+              cp "$source/chirondb-temporal/verification/sources.json" "$stage/chirondb-temporal/verification/"
+            fi
             while IFS= read -r -d '' sbom; do
               cp "$sbom" "$stage/sbom/$(basename "$sbom")"
             done < <(find "$source" -name '*.cdx.json' -not -path '*/target/*' -print0)

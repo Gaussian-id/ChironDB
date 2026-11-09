@@ -42,7 +42,7 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked -j 2
       - name: WAL phase crash matrix (non-production hooks)
-        run: cargo test -p chirondb --features fault-injection --test process_kill --locked -j 2
+        run: cargo test -p chirondb --features fault-injection --test process_kill --test temporal_recovery --locked -j 2
       - name: Storage, checkpoint, and graph batch fault injection
         # Hooks are process-wide, including background workers and child tests.
         # Keep unrelated libtest cases from observing another case's hook.
@@ -50,7 +50,7 @@ jobs:
           RUST_TEST_THREADS: '1'
         run: >-
           cargo test -p chirondb-core --features fault-injection --locked -j 2
-          --lib --test storage_recovery_regressions --test graph_batch_ingest --test crash_consistency
+          --lib --test storage_recovery_regressions --test graph_batch_ingest --test crash_consistency --test temporal_acid
       - name: Durable ACK crash campaign (1000 plaintext and 1000 encrypted)
         timeout-minutes: 30
         env:

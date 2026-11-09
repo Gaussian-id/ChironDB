@@ -361,6 +361,7 @@ impl Db {
         inner.collections.insert(
             config.name.clone(),
             Arc::new(RwLock::new(Collection {
+                temporal: temporal::TemporalState::empty(&collection_dir),
                 security: verified_authority,
                 config: config.clone(),
                 streamer: crate::streamer::Streamer::new(),

@@ -17,7 +17,7 @@ The server beta.3 adds atomic edge batches. Rust `0.1.0-beta.2` and Python
 | Protected application operations | `protected()` | Requires provisioned credentials and current server authority |
 | Decision Tree / Random Forest | ML helpers | Optional local worker; unavailable under protected tenant enforcement |
 | Atomic graph edge batches | `relate_batch` / `relateBatch` | **Unreleased SDK source addition**, server beta.3+; absent from npm beta.3 |
-| Time series: APPEND, HISTORY, LATEST, temporal PIPELINE | `query()` | **Early stage / evaluation only**, requires a compatible ChironQL 1.5 server; not in public server beta.3 |
+| Time series: APPEND, HISTORY, LATEST, temporal PIPELINE | `query()` | **Early stage / evaluation only**, available in current ChironQL 1.5 source builds; absent from the published beta.3 tag |
 
 The current source adds batch methods and fixes temporal decoding in Rust/Python.
 Install a qualified candidate checkout/artifact for those changes; installing
@@ -27,8 +27,9 @@ All clients retain explicit transaction decisions and no automatic mutation retr
 
 ## Time series — early stage
 
-Time series is an **early-stage evaluation feature**, not a production-ready or
-public-server-beta.3 capability. The SDK sends ChironQL through the existing
+Current source builds include time series as an **early-stage evaluation feature**.
+The published `v0.1.0-beta.3` server tag does not include it. See the
+[ChironQL 1.5 examples](CHIRONQL.md#time-series-chironql-15). The SDK sends queries through the existing
 `query()` interface; it does not enable temporal support on an older server.
 Use a compatible ChironQL 1.5 server and updated Rust/Python decoders. No dedicated
 `timeseries()` API is exposed. Runtime forwarding already works in npm beta.3.
@@ -79,8 +80,9 @@ limit. Protected use requires `temporal_append` / `temporal_read` collection gra
 Temporal batches are separate from SQL/vector/graph atomic transactions;
 APPEND inside a multi-model TRANSACTION is rejected. Temporal PIPELINE is a
 bounded read composition. Targeted temporal WAL restore and the legacy point-only
-replication path are unsupported. Capacity, sustained-workload and release gates
-remain open; local functional tests do not establish production readiness.
+replication path are unsupported. Each collection is limited to 4,096 temporal
+runs, and current compaction retains existing runs. Capacity, sustained-workload
+and release gates remain open; local functional tests do not establish production readiness.
 
 ## Atomic graph batches — unreleased SDK source
 
@@ -448,6 +450,10 @@ wait can return a resource-limit error after 30 seconds. Other calls on that han
 wait while COMMIT runs; a consumed handle rejects later statement execution.
 Shared resource admission and commit publication still apply
 across handles.
+
+SQL transactions use snapshot isolation. Disjoint writes can exhibit write skew;
+serializable isolation is not exposed. See the [HTTP transaction contract](HTTP_API.md)
+for isolation and atomicity boundaries, shared by all transports.
 
 A COMMIT failure before PREPARE, including a receipt memory-limit refusal, keeps
 the live session's private statements and original handle. Retry COMMIT explicitly
@@ -1253,7 +1259,7 @@ See [ChironQL](CHIRONQL.md#tabular-ml-materialization-preview).
 The Rust client exposes `execute_chironql(&ChironQlRequest)`. The Python client
 exposes `chironql(query, parameters=None, retry_id=None, ...)`. Both call the
 same `/v1/chironql` analyzer and executor used by the terminal. Use typed API
-methods when you do not need language composition; use ChironQL 1.4 `SQL`,
+methods when you do not need language composition; use ChironQL 1.5 `SQL`, `HISTORY`, `LATEST`,
 read-only `PIPELINE`, or the bounded atomic `TRANSACTION` block when one request
 must express relational or multi-model work. The transaction block uses the
 same request `parameters` and audit-correlation `retry_id` fields as standalone SQL.

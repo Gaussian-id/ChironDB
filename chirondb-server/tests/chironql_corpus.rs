@@ -16,7 +16,7 @@ struct Example {
 }
 
 #[test]
-fn documented_chironql_1_0_through_1_4_corpus_keeps_its_parse_contract() {
+fn documented_chironql_1_0_through_1_5_corpus_keeps_its_parse_contract() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/chironql_documentation.json");
     let corpus: Corpus =

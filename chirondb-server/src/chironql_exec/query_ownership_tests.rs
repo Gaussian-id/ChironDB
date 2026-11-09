@@ -118,9 +118,10 @@ fn randomized_join_sort_projection_matches_independent_nested_loop() {
             let r = qualified("r", right, &mut memory);
             let result = assemble_pipeline_response(
                 &plan,
-                v,
+                Some(v),
                 None,
                 r,
+                None,
                 "random-oracle",
                 &mut QueryTrace::new("random-oracle"),
                 Role::ReadOnly,
@@ -162,9 +163,10 @@ fn pipeline_sort_keeps_large_integer_order_and_duplicate_projection() {
     let r = qualified("r", source(), &mut memory);
     let result = assemble_pipeline_response(
         &plan,
-        v,
+        Some(v),
         None,
         r,
+        None,
         "integer-oracle",
         &mut QueryTrace::new("integer-oracle"),
         Role::ReadOnly,

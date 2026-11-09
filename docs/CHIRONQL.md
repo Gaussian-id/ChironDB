@@ -8,7 +8,7 @@ delete, and graph create/update/delete mutations under one durable decision.
 
 **Evaluation only: ChironDB and these features are not production ready.**
 
-**Status: 1.4 local preview.** The language is implemented and served on every ChironQL surface: the embedded server
+**Status: 1.5 local preview.** The language is implemented and served on every ChironQL surface: the embedded server
 console, the `chironql` client, `POST /v1/chironql`,
 `chirondb.v1.ChironDb/ExecuteQuery`, and ChironWire `ExecuteChironQl`.
 
@@ -59,6 +59,64 @@ password to that same durable identity and publication guard. SQL passwords
 are issued separately from ChironQL bearer keys; see the
 [protected HTTP reference](HTTP_API.md). The atomic multi-model mutation
 profile remains a local preview limited to one collection per block.
+
+## Time series (ChironQL 1.5)
+
+Create an asset collection named `armada` before running the example. Each sample belongs to the caller’s tenant, collection, asset and property. Asset IDs can exist solely in a table. Appending a temperature requires no vector.
+
+<!-- temporal-direct -->
+<!-- chironql-example: temporal-Append -->
+```sql
+APPEND INTO armada [
+  {asset: 'truk-7', property: 'suhu', time_ns: '1700000000000000000', value: 24.5},
+  {asset: 'truk-7', property: 'suhu', time_ns: '1700000000000000001', value: 25.0}
+];
+```
+
+<!-- chironql-example: temporal-History -->
+```sql
+HISTORY armada ASSET 'truk-7' PROPERTY 'suhu'
+  FROM '1700000000000000000' TO '1700000000000000002' LIMIT 100;
+```
+
+<!-- chironql-example: temporal-Latest -->
+```sql
+LATEST armada ASSET 'truk-7' PROPERTY 'suhu';
+```
+
+The history returns `24.5` and `25.0`, in event-time order. The latest row contains `25.0`. Both results contain `asset_ref` (namespace and ID), `property`, `time_ns` and `value`. Quote nanoseconds as signed decimal integers. The response also carries nanoseconds as decimal strings. An unknown series returns zero rows.
+
+A temporal batch has its own commit. It cannot be included in a SQL interactive transaction or the SQL/vector/graph `TRANSACTION` block. SQL uses snapshot isolation; see the [shared transaction contract](HTTP_API.md) for its concurrency limits.
+
+`APPEND` accepts 1–1,024 observations in one durable batch. Each series has a single type, boolean or float64. NaN is rejected. A retry of an identical observation returns zero newly affected rows. A different value at an existing timestamp rejects the whole batch. Late observations appear in their event-time position. `HISTORY` includes its lower bound and excludes its upper bound. Its required limit is 1–4,096 rows.
+
+<!-- temporal-pipeline -->
+```sql
+SQL CREATE TABLE trucks (id TEXT PRIMARY KEY);
+SQL INSERT INTO trucks VALUES ('truk-7'), ('truk-8');
+```
+
+<!-- chironql-example: temporal-Pipeline -->
+```sql
+PIPELINE
+RELATIONAL r { SQL SELECT id FROM trucks LIMIT 2 }
+TEMPORAL t { HISTORY armada ASSET r.record_ref PROPERTY 'suhu' FROM '1700000000000000000' TO '1700000000000000002' LIMIT 2 }
+LEFT JOIN t ON t.asset_ref = r.record_ref
+RETURN r.id,t.time_ns,t.value
+ORDER BY r.id ASC
+LIMIT 8;
+```
+
+The table selects two trucks. The first joins to both temperatures and the second has null observation fields. A visible text `id` can supply `r.record_ref` in the temporal collection. A stored `RECORD_REF('armada')` column can also supply the reference directly. With a vector or graph source, use its qualified record reference in the same stage. `LATEST` permits one observation per asset. `HISTORY` requires a range and per-asset limit. The product of unique assets and the per-asset limit must fit within 4,096 rows and the request memory budget before the stage reads history. The final pipeline `LIMIT` bounds the joined result. Use `EXPLAIN PIPELINE` to see the stage and limits.
+
+Use the same statements in the console, the `chironql` client, HTTP, gRPC or ChironWire. Protected deployments require the collection-scoped actions `temporal_append` or `temporal_read`, plus the normal permissions for each pipeline source. After enabling temporal writes, recover with a compatible binary. For downgrade, restore a verified backup taken before the first append. Full snapshots preserve temporal history. Targeted WAL restore for an activated temporal collection is rejected.
+
+An unquoted timestamp produces a parse error.
+
+<!-- chironql-example: temporal-RejectNumericTime -->
+```sql
+HISTORY armada ASSET 'a' PROPERTY 'p' FROM 1700000000000000000 TO '2' LIMIT 1;
+```
 
 ## Tabular ML materialization preview
 
@@ -418,8 +476,9 @@ that mutation. Conservative operation reservations remain until output consumpti
 
 ### Read-only multi-model pipeline
 
-`PIPELINE` has one bounded vector stage, an optional bounded graph traversal, one relational
-`SQL SELECT`, typed equijoins, and a bounded final result:
+`PIPELINE` joins a relational `SQL SELECT` with a vector, graph or temporal result. A graph traversal starts from a bounded vector stage. A temporal stage can start from table rows alone, as in the [truck history example](#time-series-chironql-15).
+
+The example below joins vector results, graph neighbours and rows from a document table.
 
 ```sql
 PIPELINE

@@ -946,7 +946,8 @@ where
 const HELP: &str = "\
  Read         SEARCH · HYBRID · MULTI · RECOMMEND · COUNT · SCROLL · GET
  Relational   SQL SELECT/EXPLAIN · SQL INSERT/UPDATE/DELETE · SQL CREATE/DROP TABLE
- Multi-model  PIPELINE vector → [graph] → relational · EXPLAIN PIPELINE
+ Time series  APPEND INTO · HISTORY · LATEST
+ Multi-model  PIPELINE [vector → graph] → relational → [temporal] · EXPLAIN PIPELINE
  Introspect   SHOW COLLECTIONS · DESCRIBE · USE
  Write        UPSERT · UPDATE ... SET PAYLOAD · DELETE ... POINTS
               DELETE ... WHERE   (counts first, then asks)

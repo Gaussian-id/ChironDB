@@ -339,6 +339,10 @@ jobs:
             CHIRONDB_ENOSPC_ROOT="$mountpoint" cargo test -p chirondb-core \
             --features fault-injection --test real_enospc --locked -- --ignored --exact \
             real_enospc_preserves_build_checkpoint_and_resumes_after_space_returns
+          CHIRONDB_ENOSPC_EVIDENCE="${RUNNER_TEMP}/real-enospc-temporal.json" \
+            CHIRONDB_ENOSPC_ROOT="$mountpoint" cargo test -p chirondb-core \
+            --features fault-injection --test real_enospc --locked -- --ignored --exact \
+            real_enospc_preserves_atomic_temporal_batches_and_acknowledgments
       - name: Upload ENOSPC evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

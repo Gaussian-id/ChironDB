@@ -42,6 +42,11 @@ impl QueryResult {
     pub fn consume<T>(self, consumer: impl FnOnce(ChironQlResponse) -> T) -> Result<T> {
         let Self { value, memory } = self;
         memory.check()?;
+        if let Some(snapshot) = &memory.temporal_snapshot
+            && !snapshot.validate()?
+        {
+            return Err(crate::security::SecurityError::Conflict.into());
+        }
         Ok(consumer(value))
     }
 }
@@ -52,6 +57,7 @@ impl QueryResult {
 #[derive(Debug)]
 pub(crate) struct QueryMemory {
     bytes: u64,
+    pub(crate) temporal_snapshot: Option<crate::db::MultiModelReadSnapshot>,
     cancellation: Option<crate::security::IdentityCancellation>,
     #[cfg(test)]
     test_cancellation: Option<Arc<AtomicBool>>,
@@ -61,6 +67,7 @@ impl QueryMemory {
     pub(crate) fn new() -> Result<Self> {
         Ok(Self {
             bytes: 4096,
+            temporal_snapshot: None,
             cancellation: None,
             #[cfg(test)]
             test_cancellation: None,
