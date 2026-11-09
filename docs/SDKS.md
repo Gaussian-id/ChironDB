@@ -1,5 +1,120 @@
 # ChironDB SDKs
 
+## Availability and compatibility
+
+SDK and server versions are independent. The published JavaScript package is
+[`@gaussian-id/chirondb`](https://www.npmjs.com/package/@gaussian-id/chirondb)
+`0.1.0-beta.3` (Node.js 22+); its original API targets the beta.2 HTTP contract.
+The server beta.3 adds atomic edge batches. Rust `0.1.0-beta.2` and Python
+`0.1.0b2` remain source/wheel distributions in this release line.
+
+| Capability | SDK entry point | Availability |
+| --- | --- | --- |
+| Dense, sparse/BM25, hybrid, named vectors, recall requests | `vector()` | Existing beta contract; recall requests are not measured recall |
+| Graph lifecycle, edges, traversal, deferred loading | `graph()` | Existing beta contract; native graph REST requires the legacy RBAC profile |
+| Native SQL, explicit transactions, status reconciliation | `relational()` | Evaluation preview; SQL uses snapshot isolation, which can allow write skew |
+| SQL/vector/graph pipelines and atomic blocks | `query()` | Existing ChironQL contract, subject to server profile and limits |
+| Protected application operations | `protected()` | Requires provisioned credentials and current server authority |
+| Decision Tree / Random Forest | ML helpers | Optional local worker; unavailable under protected tenant enforcement |
+| Atomic graph edge batches | `relate_batch` / `relateBatch` | **Unreleased SDK source addition**, server beta.3+; absent from npm beta.3 |
+| Time series: APPEND, HISTORY, LATEST, temporal PIPELINE | `query()` | **Early stage / evaluation only**, requires a compatible ChironQL 1.5 server; not in public server beta.3 |
+
+The current source adds batch methods and fixes temporal decoding in Rust/Python.
+Install a qualified candidate checkout/artifact for those changes; installing
+npm beta.3 does not install the unreleased changes. TypeScript source corrects
+nested graph receipts, traversal-budget fields and trace outcome objects.
+All clients retain explicit transaction decisions and no automatic mutation retries.
+
+## Time series — early stage
+
+Time series is an **early-stage evaluation feature**, not a production-ready or
+public-server-beta.3 capability. The SDK sends ChironQL through the existing
+`query()` interface; it does not enable temporal support on an older server.
+Use a compatible ChironQL 1.5 server and updated Rust/Python decoders. No dedicated
+`timeseries()` API is exposed. Runtime forwarding already works in npm beta.3.
+
+With a pre-created `armada` collection, submit each statement separately:
+
+```sql
+APPEND INTO armada [
+  {asset: 'truk-7', property: 'suhu', time_ns: '1700000000000000000', value: 24.5},
+  {asset: 'truk-7', property: 'suhu', time_ns: '1700000000000000001', value: 25.0}
+];
+
+HISTORY armada ASSET 'truk-7' PROPERTY 'suhu'
+  FROM '1700000000000000000' TO '1700000000000000002' LIMIT 100;
+
+LATEST armada ASSET 'truk-7' PROPERTY 'suhu';
+```
+
+```js
+// @gaussian-id/chirondb; requires the early-stage server.
+const history = await db.query("HISTORY armada ASSET 'truk-7' PROPERTY 'suhu' FROM '1700000000000000000' TO '1700000000000000002' LIMIT 100;");
+console.log(history.rows?.map(row => row.time_ns));
+```
+
+```python
+history = db.query("HISTORY armada ASSET 'truk-7' PROPERTY 'suhu' FROM '1700000000000000000' TO '1700000000000000002' LIMIT 100;")
+print([row["time_ns"] for row in history.rows])
+# AsyncChironDbClient: await db.query(...) with the same statement.
+```
+
+```rust
+use chirondb_client::ChironQlRequest;
+let history = db.query(&ChironQlRequest {
+    query: "HISTORY armada ASSET 'truk-7' PROPERTY 'suhu' FROM '1700000000000000000' TO '1700000000000000002' LIMIT 100;".into(),
+    ..Default::default()
+}).await?;
+println!("{:?}", history.rows);
+```
+
+Keep signed nanosecond timestamps as **decimal strings**, including in returned
+rows; JavaScript `Number` and `Date` cannot preserve this precision. A series is
+identified by tenant, collection, asset and property and has one boolean or
+float64 value type. APPEND accepts 1–1,024 observations atomically; exact repeats
+insert zero new observations and conflicting values reject the batch. HISTORY
+uses an inclusive lower and exclusive upper bound with a required 1–4,096 row
+limit. Protected use requires `temporal_append` / `temporal_read` collection grants.
+
+Temporal batches are separate from SQL/vector/graph atomic transactions;
+APPEND inside a multi-model TRANSACTION is rejected. Temporal PIPELINE is a
+bounded read composition. Targeted temporal WAL restore and the legacy point-only
+replication path are unsupported. Capacity, sustained-workload and release gates
+remain open; local functional tests do not establish production readiness.
+
+## Atomic graph batches — unreleased SDK source
+
+Create/configure the graph, edge type and endpoint points first. With existing
+`docs` points `a` and `b` and edge type `cites`:
+
+```js
+const batch = await db.graph().relateBatch('docs', {
+  edges: [{source_point_id: 'a', target_point_id: 'b', edge_type: 'cites'}],
+  idempotency_key: 'import-edges-1',
+});
+console.log(batch.edge_ids, batch.receipt.durable);
+```
+
+```python
+batch = db.graph().relate_batch("docs", [
+    {"source_point_id": "a", "target_point_id": "b", "edge_type": "cites"},
+], idempotency_key="import-edges-1")
+print([str(edge) for edge in batch.edge_ids], batch.receipt["durable"])
+```
+
+Rust exposes `RelateBatchRequest { edges: Vec<RelateRequest>, idempotency_key }`
+and `RelateBatchResult { edge_ids, receipt }` through both
+`db.relate_batch(collection, request, wait)` and `db.graph().relate_batch(...)`.
+Python supports the same operation on sync and async clients. `wait` defaults
+to true in Python/JavaScript; Rust takes it explicitly.
+
+Use one batch key, with no per-edge keys, and preserve edge order and content
+when reconciling an uncertain acknowledgement. The server validates the whole
+batch before mutation; a failed edge does not leave a partial batch. Native
+batch graph REST is unavailable on protected installations. Use the supported
+ChironQL transaction profile there. Do not infer all-model atomicity from an
+edge-only batch.
+
 Rust/Python source examples below run from their standalone SDK checkouts.
 Rust wire DTO names and JSON representations are unchanged, but SDK and
 embedded-engine structs are distinct Rust types. Compare or convert through
@@ -121,8 +236,8 @@ and input returns the same allocation rows. General query credential responses
 are excluded from the Python typed result's representation; store explicit
 issuance responses privately rather than logging/exporting them.
 
-The SDK remains independently source-distributed beta.2. This interface does not certify
-production relational/resource acceptance or engine benchmark improvements.
+SDKs are versioned independently; see the availability table above. This interface
+does not certify production acceptance or engine benchmark improvements.
 
 ## Native relational SQL preview
 
@@ -1646,11 +1761,17 @@ They do not initialize authority or issue credentials.
 
 The [Node SDK](https://github.com/Gaussian-id/chirondb-js) provides camelCase
 methods for the same HTTP contracts, with ESM/CommonJS exports and TypeScript
-declarations. Install a qualified local npm tarball until a registry release
-is explicitly published. Request/response DTO fields keep server snake_case.
+declarations. Install the published scoped package:
+
+```bash
+npm install @gaussian-id/chirondb@0.1.0-beta.3
+```
+
+Request/response DTO fields keep server snake_case. New source-only methods
+listed above require a separately qualified candidate artifact.
 
 ```js
-import { ChironDbClient } from 'chirondb-client';
+import { ChironDbClient } from '@gaussian-id/chirondb';
 const db = new ChironDbClient('http://127.0.0.1:7401', {
   apiKey: process.env.CHIRONDB_API_KEY, timeoutMs: 30000,
 });

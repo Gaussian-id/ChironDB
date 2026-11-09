@@ -32,3 +32,9 @@ using **New repository secret**. An organization secret with that same name and
 access to this repository also works. See
 [GitHub's secret setup](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets).
 The workflow already limits authenticated jobs to trusted repository code.
+
+The Node pin includes the published `@gaussian-id/chirondb` beta.3 scope and
+package consumer checks. SDK and server version numbers are independent.
+Unreleased SDK batch helpers and early-stage temporal decoder changes must be
+qualified and committed in their SDK repositories before advancing these pins.
+The public fixture does not certify ChironQL 1.5 time series.
