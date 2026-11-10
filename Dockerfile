@@ -3,7 +3,8 @@
 FROM rust:1.92.0-bookworm@sha256:e90e846de4124376164ddfbaab4b0774c7bdeef5e738866295e5a90a34a307a2 AS build
 ARG TARGETARCH
 WORKDIR /app
-RUN apt-get update \
+RUN apt-get -o Acquire::Retries=0 update \
+    && apt-get -o Acquire::Retries=0 upgrade -y \
     && apt-get install -y --no-install-recommends protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 COPY . .
@@ -24,7 +25,8 @@ LABEL org.opencontainers.image.title="ChironDB" \
       org.opencontainers.image.version="${CHIRONDB_VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.licenses="AGPL-3.0-only"
-RUN apt-get update \
+RUN apt-get -o Acquire::Retries=0 update \
+    && apt-get -o Acquire::Retries=0 upgrade -y \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 chirondb \

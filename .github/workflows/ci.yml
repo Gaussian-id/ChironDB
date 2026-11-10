@@ -40,7 +40,9 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: Test
-        run: cargo test --workspace --locked -j 2
+        run: cargo test --workspace --locked -j 2 -- --skip stable_tail::tests::real_shard_smoke_emits_both_modes
+      - name: Physical stable-tail gate (both binaries, serialized)
+        run: python3 .github/tools/test_stable_tail.py
       - name: WAL phase crash matrix (non-production hooks)
         run: cargo test -p chirondb --features fault-injection --test process_kill --test temporal_recovery --locked -j 2
       - name: Storage, checkpoint, and graph batch fault injection
@@ -193,6 +195,7 @@ jobs:
           SDK_REPOS_READ_TOKEN: ${{ secrets.SDK_REPOS_READ_TOKEN }}
         run: |
           python3 -m venv "$RUNNER_TEMP/sdk-venv"
+          env -u SDK_REPOS_READ_TOKEN "$RUNNER_TEMP/sdk-venv/bin/python" -m pip install --only-binary=:all: --upgrade pip==26.3
           "$RUNNER_TEMP/sdk-venv/bin/python" .github/tools/install_standalone_sdks.py
           echo "$RUNNER_TEMP/sdk-venv/bin" >> "$GITHUB_PATH"
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
@@ -203,6 +206,7 @@ jobs:
           CHIRONDB_ML_WORKER_SCRIPT: ${{ github.workspace }}/ml-worker/chirondb_ml_worker.py
         run: |
           python3 -m venv "$RUNNER_TEMP/sdk-ml"
+          "$RUNNER_TEMP/sdk-ml/bin/python" -m pip install --only-binary=:all: --upgrade pip==26.3
           "$RUNNER_TEMP/sdk-ml/bin/python" -m pip install -r ml-worker/requirements-traditional.txt
           export CHIRONDB_ML_WORKER_PYTHON="$RUNNER_TEMP/sdk-ml/bin/python"
           cargo fmt --manifest-path sdk-integration/Cargo.toml -- --check
@@ -221,12 +225,14 @@ jobs:
       - name: MCP Python SDK and stdio interoperability
         run: |
           python3 -m venv "$RUNNER_TEMP/mcp-venv"
+          "$RUNNER_TEMP/mcp-venv/bin/python" -m pip install --only-binary=:all: --upgrade pip==26.3
           "$RUNNER_TEMP/mcp-venv/bin/pip" install -r chirondb-server/tests/mcp_requirements.txt
           "$RUNNER_TEMP/mcp-venv/bin/pip" install "$(ls "$CHIRONDB_SDK_PYTHON_ROOT"/dist/*.whl)"
           "$RUNNER_TEMP/mcp-venv/bin/python" chirondb-server/tests/mcp_interop.py --bins "$RUNNER_TEMP/sdk-bins"
       - name: Traditional ML worker and real protocol/SDK scenarios
         run: |
           python3 -m venv "$RUNNER_TEMP/chirondb-ml-python"
+          "$RUNNER_TEMP/chirondb-ml-python/bin/python" -m pip install --only-binary=:all: --upgrade pip==26.3
           ml_python="$RUNNER_TEMP/chirondb-ml-python/bin/python"
           "$ml_python" -m pip install -r ml-worker/requirements-traditional.txt requests==2.34.2 protobuf==7.36.2
           PYTHONPATH=ml-worker "$ml_python" -m unittest -v test_worker

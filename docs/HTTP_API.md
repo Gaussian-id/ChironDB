@@ -45,6 +45,44 @@ unless TLS, API credentials, RBAC with stable principal IDs, and an external
 encryption keyring are configured. `CHIRONDB_ALLOW_INSECURE_NON_LOOPBACK=true`
 is a logged/audited development escape hatch, not a production profile.
 
+### Credential lifecycle and authentication telemetry
+
+Legacy API-key authentication uses a stable `legacy-key-...` fingerprint as the
+principal when no explicit RBAC ID is configured. Explicit RBAC IDs remain
+unchanged. Existing audit history is preserved; audit consumers should accept
+the fingerprint for newly recorded legacy events. Legacy transaction/idempotency
+receipts owned by the former raw-key identity do not automatically transfer to
+the fingerprint. Reconcile outstanding outcomes before upgrading; explicit RBAC
+IDs keep their existing ownership.
+
+Key-file changes take effect when the server next reads the configured keys.
+Replace key files atomically: an empty or unreadable file removes its keys from
+the accepted set. A separately configured static key remains accepted until its
+own configuration changes. Legacy PostgreSQL sessions bind to the observed
+credential generation and recheck before operations, COMMIT and output writes.
+Observation closes new admission and drains already admitted synchronous
+publication/commit operations before acknowledging retirement. Existing sessions,
+including prepared statements and portals, remain retired if the key is added
+back; reconnect to authenticate again. Uncommitted transactions
+are abandoned when the retired session next operates or publishes. Work already
+committed cannot be undone by revocation; bytes already handed to the transport
+cannot be recalled. A file-read warning is emitted on error-kind transitions
+and on recurrence after a successful read, rather than once per request.
+
+HTTP, gRPC, ChironWire and PostgreSQL record generic authentication failures
+without credentials, queries or caller-supplied request IDs. Anonymous audit
+writes are limited to 16 records per second per transport per process. Monitor
+`chirondb_authentication_failures_total{transport}` for every rejection and
+`chirondb_authentication_audit_suppressed_total{transport,reason}` for omitted
+records (`rate_limit` or `audit_unavailable`). The fixed transport labels are
+`http`, `grpc`, `chironwire` and `pgwire`; both PostgreSQL authentication modes
+share the same budget. Authentication remains denied when an audit write fails.
+
+Secure startup validates normalized cold-storage and WAL object-store URLs and
+their transport options. Remote endpoints require HTTPS with certificate
+validation, including S3 endpoint overrides. Supported local storage remains
+available. URL/configuration errors omit potentially sensitive option values.
+
 ## Transaction outcome and degraded writes
 
 Every mutation is decided by the installation transaction journal before its

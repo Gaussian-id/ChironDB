@@ -234,7 +234,7 @@ pub async fn fan_out_search<C: ShardClient>(
     budget_ms: u64,
 ) -> SearchResponse {
     use tokio::task::JoinSet;
-    use tokio::time::{Duration, timeout};
+    use tokio::time::{Duration, Instant, timeout_at};
 
     if shard_clients.is_empty() {
         return SearchResponse {
@@ -248,6 +248,11 @@ pub async fn fan_out_search<C: ShardClient>(
 
     let start = std::time::Instant::now();
     let budget = Duration::from_millis(budget_ms);
+    // Use one absolute deadline. Recreating a relative timeout after a delayed
+    // poll can otherwise grant the coordinator a fresh part of its budget.
+    // An unrepresentably distant deadline retains the existing effectively
+    // unbounded behavior without overflowing the platform's Instant.
+    let deadline = Instant::from_std(start).checked_add(budget);
 
     // Collect shards in completion order. Waiting on handles in submission
     // order lets one straggler hide a fast shard that has already finished.
@@ -262,34 +267,41 @@ pub async fn fan_out_search<C: ShardClient>(
     let mut degraded = false;
 
     while !tasks.is_empty() {
-        let remaining = budget.saturating_sub(start.elapsed());
-        if remaining.is_zero() {
-            degraded = true;
-            tasks.abort_all();
-            break;
-        }
-        match timeout(remaining, tasks.join_next()).await {
-            Ok(Some(Ok(Ok(resp)))) => {
-                degraded |= resp.degraded;
-                total_searched += resp.searched;
-                all_hits.extend(resp.hits);
-            }
-            Ok(Some(Ok(Err(_)))) => {
-                // shard returned an error — treat as degraded
-                degraded = true;
-            }
-            Ok(Some(Err(_))) => {
-                // task panicked
-                degraded = true;
-            }
-            Ok(None) => break,
-            Err(_) => {
-                // The budget applies to the whole fan-out. Abort unfinished
-                // shard futures so timed-out work cannot continue detached.
+        let result = if let Some(deadline) = deadline {
+            if Instant::now() >= deadline {
                 degraded = true;
                 tasks.abort_all();
                 break;
             }
+            // Timeout polls its inner future before its timer. After executor
+            // delay both may be ready, so an Ok result alone does not prove
+            // that the response arrived within this query's deadline.
+            match timeout_at(deadline, tasks.join_next()).await {
+                Ok(result) if Instant::now() < deadline => result,
+                _ => {
+                    degraded = true;
+                    tasks.abort_all();
+                    break;
+                }
+            }
+        } else {
+            tasks.join_next().await
+        };
+        match result {
+            Some(Ok(Ok(resp))) => {
+                degraded |= resp.degraded;
+                total_searched += resp.searched;
+                all_hits.extend(resp.hits);
+            }
+            Some(Ok(Err(_))) => {
+                // shard returned an error — treat as degraded
+                degraded = true;
+            }
+            Some(Err(_)) => {
+                // task panicked
+                degraded = true;
+            }
+            None => break,
         }
     }
 
@@ -626,6 +638,68 @@ mod tests {
         // The fast shard's result should still be present
         assert_eq!(resp.hits.len(), 1);
         assert_eq!(resp.hits[0].id, "fast");
+    }
+
+    struct LateReadyShard;
+
+    impl ShardClient for LateReadyShard {
+        async fn search(self, _req: SearchRequest) -> crate::error::Result<SearchResponse> {
+            // Delay the sole executor thread deliberately. When the coordinator
+            // is polled again, both the shard result and its timeout are ready.
+            // This models a delayed poll, not a shard that cooperatively waits
+            // for the timer to fire.
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            Ok(SearchResponse {
+                hits: vec![SearchHit {
+                    id: "late".into(),
+                    score: 1.0,
+                    payload: json!({}),
+                }],
+                degraded: false,
+                searched: 1,
+                elapsed_ms: 0,
+                graph: None,
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fan_out_rejects_ready_response_after_deadline() {
+        let req = SearchRequest {
+            graph: None,
+            vector: vec![1.0],
+            vector_name: None,
+            k: 1,
+            filter: None,
+            budget_ms: None,
+            consistency: None,
+            ef_search: None,
+            recall_target: None,
+            with_payload: None,
+        };
+        for budget_ms in [1_000, u64::MAX] {
+            let timely = FakeShard {
+                hits: vec![SearchHit {
+                    id: "timely".into(),
+                    score: 1.0,
+                    payload: json!({}),
+                }],
+                delay_ms: 0,
+            };
+            let response = fan_out_search(vec![timely], req.clone(), budget_ms).await;
+            assert!(!response.degraded);
+            assert_eq!(response.hits[0].id, "timely");
+        }
+        let response = fan_out_search(vec![LateReadyShard], req, 5).await;
+        assert!(
+            response.degraded,
+            "a late ready shard must not satisfy the budget"
+        );
+        assert!(
+            response.hits.is_empty(),
+            "late shard results must not be published"
+        );
+        assert_eq!(response.searched, 0);
     }
 
     #[tokio::test]

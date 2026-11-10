@@ -28,9 +28,11 @@ jobs:
       - name: Resolve tested revision and trees
         id: trees
         run: |
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "core=$(git rev-parse HEAD:chirondb-core)" >> "$GITHUB_OUTPUT"
-          echo "server=$(git rev-parse HEAD:chirondb-server)" >> "$GITHUB_OUTPUT"
+          {
+            echo "sha=$(git rev-parse HEAD)"
+            echo "core=$(git rev-parse HEAD:chirondb-core)"
+            echo "server=$(git rev-parse HEAD:chirondb-server)"
+          } >> "$GITHUB_OUTPUT"
       - name: Run fixed 1M, 10M, and guarded 100M tiers
         env:
           TESTED_SHA: ${{ steps.trees.outputs.sha }}

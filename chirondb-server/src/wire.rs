@@ -688,14 +688,16 @@ where
         // Unauthenticated frame buffers cannot consume authenticated work capacity.
         let work = if let Some(authority) = db.identity_authority() {
             if let Err(error) = authority.authenticate(&request.api_key) {
-                send_wire_response(
-                    &response_sender,
-                    error_response(
-                        request.request_id,
-                        crate::grpc_protected::authentication_error(error),
-                    ),
-                )
-                .await?;
+                let status = if matches!(error, crate::security::SecurityError::Unauthenticated)
+                    && crate::auth::denial::record(&db, crate::auth::denial::Transport::Wire)
+                        .is_err()
+                {
+                    Status::unavailable("audit unavailable")
+                } else {
+                    crate::grpc_protected::authentication_error(error)
+                };
+                send_wire_response(&response_sender, error_response(request.request_id, status))
+                    .await?;
                 continue;
             }
             Some(Arc::new(
@@ -1151,20 +1153,7 @@ fn dispatch_request_inner(
     let request_id = request.request_id;
     let api_key = optional_api_key(&request.api_key);
     let Some(principal) = auth.permission_for(api_key) else {
-        if db
-            .audit_access_event(
-                "authentication",
-                "chironwire_authenticate",
-                "failure",
-                None,
-                "unknown",
-                None,
-                "chironwire",
-                Some(&request_id.to_string()),
-                Some("invalid_credential"),
-            )
-            .is_err()
-        {
+        if crate::auth::denial::record(db, crate::auth::denial::Transport::Wire).is_err() {
             return error_response(request_id, Status::unavailable("audit unavailable"));
         }
         return error_response(

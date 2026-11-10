@@ -25,6 +25,9 @@ use crate::{
     model::{Point, SparseVector},
 };
 
+mod object_store_security;
+pub use object_store_security::validate_secure_object_store_url;
+
 const MANIFEST_MAGIC: &[u8; 8] = b"GAUSSMF1";
 const VECTOR_MAGIC: &[u8; 8] = b"GAUSSGD1";
 const VECTOR_MAGIC_V2: &[u8; 8] = b"GAUSSGD2";
@@ -1817,12 +1820,12 @@ fn cold_object_store(config: &ColdObjectStoreConfig) -> Result<ColdObjectStore> 
             })
         }
         ColdObjectStoreConfig::Url(raw_url) => {
-            let url = Url::parse(raw_url).map_err(|error| {
-                GaussError::InvalidRequest(format!(
-                    "invalid cold object store URL '{raw_url}': {error}"
-                ))
-            })?;
+            let url = Url::parse(raw_url)
+                .map_err(|_| GaussError::InvalidRequest("invalid cold object store URL".into()))?;
             let mut options = std::env::vars().collect::<Vec<_>>();
+            if encryption::encryption_enforced() {
+                object_store_security::validate_options(&url, &options)?;
+            }
             if url.scheme() == "http"
                 && !options
                     .iter()
@@ -1832,10 +1835,8 @@ fn cold_object_store(config: &ColdObjectStoreConfig) -> Result<ColdObjectStore> 
                 // the operator's opt-in to plaintext transport.
                 options.push(("allow_http".to_string(), "true".to_string()));
             }
-            let (store, prefix) = parse_url_opts(&url, options).map_err(|error| {
-                GaussError::InvalidRequest(format!(
-                    "failed to open cold object store URL '{raw_url}': {error}"
-                ))
+            let (store, prefix) = parse_url_opts(&url, options).map_err(|_| {
+                GaussError::InvalidRequest("failed to open cold object store URL".into())
             })?;
             Ok(ColdObjectStore {
                 store: Arc::from(store),

@@ -960,6 +960,8 @@ identity publication guard remains attached through the encoded response body.
 Use verified TLS and one API-key metadata header. Each RPC reauthenticates, including
 RPCs on an already-open channel. Duplicate credential aliases are rejected. Legacy
 `GaussDb` RPCs and other operations without a protected implementation remain closed.
+Authentication failures use bounded, redacted audit events and fixed-label
+[authentication counters](HTTP_API.md#credential-lifecycle-and-authentication-telemetry).
 Protected bounded dense/BM25/text-hybrid pipelines and INSERT/UPDATE/DELETE atomic multi-model blocks use the
 same core as HTTP. Server-ID INSERT returns binding/reference/edge rows in `rows_json` and keeps
 them on keyed replay. Graph schema commands require collection Schema and a current security

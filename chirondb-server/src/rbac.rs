@@ -345,7 +345,7 @@ impl Principal {
     }
 }
 
-fn legacy_principal_id(key: &str) -> String {
+pub(crate) fn legacy_principal_id(key: &str) -> String {
     let digest = Sha256::digest(key.as_bytes());
     format!("legacy-key-{}", hex_prefix(&digest, 8))
 }

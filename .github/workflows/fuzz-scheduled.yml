@@ -23,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [protocol_decoders, query_decoders, storage_decoders, index_decoders]
+        target: [protocol_decoders, query_decoders, storage_decoders, index_decoders, temporal_decoders]
         mode: [asan, careful-ub-checks]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

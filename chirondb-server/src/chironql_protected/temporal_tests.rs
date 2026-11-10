@@ -105,6 +105,65 @@ fn protected_temporal_reads_bind_scope_and_recheck_at_publication() {
     );
     let pending = execute(&db, token, &req(sql)).unwrap();
     let authority = db.identity_authority().unwrap();
+    // Every domain is revalidated, including a SQL grant revoked after execution.
+    let actor = authority.authenticate(token).unwrap();
+    let granted = actor.principal().clone();
+    let mut restricted = granted.clone();
+    for grant in &mut restricted.grants {
+        grant.actions.remove(&Action::Read);
+    }
+    authority
+        .put_principal(&actor, actor.revision(), restricted)
+        .unwrap();
+    assert!(pending.publish(|_| panic!("revoked SQL output")).is_err());
+    assert!(execute(&db, token, &req(sql)).is_err());
+    let actor = authority.authenticate(token).unwrap();
+    authority
+        .put_principal(&actor, actor.revision(), granted)
+        .unwrap();
+    assert!(
+        execute(&db, token, &req(sql))
+            .unwrap()
+            .publish(|r| r)
+            .is_ok()
+    );
+
+    let actor = authority.authenticate(token).unwrap();
+    let read = db
+        .bind_access(&actor, "armada", "acme", Action::TemporalRead)
+        .unwrap();
+    let append = db
+        .bind_access(&actor, "armada", "acme", Action::TemporalAppend)
+        .unwrap();
+    use chirondb_core::db::temporal::{SensorValue, TemporalAccess, TemporalSample};
+    let latest_with = |access| db.latest_temporal("armada", access, "truck", "temp");
+    assert!(
+        latest_with(TemporalAccess::Authorized(&read))
+            .unwrap()
+            .is_some()
+    );
+    assert!(latest_with(TemporalAccess::Authorized(&append)).is_err());
+    let untrusted_scope = chirondb_core::tenant::TenantScope::tenant("admin", "acme");
+    assert!(latest_with(TemporalAccess::Scoped(&untrusted_scope)).is_err());
+    assert!(
+        db.bind_access(&actor, "armada", "other-tenant", Action::TemporalRead)
+            .is_err()
+    );
+    assert!(
+        db.append_temporal_batch(
+            "armada",
+            TemporalAccess::Authorized(&read),
+            vec![TemporalSample::new(
+                "truck",
+                "temp",
+                2,
+                SensorValue::Boolean(true)
+            )]
+        )
+        .is_err()
+    );
+
+    let pending = execute(&db, token, &req(sql)).unwrap();
     let actor = authority.authenticate(token).unwrap();
     let mut principal = actor.principal().clone();
     for g in &mut principal.grants {
@@ -115,4 +174,35 @@ fn protected_temporal_reads_bind_scope_and_recheck_at_publication() {
         .unwrap();
     assert!(pending.publish(|_| panic!("revoked output")).is_err());
     assert!(execute(&db, token, &req(sql)).is_err());
+    assert!(latest_with(TemporalAccess::Authorized(&read)).is_err());
+
+    let actor = authority.authenticate(token).unwrap();
+    let mut principal = actor.principal().clone();
+    for grant in &mut principal.grants {
+        grant.actions.insert(Action::TemporalRead);
+    }
+    authority
+        .put_principal(&actor, actor.revision(), principal)
+        .unwrap();
+    let actor = authority.authenticate(token).unwrap();
+    let old = db
+        .bind_access(&actor, "armada", "acme", Action::TemporalRead)
+        .unwrap();
+    db.delete_protected_collection_authorized(&actor, "armada")
+        .unwrap();
+    db.create_protected_collection_authorized(
+        &actor,
+        db.catalog_revision_authorized(&actor).unwrap(),
+        serde_json::from_value(json!({"name":"armada","vector_dim":2})).unwrap(),
+    )
+    .unwrap();
+    assert!(latest_with(TemporalAccess::Authorized(&old)).is_err());
+    let fresh = db
+        .bind_access(&actor, "armada", "acme", Action::TemporalRead)
+        .unwrap();
+    assert!(
+        latest_with(TemporalAccess::Authorized(&fresh))
+            .unwrap()
+            .is_none()
+    );
 }
