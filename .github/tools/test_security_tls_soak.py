@@ -11,6 +11,20 @@ import security_tls_soak as soak
 
 
 class TlsFixtureTests(unittest.TestCase):
+    def test_generated_chains_pass_strict_certificate_validation(self):
+        with tempfile.TemporaryDirectory(prefix="chiron-tls-pki-") as directory:
+            pki = soak.generate_pki(Path(directory), "openssl")
+            for name, purpose in [("initial", "sslserver"),
+                                  ("replacement", "sslserver"),
+                                  ("client", "sslclient")]:
+                with self.subTest(certificate=name):
+                    result = subprocess.run(
+                        ["openssl", "verify", "-x509_strict", "-purpose", purpose,
+                         "-CAfile", str(pki["ca_cert"]), str(pki[f"{name}_cert"])],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_browser_requires_completed_body(self):
         with tempfile.TemporaryDirectory(prefix="chiron-tls-fixture-") as directory:
             root = Path(directory)

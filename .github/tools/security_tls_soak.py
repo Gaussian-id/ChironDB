@@ -95,6 +95,10 @@ extendedKeyUsage=clientAuth
             "2",
             "-subj",
             "/CN=ChironDB TLS Soak CA",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+            "-addext",
+            "keyUsage=critical,keyCertSign,cRLSign",
             "-out",
             str(ca_cert),
         ]
