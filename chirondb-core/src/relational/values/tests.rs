@@ -68,6 +68,7 @@ fn overlay_read_owners_keep_payload_reservations_after_the_table_drops() {
         rows.insert(
             1,
             VersionChain::single(RowVersion {
+                security: None,
                 begin: 1,
                 end: None,
                 values: RowValues::adopt(vec![RelationalValue::Text("x".repeat(64 * 1024))])

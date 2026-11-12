@@ -162,6 +162,7 @@ fn locator_validation_rejects_overlaps_and_duplicate_logical_versions() {
         drop(engine);
         let versions = [
             RowVersion {
+                security: None,
                 begin: 1,
                 end: Some(3),
                 values: RowValues::adopt(vec![
@@ -171,6 +172,7 @@ fn locator_validation_rejects_overlaps_and_duplicate_logical_versions() {
                 .unwrap(),
             },
             RowVersion {
+                security: None,
                 begin: if same_begin { 1 } else { 2 },
                 end: None,
                 values: RowValues::adopt(vec![
@@ -225,6 +227,7 @@ fn disk_version_chains_retain_metadata_quota_after_readers_drop() {
     let mut records = (2..=33)
         .map(|begin| {
             let version = RowVersion {
+                security: None,
                 begin,
                 end: (begin < 33).then_some(begin + 1),
                 values: RowValues::copy(&[

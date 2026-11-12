@@ -10,6 +10,15 @@ holds data.
 
 ## Where it is enforced
 
+This page describes legacy vector tenant isolation, not universal SQL RLS or
+field-level ACLs. Native legacy SQL is refused when tenant enforcement blocks
+unscoped access or the caller has a collection allowlist. The same restriction
+applies to SQL inside ChironQL pipelines and transactions and to native
+PostgreSQL preparation/execution. Protected SQL combines tenant-bound table
+grants with row owner/department/classification and column Read/Query/Write;
+see [protected security](CHIRONQL_SECURITY.md#protected-relational-sql).
+`Disabled` and `DryRun` must not be used as enforced isolation boundaries.
+
 In `chirondb-core`, not in any one query surface. HTTP, gRPC, ChironWire, MCP,
 the pgvector subset and ChironQL all reach the same engine, and a rule applied
 in only one of them protects only that one.

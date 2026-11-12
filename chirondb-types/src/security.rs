@@ -286,12 +286,42 @@ pub struct CollectionPolicy {
     pub templates: BTreeMap<String, IngestTemplate>,
 }
 
-/// Stored separately from ordinary payload and bound to the physical point.
+/// Content owned by a protected binding. Metadata-only assets have no vector
+/// storage row and must never enter vector search or graph-node domains.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ResourceContent {
+    #[default]
+    Point,
+    TemporalAsset {
+        metadata: serde_json::Value,
+    },
+    GraphEdge {
+        edge_id: u64,
+        graph_epoch: u64,
+        source: Uuid,
+        target: Uuid,
+    },
+}
+
+impl ResourceContent {
+    pub fn is_point(&self) -> bool {
+        matches!(self, Self::Point)
+    }
+
+    pub fn is_temporal_asset(&self) -> bool {
+        matches!(self, Self::TemporalAsset { .. })
+    }
+}
+
+/// Stored separately from ordinary payload and bound to a durable resource.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceRecord {
     pub key: PointKey,
     pub storage_id: Uuid,
+    #[serde(default, skip_serializing_if = "ResourceContent::is_point")]
+    pub content: ResourceContent,
     pub labels: ResourceLabels,
     pub properties: BTreeMap<String, PropertyRule>,
     pub representations: BTreeMap<String, Representation>,

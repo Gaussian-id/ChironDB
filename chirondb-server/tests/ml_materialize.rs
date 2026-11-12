@@ -49,8 +49,8 @@ async fn tenant_enforcement_denies_unscoped_ml_routes() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
     let body: Value = response.json().await.unwrap();
-    assert_eq!(body["code"], "chironql.ml_tenant_unsupported");
+    assert_eq!(body["code"], "chironql.permission_denied");
     server.abort();
 }

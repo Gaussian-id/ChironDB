@@ -66,6 +66,9 @@ impl AtomicOutput {
             _memory: memory,
         })
     }
+    pub(crate) fn sql_publication_context(&self) -> crate::SqlPublication {
+        self.receipt.sql_publication_context()
+    }
     pub(crate) fn publication_context(&self) -> AccessContext {
         self.receipt
             .publication_context()

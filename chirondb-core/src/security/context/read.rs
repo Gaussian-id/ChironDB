@@ -62,6 +62,7 @@ impl AuthorizedResources<'_> {
         self.context.publication_permit()?;
         if record.key.tenant != self.context.tenant
             || record.key.collection != self.context.incarnation()
+            || !record.content.is_point()
         {
             return Err(SecurityError::NotFound);
         }

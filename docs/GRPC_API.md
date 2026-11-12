@@ -954,9 +954,18 @@ confer SQL data rights on their immutable creator. Older receipts without saved
 table authorization are denied without re-execution. See the
 [strict migration contract](CHIRONQL_SECURITY.md#protected-relational-sql).
 
-Exact table grants map Read/Create/Update/Delete to
-SELECT/INSERT/UPDATE/DELETE, DDL requires installation action Schema, and the
+Exact table grants require Read for SELECT/EXPLAIN, Create for blind INSERT,
+Read plus Create for INSERT with RETURNING/ON CONFLICT, Read plus Update for
+UPDATE, and Read plus Delete for DELETE. DDL requires installation action Schema, and the
 identity publication guard remains attached through the encoded response body.
+Native row owner/department/classification and object grants further constrain
+table permissions. Columns require separate Read/Query/Write; missing historical
+authority fails closed. `ExecuteQuery` accepts SHOW/ALTER ROW SECURITY with the
+same [revision-bound control plane](CHIRONQL_SECURITY.md#native-row-security-administration)
+as HTTP. Table-policy guards remain attached through encoded publication and
+receipt replay. Legacy SQL rejects tenant-enforced
+and collection-allowlisted calls; native legacy DDL requires Admin, including
+batch/interactive operations. Mutation replay rechecks Read dependencies.
 Use verified TLS and one API-key metadata header. Each RPC reauthenticates, including
 RPCs on an already-open channel. Duplicate credential aliases are rejected. Legacy
 `GaussDb` RPCs and other operations without a protected implementation remain closed.
@@ -969,6 +978,11 @@ revision. See [atomic INSERT](CHIRONQL.md#protected-atomic-insert). Protected gr
 node/edge filters with node-only output. Standalone protected ChironQL `TRAVERSE` supports
 nodes, edges and paths with authorized payloads; paths require `LIMIT`. See
 [protected filters](CHIRONQL_SECURITY.md#protected-graph-filters).
+Edge fields additionally use `/edges/<field>` rules on both endpoints for
+Read/Query/Write. Protected temporal HISTORY/LATEST and APPEND require current
+asset authority and property Read/Write. Their optional metadata WHERE needs
+Query. ChironQL 1.2 CREATE/GET/UPDATE/DELETE ASSET supports metadata-only assets; privileged REGISTER ASSET explicitly binds historical names. Bare SQL/temporal names remain unauthorized until registered.
+See [temporal access](CHIRONQL_SECURITY.md#protected-temporal-access).
 Numeric sparse hybrid remains unavailable. PostgreSQL wire
 uses the same protected authority after TLS `SSLRequest` and a separate
 `SCRAM-SHA-256` SQL password; gRPC continues to use bearer credentials.

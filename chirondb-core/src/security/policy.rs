@@ -442,68 +442,99 @@ pub(crate) fn validate_payload_change(
     old: &Value,
     new: &Value,
 ) -> Result<()> {
-    fn visit(
-        record: &ResourceRecord,
-        attributes: &SubjectAttributes,
-        path: &str,
-        old: Option<&Value>,
-        new: Option<&Value>,
-        depth: usize,
-        count: &mut usize,
-    ) -> Result<()> {
-        *count += 1;
-        if depth > 16 || *count > MAX_POLICY_GRANTS {
-            return Err(SecurityError::BudgetExceeded);
-        }
-        if old == new {
-            return Ok(());
-        }
-        if record.properties.contains_key(path) {
-            return if field_allowed(record, attributes, path, PropertyAction::Write) {
-                Ok(())
-            } else {
-                Err(SecurityError::Forbidden)
-            };
-        }
-        let old_fields = old.and_then(Value::as_object);
-        let new_fields = new.and_then(Value::as_object);
-        if old_fields.is_some() || new_fields.is_some() {
-            // Scalar/object changes require permission for the scalar and for
-            // every affected descendant, including descendants being removed.
-            if (old.is_some_and(|value| !value.is_object())
-                || new.is_some_and(|value| !value.is_object()))
-                && !field_allowed(record, attributes, path, PropertyAction::Write)
-            {
+    validate_payload_replacement(record, attributes, old, new, None)
+}
+
+/// A full replacement also submits unchanged fields. Comparing a hidden value
+/// before checking its authority would turn success into an equality oracle.
+/// A reader may carry an unchanged field through an otherwise writable edit.
+pub(crate) fn validate_payload_replacement(
+    record: &ResourceRecord,
+    attributes: &SubjectAttributes,
+    old: &Value,
+    new: &Value,
+    read_unchanged: Option<bool>,
+) -> Result<()> {
+    struct Replacement<'a> {
+        record: &'a ResourceRecord,
+        attributes: &'a SubjectAttributes,
+        read_unchanged: Option<bool>,
+    }
+    impl Replacement<'_> {
+        fn visit(
+            &self,
+            path: &str,
+            old: Option<&Value>,
+            new: Option<&Value>,
+            depth: usize,
+            count: &mut usize,
+        ) -> Result<()> {
+            let Self {
+                record,
+                attributes,
+                read_unchanged,
+            } = *self;
+            *count += 1;
+            if depth > 16 || *count > MAX_POLICY_GRANTS {
+                return Err(SecurityError::BudgetExceeded);
+            }
+            if old == new && read_unchanged.is_none() {
+                return Ok(());
+            }
+            if record.properties.contains_key(path) {
+                return if field_allowed(record, attributes, path, PropertyAction::Write)
+                    || (old == new
+                        && read_unchanged == Some(true)
+                        && field_allowed(record, attributes, path, PropertyAction::Read))
+                {
+                    Ok(())
+                } else {
+                    Err(SecurityError::Forbidden)
+                };
+            }
+            let old_fields = old.and_then(Value::as_object);
+            let new_fields = new.and_then(Value::as_object);
+            if old_fields.is_some() || new_fields.is_some() {
+                // Scalar/object changes require permission for the scalar and for
+                // every affected descendant, including descendants being removed.
+                if (old.is_some_and(|value| !value.is_object())
+                    || new.is_some_and(|value| !value.is_object()))
+                    && !field_allowed(record, attributes, path, PropertyAction::Write)
+                {
+                    return Err(SecurityError::Forbidden);
+                }
+                let names: BTreeSet<_> = old_fields
+                    .into_iter()
+                    .chain(new_fields)
+                    .flat_map(|fields| fields.keys())
+                    .collect();
+                if names.is_empty() && !path.is_empty() {
+                    return Err(SecurityError::Forbidden);
+                }
+                for name in names {
+                    self.visit(
+                        &child_path(path, name),
+                        old_fields.and_then(|fields| fields.get(name)),
+                        new_fields.and_then(|fields| fields.get(name)),
+                        depth + 1,
+                        count,
+                    )?;
+                }
+            } else if !field_allowed(record, attributes, path, PropertyAction::Write) {
                 return Err(SecurityError::Forbidden);
             }
-            let names: BTreeSet<_> = old_fields
-                .into_iter()
-                .chain(new_fields)
-                .flat_map(|fields| fields.keys())
-                .collect();
-            if names.is_empty() && !path.is_empty() {
-                return Err(SecurityError::Forbidden);
-            }
-            for name in names {
-                visit(
-                    record,
-                    attributes,
-                    &child_path(path, name),
-                    old_fields.and_then(|fields| fields.get(name)),
-                    new_fields.and_then(|fields| fields.get(name)),
-                    depth + 1,
-                    count,
-                )?;
-            }
-        } else if !field_allowed(record, attributes, path, PropertyAction::Write) {
-            return Err(SecurityError::Forbidden);
+            Ok(())
         }
-        Ok(())
     }
     if !new.is_object() {
         return Err(SecurityError::Invalid("payload must be an object".into()));
     }
-    visit(record, attributes, "", Some(old), Some(new), 0, &mut 0)
+    Replacement {
+        record,
+        attributes,
+        read_unchanged,
+    }
+    .visit("", Some(old), Some(new), 0, &mut 0)
 }
 
 pub(crate) fn project_payload(
@@ -568,6 +599,41 @@ pub(crate) fn validate_resource(
     incarnation: uuid::Uuid,
     revision: u64,
 ) -> Result<()> {
+    if let ResourceContent::TemporalAsset { metadata } = &record.content {
+        if !metadata.is_object() || !record.representations.is_empty() {
+            return Err(SecurityError::Invalid(
+                "invalid temporal asset metadata".into(),
+            ));
+        }
+        super::storage::serialized_len(metadata, 64 * 1024)
+            .map_err(|_| SecurityError::BudgetExceeded)?;
+    }
+    if let ResourceContent::GraphEdge {
+        edge_id,
+        graph_epoch,
+        source,
+        target,
+    } = &record.content
+    {
+        let edge = crate::graph::EdgeId::from_raw(*edge_id);
+        if *graph_epoch == 0
+            || edge.epoch() == 0
+            || edge.counter() == 0
+            || source.is_nil()
+            || target.is_nil()
+            || !record.representations.is_empty()
+            || record.create_receipt.is_some()
+            || record.key.id != format!("@edge/{graph_epoch}/{edge_id}")
+        {
+            return Err(SecurityError::Invalid(
+                "invalid graph edge authority".into(),
+            ));
+        }
+    } else if record.key.id.starts_with("@edge/") {
+        return Err(SecurityError::Invalid(
+            "reserved graph edge identity".into(),
+        ));
+    }
     if record.key.collection != incarnation
         || !policy::identifier(&record.key.tenant)
         || record.key.id.is_empty()

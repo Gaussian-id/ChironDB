@@ -6,6 +6,7 @@ use std::mem::size_of;
 /// Atomic result and unique receiving reservations. Public DTO fields/versions
 /// are unchanged; transports retain this owner through consumption or encoding.
 pub struct MultiModelResponse {
+    sql_publication: crate::SqlPublication,
     value: MultiModelTransactionResponse,
     _sql: Option<Reservation>,
     _memory: Reservation,
@@ -21,7 +22,9 @@ impl Serialize for MultiModelResponse {
         &self,
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
-        self.value.serialize(serializer)
+        self.sql_publication
+            .publish(|| self.value.serialize(serializer))
+            .map_err(serde::ser::Error::custom)?
     }
 }
 impl std::fmt::Debug for MultiModelResponse {
@@ -30,9 +33,17 @@ impl std::fmt::Debug for MultiModelResponse {
     }
 }
 impl MultiModelResponse {
+    pub(super) fn with_sql_publication(mut self, publication: crate::SqlPublication) -> Self {
+        self.sql_publication = publication;
+        self
+    }
+    pub fn sql_publication_context(&self) -> crate::SqlPublication {
+        self.sql_publication.clone()
+    }
     pub(super) fn decoded(value: wal_decode::Owned<MultiModelTransactionResponse>) -> Self {
         let (value, memory) = value.into_parts();
         Self {
+            sql_publication: crate::SqlPublication::default(),
             value,
             _sql: None,
             _memory: memory,
@@ -44,9 +55,11 @@ impl MultiModelResponse {
         edge_ids: Vec<EdgeToken>,
         metadata: ResponseMetadata,
     ) -> Self {
+        let sql_publication = sql.publication_context();
         let (sql, sql_memory) = sql.into_parts();
         let ResponseMetadata { records, _memory } = metadata;
         Self {
+            sql_publication,
             value: MultiModelTransactionResponse {
                 sql,
                 graph,
@@ -72,11 +85,12 @@ impl MultiModelResponse {
         consumer: impl FnOnce(MultiModelTransactionResponse) -> Result<T>,
     ) -> Result<T> {
         let Self {
+            sql_publication,
             value,
             _sql,
             _memory,
         } = self;
-        consumer(value)
+        sql_publication.publish(|| consumer(value))?
     }
 }
 

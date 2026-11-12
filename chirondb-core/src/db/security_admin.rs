@@ -9,6 +9,29 @@ use crate::transaction_journal::TransactionAudit;
 use std::collections::BTreeSet;
 
 impl Db {
+    /// Resolve an opaque edge token only for a current label/grant administrator.
+    /// The returned binding is an internal authority key, never a point identity.
+    pub fn edge_security_id_authorized(
+        &self,
+        context: &AccessContext,
+        token: &crate::graph::EdgeToken,
+    ) -> Result<String> {
+        if !matches!(
+            context.action(),
+            Action::LabelsManage | Action::GrantsManage
+        ) {
+            return Err(SecurityError::Forbidden.into());
+        }
+        let collection = self.get_coll_authorized(context)?;
+        let collection = collection.read();
+        let graph = graph_runtime::active_mutable_graph(&collection)?;
+        let edge = crate::edge_token::decode(self.graph_database_id(), token)?;
+        if !graph.edge_visible(edge) {
+            return Err(SecurityError::NotFound.into());
+        }
+        Ok(context.authorize_edge(edge, graph.epoch())?.key.id)
+    }
+
     /// Build a complete authoritative transaction generation on a stopped,
     /// protected installation. Existing full WAL remains available for repair
     /// until model checkpoints and archival reclamation are qualified.

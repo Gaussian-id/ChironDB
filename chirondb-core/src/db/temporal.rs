@@ -2,7 +2,8 @@
 use super::*;
 use crate::encryption::{FileType, PersistentFile, atomic_write_persistent};
 use crate::relational::wal_decode::MetadataCharge;
-use crate::security::{AccessContext, Action, SecurityError};
+use crate::search::PointResolver;
+use crate::security::{AccessContext, Action, SecurityError, SecurityFilter};
 use crate::tenant::TenantScope;
 pub use chirondb_temporal::{Point as Observation, Value as SensorValue};
 use chirondb_temporal::{Segment, Series, encode_segment};
@@ -103,6 +104,14 @@ pub(in crate::db) fn prepare_restore_checkpoint(dir: &Path, entry: &WalEntry) ->
 pub enum TemporalAccess<'a> {
     Scoped(&'a TenantScope),
     Authorized(&'a AccessContext),
+}
+
+pub struct TemporalQuery<'a> {
+    pub asset: &'a str,
+    pub property: &'a str,
+    pub range: Option<(i64, i64, usize)>,
+    /// Predicate over asset metadata; it never replaces object/property policy.
+    pub filter: Option<&'a Filter>,
 }
 
 // Seek without mapping plaintext from a protected file. PersistentFile charges
@@ -380,10 +389,11 @@ impl Db {
         coll: &Collection,
         access: TemporalAccess<'a>,
         action: Action,
+        enforcement: crate::tenant::TenantEnforcement,
     ) -> Result<&'a str> {
         match (access, &coll.security) {
             (TemporalAccess::Scoped(scope), None) if self.identity_authority.is_none() => {
-                if self.tenant_enforcement().blocks() && scope.tenant_id().is_none() {
+                if enforcement.blocks() && scope.tenant_id().is_none() {
                     return Err(SecurityError::Forbidden.into());
                 }
                 Ok(scope.tenant_id().unwrap_or(""))
@@ -406,6 +416,7 @@ impl Db {
         let _life = self.lifecycle_gate.read();
         self.ensure_storage_mutations_available()?;
         let _maintenance = self.maintenance_barrier.read();
+        let enforcement = self.tenant_enforcement();
         let c = self
             .inner
             .read()
@@ -415,7 +426,7 @@ impl Db {
             .ok_or_else(|| GaussError::CollectionNotFound(collection.into()))?;
         let mut c = c.write();
         let tenant = self
-            .bind_temporal(&c, access, Action::TemporalAppend)?
+            .bind_temporal(&c, access, Action::TemporalAppend, enforcement)?
             .to_owned();
         let (ctx, incarnation) = match access {
             TemporalAccess::Scoped(scope) => (audit_context(scope), None),
@@ -433,6 +444,13 @@ impl Db {
             TemporalAccess::Authorized(ctx) => Some(ctx.publication_permit()?),
             _ => None,
         };
+        if let TemporalAccess::Authorized(context) = access {
+            // Validate the complete batch before storage preparation, WAL, or
+            // duplicate detection. A replay must obey the current authority.
+            for sample in &samples {
+                context.authorize_temporal_property(&sample.asset, &sample.property)?;
+            }
+        }
         let op = self.audit_operation_with_context(
             "append_temporal_batch",
             Some(collection),
@@ -487,19 +505,37 @@ impl Db {
         self.finish_committed_legacy_audit(op, serde_json::json!({"affected":affected}));
         Ok(affected)
     }
-    fn temporal_query(
+    pub fn query_temporal(
         &self,
         collection: &str,
         access: TemporalAccess<'_>,
-        asset: &str,
-        property: &str,
-        range: Option<(i64, i64, usize)>,
+        query: TemporalQuery<'_>,
     ) -> Result<Vec<Observation>> {
+        let TemporalQuery {
+            asset,
+            property,
+            range,
+            filter,
+        } = query;
         if range.is_some_and(|(lo, hi, n)| lo > hi || n == 0 || n > MAX_HISTORY) {
             return Err(invalid("invalid temporal range or limit"));
         }
         let _life = self.lifecycle_gate.read();
         self.ensure_storage_mutations_available()?;
+        let enforcement = self.tenant_enforcement();
+        if filter.is_some() {
+            match access {
+                TemporalAccess::Authorized(context) => {
+                    let record = context.authorize_temporal_property(asset, property)?;
+                    if record.content.is_point() {
+                        self.ensure_collection_cold_materialized_authorized(context)?;
+                    }
+                }
+                TemporalAccess::Scoped(_) => {
+                    self.ensure_collection_cold_materialized(collection)?;
+                }
+            }
+        }
         let c = self
             .inner
             .read()
@@ -508,11 +544,48 @@ impl Db {
             .cloned()
             .ok_or_else(|| GaussError::CollectionNotFound(collection.into()))?;
         let c = c.read();
-        let tenant = self.bind_temporal(&c, access, Action::TemporalRead)?;
+        let tenant = self.bind_temporal(&c, access, Action::TemporalRead, enforcement)?;
         let _permit = match access {
             TemporalAccess::Authorized(ctx) => Some(ctx.publication_permit()?),
             _ => None,
         };
+        match access {
+            TemporalAccess::Authorized(context) => {
+                let resource = context.authorize_temporal_property(asset, property)?;
+                if let Some(filter) = filter {
+                    let filter = SecurityFilter::compile(filter.clone())?;
+                    let matches = match &resource.content {
+                        crate::security::ResourceContent::Point => {
+                            let point = c
+                                .resolve_candidate(&resource.storage_id.to_string())?
+                                .ok_or(SecurityError::NotFound)?;
+                            context.matches_filter(asset, &filter, &point.payload)?
+                        }
+                        crate::security::ResourceContent::GraphEdge { .. } => {
+                            return Err(SecurityError::NotFound.into());
+                        }
+                        crate::security::ResourceContent::TemporalAsset { metadata } => {
+                            context.matches_filter(asset, &filter, metadata)?
+                        }
+                    };
+                    if !matches {
+                        return Ok(Vec::new());
+                    }
+                }
+            }
+            TemporalAccess::Scoped(scope) => {
+                if let Some(filter) = filter {
+                    let Some(point) = c.resolve_candidate(asset)? else {
+                        return Ok(Vec::new());
+                    };
+                    if !scope.may_read_payload(enforcement, &point.payload)
+                        || !filter.matches(&point.payload)
+                    {
+                        return Ok(Vec::new());
+                    }
+                }
+            }
+        }
         c.temporal
             .read(&Series::new(tenant, asset, property), range)
     }
@@ -526,12 +599,15 @@ impl Db {
         range: std::ops::Range<i64>,
         limit: usize,
     ) -> Result<Vec<Observation>> {
-        self.temporal_query(
+        self.query_temporal(
             collection,
             access,
-            asset,
-            property,
-            Some((range.start, range.end, limit)),
+            TemporalQuery {
+                asset,
+                property,
+                range: Some((range.start, range.end, limit)),
+                filter: None,
+            },
         )
     }
     /// Return the observation with greatest event time in this tenant, or None.
@@ -543,7 +619,16 @@ impl Db {
         property: &str,
     ) -> Result<Option<Observation>> {
         Ok(self
-            .temporal_query(collection, access, asset, property, None)?
+            .query_temporal(
+                collection,
+                access,
+                TemporalQuery {
+                    asset,
+                    property,
+                    range: None,
+                    filter: None,
+                },
+            )?
             .pop())
     }
 }

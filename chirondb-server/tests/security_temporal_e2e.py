@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Protected temporal authority through the public TLS query transports."""
 import argparse
+import json
 from pathlib import Path
 
-from security_installation_e2e import InstallationLab
+from security_installation_e2e import InstallationLab, sql_value
 
 
 class TemporalLab(InstallationLab):
@@ -30,6 +31,33 @@ class TemporalLab(InstallationLab):
         latest = "LATEST alpha ASSET 'truck' PROPERTY 'temp';"
         history = "HISTORY alpha ASSET 'truck' PROPERTY 'temp' FROM '-9223372036854775808' TO '9223372036854775807' LIMIT 10;"
         kinds = ['http', 'http-v1', 'grpc', 'wire']
+        # Collection grants cannot authorize a bare, unregistered series name.
+        for kind in kinds:
+            self.transport(kind, 'writer',
+                           "APPEND INTO alpha [{asset:'truck',property:'temp',time_ns:'0',value:0}];",
+                           denied=True, not_found=True)
+            self.transport(kind, 'reader', latest, denied=True, not_found=True)
+
+        # Explicitly register the historical identity using a trusted template.
+        # The registrar has no temporal data grant, and remains denied below.
+        self.query('admin', 'CREATE ROLE asset_registrar;')
+        self.query('admin', 'GRANT CREATE, INGEST ON COLLECTION alpha TO ROLE asset_registrar;')
+        self.query('admin', 'GRANT ROLE asset_registrar TO USER admin;')
+        policy = {
+            'department_actions': ['temporal_read', 'temporal_append'],
+            'owner_actions': [],
+            'templates': {'asset': {
+                'department': 'Testing', 'classification': 'internal',
+                'properties': {
+                    '/temp': {'classification': 'internal', 'actions': ['read', 'write']},
+                    '/location': {'classification': 'internal', 'actions': ['read', 'query', 'write']},
+                    '/private_temp': {'classification': 'restricted', 'actions': ['read', 'write']},
+                },
+                'representations': {},
+            }},
+        }
+        self.query('admin', 'ALTER COLLECTION alpha SET SECURITY POLICY ' + sql_value(policy) + ';')
+        self.query('admin', "REGISTER ASSET alpha ID 'truck' TEMPLATE asset METADATA {location:'north'};")
         for timestamp, kind in enumerate(kinds):
             append = f"APPEND INTO alpha [{{asset:'truck',property:'temp',time_ns:'{timestamp}',value:{timestamp}}}];"
             self.transport(kind, 'writer', append)
@@ -42,13 +70,40 @@ class TemporalLab(InstallationLab):
                 result = self.transport(kind, user, history)
                 self.check(f'{kind} {user} history excludes duplicate replay',
                            len(result['rows']) == timestamp + 1, result['rows'])
+                filtered = self.transport(kind, user, latest[:-1] + " WHERE location = 'north';")
+                self.check(f'{kind} {user} metadata filter matches',
+                           filtered['rows'][0]['value'] == timestamp, filtered)
+                filtered = self.transport(kind, user, latest[:-1] + " WHERE location = 'south';")
+                self.check(f'{kind} {user} metadata filter excludes', filtered.get('rows', []) == [], filtered)
+                self.transport(kind, user, latest[:-1] + " WHERE private_temp = 0;", denied=True)
+                self.transport(kind, user, latest.replace("'temp'", "'private_temp'"), denied=True)
                 self.transport(kind, user, latest.replace('alpha', 'beta'), denied=True)
+            self.transport(kind, 'writer',
+                           "APPEND INTO alpha [{asset:'truck',property:'temp',time_ns:'100',value:100},"
+                           "{asset:'truck',property:'private_temp',time_ns:'100',value:100}];",
+                           denied=True)
+            result = self.transport(kind, 'writer', history)
+            self.check(f'{kind} rejected mixed-property append is atomic',
+                       len(result['rows']) == timestamp + 1, result)
             self.transport(kind, 'outsider', history, denied=True)
             self.transport(kind, 'admin', latest, denied=True)  # admin has no implicit data grant
 
         # A SQL -> temporal pipeline requires both domains, including for EXPLAIN.
         self.query('admin', 'SQL CREATE TABLE fleet_assets (id TEXT PRIMARY KEY);')
         self.query('admin', 'GRANT READ, CREATE ON TABLE fleet_assets TO ROLE writer_role;')
+        self.query('writer', "SQL INSERT INTO fleet_assets VALUES ('truck');", 1)
+        view = self.query('admin', 'SHOW ROW SECURITY fleet_assets LIMIT 16;')['rows'][0]['security']
+        row_policy = view['policy']
+        revision = row_policy['revision']
+        row_policy['revision'] += 1
+        template = row_policy['policy']['templates'][row_policy['default_template']]
+        template['department'] = 'Testing'
+        template['classification'] = 'internal'
+        template['properties']['/id']['classification'] = 'internal'
+        delta = {'table': view['table'], 'incarnation': view['incarnation'],
+                 'expected_revision': revision, 'policy': row_policy, 'records': []}
+        self.query('admin', 'ALTER ROW SECURITY fleet_assets APPLY JSON ' +
+                   sql_value(json.dumps(delta)) + f' IF REVISION {revision};')
         self.query('writer', "SQL INSERT INTO fleet_assets VALUES ('truck');")
         pipeline = "PIPELINE\nRELATIONAL r { SQL SELECT id FROM fleet_assets LIMIT 1 }\nTEMPORAL t { LATEST alpha ASSET r.record_ref PROPERTY 'temp' }\nINNER JOIN t ON t.asset_ref = r.record_ref\nRETURN r.id,t.value\nLIMIT 1;"
         for kind in kinds:

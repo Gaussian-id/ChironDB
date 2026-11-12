@@ -582,6 +582,13 @@ where
                 return Ok(());
             }
             b'P' => {
+                // Native Parse consults catalog membership. Enforce the scope
+                // boundary before even returning preparation metadata/errors.
+                if crate::sql_security::authorize_legacy(&db, &principal, Action::Read).is_err() {
+                    write_permission_denied(&mut writer).await?;
+                    extended_failed = true;
+                    continue;
+                }
                 match parse_native_parse_message_admitted(
                     payload,
                     &db,
@@ -729,7 +736,8 @@ where
                         write_message(&mut writer, b'n', &[]).await?;
                         continue;
                     }
-                    if authorize(&principal, Action::Read, None).is_err() {
+                    if crate::sql_security::authorize_legacy(&db, &principal, Action::Read).is_err()
+                    {
                         write_permission_denied(&mut writer).await?;
                         extended_failed = true;
                         continue;
@@ -888,7 +896,7 @@ where
                             crate::SqlStatementClass::Write => Action::Write,
                             crate::SqlStatementClass::Admin => Action::Admin,
                         };
-                        if authorize(&principal, action, None).is_err() {
+                        if crate::sql_security::authorize_legacy(&db, &principal, action).is_err() {
                             transaction.failed = true;
                             extended_failed = true;
                             write_permission_denied(&mut writer).await?;
@@ -1067,7 +1075,7 @@ where
             .await?;
             return Ok(());
         }
-        if authorize(principal, Action::Read, None).is_err() {
+        if crate::sql_security::authorize_legacy(db, principal, Action::Read).is_err() {
             write_permission_denied(writer).await?;
             return Ok(());
         }
@@ -1181,7 +1189,7 @@ where
             crate::SqlStatementClass::Write => Action::Write,
             crate::SqlStatementClass::Admin => Action::Admin,
         };
-        if authorize(principal, action, None).is_err() {
+        if crate::sql_security::authorize_legacy(db, principal, action).is_err() {
             active.failed = true;
             write_permission_denied(writer).await?;
             return Ok(());
@@ -1212,7 +1220,7 @@ where
             }
         }
     };
-    if authorize(principal, action, None).is_err() {
+    if crate::sql_security::authorize_legacy(db, principal, action).is_err() {
         active.failed = true;
         write_permission_denied(writer).await?;
         return Ok(());
@@ -1544,7 +1552,7 @@ async fn execute_catalog_query<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    if authorize(principal, Action::Read, None).is_err() {
+    if crate::sql_security::authorize_legacy(db, principal, Action::Read).is_err() {
         if db
             .audit_access_event(
                 "authorization",
@@ -1685,7 +1693,7 @@ where
         crate::SqlStatementClass::Write => Action::Write,
         crate::SqlStatementClass::Admin => Action::Admin,
     };
-    if authorize(principal, action, None).is_err() {
+    if crate::sql_security::authorize_legacy(db, principal, action).is_err() {
         write_permission_denied(writer).await?;
         return Ok(false);
     }

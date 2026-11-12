@@ -89,6 +89,8 @@ struct Envelope<'a> {
 }
 #[derive(Deserialize)]
 struct Version<'a> {
+    #[serde(default, borrow)]
+    security: Option<&'a serde_json::value::RawValue>,
     begin: u64,
     end: Option<u64>,
     #[serde(borrow)]
@@ -116,6 +118,10 @@ pub(super) fn persisted_row(bytes: &[u8]) -> Result<PersistedRowVersion> {
     Ok(PersistedRowVersion {
         row_id: row.row_id,
         version: RowVersion {
+            security: version
+                .security
+                .map(row_security::Metadata::decode)
+                .transpose()?,
             begin: version.begin,
             end: version.end,
             values: RowValues::decode(version.values)?,

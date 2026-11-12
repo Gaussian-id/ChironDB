@@ -54,6 +54,7 @@ fn protected_temporal_reads_bind_scope_and_recheck_at_publication() {
         actions: BTreeSet::from([
             Action::Read,
             Action::Create,
+            Action::Ingest,
             Action::TemporalRead,
             Action::TemporalAppend,
         ]),
@@ -61,6 +62,77 @@ fn protected_temporal_reads_bind_scope_and_recheck_at_publication() {
     authority
         .put_principal(&actor, actor.revision(), principal)
         .unwrap();
+    let manager = db
+        .management_identity(&authority.authenticate(token).unwrap())
+        .unwrap();
+    let context = db
+        .bind_access(&manager, "armada", "acme", Action::PolicyManage)
+        .unwrap();
+    let property = PropertyRule {
+        classification: Classification::Internal,
+        actions: BTreeSet::from([
+            PropertyAction::Read,
+            PropertyAction::Query,
+            PropertyAction::Write,
+        ]),
+    };
+    db.replace_collection_policy_authorized(
+        &context,
+        RevisionUpdate {
+            expected_revision: context.policy_revision(),
+            value: CollectionPolicy {
+                department_actions: BTreeSet::new(),
+                owner_actions: BTreeSet::from([
+                    Action::Read,
+                    Action::TemporalRead,
+                    Action::TemporalAppend,
+                ]),
+                templates: std::collections::BTreeMap::from([(
+                    "asset".into(),
+                    IngestTemplate {
+                        department: "Security".into(),
+                        classification: Classification::Internal,
+                        properties: std::collections::BTreeMap::from([("/temp".into(), property)]),
+                        representations: std::collections::BTreeMap::from([(
+                            "dense".into(),
+                            Representation {
+                                source_fields: BTreeSet::from(["/temp".into()]),
+                                classification: Classification::Internal,
+                            },
+                        )]),
+                    },
+                )]),
+            },
+        },
+    )
+    .unwrap();
+    let create = db
+        .bind_access(
+            &authority.authenticate(token).unwrap(),
+            "armada",
+            "acme",
+            Action::Create,
+        )
+        .unwrap();
+    let asset = db
+        .create_points_authorized(
+            &create,
+            "asset",
+            vec![NewPoint {
+                vector: vec![1., 0.],
+                vectors: Default::default(),
+                sparse_vector: None,
+                payload: json!({"temp":false}),
+            }],
+            true,
+        )
+        .unwrap()
+        .publish(|ids| ids[0].clone())
+        .unwrap();
+    let req = |s: &str| ChironQlRequest {
+        query: s.replace("'truck'", &format!("'{asset}'")),
+        ..Default::default()
+    };
     for sql in [
         "SQL CREATE TABLE fleet_assets (id TEXT PRIMARY KEY);",
         "SQL INSERT INTO fleet_assets VALUES ('truck');",
@@ -72,7 +144,7 @@ fn protected_temporal_reads_bind_scope_and_recheck_at_publication() {
             .unwrap();
     }
     let sql = "PIPELINE\nRELATIONAL r { SQL SELECT id FROM fleet_assets LIMIT 1 }\nTEMPORAL t { LATEST armada ASSET r.record_ref PROPERTY 'temp' }\nINNER JOIN t ON t.asset_ref = r.record_ref\nRETURN r.id,t.time_ns,t.value\nLIMIT 1;";
-    let expected = json!({"id":"truck","time_ns":"-9223372036854775808","value":true});
+    let expected = json!({"id":asset,"time_ns":"-9223372036854775808","value":true});
     assert_eq!(
         execute(&db, token, &req(sql))
             .unwrap()
@@ -136,7 +208,7 @@ fn protected_temporal_reads_bind_scope_and_recheck_at_publication() {
         .bind_access(&actor, "armada", "acme", Action::TemporalAppend)
         .unwrap();
     use chirondb_core::db::temporal::{SensorValue, TemporalAccess, TemporalSample};
-    let latest_with = |access| db.latest_temporal("armada", access, "truck", "temp");
+    let latest_with = |access| db.latest_temporal("armada", access, &asset, "temp");
     assert!(
         latest_with(TemporalAccess::Authorized(&read))
             .unwrap()
@@ -200,9 +272,5 @@ fn protected_temporal_reads_bind_scope_and_recheck_at_publication() {
     let fresh = db
         .bind_access(&actor, "armada", "acme", Action::TemporalRead)
         .unwrap();
-    assert!(
-        latest_with(TemporalAccess::Authorized(&fresh))
-            .unwrap()
-            .is_none()
-    );
+    assert!(latest_with(TemporalAccess::Authorized(&fresh)).is_err());
 }

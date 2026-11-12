@@ -529,6 +529,17 @@ where
                                             extended_failed = true;
                                             continue;
                                         };
+                                        let _row_policies = match response
+                                            .publication_context()
+                                            .publication_permits()
+                                        {
+                                            Ok(permits) => permits,
+                                            Err(error) => {
+                                                write_protected_error(&mut writer, &error).await?;
+                                                extended_failed = true;
+                                                continue;
+                                            }
+                                        };
                                         if let Some(columns) = output::prepare(
                                             &mut writer,
                                             native_result_columns(&response.results),
@@ -1098,6 +1109,16 @@ async fn protected_query<W: AsyncWrite + Unpin>(
                 write_error_response(writer, "ERROR", "28000", "authorization was revoked", None)
                     .await?;
                 return Ok(());
+            };
+            let _row_policies = match response.publication_context().publication_permits() {
+                Ok(permits) => permits,
+                Err(error) => {
+                    if let Some(active) = transaction.as_mut() {
+                        active.failed = true;
+                    }
+                    write_protected_error(writer, &error).await?;
+                    return Ok(());
+                }
             };
             write_native_relational_results_formatted(
                 writer,
