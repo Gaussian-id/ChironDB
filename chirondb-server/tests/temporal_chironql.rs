@@ -339,12 +339,12 @@ fn documented_time_series_statements_and_pipeline_limits() {
     };
     assert_eq!(
         execute(&mut restricted, pipe).unwrap_err().code,
-        "chironql.collection_forbidden"
+        "chironql.permission_denied"
     );
     restricted.allowed_collections = Some(std::collections::HashSet::from(["trucks".into()]));
     assert_eq!(
         execute(&mut restricted, pipe).unwrap_err().code,
-        "chironql.collection_forbidden"
+        "chironql.permission_denied"
     );
     let rows = run(pipe).unwrap().rows;
     assert_eq!(

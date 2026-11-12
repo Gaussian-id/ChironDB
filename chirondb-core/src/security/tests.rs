@@ -31,6 +31,7 @@ fn resource() -> ResourceRecord {
             id: "document".into(),
         },
         storage_id: Uuid::new_v4(),
+        content: ResourceContent::Point,
         labels: ResourceLabels {
             owner: "owner".into(),
             department: "HR".into(),

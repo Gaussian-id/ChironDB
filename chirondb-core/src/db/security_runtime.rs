@@ -26,6 +26,69 @@ pub(super) fn physical_point(point: &NewPoint, id: String) -> Point {
     }
 }
 
+/// Both standalone and SQL+graph atomic replacement use the same authority.
+pub(super) fn authorize_point_replacement(
+    context: &AccessContext,
+    old: &Point,
+    point: &Point,
+) -> Result<()> {
+    let record = context.authorize(&point.id)?;
+    if !record.content.is_point() {
+        return Err(SecurityError::NotFound.into());
+    }
+    context.authorize_payload_change(&point.id, &old.payload, &point.payload)?;
+    context.authorize_representation_replacement(&point.id, "dense", old.vector == point.vector)?;
+    if old.sparse_vector.is_some() || point.sparse_vector.is_some() {
+        context.authorize_representation_replacement(
+            &point.id,
+            "sparse",
+            old.sparse_vector == point.sparse_vector,
+        )?;
+    }
+    for name in old
+        .vectors
+        .keys()
+        .chain(point.vectors.keys())
+        .collect::<BTreeSet<_>>()
+    {
+        context.authorize_representation_replacement(
+            &point.id,
+            name,
+            old.vectors.get(name) == point.vectors.get(name),
+        )?;
+    }
+    for name in point
+        .vectors
+        .keys()
+        .map(String::as_str)
+        .chain((!point.vector.is_empty()).then_some("dense"))
+        .chain(point.sparse_vector.is_some().then_some("sparse"))
+    {
+        let representation = record
+            .representations
+            .get(name)
+            .ok_or(SecurityError::Forbidden)?;
+        if representation
+            .source_fields
+            .iter()
+            .any(|field| old.payload.pointer(field) != point.payload.pointer(field))
+        {
+            context.authorize_representation_write(&point.id, name)?;
+        }
+        if representation
+            .source_fields
+            .iter()
+            .any(|field| point.payload.pointer(field).is_none())
+        {
+            return Err(SecurityError::Invalid(
+                "representation source is absent from updated content".into(),
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 impl Db {
     fn standalone_reference_context(
         &self,
@@ -622,17 +685,22 @@ mod tests {
                 IngestTemplate {
                     department: "Finance".into(),
                     classification: Classification::Internal,
-                    properties: BTreeMap::from([(
-                        "/text".into(),
-                        PropertyRule {
-                            classification: Classification::Internal,
-                            actions: BTreeSet::from([
-                                PropertyAction::Read,
-                                PropertyAction::Query,
-                                PropertyAction::Write,
-                            ]),
-                        },
-                    )]),
+                    properties: ["/text", "/edges/kind", "/edges/winner", "/edges/state"]
+                        .into_iter()
+                        .map(|path| {
+                            (
+                                path.into(),
+                                PropertyRule {
+                                    classification: Classification::Internal,
+                                    actions: BTreeSet::from([
+                                        PropertyAction::Read,
+                                        PropertyAction::Query,
+                                        PropertyAction::Write,
+                                    ]),
+                                },
+                            )
+                        })
+                        .collect(),
                     representations: BTreeMap::from([(
                         "dense".into(),
                         Representation {
@@ -739,6 +807,8 @@ mod tests {
                     Action::Search,
                     Action::GraphRead,
                     Action::GraphWrite,
+                    Action::TemporalRead,
+                    Action::TemporalAppend,
                     Action::Schema,
                     Action::PolicyManage,
                     Action::LabelsManage,
@@ -1501,10 +1571,24 @@ mod tests {
         let mut retiring = request("DELETE FROM docs WHERE id='other'".into(), "retire");
         retiring.points.clear();
         retiring.point_deletes.push(ids[1].clone());
+        let queued = db
+            .execute_sql_authorized_owned(
+                &identity,
+                sql("SELECT target FROM docs WHERE id='row'".into()),
+                "before-refusal",
+            )
+            .unwrap();
         assert!(matches!(
             execute(&db, &identity, retiring.clone(), Action::Delete),
             Err(GaussError::Security(SecurityError::Conflict))
         ));
+        assert!(serde_json::to_vec(&queued).is_ok());
+        db.execute_sql_authorized(
+            &identity,
+            sql("SELECT target FROM docs WHERE id='row'".into()),
+            "after-refusal",
+        )
+        .unwrap();
         let read = db
             .bind_access(&identity, "docs", "acme", Action::Read)
             .unwrap();
@@ -1522,8 +1606,11 @@ mod tests {
                 parameters: vec![],
             },
         );
-        let retired = execute(&db, &identity, retiring, Action::Delete).unwrap();
+        let retired = execute(&db, &identity, retiring.clone(), Action::Delete).unwrap();
         assert!(retired.sql.committed);
+        assert!(serde_json::to_vec(&queued).is_err());
+        let replay = execute(&db, &identity, retiring, Action::Delete).unwrap();
+        assert_eq!(replay.sql.transaction_id, retired.sql.transaction_id);
         drop(db);
         let reopened = Db::open(directory.path()).unwrap();
         let identity = reopened
@@ -1535,7 +1622,7 @@ mod tests {
         // reference to a point retired by the later transaction.
         assert!(matches!(
             execute(&reopened, &identity, valid, Action::Update),
-            Err(GaussError::Security(SecurityError::NotFound))
+            Err(GaussError::Security(SecurityError::Conflict))
         ));
         let rows = reopened
             .execute_sql_authorized(
@@ -1548,6 +1635,159 @@ mod tests {
             matches!(&rows.results[0], crate::SqlResult::Rows { rows, .. }
             if rows == &vec![vec![crate::RelationalValue::Null]])
         );
+    }
+
+    #[test]
+    fn protected_point_retirement_cannot_probe_unqueryable_sql_references() {
+        let (_directory, db, key, _) = fixture(true);
+        let actor = db.identity_authority().unwrap().authenticate(&key).unwrap();
+        let ids = db
+            .create_points_authorized(
+                &db.bind_access(&actor, "docs", "acme", Action::Create)
+                    .unwrap(),
+                "standard",
+                vec![point("referenced"), point("unused"), point("atomic-unused")],
+                true,
+            )
+            .unwrap()
+            .publish(|ids| ids)
+            .unwrap();
+        let sql = |text: String| crate::SqlExecutionRequest {
+            statements: vec![crate::SqlStatementRequest {
+                sql: text,
+                parameters: vec![],
+            }],
+            idempotency_key: None,
+            retry_id: None,
+        };
+        db.execute_sql_authorized(
+            &actor,
+            sql("CREATE TABLE docs(id BIGINT PRIMARY KEY, target RECORD_REF('docs'))".into()),
+            "setup",
+        )
+        .unwrap();
+        db.execute_sql_authorized(
+            &actor,
+            sql(format!(
+                "INSERT INTO docs VALUES(1,RECORD_REF('docs','{}')),(2,NULL)",
+                ids[0]
+            )),
+            "setup",
+        )
+        .unwrap();
+        let set_query = |enabled: bool, other_owner: bool, searchable: bool| {
+            let output = db
+                .relational_security_authorized(&actor, "docs", 0, 8)
+                .unwrap();
+            let crate::SqlResult::Rows { rows, .. } = &output.results[0] else {
+                panic!()
+            };
+            let crate::RelationalValue::Json(view) = &rows[0][0] else {
+                panic!()
+            };
+            let mut policy: chirondb_types::RelationalRowPolicy =
+                serde_json::from_value(view["policy"].clone()).unwrap();
+            let expected_revision = policy.revision;
+            policy.revision += 1;
+            let mut record: ResourceRecord =
+                serde_json::from_value(view["rows"][0]["authority"].clone()).unwrap();
+            record.revision = policy.revision;
+            record.labels.owner = if other_owner {
+                "other-reader"
+            } else {
+                "writer"
+            }
+            .into();
+            record.grants = if searchable {
+                vec![ObjectGrant {
+                    subject: Subject::Principal("writer".into()),
+                    actions: BTreeSet::from([Action::Search]),
+                    effect: Effect::Permit,
+                    inherit: false,
+                }]
+            } else {
+                vec![]
+            };
+            record.properties.get_mut("/target").unwrap().actions = if enabled {
+                BTreeSet::from([PropertyAction::Query])
+            } else {
+                BTreeSet::from([PropertyAction::Read, PropertyAction::Write])
+            };
+            db.change_relational_security_authorized(
+                &actor,
+                chirondb_types::relational::RelationalSecurityDelta {
+                    table: "docs".into(),
+                    incarnation: serde_json::from_value(view["incarnation"].clone()).unwrap(),
+                    expected_revision,
+                    policy,
+                    records: vec![record],
+                },
+            )
+            .unwrap();
+        };
+        let standalone = |id: &String| {
+            db.delete_points_authorized(
+                &db.bind_access(&actor, "docs", "acme", Action::Delete)
+                    .unwrap(),
+                std::slice::from_ref(id),
+            )
+        };
+        let atomic = |id: &String| {
+            let vector = db
+                .bind_access(&actor, "docs", "acme", Action::Delete)
+                .unwrap();
+            let graph = db
+                .bind_access(&actor, "docs", "acme", Action::GraphWrite)
+                .unwrap();
+            db.execute_multimodel_transaction_authorized_with_sql_rows(
+                &actor,
+                &vector,
+                &graph,
+                MultiModelTransactionRequest {
+                    sql: sql("UPDATE docs SET id=2 WHERE id=2".into()),
+                    collection: "docs".into(),
+                    points: vec![],
+                    point_deletes: vec![id.clone()],
+                    relations: vec![],
+                    edge_deletes: vec![],
+                    edge_updates: vec![],
+                },
+                "reference-query",
+                Some(1),
+            )
+        };
+        for (query, other_owner) in [(false, false), (true, true)] {
+            set_query(query, other_owner, false);
+            for id in [&ids[1], &ids[0]] {
+                assert!(
+                    matches!(
+                        standalone(id),
+                        Err(GaussError::Security(SecurityError::Forbidden))
+                    ),
+                    "standalone existence probe"
+                );
+                assert!(
+                    matches!(
+                        atomic(id),
+                        Err(GaussError::Security(SecurityError::Forbidden))
+                    ),
+                    "atomic existence probe"
+                );
+            }
+        }
+        set_query(true, true, true);
+        // Query on the reference key is sufficient without field Read; integrity
+        // still prevents deleting the referenced point, in either write path.
+        assert!(matches!(
+            standalone(&ids[0]),
+            Err(GaussError::Security(SecurityError::Conflict))
+        ));
+        assert!(matches!(
+            atomic(&ids[0]),
+            Err(GaussError::Security(SecurityError::Conflict))
+        ));
+        atomic(&ids[2]).unwrap();
+        standalone(&ids[1]).unwrap();
     }
 
     #[test]
@@ -2404,6 +2644,56 @@ mod tests {
                 "retry",
             )
             .unwrap();
+        let labels = db
+            .bind_access(&identity, "docs", "acme", Action::LabelsManage)
+            .unwrap();
+        let mut target = labels.authorize(&ids[1]).unwrap();
+        let original = target.properties.clone();
+        target.properties.get_mut("/edges/state").unwrap().actions =
+            BTreeSet::from([PropertyAction::Read, PropertyAction::Query]);
+        db.replace_object_labels_authorized(
+            &labels,
+            &ids[1],
+            RevisionUpdate {
+                expected_revision: labels.policy_revision(),
+                value: ObjectLabels {
+                    labels: target.labels.clone(),
+                    properties: target.properties,
+                },
+            },
+        )
+        .unwrap();
+        let current_update = db
+            .bind_access(&identity, "docs", "acme", Action::Update)
+            .unwrap();
+        let current_graph = db
+            .bind_access(&identity, "docs", "acme", Action::GraphWrite)
+            .unwrap();
+        assert!(
+            db.execute_multimodel_transaction_authorized(
+                &identity,
+                &current_update,
+                &current_graph,
+                second_request.clone(),
+                "field-revoked-replay"
+            )
+            .is_err()
+        );
+        let labels = db
+            .bind_access(&identity, "docs", "acme", Action::LabelsManage)
+            .unwrap();
+        db.replace_object_labels_authorized(
+            &labels,
+            &ids[1],
+            RevisionUpdate {
+                expected_revision: labels.policy_revision(),
+                value: ObjectLabels {
+                    labels: target.labels,
+                    properties: original,
+                },
+            },
+        )
+        .unwrap();
         replace_permissions(
             &db,
             &identity,
@@ -3609,6 +3899,348 @@ mod tests {
             .unwrap();
         assert_eq!(result[0].payload["note"], "ordinary content edit");
         assert_eq!(result[0].vector, vec![1.0, 0.0]);
+    }
+
+    #[test]
+    fn protected_replacement_cannot_probe_hidden_values_with_noop_writes() {
+        let (_directory, db, key, other_key) = fixture(false);
+        let authority = db.identity_authority().unwrap();
+        let root = authority.authenticate(&key).unwrap();
+        let writer = authority.authenticate(&other_key).unwrap();
+        let create = db
+            .bind_access(&writer, "docs", "acme", Action::Create)
+            .unwrap();
+        let id = db
+            .create_points_authorized(&create, "standard", vec![point("secret")], true)
+            .unwrap()
+            .publish(|ids| ids[0].clone())
+            .unwrap();
+        let labels = db
+            .bind_access(&root, "docs", "acme", Action::LabelsManage)
+            .unwrap();
+        let record = labels.authorize(&id).unwrap();
+        let mut properties = record.properties.clone();
+        properties.get_mut("/text").unwrap().actions.clear();
+        db.replace_object_labels_authorized(
+            &labels,
+            &id,
+            RevisionUpdate {
+                expected_revision: labels.policy_revision(),
+                value: ObjectLabels {
+                    labels: record.labels,
+                    properties,
+                },
+            },
+        )
+        .unwrap();
+        let update = db
+            .bind_access(&writer, "docs", "acme", Action::Update)
+            .unwrap();
+        let before = db.inner.read().collections["docs"]
+            .read()
+            .wal
+            .len()
+            .unwrap();
+        for guess in ["secret", "incorrect"] {
+            assert!(
+                db.update_points_authorized(
+                    &update,
+                    vec![physical_point(&point(guess), id.clone())],
+                    true
+                )
+                .is_err(),
+                "a hidden payload guess must not succeed even when equal"
+            );
+        }
+        assert_eq!(
+            db.inner.read().collections["docs"]
+                .read()
+                .wal
+                .len()
+                .unwrap(),
+            before
+        );
+
+        // Restore field authority, then remove both vector read and attestation.
+        // An unchanged submitted vector must not bypass those capabilities.
+        let labels = db
+            .bind_access(&root, "docs", "acme", Action::LabelsManage)
+            .unwrap();
+        let record = labels.authorize(&id).unwrap();
+        let mut properties = record.properties.clone();
+        properties.get_mut("/text").unwrap().actions = BTreeSet::from([
+            PropertyAction::Read,
+            PropertyAction::Query,
+            PropertyAction::Write,
+        ]);
+        db.replace_object_labels_authorized(
+            &labels,
+            &id,
+            RevisionUpdate {
+                expected_revision: labels.policy_revision(),
+                value: ObjectLabels {
+                    labels: record.labels,
+                    properties,
+                },
+            },
+        )
+        .unwrap();
+        let mut principal = writer.principal().clone();
+        principal.grants[0].actions.remove(&Action::Read);
+        principal.grants[0].actions.remove(&Action::Ingest);
+        authority
+            .put_principal(&root, authority.revision(), principal)
+            .unwrap();
+        let writer = authority.authenticate(&other_key).unwrap();
+        let update = db
+            .bind_access(&writer, "docs", "acme", Action::Update)
+            .unwrap();
+        let before = db.inner.read().collections["docs"]
+            .read()
+            .wal
+            .len()
+            .unwrap();
+        for vector in [vec![1.0, 0.0], vec![0.0, 1.0]] {
+            let mut replacement = physical_point(&point("secret"), id.clone());
+            replacement.vector = vector;
+            assert!(
+                db.update_points_authorized(&update, vec![replacement], true)
+                    .is_err(),
+                "a hidden representation guess must not succeed even when equal"
+            );
+        }
+        assert_eq!(
+            db.inner.read().collections["docs"]
+                .read()
+                .wal
+                .len()
+                .unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn protected_temporal_assets_have_metadata_authority_without_vectors() {
+        use crate::db::temporal::{SensorValue, TemporalAccess, TemporalQuery, TemporalSample};
+        let (directory, db, key, other_key) = fixture(false);
+        let authority = db.identity_authority().unwrap().clone();
+        let root = authority.authenticate(&key).unwrap();
+        let writer = authority.authenticate(&other_key).unwrap();
+        let mut principal = writer.principal().clone();
+        principal.grants[0]
+            .actions
+            .extend([Action::TemporalRead, Action::TemporalAppend]);
+        authority
+            .put_principal(&root, authority.revision(), principal)
+            .unwrap();
+        let root = authority.authenticate(&key).unwrap();
+        let writer = authority.authenticate(&other_key).unwrap();
+        let manager = db
+            .bind_access(&root, "docs", "acme", Action::PolicyManage)
+            .unwrap();
+        let mut policy = db.inner.read().collections["docs"]
+            .read()
+            .security
+            .as_ref()
+            .unwrap()
+            .checkpoint()
+            .policy;
+        policy
+            .owner_actions
+            .extend([Action::TemporalRead, Action::TemporalAppend]);
+        let mut template = policy.templates["standard"].clone();
+        template.representations.clear();
+        template
+            .properties
+            .insert("/temperature".into(), template.properties["/text"].clone());
+        policy.templates.insert("asset".into(), template);
+        db.replace_collection_policy_authorized(
+            &manager,
+            RevisionUpdate {
+                expected_revision: manager.policy_revision(),
+                value: policy,
+            },
+        )
+        .unwrap();
+        let create = db
+            .bind_access(&writer, "docs", "acme", Action::Create)
+            .unwrap();
+        assert!(
+            db.register_temporal_asset_authorized(
+                &create,
+                "historic-truck".into(),
+                "asset",
+                serde_json::json!({"text":"north"})
+            )
+            .is_err()
+        );
+        let id = db
+            .create_temporal_asset_authorized(&create, "asset", serde_json::json!({"text":"north"}))
+            .unwrap()
+            .publish(|id| id)
+            .unwrap();
+        let read = db
+            .bind_access(&writer, "docs", "acme", Action::Read)
+            .unwrap();
+        assert_eq!(
+            db.get_temporal_asset_authorized(&read, &id)
+                .unwrap()
+                .publish(|v| v)
+                .unwrap(),
+            serde_json::json!({"text":"north"})
+        );
+        assert!(read.authorized_domain().unwrap().is_empty());
+        assert!(
+            db.get_points_authorized(&read, std::slice::from_ref(&id))
+                .unwrap()
+                .publish(|points| points)
+                .unwrap()
+                .is_empty()
+        );
+        let append = db
+            .bind_access(&writer, "docs", "acme", Action::TemporalAppend)
+            .unwrap();
+        db.append_temporal_batch(
+            "docs",
+            TemporalAccess::Authorized(&append),
+            vec![TemporalSample::new(
+                &id,
+                "temperature",
+                10,
+                SensorValue::Float(42.0),
+            )],
+        )
+        .unwrap();
+        let temporal = db
+            .bind_access(&writer, "docs", "acme", Action::TemporalRead)
+            .unwrap();
+        let filter = Filter(serde_json::json!({"text":{"eq":"north"}}));
+        assert_eq!(
+            db.query_temporal(
+                "docs",
+                TemporalAccess::Authorized(&temporal),
+                TemporalQuery {
+                    asset: &id,
+                    property: "temperature",
+                    range: None,
+                    filter: Some(&filter),
+                }
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        let queued = db.get_temporal_asset_authorized(&read, &id).unwrap();
+        let update = db
+            .bind_access(&writer, "docs", "acme", Action::Update)
+            .unwrap();
+        let revision = db
+            .replace_temporal_asset_authorized(
+                &update,
+                &id,
+                RevisionUpdate {
+                    expected_revision: update.policy_revision(),
+                    value: serde_json::json!({"text":"south"}),
+                },
+            )
+            .unwrap()
+            .publish(|revision| revision)
+            .unwrap();
+        assert!(queued.publish(|v| v).is_err());
+        assert!(temporal.publication_permit().is_err());
+        let update = db
+            .bind_access(&writer, "docs", "acme", Action::Update)
+            .unwrap();
+        // Same-value updates must remain replayable from the WAL as asset writes.
+        db.replace_temporal_asset_authorized(
+            &update,
+            &id,
+            RevisionUpdate {
+                expected_revision: revision,
+                value: serde_json::json!({"text":"south"}),
+            },
+        )
+        .unwrap()
+        .publish(|_| ())
+        .unwrap();
+        drop(authority);
+        drop(db);
+        let db = Db::open(directory.path()).unwrap();
+        let writer = db
+            .identity_authority()
+            .unwrap()
+            .authenticate(&other_key)
+            .unwrap();
+        let read = db
+            .bind_access(&writer, "docs", "acme", Action::Read)
+            .unwrap();
+        assert_eq!(
+            db.get_temporal_asset_authorized(&read, &id)
+                .unwrap()
+                .publish(|v| v)
+                .unwrap(),
+            serde_json::json!({"text":"south"})
+        );
+        let temporal = db
+            .bind_access(&writer, "docs", "acme", Action::TemporalRead)
+            .unwrap();
+        assert!(
+            db.query_temporal(
+                "docs",
+                TemporalAccess::Authorized(&temporal),
+                TemporalQuery {
+                    asset: &id,
+                    property: "temperature",
+                    range: None,
+                    filter: Some(&filter),
+                }
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            db.latest_temporal(
+                "docs",
+                TemporalAccess::Authorized(&temporal),
+                &id,
+                "temperature"
+            )
+            .unwrap()
+            .unwrap()
+            .value,
+            SensorValue::Float(42.0)
+        );
+        let delete = db
+            .bind_access(&writer, "docs", "acme", Action::Delete)
+            .unwrap();
+        db.delete_temporal_asset_authorized(&delete, &id, delete.policy_revision())
+            .unwrap()
+            .publish(|_| ())
+            .unwrap();
+        assert!(temporal.publication_permit().is_err());
+        drop(db);
+        let db = Db::open(directory.path()).unwrap();
+        let writer = db
+            .identity_authority()
+            .unwrap()
+            .authenticate(&other_key)
+            .unwrap();
+        let read = db
+            .bind_access(&writer, "docs", "acme", Action::Read)
+            .unwrap();
+        assert!(db.get_temporal_asset_authorized(&read, &id).is_err());
+        let temporal = db
+            .bind_access(&writer, "docs", "acme", Action::TemporalRead)
+            .unwrap();
+        assert!(
+            db.latest_temporal(
+                "docs",
+                TemporalAccess::Authorized(&temporal),
+                &id,
+                "temperature"
+            )
+            .is_err()
+        );
     }
 
     #[test]

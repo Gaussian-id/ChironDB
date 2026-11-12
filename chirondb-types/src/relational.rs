@@ -179,9 +179,32 @@ pub enum ForeignKeyAction {
     SetDefault,
 }
 
+/// Trusted row defaults and object policy for one relational table incarnation.
+/// The default template carries column rules; ordinary SQL values cannot edit it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelationalRowPolicy {
+    pub revision: u64,
+    pub default_template: String,
+    pub policy: crate::security::CollectionPolicy,
+}
+
+/// Authority-only WAL mutation. Row values and scalar indexes are unchanged.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelationalSecurityDelta {
+    pub table: String,
+    pub incarnation: uuid::Uuid,
+    pub expected_revision: u64,
+    pub policy: RelationalRowPolicy,
+    pub records: Vec<crate::security::ResourceRecord>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TableDefinition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_policy: Option<RelationalRowPolicy>,
     /// Stable catalog identity used by persisted row keys.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub table_id: u64,

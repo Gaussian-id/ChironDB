@@ -25,7 +25,7 @@ struct Args {
 
 struct Bridge(Peer<RoleClient>);
 impl ServerHandler for Bridge {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         chirondb::mcp::server_info()
     }
     fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
@@ -99,4 +99,87 @@ async fn main() -> anyhow::Result<()> {
     server.waiting().await?;
     upstream.cancel().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use rmcp::transport::streamable_http_client::{
+        StreamableHttpClient, StreamableHttpError, StreamableHttpPostResponse,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn reply(
+        headers: &str,
+        body: &[u8],
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<reqwest::Error>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let headers = headers.to_owned();
+        let body = body.to_vec();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0; 4096];
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&chunk[..count]);
+                assert!(request.len() <= 16 * 1024);
+                if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = std::str::from_utf8(&request[..end]).unwrap();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            // Oversized replies may be rejected before the peer finishes writing.
+            let _ = stream.write_all(&body).await;
+        });
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let message = serde_json::from_value(serde_json::json!({
+            "jsonrpc":"2.0", "id":1, "method":"ping"
+        }))
+        .unwrap();
+        let result = client
+            .post_message(endpoint.into(), message, None, None, Default::default())
+            .await;
+        server.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn upstream_transport_bounds_json_and_streamed_error_bodies() {
+        let small = br#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            small.len()
+        );
+        assert!(matches!(
+            reply(&headers, small).await,
+            Ok(StreamableHttpPostResponse::Json(..))
+        ));
+        let error = reply("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 16777217\r\nConnection: close\r\n\r\n", &[]).await;
+        assert!(matches!(
+            error,
+            Err(StreamableHttpError::ResponseBodyTooLarge { .. })
+        ));
+        // No Content-Length: the streaming limit must apply while reading.
+        let error = reply("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n", &vec![b'x'; 64 * 1024 + 1]).await;
+        assert!(matches!(
+            error,
+            Err(StreamableHttpError::ResponseBodyTooLarge { .. })
+        ));
+    }
 }

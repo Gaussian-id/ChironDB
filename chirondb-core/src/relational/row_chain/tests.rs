@@ -3,6 +3,7 @@ use crate::relational::memory::with_storage_pool;
 
 fn version(begin: u64) -> RowVersion {
     RowVersion {
+        security: None,
         begin,
         end: None,
         values: RowValues::copy(&[RelationalValue::Integer(1)]).unwrap(),
@@ -62,6 +63,7 @@ fn snapshots_share_metadata_and_private_copies_keep_separate_reservations() {
 
 fn version_in_same_payload(row: &RowVersion, begin: u64) -> RowVersion {
     RowVersion {
+        security: None,
         begin,
         ..row.clone()
     }
@@ -97,6 +99,7 @@ fn garbage_collection_refusal_keeps_versions_and_retention_frontier() {
     let mut old = version(1);
     old.end = Some(2);
     let current = RowVersion {
+        security: None,
         begin: 2,
         end: None,
         values: old.values.clone(),

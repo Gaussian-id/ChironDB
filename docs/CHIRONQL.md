@@ -62,7 +62,7 @@ profile remains a local preview limited to one collection per block.
 
 ## Time series (ChironQL 1.5)
 
-Create an asset collection named `armada` before running the example. Each sample belongs to the caller’s tenant, collection, asset and property. Asset IDs can exist solely in a table. Appending a temperature requires no vector.
+The following fixture uses an unprotected local installation. Create an asset collection named `armada` before running it. Each sample belongs to the caller’s tenant, collection, asset and property. In that profile asset IDs can exist solely in a table. Protected temporal access instead requires a registered protected asset and explicit property rules; see [temporal authorization](CHIRONQL_SECURITY.md#protected-temporal-access).
 
 <!-- temporal-direct -->
 <!-- chironql-example: temporal-Append -->
@@ -109,7 +109,7 @@ LIMIT 8;
 
 The table selects two trucks. The first joins to both temperatures and the second has null observation fields. A visible text `id` can supply `r.record_ref` in the temporal collection. A stored `RECORD_REF('armada')` column can also supply the reference directly. With a vector or graph source, use its qualified record reference in the same stage. `LATEST` permits one observation per asset. `HISTORY` requires a range and per-asset limit. The product of unique assets and the per-asset limit must fit within 4,096 rows and the request memory budget before the stage reads history. The final pipeline `LIMIT` bounds the joined result. Use `EXPLAIN PIPELINE` to see the stage and limits.
 
-Use the same statements in the console, the `chironql` client, HTTP, gRPC or ChironWire. Protected deployments require the collection-scoped actions `temporal_append` or `temporal_read`, plus the normal permissions for each pipeline source. After enabling temporal writes, recover with a compatible binary. For downgrade, restore a verified backup taken before the first append. Full snapshots preserve temporal history. Targeted WAL restore for an activated temporal collection is rejected.
+Use the same statement forms in the console, the `chironql` client, HTTP, gRPC or ChironWire. Protected deployments require collection and asset `temporal_append` or `temporal_read` authority, property Write or Read respectively, and the normal permissions for each pipeline source. `HISTORY` and `LATEST` accept an optional trailing `WHERE` over asset metadata; protected predicates additionally require Query for every referenced field. A predicate cannot grant access to an asset or property. Metadata-only assets use ChironQL 1.2 CREATE/GET/UPDATE/DELETE ASSET; installation policy managers can explicitly REGISTER ASSET for historical names. Standalone SQL-only or temporal-only names remain unauthorized until bound. See [metadata-only assets](CHIRONQL_SECURITY.md#metadata-only-assets). After enabling temporal writes, recover with a compatible binary. For downgrade, restore a verified backup taken before the first append. Full snapshots preserve temporal history. Targeted WAL restore for an activated temporal collection is rejected.
 
 An unquoted timestamp produces a parse error.
 
@@ -312,6 +312,13 @@ end of the line.
 
 Prefix one native SQL statement with `SQL`. Classification comes from the parsed SQL AST, so a
 keyword in a comment or string cannot disguise a mutation.
+
+Legacy SQL rejects tenant-enforced and collection-allowlisted requests, including
+SQL stages in pipelines/transactions. Protected SQL combines exact table authority
+with row owner/department/classification and column Read/Query/Write. Native
+SHOW/ALTER ROW SECURITY manages those rules. UPDATE/DELETE require Read
+and their write action; INSERT requires Read when using RETURNING or ON CONFLICT.
+See [protected SQL](CHIRONQL_SECURITY.md#protected-relational-sql).
 
 ```sql
 SQL SELECT id, title
@@ -895,11 +902,12 @@ silently dropped would create a collection quietly different from the one that w
 `index_kind` is refused on purpose. LS-VEC is the sole index path, which is also why
 `CREATE INDEX … USING hnsw` is rejected rather than honoured.
 
-### Both statements need a write-capable role
+### Both statements need an administrator
 
-`CREATE COLLECTION` and `DROP COLLECTION` are write statements. A `read_write` or `admin`
-session may execute them; `read_only` is refused. The attached console defaults to `read_write`,
-and `--console-role read_only` narrows it for inspection. `DROP COLLECTION` destroys the
+`CREATE COLLECTION` and `DROP COLLECTION` are admin statements. A legacy `admin`
+session may execute them; `read_only` and `read_write` are refused. Protected
+installations require the corresponding explicit collection administration action.
+`DROP COLLECTION` destroys the
 collection and its data directory, so it also requires the confirmation described below.
 
 ### DROP counts first, then asks

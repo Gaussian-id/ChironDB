@@ -14,6 +14,8 @@ use axum::{
 use subtle::ConstantTimeEq;
 use tonic::{Request as GrpcRequest, Status, service::Interceptor};
 
+pub(crate) mod denial;
+pub(crate) mod session;
 mod work;
 use work::WorkLimiter;
 pub use work::WorkPermit;
@@ -23,12 +25,23 @@ use crate::{
     rbac::{Action, Permission, RbacConfig, authorize},
 };
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct AuthConfig {
     keyring: Option<Arc<Keyring>>,
     rate_limiter: Option<RateLimiter>,
     rbac: Option<Arc<RbacConfig>>,
     work_limiter: WorkLimiter,
+}
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthConfig")
+            .field("enabled", &self.is_enabled())
+            .field("rbac_enabled", &self.rbac.is_some())
+            .field("rate_limit_enabled", &self.rate_limiter.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl AuthConfig {
@@ -51,6 +64,7 @@ impl AuthConfig {
             Arc::new(Keyring {
                 static_keys: keys,
                 file: api_key_file,
+                observed: Mutex::new(session::ObservedCredentials::default()),
             })
         });
         Self {
@@ -196,9 +210,7 @@ impl AuthConfig {
         let Some(keyring) = &self.keyring else {
             return Vec::new();
         };
-        let mut keys = keyring.static_keys.clone();
-        keys.extend(keyring.file_keys());
-        keys
+        keyring.keys()
     }
 }
 
@@ -206,31 +218,70 @@ impl AuthConfig {
 struct Keyring {
     static_keys: Vec<Arc<str>>,
     file: Option<PathBuf>,
+    observed: Mutex<session::ObservedCredentials>,
 }
 
 impl Keyring {
     fn accepts(&self, candidate: &str) -> bool {
         let mut accepted = false;
-        for key in &self.static_keys {
-            accepted |= constant_time_eq(key, candidate);
-        }
-        for key in self.file_keys() {
+        for key in self.keys() {
             accepted |= constant_time_eq(&key, candidate);
         }
         accepted
     }
 
-    fn file_keys(&self) -> Vec<Arc<str>> {
+    fn keys(&self) -> Vec<Arc<str>> {
+        // Serialize file reads/observations, but never hold this inventory lock
+        // while waiting for an admitted publication or engine commit to drain.
+        let (keys, retiring) = {
+            let mut observed = self
+                .observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let keys = self.read_keys(&mut observed);
+            let retiring = observed.observe(&keys);
+            (keys, retiring)
+        };
+        for epoch in retiring {
+            epoch.drain();
+        }
+        keys
+    }
+
+    fn bind(&self, candidate: &str) -> Option<Arc<session::CredentialEpoch>> {
+        let (binding, retiring) = {
+            let mut observed = self
+                .observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let keys = self.read_keys(&mut observed);
+            let retiring = observed.observe(&keys);
+            (observed.binding(candidate), retiring)
+        };
+        for epoch in retiring {
+            epoch.drain();
+        }
+        binding.filter(|epoch| !epoch.is_closed())
+    }
+
+    fn read_keys(&self, observed: &mut session::ObservedCredentials) -> Vec<Arc<str>> {
+        let mut keys = self.static_keys.clone();
         let Some(path) = &self.file else {
-            return Vec::new();
+            return keys;
         };
         match std::fs::read_to_string(path) {
-            Ok(raw) => parse_keys(Some(&raw)),
+            Ok(raw) => {
+                observed.file_error = None;
+                keys.extend(parse_keys(Some(&raw)));
+            }
             Err(error) => {
-                tracing::warn!(%error, path = %path.display(), "failed to read api key file");
-                Vec::new()
+                if observed.file_error != Some(error.kind()) {
+                    tracing::warn!(%error, path = %path.display(), "failed to read api key file");
+                }
+                observed.file_error = Some(error.kind());
             }
         }
+        keys
     }
 }
 
@@ -423,17 +474,8 @@ pub async fn require_http_auth(
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
     let Some(principal) = auth.permission_for(key) else {
-        audit_http(
-            &db,
-            "authentication",
-            "http_authenticate",
-            "failure",
-            None,
-            "unknown",
-            None,
-            request_id.as_deref(),
-            Some("invalid_credential"),
-        )?;
+        denial::record(&db, denial::Transport::Http)
+            .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "audit unavailable").into_response())?;
         return Err((
             StatusCode::UNAUTHORIZED,
             [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
@@ -601,10 +643,20 @@ impl Interceptor for GrpcAuthInterceptor {
             );
             let token =
                 crate::security_http::credential(&request.metadata().clone().into_headers())
-                    .map_err(|_| Status::unauthenticated("missing or invalid credential"))?;
-            authority
-                .authenticate(&token)
-                .map_err(crate::grpc_protected::authentication_error)?;
+                    .map_err(
+                        |_| match denial::record(&self.db, denial::Transport::Grpc) {
+                            Ok(()) => Status::unauthenticated("missing or invalid credential"),
+                            Err(_) => Status::unavailable("audit unavailable"),
+                        },
+                    )?;
+            authority.authenticate(&token).map_err(|error| {
+                if matches!(error, crate::security::SecurityError::Unauthenticated)
+                    && denial::record(&self.db, denial::Transport::Grpc).is_err()
+                {
+                    return Status::unavailable("audit unavailable");
+                }
+                crate::grpc_protected::authentication_error(error)
+            })?;
             if request
                 .extensions()
                 .get::<crate::grpc_protected::ProtectedQuery>()
@@ -634,21 +686,7 @@ impl Interceptor for GrpcAuthInterceptor {
         }
         let key = extract_grpc_key(request.metadata());
         let Some(permission) = self.auth.permission_for(key) else {
-            self.db
-                .audit_access_event(
-                    "authentication",
-                    "grpc_authenticate",
-                    "failure",
-                    None,
-                    "unknown",
-                    None,
-                    "grpc",
-                    request
-                        .metadata()
-                        .get("x-request-id")
-                        .and_then(|value| value.to_str().ok()),
-                    Some("invalid_credential"),
-                )
+            denial::record(&self.db, denial::Transport::Grpc)
                 .map_err(|_| Status::unavailable("audit unavailable"))?;
             return Err(Status::unauthenticated("missing or invalid api key"));
         };
@@ -802,7 +840,7 @@ fn bearer_value(value: Option<&str>) -> Option<&str> {
 }
 
 fn principal_key(key: Option<&str>) -> String {
-    key.unwrap_or("anonymous").to_string()
+    key.map_or_else(|| "anonymous".to_string(), crate::rbac::legacy_principal_id)
 }
 
 #[cfg(test)]
@@ -814,6 +852,29 @@ mod tests {
     use crate::rbac::{ApiKeyEntry, Permission, RbacConfig, Role};
     use axum::http::{HeaderMap, HeaderValue};
     use tonic::{Code, Request, service::Interceptor};
+
+    #[test]
+    fn legacy_principal_and_debug_redact_credentials_but_preserve_explicit_ids() {
+        let key = format!("synthetic-{}", uuid::Uuid::new_v4());
+        let auth = AuthConfig::from_optional_key(Some(key.clone()));
+        let principal = auth.permission_for(Some(&key)).unwrap();
+        assert_eq!(principal.id, crate::rbac::legacy_principal_id(&key));
+        assert!(!principal.id.contains(&key));
+        assert!(!format!("{auth:?}").contains(&key));
+        let auth = auth.with_rbac(RbacConfig {
+            keys: vec![ApiKeyEntry {
+                id: Some("stable-admin".into()),
+                key: key.clone(),
+                tenant_id: None,
+                role: Role::Admin,
+                allowed_collections: vec![],
+                max_collections: None,
+                capabilities: vec![],
+            }],
+        });
+        assert_eq!(auth.permission_for(Some(&key)).unwrap().id, "stable-admin");
+        assert!(!format!("{auth:?}").contains(&key));
+    }
 
     #[test]
     fn chirondb_api_key_header_precedes_legacy_header() {

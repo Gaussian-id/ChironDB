@@ -45,6 +45,44 @@ unless TLS, API credentials, RBAC with stable principal IDs, and an external
 encryption keyring are configured. `CHIRONDB_ALLOW_INSECURE_NON_LOOPBACK=true`
 is a logged/audited development escape hatch, not a production profile.
 
+### Credential lifecycle and authentication telemetry
+
+Legacy API-key authentication uses a stable `legacy-key-...` fingerprint as the
+principal when no explicit RBAC ID is configured. Explicit RBAC IDs remain
+unchanged. Existing audit history is preserved; audit consumers should accept
+the fingerprint for newly recorded legacy events. Legacy transaction/idempotency
+receipts owned by the former raw-key identity do not automatically transfer to
+the fingerprint. Reconcile outstanding outcomes before upgrading; explicit RBAC
+IDs keep their existing ownership.
+
+Key-file changes take effect when the server next reads the configured keys.
+Replace key files atomically: an empty or unreadable file removes its keys from
+the accepted set. A separately configured static key remains accepted until its
+own configuration changes. Legacy PostgreSQL sessions bind to the observed
+credential generation and recheck before operations, COMMIT and output writes.
+Observation closes new admission and drains already admitted synchronous
+publication/commit operations before acknowledging retirement. Existing sessions,
+including prepared statements and portals, remain retired if the key is added
+back; reconnect to authenticate again. Uncommitted transactions
+are abandoned when the retired session next operates or publishes. Work already
+committed cannot be undone by revocation; bytes already handed to the transport
+cannot be recalled. A file-read warning is emitted on error-kind transitions
+and on recurrence after a successful read, rather than once per request.
+
+HTTP, gRPC, ChironWire and PostgreSQL record generic authentication failures
+without credentials, queries or caller-supplied request IDs. Anonymous audit
+writes are limited to 16 records per second per transport per process. Monitor
+`chirondb_authentication_failures_total{transport}` for every rejection and
+`chirondb_authentication_audit_suppressed_total{transport,reason}` for omitted
+records (`rate_limit` or `audit_unavailable`). The fixed transport labels are
+`http`, `grpc`, `chironwire` and `pgwire`; both PostgreSQL authentication modes
+share the same budget. Authentication remains denied when an audit write fails.
+
+Secure startup validates normalized cold-storage and WAL object-store URLs and
+their transport options. Remote endpoints require HTTPS with certificate
+validation, including S3 endpoint overrides. Supported local storage remains
+available. URL/configuration errors omit potentially sensitive option values.
+
 ## Transaction outcome and degraded writes
 
 Every mutation is decided by the installation transaction journal before its
@@ -429,7 +467,9 @@ executing operation is not expired mid-statement.
 
 The isolation level is **snapshot isolation**: a transaction reads its starting
 snapshot plus its own writes. Other transactions cannot read its uncommitted
-writes. Concurrent changes to the same row conflict at commit; disjoint row
+writes. Protected mutations conservatively conflict on concurrent snapshot changes
+to preserve authority and constraint preflight; the following disjoint-write
+behavior describes the unprotected profile. Concurrent changes to the same row conflict at commit; disjoint row
 writes can both commit after revalidation of declared constraints. This does
 not provide serializable isolation: two transactions can read the same
 cross-row condition and change different rows, causing write skew. Applications
@@ -540,6 +580,16 @@ a misconfigured grant names that table. FK parent checks and CASCADE/SET actions
 add all affected table/action pairs before execution. Interactive commit
 reauthorizes its complete accumulated statement set, and protected response
 bodies remain guarded against acknowledged credential or role revocation.
+Rows additionally enforce owner/department/classification and object grants;
+columns distinguish projection Read, predicate Query and assignment Write.
+New rows use the table's trusted owner template; missing historical authority
+fails closed. `SHOW ROW SECURITY` and `ALTER ROW SECURITY` use the ChironQL
+endpoint, including its unversioned alias. See the
+[native row control plane](CHIRONQL_SECURITY.md#native-row-security-administration)
+for revisions, registration, constraint key-domain permissions and column DDL.
+Queued results and receipts retain native table-policy dependencies; private
+interactive results expire at transaction termination.
+
 Table names remain installation-global in this beta, so tenants must choose
 distinct names; a conflicting cross-tenant name is deliberately hidden.
 
@@ -1467,15 +1517,28 @@ curl --fail -X POST http://127.0.0.1:7401/v1/chironql/parse \
 ```
 
 `kind` classifies the statement. Collection DDL — `CREATE COLLECTION` and
-`DROP COLLECTION` — is `write` and accepts a `read_write` or `admin` session.
+`DROP COLLECTION` — is `admin` and requires an `admin` legacy session.
+Protected collection administration uses its explicit collection actions.
 `DROP` also needs the same `"confirm": true` the filtered delete needs. See
 [CHIRONQL.md](CHIRONQL.md#collections).
 
 ## Multi-tenancy
 
-When row-level tenant isolation is enabled, every request is scoped to the
-tenant of the API key that made it, and writes are stamped with it. See
-[TENANT_ISOLATION.md](TENANT_ISOLATION.md). It is off by default.
+Legacy vector requests apply the API key's tenant scope when enforcement is
+enabled, and vector writes receive a server-owned tenant stamp. Graph checks
+endpoint scope; temporal series have a tenant component. Legacy native SQL,
+including SQL inside ChironQL pipelines/transactions, rejects tenant-enforced
+or collection-allowlisted requests because it has no row policy. A tenant name
+in an audit context does not authorize SQL. `Disabled` and `DryRun` do not
+provide enforced row isolation. See [TENANT_ISOLATION.md](TENANT_ISOLATION.md).
+
+Protected SQL combines tenant-bound table grants with persistent row labels,
+object grants and separate column Read/Query/Write rules. UPDATE and
+DELETE require Read in addition to their mutation action; INSERT with RETURNING
+or ON CONFLICT also requires Read. Blind INSERT VALUES without either clause
+requires Create. Native SQL DDL requires Admin in legacy mode and Schema in
+protected mode, including batches and interactive transactions. See the
+[protected SQL contract](CHIRONQL_SECURITY.md#protected-relational-sql).
 
 ## Endpoint map
 

@@ -89,17 +89,22 @@ fn setup(data: &std::path::Path, token: &str) -> Db {
             IngestTemplate {
                 department: "Security".into(),
                 classification: Classification::Internal,
-                properties: BTreeMap::from([(
-                    "/text".into(),
-                    PropertyRule {
-                        classification: Classification::Internal,
-                        actions: BTreeSet::from([
-                            PropertyAction::Read,
-                            PropertyAction::Query,
-                            PropertyAction::Write,
-                        ]),
-                    },
-                )]),
+                properties: ["/text", "/edges/kind"]
+                    .into_iter()
+                    .map(|path| {
+                        (
+                            path.into(),
+                            PropertyRule {
+                                classification: Classification::Internal,
+                                actions: BTreeSet::from([
+                                    PropertyAction::Read,
+                                    PropertyAction::Query,
+                                    PropertyAction::Write,
+                                ]),
+                            },
+                        )
+                    })
+                    .collect(),
                 representations: BTreeMap::from([(
                     "dense".into(),
                     Representation {

@@ -67,10 +67,12 @@ jobs:
         id: metadata
         shell: bash
         run: |
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "epoch=$(git show -s --format=%ct HEAD)" >> "$GITHUB_OUTPUT"
-          echo "core=$(git rev-parse HEAD:chirondb-core)" >> "$GITHUB_OUTPUT"
-          echo "server=$(git rev-parse HEAD:chirondb-server)" >> "$GITHUB_OUTPUT"
+          {
+            echo "sha=$(git rev-parse HEAD)"
+            echo "epoch=$(git show -s --format=%ct HEAD)"
+            echo "core=$(git rev-parse HEAD:chirondb-core)"
+            echo "server=$(git rev-parse HEAD:chirondb-server)"
+          } >> "$GITHUB_OUTPUT"
       - name: Create two clean source directories
         shell: bash
         run: |
@@ -191,7 +193,7 @@ jobs:
         run: |
           mkdir -p signed
           find downloaded -name '*.tar.gz' -exec cp {} signed/ \;
-          (cd signed && sha256sum *.tar.gz > SHA256SUMS)
+          (cd signed && sha256sum -- *.tar.gz > SHA256SUMS)
       - uses: sigstore/cosign-installer@f713795cb21599bc4e5c4b58cbad1da852d7eeb9 # v3
       - name: Keyless-sign and verify internal checksums
         working-directory: signed

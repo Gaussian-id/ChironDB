@@ -33,7 +33,10 @@ use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::Db;
-use crate::auth::AuthConfig;
+use crate::auth::{
+    AuthConfig, denial,
+    session::{LegacySession, SessionWriter},
+};
 use crate::pg_catalog;
 use crate::pgvector_exec::{self, ColumnSpec, ExecError, PgType, QueryResponse, SessionState};
 use crate::pgvector_parser::{self, ParseError, Statement};
@@ -316,30 +319,21 @@ where
     // Auth: cleartext password = API key. If auth disabled, resolve the local
     // compatibility principal. Secure listener policy prevents this exchange
     // from running on a public plaintext socket.
-    let principal = if auth.is_enabled() {
+    let (principal, credential_session) = if auth.is_enabled() {
         write_auth_cleartext_password(&mut writer).await?;
-        let password =
-            output::prepare(&mut writer, read_password_message(&mut reader).await).await?;
+        let password = read_password_message(&mut reader).await;
+        if password.is_err() {
+            let _ = denial::record(&db, denial::Transport::Postgres);
+        }
+        let password = output::prepare(&mut writer, password).await?;
         let bytes = password.as_ref().split(|&b| b == 0).next().unwrap_or(&[]);
         let password = std::str::from_utf8(bytes).map_err(|_| {
+            let _ = denial::record(&db, denial::Transport::Postgres);
             io::Error::new(io::ErrorKind::InvalidData, "password is not valid UTF-8")
         })?;
-        let principal = auth.permission_for(Some(password));
+        let principal = LegacySession::authenticate(&db, &auth, Some(password));
         if principal.is_none() {
-            if db
-                .audit_access_event(
-                    "authentication",
-                    "pgwire_authenticate",
-                    "failure",
-                    None,
-                    "unknown",
-                    None,
-                    "pgwire",
-                    None,
-                    Some("invalid_credential"),
-                )
-                .is_err()
-            {
+            if denial::record(&db, denial::Transport::Postgres).is_err() {
                 write_error_response(&mut writer, "FATAL", "58030", "audit unavailable", None)
                     .await?;
                 writer.flush().await?;
@@ -358,7 +352,7 @@ where
         }
         principal.expect("checked above")
     } else {
-        auth.permission_for(None).ok_or_else(|| {
+        LegacySession::authenticate(&db, &auth, None).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "principal resolution failed",
@@ -385,6 +379,7 @@ where
         return Ok(());
     }
 
+    let mut writer = SessionWriter::new(writer, &credential_session);
     let _session_memory = match frontend::session(&memory) {
         Ok(memory) => memory,
         Err((state, message)) => {
@@ -455,6 +450,8 @@ where
             None
         };
         let payload = payload.as_ref().map_or(&[][..], AsRef::as_ref);
+        // A connection, prepared statement, or portal never grants lasting authority.
+        writer.authorize()?;
 
         match msg_type {
             b'Q' => {
@@ -585,6 +582,13 @@ where
                 return Ok(());
             }
             b'P' => {
+                // Native Parse consults catalog membership. Enforce the scope
+                // boundary before even returning preparation metadata/errors.
+                if crate::sql_security::authorize_legacy(&db, &principal, Action::Read).is_err() {
+                    write_permission_denied(&mut writer).await?;
+                    extended_failed = true;
+                    continue;
+                }
                 match parse_native_parse_message_admitted(
                     payload,
                     &db,
@@ -732,7 +736,8 @@ where
                         write_message(&mut writer, b'n', &[]).await?;
                         continue;
                     }
-                    if authorize(&principal, Action::Read, None).is_err() {
+                    if crate::sql_security::authorize_legacy(&db, &principal, Action::Read).is_err()
+                    {
                         write_permission_denied(&mut writer).await?;
                         extended_failed = true;
                         continue;
@@ -754,6 +759,7 @@ where
                                 continue;
                             }
                         };
+                    writer.authorize()?;
                     let response = if let Some(transaction) = relational_transaction.as_ref() {
                         db.execute_sql_transaction_cancellable_owned(
                             &transaction.handle,
@@ -890,7 +896,7 @@ where
                             crate::SqlStatementClass::Write => Action::Write,
                             crate::SqlStatementClass::Admin => Action::Admin,
                         };
-                        if authorize(&principal, action, None).is_err() {
+                        if crate::sql_security::authorize_legacy(&db, &principal, action).is_err() {
                             transaction.failed = true;
                             extended_failed = true;
                             write_permission_denied(&mut writer).await?;
@@ -916,6 +922,7 @@ where
                                 continue;
                             }
                         };
+                        writer.authorize()?;
                         match db.execute_sql_transaction_cancellable_owned(
                             &transaction.handle,
                             request,
@@ -1036,13 +1043,14 @@ async fn handle_pg_relational_transaction_query<W>(
     db: &Db,
     principal: &Permission,
     transaction: &mut Option<PgRelationalTransaction>,
-    writer: &mut W,
+    writer: &mut SessionWriter<'_, W>,
     sql: &str,
     cancellation: Arc<AtomicBool>,
 ) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
+    writer.authorize()?;
     let normalized = sql.trim().trim_end_matches(';').trim().to_ascii_lowercase();
     let audit_context = chirondb_core::audit::AuditContext {
         principal_id: principal.id.clone(),
@@ -1067,7 +1075,7 @@ where
             .await?;
             return Ok(());
         }
-        if authorize(principal, Action::Read, None).is_err() {
+        if crate::sql_security::authorize_legacy(db, principal, Action::Read).is_err() {
             write_permission_denied(writer).await?;
             return Ok(());
         }
@@ -1110,11 +1118,17 @@ where
             }
             return Ok(());
         }
-        match db.commit_sql_transaction_cancellable_owned(
-            &handle,
-            &audit_context,
-            cancellation.clone(),
-        ) {
+        let committed = {
+            // A key-file observer closes new admission, then waits for this
+            // already admitted commit before acknowledging retirement.
+            let _lease = writer.lease()?;
+            db.commit_sql_transaction_cancellable_owned(
+                &handle,
+                &audit_context,
+                cancellation.clone(),
+            )
+        };
+        match committed {
             Ok(_) => {
                 *transaction = None;
                 write_command_complete(writer, "COMMIT").await?;
@@ -1175,11 +1189,12 @@ where
             crate::SqlStatementClass::Write => Action::Write,
             crate::SqlStatementClass::Admin => Action::Admin,
         };
-        if authorize(principal, action, None).is_err() {
+        if crate::sql_security::authorize_legacy(db, principal, action).is_err() {
             active.failed = true;
             write_permission_denied(writer).await?;
             return Ok(());
         }
+        writer.authorize()?;
         let response = db.execute_sql_transaction_cancellable_owned(
             &active.handle,
             crate::SqlExecutionRequest {
@@ -1205,11 +1220,12 @@ where
             }
         }
     };
-    if authorize(principal, action, None).is_err() {
+    if crate::sql_security::authorize_legacy(db, principal, action).is_err() {
         active.failed = true;
         write_permission_denied(writer).await?;
         return Ok(());
     }
+    writer.authorize()?;
     match db.execute_sql_transaction_cancellable_owned(
         &active.handle,
         crate::SqlExecutionRequest {
@@ -1242,13 +1258,14 @@ async fn handle_query<W>(
     principal: &Permission,
     session: &SessionState,
     memory: &memory::SessionMemory,
-    writer: &mut W,
+    writer: &mut SessionWriter<'_, W>,
     sql: &str,
     cancellation: Arc<AtomicBool>,
 ) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
+    writer.authorize()?;
     let trimmed = sql.trim();
     if trimmed.is_empty() || trimmed == ";" {
         write_message(writer, b'I', &[]).await?;
@@ -1322,6 +1339,7 @@ where
     }
 
     for stmt in stmts {
+        writer.authorize()?;
         if cancellation.load(Ordering::Acquire) {
             write_error_response(writer, "ERROR", "57014", "query canceled", None).await?;
             return Ok(());
@@ -1384,7 +1402,15 @@ where
                 }
             }
         };
-        let execution = pgvector_exec::execute_scoped(db, session, principal, stmt);
+        writer.authorize()?;
+        let execution = {
+            let _commit_lease = if action != Action::Read {
+                writer.lease()?
+            } else {
+                None
+            };
+            pgvector_exec::execute_scoped(db, session, principal, stmt)
+        };
         let audit_result = match &execution {
             Ok(_) if action == Action::Read => db.audit_access_event(
                 "access",
@@ -1526,7 +1552,7 @@ async fn execute_catalog_query<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    if authorize(principal, Action::Read, None).is_err() {
+    if crate::sql_security::authorize_legacy(db, principal, Action::Read).is_err() {
         if db
             .audit_access_event(
                 "authorization",
@@ -1653,7 +1679,7 @@ where
 async fn handle_native_relational_query<W>(
     db: &Db,
     principal: &Permission,
-    writer: &mut W,
+    writer: &mut SessionWriter<'_, W>,
     sql: &str,
     analysis: &crate::SqlStatementAnalysis,
     input: NativeExecutionInput<'_>,
@@ -1661,12 +1687,13 @@ async fn handle_native_relational_query<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    writer.authorize()?;
     let action = match analysis.class {
         crate::SqlStatementClass::Read => Action::Read,
         crate::SqlStatementClass::Write => Action::Write,
         crate::SqlStatementClass::Admin => Action::Admin,
     };
-    if authorize(principal, action, None).is_err() {
+    if crate::sql_security::authorize_legacy(db, principal, action).is_err() {
         write_permission_denied(writer).await?;
         return Ok(false);
     }
@@ -1683,11 +1710,16 @@ where
         transport: "pgwire".to_string(),
         request_id: None,
     };
-    let response = match db.execute_sql_with_audit_cancellable_owned(
-        request,
-        &audit_context,
-        input.cancellation,
-    ) {
+    writer.authorize()?;
+    let executed = {
+        let _commit_lease = if action != Action::Read {
+            writer.lease()?
+        } else {
+            None
+        };
+        db.execute_sql_with_audit_cancellable_owned(request, &audit_context, input.cancellation)
+    };
+    let response = match executed {
         Ok(response) => response,
         Err(error) => {
             write_native_relational_error(writer, &error).await?;

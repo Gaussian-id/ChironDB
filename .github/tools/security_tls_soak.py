@@ -9,6 +9,7 @@ import hashlib
 import http.client
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import socket
@@ -21,18 +22,22 @@ import time
 from typing import Callable
 
 
-API_KEY = "tls-soak-" + ("a" * 32)
-
-
 def command(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        argv,
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        **kwargs,
-    )
+    kwargs.setdefault("timeout", 30)
+    try:
+        return subprocess.run(
+            argv,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **kwargs,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        # External-client diagnostics can contain authentication material. Keep
+        # credentials and response bodies out of the published evidence report.
+        raise RuntimeError(f"external client {Path(argv[0]).name} failed: {type(error).__name__}") from None
+
 
 
 def require_tool(name: str) -> str:
@@ -90,6 +95,10 @@ extendedKeyUsage=clientAuth
             "2",
             "-subj",
             "/CN=ChironDB TLS Soak CA",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+            "-addext",
+            "keyUsage=critical,keyCertSign,cRLSign",
             "-out",
             str(ca_cert),
         ]
@@ -209,61 +218,74 @@ class Soak:
         self.active_key = root / "server.key"
         self.data_dir = root / "data"
         self.snapshot_root = root / "snapshots"
-        self.rbac = root / "rbac.json"
+        self.api_key_file = root / "admin.key"
+        self.api_key = ""
+        self.sql_username = ""
+        self.sql_password = ""
         self.keyring = root / "keyring.json"
         self.browser_page = root / "browser" / "index.html"
 
     def prepare_config(self) -> None:
         self.snapshot_root.mkdir()
-        self.rbac.write_text(
-            json.dumps(
-                {
-                    "keys": [
-                        {
-                            "id": "tls-soak-admin",
-                            "key": API_KEY,
-                            "tenant_id": "tls-soak",
-                            "role": "admin",
-                        }
-                    ]
-                }
-            )
-        )
-        self.keyring.write_text(
-            json.dumps(
-                {
-                    "version": 1,
-                    "active_key_id": "tls-soak-key",
-                    "keys": [
-                        {
-                            "id": "tls-soak-key",
-                            "key_base64": base64.b64encode(os.urandom(32)).decode(),
-                        }
-                    ],
-                }
-            )
-        )
-        os.chmod(self.keyring, 0o600)
+        command([
+            str(self.args.ctl), "security", "init", "--data-dir", str(self.data_dir),
+            "--tenant", "default", "--admin", "tls-soak-admin",
+            "--keyring-out", str(self.keyring), "--admin-key-out", str(self.api_key_file),
+        ])
+        self.api_key = self.api_key_file.read_text().strip()
         atomic_replace(self.pki["initial_cert"], self.active_cert)
         atomic_replace(self.pki["initial_key"], self.active_key)
         browser_dir = self.browser_page.parent
         browser_dir.mkdir()
+        query = b"SHOW CURRENT USER;"
+        message = bytes([10, len(query)]) + query
+        frame = bytes([0]) + len(message).to_bytes(4, "big") + message
         self.browser_page.write_text(
-            f"""<!doctype html><meta charset=utf-8><body>pending<script>
-const body = new Uint8Array([0,0,0,0,0]);
-fetch('https://127.0.0.1:{self.args.grpc_port}/chirondb.v1.ChironDb/Health', {{
-  method: 'POST',
-  mode: 'cors',
-  headers: {{
-    'content-type': 'application/grpc-web+proto',
-    'x-grpc-web': '1',
-    'x-chirondb-api-key': '{API_KEY}'
-  }},
-  body
+            rf"""<!doctype html><meta charset=utf-8><body>pending<script>
+const body = new Uint8Array({list(frame)});
+fetch('https://127.0.0.1:{self.args.grpc_port}/chirondb.v1.ChironDb/ExecuteQuery', {{
+  method: 'POST', mode: 'cors',
+  headers: {{'content-type': 'application/grpc-web+proto', 'x-grpc-web': '1',
+             'x-chirondb-api-key': {json.dumps(self.api_key)}}}, body
 }}).then(async response => {{
   const bytes = new Uint8Array(await response.arrayBuffer());
-  document.body.textContent = response.ok && bytes.length > 5 ? 'grpc-web-passed' : 'grpc-web-failed';
-}}).catch(error => document.body.textContent = 'grpc-web-error:' + error);
+  const decoder = new TextDecoder();
+  const rows = [];
+  let ok = false, kind = '';
+  for (let offset = 0; offset < bytes.length;) {{
+    if (offset + 5 > bytes.length) throw Error('frame header');
+    const flag = bytes[offset];
+    const size = new DataView(bytes.buffer).getUint32(offset + 1);
+    offset += 5;
+    if (size > 1048576 || offset + size > bytes.length) throw Error('frame size');
+    const payload = bytes.subarray(offset, offset + size); offset += size;
+    if (flag === 128) {{
+      ok = /^grpc-status:\s*0\s*$/m.test(decoder.decode(payload));
+    }} else if (flag === 0) {{
+      let cursor = 0;
+      const varint = () => {{
+        let value = 0;
+        for (let shift = 0; shift < 35 && cursor < payload.length; shift += 7) {{
+          const byte = payload[cursor++]; value += (byte & 127) * 2 ** shift;
+          if (!(byte & 128)) return value;
+        }}
+        throw Error('varint');
+      }};
+      while (cursor < payload.length) {{
+        const tag = varint();
+        if ((tag & 7) === 0) {{ varint(); continue; }}
+        if ((tag & 7) !== 2) throw Error('field type');
+        const length = varint();
+        if (cursor + length > payload.length) throw Error('field size');
+        const value = decoder.decode(payload.subarray(cursor, cursor + length)); cursor += length;
+        if ((tag >>> 3) === 1) kind = value;
+        if ((tag >>> 3) === 3) rows.push(JSON.parse(value));
+      }}
+    }} else throw Error('frame flags');
+  }}
+  document.body.textContent = response.ok && ok && kind === 'rows' && rows.length === 1 &&
+    rows[0].name === 'tls-soak-admin' ? 'grpc-web-passed' : 'grpc-web-failed';
+}}).catch(() => {{ document.body.textContent = 'grpc-web-error'; }});
 </script>"""
         )
 
@@ -271,17 +293,15 @@ fetch('https://127.0.0.1:{self.args.grpc_port}/chirondb.v1.ChironDb/Health', {{
         result = [
             str(self.args.server),
             "--listen-http",
-            f"0.0.0.0:{self.args.http_port}",
+            f"127.0.0.1:{self.args.http_port}",
             "--listen-grpc",
-            f"0.0.0.0:{self.args.grpc_port}",
+            f"127.0.0.1:{self.args.grpc_port}",
             "--listen-wire",
-            f"0.0.0.0:{self.args.wire_port}",
+            f"127.0.0.1:{self.args.wire_port}",
             "--data-dir",
             str(self.data_dir),
-            "--api-key",
-            API_KEY,
-            "--rbac-config-file",
-            str(self.rbac),
+            "--tenant-enforcement",
+            "enforced",
             "--encryption-keyring-file",
             str(self.keyring),
             "--snapshot-root",
@@ -326,6 +346,32 @@ fetch('https://127.0.0.1:{self.args.grpc_port}/chirondb.v1.ChironDb/Health', {{
             self.server.wait(timeout=5)
         self.server = None
 
+    def provision_sql_credential(self) -> None:
+        context = ssl.create_default_context(cafile=str(self.pki["ca_cert"]))
+        connection = http.client.HTTPSConnection(
+            "localhost", self.args.http_port, context=context, timeout=10
+        )
+        def request(path: str, payload: dict[str, object] | None = None) -> dict[str, object]:
+            connection.request(
+                "GET" if payload is None else "POST", "/v1/security/" + path,
+                body=None if payload is None else json.dumps(payload),
+                headers={"Authorization": "Bearer " + self.api_key, "Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            body = response.read(1024 * 1024 + 1)
+            if response.status != 200 or len(body) > 1024 * 1024:
+                raise RuntimeError("protected SQL credential provisioning failed")
+            return json.loads(body)
+        try:
+            identity = request("whoami")
+            credential = request("sql-credentials", {
+                "principal": identity["principal"], "expected_revision": identity["identity_revision"],
+            })
+            self.sql_username = str(credential["username"])
+            self.sql_password = str(credential["password"])
+        finally:
+            connection.close()
+
     def start_browser_origin(self) -> None:
         self.page_server = subprocess.Popen(
             [sys.executable, "-m", "http.server", str(self.page_port), "--bind", "127.0.0.1"],
@@ -361,8 +407,9 @@ fetch('https://127.0.0.1:{self.args.grpc_port}/chirondb.v1.ChironDb/Health', {{
             str(self.pki["ca_cert"]),
             "-authority",
             "localhost",
+            "-expand-headers",
             "-H",
-            f"authorization: Bearer {API_KEY}",
+            "authorization: Bearer ${CHIRON_TLS_SOAK_KEY}",
             "-import-path",
             str(self.args.proto_root),
             "-proto",
@@ -370,9 +417,13 @@ fetch('https://127.0.0.1:{self.args.grpc_port}/chirondb.v1.ChironDb/Health', {{
         ]
         if mtls:
             argv.extend(["-cert", str(self.pki["client_cert"]), "-key", str(self.pki["client_key"])])
-        argv.extend([f"127.0.0.1:{self.args.grpc_port}", "chirondb.v1.ChironDb.Health"])
-        if json.loads(command(argv).stdout).get("status") != "ok":
-            raise RuntimeError("grpcurl health response was not ok")
+        argv.extend(["-d", json.dumps({"query": "SHOW CURRENT USER;"}),
+                     f"127.0.0.1:{self.args.grpc_port}", "chirondb.v1.ChironDb.ExecuteQuery"])
+        environment = dict(os.environ, CHIRON_TLS_SOAK_KEY=self.api_key)
+        result = json.loads(command(argv, env=environment).stdout)
+        rows = [json.loads(row) for row in result.get("rowsJson", [])]
+        if len(rows) != 1 or rows[0].get("name") != "tls-soak-admin":
+            raise RuntimeError("grpcurl protected identity response was invalid")
 
     def psql(self, mtls: bool = False) -> None:
         environment = os.environ.copy()
@@ -381,9 +432,9 @@ fetch('https://127.0.0.1:{self.args.grpc_port}/chirondb.v1.ChironDb/Health', {{
                 "PGHOST": "localhost",
                 "PGHOSTADDR": "127.0.0.1",
                 "PGPORT": str(self.args.wire_port),
-                "PGUSER": "tls-soak",
+                "PGUSER": self.sql_username,
                 "PGDATABASE": "tls-soak",
-                "PGPASSWORD": API_KEY,
+                "PGPASSWORD": self.sql_password,
                 "PGSSLMODE": "verify-full",
                 "PGSSLROOTCERT": str(self.pki["ca_cert"]),
                 "PGCONNECT_TIMEOUT": "5",
@@ -392,17 +443,15 @@ fetch('https://127.0.0.1:{self.args.grpc_port}/chirondb.v1.ChironDb/Health', {{
         if mtls:
             environment["PGSSLCERT"] = str(self.pki["client_cert"])
             environment["PGSSLKEY"] = str(self.pki["client_key"])
-        result = command([self.args.psql, "-Atqc", "SELECT version()"], env=environment)
-        if "ChironDB" not in result.stdout:
-            raise RuntimeError("psql version response did not identify ChironDB")
+        result = command([self.args.psql, "-Atqc", "SELECT current_user"], env=environment)
+        if result.stdout.strip() != "tls-soak-admin":
+            raise RuntimeError("psql protected identity response was invalid")
 
     def wire(self, mtls: bool = False) -> None:
         argv = [
             str(self.args.wirectl),
             "--endpoint",
             f"127.0.0.1:{self.args.wire_port}",
-            "--api-key",
-            API_KEY,
             "--ca-cert",
             str(self.pki["ca_cert"]),
             "--tls-domain",
@@ -410,9 +459,11 @@ fetch('https://127.0.0.1:{self.args.grpc_port}/chirondb.v1.ChironDb/Health', {{
         ]
         if mtls:
             argv.extend(["--client-cert", str(self.pki["client_cert"]), "--client-key", str(self.pki["client_key"])])
-        argv.append("health")
-        if json.loads(command(argv).stdout).get("status") != "ok":
-            raise RuntimeError("ChironWire health response was not ok")
+        argv.extend(["query", "SHOW CURRENT USER;"])
+        environment = dict(os.environ, CHIRONDB_API_KEY=self.api_key)
+        rows = json.loads(command(argv, env=environment).stdout).get("rows", [])
+        if len(rows) != 1 or rows[0].get("name") != "tls-soak-admin":
+            raise RuntimeError("ChironWire protected identity response was invalid")
 
     def browser(self) -> None:
         profile = self.root / f"chrome-{time.time_ns()}"
@@ -438,7 +489,7 @@ fetch('https://127.0.0.1:{self.args.grpc_port}/chirondb.v1.ChironDb/Health', {{
             )
         finally:
             shutil.rmtree(profile, ignore_errors=True)
-        if "grpc-web-passed" not in result.stdout:
+        if not re.search(r"<body[^>]*>\s*grpc-web-passed\s*</body>", result.stdout):
             raise RuntimeError("browser gRPC-Web probe failed")
 
     def worker(self, name: str, operation: Callable[[], None], interval: float) -> None:
@@ -480,6 +531,8 @@ fetch('https://127.0.0.1:{self.args.grpc_port}/chirondb.v1.ChironDb/Health', {{
                 self.args.openssl,
                 "s_client",
                 "-tls1_1",
+                "-cipher",
+                "DEFAULT:@SECLEVEL=0",
                 "-connect",
                 f"127.0.0.1:{self.args.http_port}",
                 "-servername",
@@ -489,9 +542,12 @@ fetch('https://127.0.0.1:{self.args.grpc_port}/chirondb.v1.ChironDb/Health', {{
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            timeout=10,
         )
         if legacy.returncode == 0:
             raise RuntimeError("TLS 1.1 unexpectedly negotiated")
+        if not re.search(r"SSL alert number (40|70)\b", legacy.stderr):
+            raise RuntimeError("TLS 1.1 probe did not observe a server rejection")
 
     def mtls_matrix(self) -> None:
         self.curl(mtls=True)
@@ -520,6 +576,7 @@ fetch('https://127.0.0.1:{self.args.grpc_port}/chirondb.v1.ChironDb/Health', {{
         self.prepare_config()
         self.start_browser_origin()
         self.start_server(mtls=False)
+        self.provision_sql_credential()
         self.tls_version_matrix()
         initial_serial = peer_serial(self.args.http_port, self.pki["ca_cert"])
         long_connection = LongLivedHttp(self.args.http_port, self.pki["ca_cert"])
@@ -615,6 +672,7 @@ fetch('https://127.0.0.1:{self.args.grpc_port}/chirondb.v1.ChironDb/Health', {{
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--server", type=Path, required=True)
+    parser.add_argument("--ctl", type=Path, required=True)
     parser.add_argument("--wirectl", type=Path, required=True)
     parser.add_argument("--proto-root", type=Path, required=True)
     parser.add_argument("--grpcurl", default="grpcurl")
@@ -633,6 +691,7 @@ def parse_args() -> argparse.Namespace:
     if args.duration_seconds < 30:
         parser.error("--duration-seconds must be at least 30; only >=3600 can pass")
     args.server = args.server.resolve()
+    args.ctl = args.ctl.resolve()
     args.wirectl = args.wirectl.resolve()
     args.proto_root = args.proto_root.resolve()
     args.openssl = require_tool("openssl")
@@ -645,7 +704,7 @@ def parse_args() -> argparse.Namespace:
     )
     if not args.chrome:
         parser.error("Chrome/Chromium is required for the real browser gRPC-Web probe")
-    for path in (args.server, args.wirectl, args.proto_root):
+    for path in (args.server, args.ctl, args.wirectl, args.proto_root):
         if not path.exists():
             parser.error(f"required path does not exist: {path}")
     return args
@@ -679,6 +738,7 @@ def main() -> int:
             "server_tree_hash": args.server_tree_hash,
             "actions_run_id": os.environ.get("GITHUB_RUN_ID"),
             "error": str(error),
+            "load_counts": soak.counts if soak else {},
             "work_dir": str(root),
         }
         write_report(args.output, report)

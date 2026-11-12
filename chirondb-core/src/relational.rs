@@ -30,6 +30,8 @@ mod record_bindings;
 mod record_references;
 mod replay;
 mod row_chain;
+mod row_security;
+pub use row_security::SqlPublication;
 mod rows;
 mod runs;
 mod schema;
@@ -293,6 +295,9 @@ pub(crate) fn check_sql_cancelled() -> Result<()> {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum RelationalMutation {
+    RowSecurity {
+        delta: chirondb_types::relational::RelationalSecurityDelta,
+    },
     CreateTable {
         definition: TableDefinition,
     },
@@ -334,12 +339,16 @@ pub struct RelationalBatch {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoredRow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security: Option<crate::security::ResourceRecord>,
     pub row_id: u64,
     pub values: Vec<RelationalValue>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct RowVersion {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    security: Option<row_security::Metadata>,
     begin: u64,
     end: Option<u64>,
     values: RowValues,
@@ -442,6 +451,7 @@ struct CheckpointTableBackings {
 
 #[derive(Clone, Debug)]
 struct TableState {
+    policy_epoch: Option<Arc<crate::security::Epoch>>,
     directory: Arc<PathBuf>,
     definition: Schema,
     rows: RowStore,
@@ -461,6 +471,14 @@ impl TableState {
     fn with_schema(definition: Schema, directory: Arc<PathBuf>) -> Result<Self> {
         let indexes = IndexCatalog::new(&definition)?;
         Ok(Self {
+            policy_epoch: definition.tenant_id.as_ref().map(|_| {
+                crate::security::Epoch::new(
+                    definition
+                        .row_policy
+                        .as_ref()
+                        .map_or(0, |policy| policy.revision),
+                )
+            }),
             directory,
             definition,
             rows: RowStore::default(),
@@ -514,7 +532,27 @@ impl TableState {
     }
 
     fn replace_definition(&mut self, definition: TableDefinition, snapshot: u64) -> Result<()> {
+        if self.definition.row_policy.is_some() && definition.row_policy.is_none() {
+            return Err(SecurityError::Invalid("cannot remove native row authority".into()).into());
+        }
+        let same_policy = definition.row_policy == self.definition.row_policy;
+        if self.definition.row_policy != definition.row_policy {
+            let mut metadata_only = self.definition.as_ref().clone();
+            metadata_only.row_policy = definition.row_policy.clone();
+            if metadata_only == definition {
+                let schema = Schema::adopt(definition)?;
+                self.policy_epoch = schema
+                    .row_policy
+                    .as_ref()
+                    .map(|policy| crate::security::Epoch::new(policy.revision));
+                self.definition = schema;
+                return Ok(());
+            }
+        }
         let mut replacement = Self::empty(definition, Arc::clone(&self.directory))?;
+        if same_policy {
+            replacement.policy_epoch = self.policy_epoch.clone();
+        }
         replacement.rows = self.rows.clone();
         replacement.next_row_id = self.next_row_id;
         replacement.rebuild_indexes(snapshot)?;
@@ -538,6 +576,9 @@ impl TableState {
 
 #[derive(Clone, Debug)]
 struct RelationalState {
+    // Execution-only identity; never serialized or installed in a live snapshot.
+    request_identity: Option<Arc<AuthenticatedIdentity>>,
+    request_identity_memory: Option<Arc<memory::Charge>>,
     directory: Arc<PathBuf>,
     sequence: u64,
     /// Installation-local monotonic allocator. Table and physical index IDs
@@ -551,6 +592,8 @@ struct RelationalState {
 impl RelationalState {
     fn empty(directory: PathBuf) -> Result<Self> {
         Ok(Self {
+            request_identity: None,
+            request_identity_memory: None,
             directory: Arc::new(directory),
             sequence: 0,
             next_catalog_id: 1,
@@ -756,6 +799,7 @@ pub struct RelationalEngine {
 }
 
 pub struct RelationalExecution {
+    publication: SqlPublication,
     pub response: SqlExecutionResponse,
     pub committed: Option<CommittedTransaction>,
     pub projection_error: Option<GaussError>,
@@ -764,6 +808,7 @@ pub struct RelationalExecution {
 }
 
 struct PreparedRelationalExecution {
+    publication: SqlPublication,
     snapshot: u64,
     results: Vec<SqlResult>,
     mutations: Vec<RelationalMutation>,
@@ -784,12 +829,23 @@ struct RowWriteDependency {
 
 #[derive(Debug)]
 struct InteractiveTransaction {
+    result_epoch: Arc<crate::security::Epoch>,
     base: RelationalState,
     history: history::History,
     protected_tenant: bool,
     last_activity: Instant,
     aborted: bool,
     _snapshot_pin: SnapshotPin,
+}
+
+impl Drop for InteractiveTransaction {
+    fn drop(&mut self) {
+        // Private DDL can produce data before a persistent table epoch exists.
+        // Such results must not outlive COMMIT, ROLLBACK, expiry or shutdown.
+        if let Err(error) = self.result_epoch.close_and_drain() {
+            tracing::warn!(%error, "private SQL result publication did not drain before retirement");
+        }
+    }
 }
 
 /// Persist only permission dependencies for commit acknowledgement replay,
@@ -802,6 +858,8 @@ pub(crate) struct SqlAuthorization {
     grants: BTreeSet<(String, SecurityAction)>,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     table_grants: BTreeSet<SqlTableRequirement>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    row_policies: BTreeMap<String, Option<(u64, uuid::Uuid, u64)>>,
 }
 
 #[derive(Clone, Deserialize, Serialize, Eq, PartialEq, Ord, PartialOrd)]
@@ -822,7 +880,37 @@ impl SqlAuthorization {
             schema: false,
             grants: BTreeSet::new(),
             table_grants: BTreeSet::new(),
+            row_policies: BTreeMap::new(),
         }
+    }
+
+    /// Historic receipts may predate read-dependency analysis. Replaying a DML
+    /// result requires Read on every written table, including an INSERT receipt
+    /// whose old proof cannot distinguish blind VALUES from ON CONFLICT.
+    pub(crate) fn authorize_replay(
+        &self,
+        identity: &AuthenticatedIdentity,
+    ) -> Result<PublicationPermit> {
+        let mut proof = self.clone();
+        for (table, action) in &self.grants {
+            if matches!(
+                action,
+                SecurityAction::Create | SecurityAction::Update | SecurityAction::Delete
+            ) {
+                proof.grants.insert((table.clone(), SecurityAction::Read));
+            }
+        }
+        for grant in &self.table_grants {
+            if matches!(
+                grant.action,
+                SecurityAction::Create | SecurityAction::Update | SecurityAction::Delete
+            ) {
+                let mut read = grant.clone();
+                read.action = SecurityAction::Read;
+                proof.table_grants.insert(read);
+            }
+        }
+        proof.authorize(identity)
     }
 
     pub(crate) fn authorize(&self, identity: &AuthenticatedIdentity) -> Result<PublicationPermit> {
@@ -1285,6 +1373,7 @@ impl RelationalEngine {
         let result = if prepared.mutations.is_empty() && idempotency.is_none() {
             let response_memory = output::reserve_results(&prepared.results)?;
             let response = RelationalExecution {
+                publication: prepared.publication.clone(),
                 response: SqlExecutionResponse {
                     transaction_id: None,
                     snapshot: prepared.snapshot,
@@ -1344,13 +1433,14 @@ impl RelationalEngine {
         request: SqlExecutionRequest,
         collections: Vec<MultiModelCollectionBatch>,
         audit_context: &AuditContext,
-        protected_tenant: Option<&str>,
+        identity: Option<&AuthenticatedIdentity>,
         receipt: Option<crate::db::multimodel::CommitReceipt<'_>>,
         project_collections: F,
     ) -> Result<RelationalExecution>
     where
         F: FnOnce(TransactionId, &[MultiModelCollectionBatch]) -> Result<()>,
     {
+        let protected_tenant = identity.map(|identity| identity.principal().tenant.as_str());
         if request.idempotency_key.is_some()
             != receipt
                 .as_ref()
@@ -1382,7 +1472,8 @@ impl RelationalEngine {
         let retry_id = request.retry_id.clone();
         let base = self.state.read().clone();
         let snapshot_pin = self.snapshots.pin(base.sequence)?;
-        let prepared = prepare_execution(base, request, true, true, protected_tenant, None, false)?;
+        let prepared =
+            prepare_execution(base, request, true, true, protected_tenant, identity, false)?;
         if prepared.mutations.is_empty() {
             return Err(invalid(
                 "multi-model transaction SQL produced no relational mutation",
@@ -1407,7 +1498,9 @@ impl RelationalEngine {
             mutations,
         };
         let mut candidate = guard.clone();
+        prepared.publication.publish(|| ())?;
         apply_batch(&mut candidate, &relational)?;
+        let publication = prepared.publication.after_commit(&candidate)?;
         let collection_names = collections
             .iter()
             .map(|projection| projection.collection.clone())
@@ -1446,13 +1539,31 @@ impl RelationalEngine {
                 "domains": ["relational", "vector", "graph"],
             }),
         );
+        let decision_started = receipt.as_ref().and_then(|receipt| {
+            receipt
+                .insert
+                .map(|insert| insert.decision_started)
+                .or(receipt.decision_started)
+        });
+        let epochs_drained = std::cell::Cell::new(false);
         let transaction = match receipt {
             Some(receipt) => receipt.commit(
                 &self.journal,
-                target,
                 mutation,
                 audit,
-                &response,
+                (
+                    &response,
+                    prepared
+                        .authorization
+                        .as_ref()
+                        .map(|proof| {
+                            let mut proof = proof.clone();
+                            proof.refresh_row_policies(&candidate)?;
+                            Ok::<_, GaussError>(proof)
+                        })
+                        .transpose()?
+                        .as_ref(),
+                ),
                 |access, reads, retired| {
                     record_references::validate(
                         &guard,
@@ -1463,8 +1574,30 @@ impl RelationalEngine {
                         retired,
                     )
                 },
-            )?,
-            None => self.journal.commit(target, mutation, audit)?,
+                // Reference/row-count refusal is not a durable decision.
+                // Drain old SQL views only after receipt validation/admission.
+                || {
+                    row_security::close_replaced_epochs(&guard, &candidate)?;
+                    epochs_drained.set(true);
+                    Ok(())
+                },
+            ),
+            None => {
+                row_security::close_replaced_epochs(&guard, &candidate)?;
+                self.journal.commit(target, mutation, audit)
+            }
+        };
+        let transaction = match transaction {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                if epochs_drained.get()
+                    && decision_started
+                        .is_some_and(|started| !started.load(AtomicOrdering::Acquire))
+                {
+                    row_security::renew_uncommitted_epochs(&mut guard, &candidate)?;
+                }
+                return Err(error);
+            }
         };
         let transaction_id = transaction.prepare.transaction_id;
         let mut relational_watermark = None;
@@ -1508,6 +1641,7 @@ impl RelationalEngine {
             self.checkpoint_after_commit(checkpoint, "multi-model");
         }
         let execution = RelationalExecution {
+            publication,
             response: SqlExecutionResponse {
                 transaction_id: Some(transaction_id.to_string()),
                 ..response
@@ -1554,7 +1688,7 @@ impl RelationalEngine {
 
     fn commit_prepared_under_reference_gate(
         &self,
-        prepared: PreparedRelationalExecution,
+        mut prepared: PreparedRelationalExecution,
         audit_context: &AuditContext,
         statement_count: usize,
         retry_id: Option<&str>,
@@ -1584,7 +1718,12 @@ impl RelationalEngine {
         // decision. The state write guard prevents another commit from
         // invalidating UNIQUE/FK checks between validation and publication.
         let mut candidate = guard.clone();
+        prepared.publication.publish(|| ())?;
         apply_batch(&mut candidate, &batch)?;
+        let publication = prepared.publication.after_commit(&candidate)?;
+        if let Some(proof) = &mut prepared.authorization {
+            proof.refresh_row_policies(&candidate)?;
+        }
         // Cancellation is accepted only before the durable journal decision.
         // Once journal.commit returns, the transaction must be reported using
         // its durable outcome rather than changed into a cancellation error.
@@ -1594,12 +1733,25 @@ impl RelationalEngine {
         let mutation = WalEntry::RelationalBatch {
             batch: batch.clone(),
         };
-        let audit = TransactionAudit::mutation(
-            "sql_transaction",
-            None,
-            audit_context,
-            serde_json::json!({"statement_count": statement_count, "retry_id": retry_id, "relational_sequence": commit_sequence}),
-        );
+        let audit = if let [RelationalMutation::RowSecurity { delta }] = batch.mutations.as_slice()
+        {
+            TransactionAudit::new(
+                "security",
+                "relational_authority.change",
+                Some(&delta.table),
+                audit_context,
+                serde_json::json!({"incarnation": delta.incarnation, "expected_revision": delta.expected_revision,
+                    "policy_revision": delta.policy.revision, "row_bindings": delta.records.len(), "relational_sequence": commit_sequence}),
+            )
+        } else {
+            TransactionAudit::mutation(
+                "sql_transaction",
+                None,
+                audit_context,
+                serde_json::json!({"statement_count": statement_count, "retry_id": retry_id, "relational_sequence": commit_sequence}),
+            )
+        };
+        row_security::close_replaced_epochs(&guard, &candidate)?;
         let transaction = if let Some(claim) = idempotency {
             claim.commit(commit_sequence, &prepared, target, mutation, audit)?
         } else {
@@ -1632,6 +1784,7 @@ impl RelationalEngine {
             self.checkpoint_after_commit(checkpoint, "relational");
         }
         Ok(RelationalExecution {
+            publication,
             response: SqlExecutionResponse {
                 transaction_id: Some(transaction_id.to_string()),
                 snapshot: commit_sequence,
@@ -1735,6 +1888,23 @@ impl RelationalEngine {
         Ok(migrated)
     }
 
+    pub(crate) fn ensure_no_live_references_authorized(
+        &self,
+        identity: &AuthenticatedIdentity,
+        collection: &str,
+        ids: &BTreeSet<String>,
+    ) -> Result<()> {
+        let state = self.state.read();
+        record_references::authorize_retirement(&state, identity, collection, ids)?;
+        record_references::ensure_unreferenced(
+            &state,
+            &identity.principal().tenant,
+            collection,
+            ids,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn ensure_no_live_references(
         &self,
         tenant: &str,
@@ -1937,6 +2107,7 @@ impl RelationalEngine {
         self.interactive.insert(
             handle.clone(),
             InteractiveTransaction {
+                result_epoch: crate::security::Epoch::new(0),
                 base,
                 history: history::History::new()?,
                 protected_tenant,
@@ -2100,6 +2271,7 @@ impl RelationalEngine {
             return Err(SecurityError::Forbidden.into());
         }
         let mut results = Vec::with_capacity(request.statements.len());
+        let mut publication = SqlPublication::default();
         for statement in request.statements {
             check_sql_cancelled()?;
             let control = parse_interactive_control(&statement.sql)?;
@@ -2187,6 +2359,7 @@ impl RelationalEngine {
                             return Err(error);
                         }
                     };
+                    publication.merge(prepared.publication.clone())?;
                     results.push(
                         prepared
                             .results
@@ -2195,6 +2368,9 @@ impl RelationalEngine {
                     );
                 }
             }
+        }
+        if let Some(identity) = identity {
+            publication.bind_session(identity, Arc::clone(&session.result_epoch))?;
         }
         session.last_activity = Instant::now();
         let response_memory = match output::reserve_results(&results) {
@@ -2215,7 +2391,8 @@ impl RelationalEngine {
                 results,
             },
             response_memory,
-        ))
+        )
+        .with_publication(publication))
     }
 
     pub fn commit_interactive(
@@ -2284,7 +2461,7 @@ impl RelationalEngine {
             crate::transaction_journal::IdempotencyAdmission::Execute(claim) => claim,
             crate::transaction_journal::IdempotencyAdmission::Replay(receipt) => {
                 let _admission = SQL_ADMISSION.acquire()?;
-                return replay_interactive_sql_receipt(receipt, identity, db);
+                return replay_interactive_sql_receipt(self, receipt, identity, db);
             }
         };
         let entry = self.interactive.get(handle, audit_context)?;
@@ -2306,8 +2483,9 @@ impl RelationalEngine {
             // Every statement is authorized against the catalog produced by
             // its predecessors before its data stage reads or writes.
             let statement_count = session.history.statements().len();
-            let mut prepared = if statement_count == 0 {
+            let prepared = if statement_count == 0 {
                 PreparedRelationalExecution {
+                    publication: SqlPublication::default(),
                     snapshot: session.base.sequence,
                     results: Vec::new(),
                     mutations: Vec::new(),
@@ -2336,7 +2514,7 @@ impl RelationalEngine {
             };
             // Move the proof out of the frozen preparation; it is held through
             // authorization and borrowed by the interactive durable receipt.
-            let authorization = prepared.authorization.take();
+            let authorization = prepared.authorization.clone();
             let permit = authorization
                 .as_ref()
                 .zip(identity)
@@ -2406,15 +2584,26 @@ impl RelationalEngine {
     }
 
     pub fn request_is_read_only(request: &SqlExecutionRequest) -> Result<bool> {
+        Ok(Self::request_class(request)? == SqlStatementClass::Read)
+    }
+
+    /// Classify the entire batch before executing any statement. In particular,
+    /// schema changes must never collapse into ordinary write permission.
+    pub fn request_class(request: &SqlExecutionRequest) -> Result<SqlStatementClass> {
+        let mut class = SqlStatementClass::Read;
         for item in &request.statements {
             if parse_interactive_control(&item.sql)?.is_some() {
                 continue;
             }
-            if Self::analyze_statement(&item.sql)?.class != SqlStatementClass::Read {
-                return Ok(false);
+            match Self::analyze_statement(&item.sql)?.class {
+                SqlStatementClass::Admin => class = SqlStatementClass::Admin,
+                SqlStatementClass::Write if class == SqlStatementClass::Read => {
+                    class = SqlStatementClass::Write;
+                }
+                _ => {}
             }
         }
-        Ok(true)
+        Ok(class)
     }
 
     pub fn wal_dir(&self) -> &Path {
@@ -2470,6 +2659,9 @@ fn extend_statement_authorization(
 ) -> Result<()> {
     ensure_statement_tenant(state, statement, Some(&authorization.tenant))?;
     let analysis = analyze_parsed_statement(statement)?;
+    for name in &analysis.tables {
+        authorization.bind_row_policy(state, name)?;
+    }
     let mut requirements = BTreeSet::new();
     match analysis.kind {
         SqlStatementKind::Select | SqlStatementKind::Explain => {
@@ -2481,10 +2673,17 @@ fn extend_statement_authorization(
             );
         }
         SqlStatementKind::Insert => {
+            // Plain INSERT VALUES is the blind-write contract. Conflict clauses
+            // inspect existing rows; RETURNING exposes stored/default values.
+            let reads = matches!(statement, Statement::Insert(insert)
+                if insert.on.is_some() || insert.returning.is_some());
             let may_update = matches!(statement, Statement::Insert(insert)
                 if matches!(&insert.on, Some(OnInsert::OnConflict(conflict))
                     if matches!(conflict.action, OnConflictAction::DoUpdate(_))));
             for table in analysis.tables {
+                if reads {
+                    requirements.insert((table.clone(), SecurityAction::Read));
+                }
                 add_relational_requirement(
                     state,
                     &mut requirements,
@@ -2531,6 +2730,7 @@ fn extend_statement_authorization(
         SqlStatementKind::SetConstraints => {}
     }
     for (table, action) in requirements {
+        authorization.bind_row_policy(state, &table)?;
         if let Some(definition) = state.tables.get(&table).map(|state| &state.definition)
             && let Some(incarnation) = definition.security_incarnation
         {
@@ -2597,6 +2797,12 @@ fn add_relational_requirement(
             .tables
             .get(&table_name)
             .ok_or(SecurityError::NotFound)?;
+        // UPDATE/DELETE select existing rows even without RETURNING. Their
+        // predicates, expressions and affected-row counts are read primitives.
+        // Apply the same requirement to cascading mutations, not just targets.
+        if matches!(action, SecurityAction::Update | SecurityAction::Delete) {
+            requirements.insert((table_name.clone(), SecurityAction::Read));
+        }
         if matches!(action, SecurityAction::Create | SecurityAction::Update) {
             for foreign_key in &table.definition.foreign_keys {
                 pending.push_back((foreign_key.referenced_table.clone(), SecurityAction::Read));
@@ -2684,12 +2890,11 @@ fn replay_standalone_sql_receipt(
             })
         })?
     };
-    let _permit = match (saved.authorization.as_ref(), reference_scope) {
-        (Some(authorization), Some((_, identity))) => Some(authorization.authorize(identity)?),
-        (None, Some((_, identity))) if !identity.has_strict_sql_scopes() => {
-            Some(engine.authorize_request(identity, request)?)
+    let publication = match (saved.authorization.as_ref(), reference_scope) {
+        (Some(authorization), Some((_, identity))) => {
+            engine.authorize_receipt(identity, authorization)?
         }
-        (None, None) => None,
+        (None, None) => SqlPublication::default(),
         _ => return Err(SecurityError::Forbidden.into()),
     };
     if let Some((db, identity)) = reference_scope {
@@ -2699,13 +2904,22 @@ fn replay_standalone_sql_receipt(
             saved.references.iter(),
         )?;
         return db.with_standalone_reference_commit(identity, &references, || {
-            replay_sql_value(receipt, saved.try_map(|saved| Ok(saved.response))?)
+            replay_sql_value(receipt, saved.try_map(|saved| Ok(saved.response))?).map(
+                |mut output| {
+                    output.publication = publication;
+                    output
+                },
+            )
         });
     }
-    replay_sql_value(receipt, saved.try_map(|saved| Ok(saved.response))?)
+    replay_sql_value(receipt, saved.try_map(|saved| Ok(saved.response))?).map(|mut output| {
+        output.publication = publication;
+        output
+    })
 }
 
 fn replay_interactive_sql_receipt(
+    engine: &RelationalEngine,
     receipt: crate::transaction_journal::IdempotencyReceipt,
     identity: Option<&AuthenticatedIdentity>,
     db: Option<&crate::Db>,
@@ -2731,9 +2945,11 @@ fn replay_interactive_sql_receipt(
     if !matches!(saved.version, 1 | 2) {
         return Err(invalid("unsupported interactive commit receipt version"));
     }
-    let _permit = match (&saved.authorization, identity) {
-        (Some(authorization), Some(identity)) => Some(authorization.authorize(identity)?),
-        (None, None) => None,
+    let publication = match (&saved.authorization, identity) {
+        (Some(authorization), Some(identity)) => {
+            engine.authorize_receipt(identity, authorization)?
+        }
+        (None, None) => SqlPublication::default(),
         _ => return Err(SecurityError::Forbidden.into()),
     };
     if let Some((db, identity)) = db.zip(identity) {
@@ -2743,10 +2959,18 @@ fn replay_interactive_sql_receipt(
             saved.references.iter(),
         )?;
         return db.with_standalone_reference_commit(identity, &references, || {
-            replay_sql_value(receipt, saved.try_map(|saved| Ok(saved.response))?)
+            replay_sql_value(receipt, saved.try_map(|saved| Ok(saved.response))?).map(
+                |mut output| {
+                    output.publication = publication;
+                    output
+                },
+            )
         });
     }
-    replay_sql_value(receipt, saved.try_map(|saved| Ok(saved.response))?)
+    replay_sql_value(receipt, saved.try_map(|saved| Ok(saved.response))?).map(|mut output| {
+        output.publication = publication;
+        output
+    })
 }
 
 fn replay_sql_receipt(
@@ -2773,6 +2997,7 @@ fn replay_sql_receipt(
             let results = Vec::new();
             let response_memory = output::reserve_results(&results)?;
             Ok(RelationalExecution {
+                publication: SqlPublication::default(),
                 response: SqlExecutionResponse {
                     transaction_id: Some(receipt.status.transaction_id.to_string()),
                     snapshot: 0,
@@ -2807,6 +3032,7 @@ fn replay_sql_value(
     })?;
     let (response, response_memory) = response.into_parts();
     Ok(RelationalExecution {
+        publication: SqlPublication::default(),
         response,
         committed: None,
         projection_error: None,
@@ -2857,6 +3083,24 @@ fn prepare_execution(
         }
     }
 
+    working.request_identity_memory = authorized_identity
+        .map(|identity| {
+            let bytes = crate::security::storage::serialized_len(
+                &(
+                    identity.principal(),
+                    identity.user_name(),
+                    identity.roles(),
+                    identity.groups(),
+                    identity.credential_id(),
+                ),
+                4 * 1024 * 1024,
+            )?;
+            let mut memory = memory::Charge::storage();
+            memory.prepare(8192 + bytes as u64 * 64)?;
+            Ok::<_, GaussError>(Arc::new(memory))
+        })
+        .transpose()?;
+    working.request_identity = authorized_identity.map(|identity| Arc::new(identity.clone()));
     let snapshot = working.sequence;
     let snapshot_state = working.clone();
     let catalog = working.tables.clone();
@@ -2881,12 +3125,14 @@ fn prepare_execution(
                     combined.schema |= required.schema;
                     combined.grants.extend(required.grants);
                     combined.table_grants.extend(required.table_grants);
+                    combined.row_policies.extend(required.row_policies);
                     Some(permit)
                 } else {
                     None
                 };
                 let mutation_count = mutations.len();
                 let before_statement = working.clone();
+                let column_rename = row_security::column_rename(&statement);
                 results.push(execute_statement(
                     &mut working,
                     snapshot,
@@ -2903,6 +3149,13 @@ fn prepare_execution(
                             .map(|identity| identity.principal().id.as_str()),
                     ),
                 )?);
+                row_security::reconcile_columns(
+                    &before_statement,
+                    &mut working,
+                    next_sequence,
+                    column_rename,
+                    &mut mutations,
+                )?;
                 check_sql_cancelled()?;
                 // A read observes the already-validated snapshot. Rechecking
                 // every table after SELECT/EXPLAIN would turn indexed reads
@@ -2946,24 +3199,27 @@ fn prepare_execution(
             &constraint_modes,
         )?;
     }
+    row_security::fence_deletions(&mut working, next_sequence, &mut mutations)?;
     guard_ml_managed_tables(&snapshot_state, &mut mutations, ml_internal)?;
-    let rebasable = mutations.iter().all(|mutation| match mutation {
-        RelationalMutation::Insert { table, .. } => {
-            snapshot_state.tables.get(table).is_some_and(|table| {
-                table
-                    .definition
-                    .columns
-                    .iter()
-                    .all(|column| column.identity.is_none())
-            })
-        }
-        RelationalMutation::Update { .. } | RelationalMutation::Delete { .. } => true,
-        RelationalMutation::CreateTable { .. }
-        | RelationalMutation::DropTable { .. }
-        | RelationalMutation::AlterTable { .. }
-        | RelationalMutation::RenameTable { .. }
-        | RelationalMutation::RewriteTable { .. } => false,
-    });
+    let rebasable = authorized_identity.is_none()
+        && mutations.iter().all(|mutation| match mutation {
+            RelationalMutation::Insert { table, .. } => {
+                snapshot_state.tables.get(table).is_some_and(|table| {
+                    table
+                        .definition
+                        .columns
+                        .iter()
+                        .all(|column| column.identity.is_none())
+                })
+            }
+            RelationalMutation::Update { .. } | RelationalMutation::Delete { .. } => true,
+            RelationalMutation::RowSecurity { .. }
+            | RelationalMutation::CreateTable { .. }
+            | RelationalMutation::DropTable { .. }
+            | RelationalMutation::AlterTable { .. }
+            | RelationalMutation::RenameTable { .. }
+            | RelationalMutation::RewriteTable { .. } => false,
+        });
     let mut write_dependencies = BTreeSet::new();
     if rebasable {
         let inserted_rows = mutations
@@ -3013,7 +3269,10 @@ fn prepare_execution(
     let intents = collect_transaction_intents(&snapshot_state, &working, snapshot, &mutations)?;
     enforce_serialized_limit(&mutations, MAX_WRITE_SET_BYTES, "SQL write set")?;
     enforce_serialized_limit(&results, MAX_RESULT_BYTES, "SQL result")?;
+    let publication =
+        SqlPublication::capture(authorized_identity, &snapshot_state, authorization.as_ref())?;
     Ok(PreparedRelationalExecution {
+        publication,
         snapshot,
         results,
         mutations,
@@ -3033,6 +3292,7 @@ fn guard_ml_managed_tables(
 ) -> Result<()> {
     for mutation in mutations {
         let name = match mutation {
+            RelationalMutation::RowSecurity { delta } => delta.table.clone(),
             RelationalMutation::CreateTable { definition }
             | RelationalMutation::AlterTable { definition }
             | RelationalMutation::RewriteTable { definition, .. } => definition.name.clone(),
@@ -3096,7 +3356,8 @@ fn collect_transaction_intents(
     let mut requests = Vec::new();
     for mutation in mutations {
         match mutation {
-            RelationalMutation::CreateTable { .. }
+            RelationalMutation::RowSecurity { .. }
+            | RelationalMutation::CreateTable { .. }
             | RelationalMutation::DropTable { .. }
             | RelationalMutation::AlterTable { .. }
             | RelationalMutation::RenameTable { .. }
@@ -3325,6 +3586,9 @@ fn rebase_mutations(
                 for row in rows {
                     if let Some(row_id) = remapped.get(&(table.clone(), row.row_id)) {
                         row.row_id = *row_id;
+                        if let Some(record) = &mut row.security {
+                            record.key.id = row_id.to_string();
+                        }
                     }
                 }
             }
@@ -3335,7 +3599,8 @@ fn rebase_mutations(
                     }
                 }
             }
-            RelationalMutation::CreateTable { .. }
+            RelationalMutation::RowSecurity { .. }
+            | RelationalMutation::CreateTable { .. }
             | RelationalMutation::DropTable { .. }
             | RelationalMutation::AlterTable { .. }
             | RelationalMutation::RenameTable { .. }
@@ -3360,12 +3625,19 @@ fn execute_statement(
 ) -> Result<SqlResult> {
     let (tenant_id, table_authority, creator) = security_scope;
     ensure_statement_tenant(state, &statement, tenant_id)?;
+    row_security::preflight(state, &statement, snapshot.max(sequence))?;
+    row_security::preflight_constraints(state, &statement, snapshot.max(sequence))?;
     match statement {
         Statement::CreateTable(create) => {
             let if_not_exists = create.if_not_exists;
             let mut definition = table_definition(create)?;
             definition.tenant_id = tenant_id.map(str::to_owned);
-            definition.security_incarnation = table_authority.then(uuid::Uuid::new_v4);
+            definition.security_incarnation =
+                (table_authority || state.request_identity.is_some()).then(uuid::Uuid::new_v4);
+            definition.row_policy = state
+                .request_identity
+                .as_deref()
+                .map(|identity| row_security::default_policy(&definition, identity));
             definition.creator_principal_id = creator.map(str::to_owned);
             let name = definition.name.clone();
             if state.tables.contains_key(&name) {
@@ -3617,7 +3889,11 @@ fn execute_alter_table(
                 let mut values = source.to_vec();
                 values.push(fill_value.clone());
                 validate_row(&definition, &values)?;
-                rewritten_rows.push(StoredRow { row_id, values });
+                rewritten_rows.push(StoredRow {
+                    security: row_security::stored(current, row_id, sequence)?,
+                    row_id,
+                    values,
+                });
             }
         }
         AlterTableOperation::AddConstraint {
@@ -3879,6 +4155,7 @@ fn execute_alter_table(
                 .map(|(row_id, values)| {
                     validate_row(&definition, &values)?;
                     Ok(StoredRow {
+                        security: row_security::stored(current, row_id, sequence)?,
                         row_id,
                         values: values.to_vec(),
                     })
@@ -4433,7 +4710,11 @@ fn execute_drop_columns(
                 values.remove(*position);
             }
             validate_row(&definition, &values)?;
-            Ok(StoredRow { row_id, values })
+            Ok(StoredRow {
+                security: row_security::stored(&current, row_id, sequence)?,
+                row_id,
+                values,
+            })
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -4715,6 +4996,7 @@ fn execute_insert(
         TableObject::TableName(name) => normalize_name(&name),
         _ => return Err(unsupported("INSERT target must be a table name")),
     };
+    let identity = state.request_identity.clone();
     let on_insert = insert.on.clone();
     let returning = insert.returning.clone();
     let source = insert
@@ -4809,6 +5091,8 @@ fn execute_insert(
                 )?;
             }
             validate_row(&table.definition, &row)?;
+            let security =
+                row_security::create(&table.definition, table.next_row_id, identity.as_deref())?;
             let conflict_row_id = conflict_columns
                 .as_ref()
                 .map(|columns| unique_conflict_row_id(table, columns, &row))
@@ -4818,6 +5102,14 @@ fn execute_insert(
                 let Some(OnInsert::OnConflict(conflict)) = on_insert.as_ref() else {
                     unreachable!("conflict columns require ON CONFLICT");
                 };
+                row_security::write(
+                    table,
+                    row_id,
+                    sequence,
+                    identity.as_deref(),
+                    SecurityAction::Read,
+                    &[],
+                )?;
                 match &conflict.action {
                     OnConflictAction::DoNothing => continue,
                     OnConflictAction::DoUpdate(update) => {
@@ -4867,8 +5159,17 @@ fn execute_insert(
                             )?;
                         }
                         validate_row(&table.definition, &new_values)?;
+                        row_security::write(
+                            table,
+                            row_id,
+                            sequence,
+                            identity.as_deref(),
+                            SecurityAction::Update,
+                            &assignment_columns.iter().copied().collect::<Vec<_>>(),
+                        )?;
                         replace_visible_row(table, row_id, sequence, new_values.clone())?;
                         let stored = StoredRow {
+                            security: row_security::stored(table, row_id, sequence)?,
                             row_id,
                             values: new_values.clone(),
                         };
@@ -4890,6 +5191,7 @@ fn execute_insert(
             table.rows.insert(
                 row_id,
                 VersionChain::single(RowVersion {
+                    security: security.clone(),
                     begin: sequence,
                     end: None,
                     values: RowValues::copy(&row)?,
@@ -4898,6 +5200,7 @@ fn execute_insert(
             table.index_row(row_id, &row)?;
             statement_rows.insert(row_id);
             let stored = StoredRow {
+                security: security.map(|metadata| (*metadata).clone()),
                 row_id,
                 values: row,
             };
@@ -4927,7 +5230,7 @@ fn execute_insert(
     }
     apply_referential_actions(state, sequence, parent_changes, mutations)?;
     if let Some(returning) = returning {
-        project_returning_rows(&definition, &affected, &returning)
+        project_returning_rows(&definition, &affected, &returning, identity.as_deref())
     } else {
         Ok(SqlResult::Mutation { affected_rows })
     }
@@ -5463,6 +5766,7 @@ fn project_returning_rows(
     definition: &TableDefinition,
     rows: &[StoredRow],
     returning: &[SelectItem],
+    identity: Option<&AuthenticatedIdentity>,
 ) -> Result<SqlResult> {
     let columns = definition
         .columns
@@ -5474,6 +5778,7 @@ fn project_returning_rows(
         })
         .collect::<Vec<_>>();
     let projection = query_projection(&columns, returning)?;
+    row_security::returning(definition, rows, &projection, identity)?;
     Ok(SqlResult::Rows {
         columns: projection.iter().map(|item| item.name.clone()).collect(),
         column_types: projection
@@ -5570,9 +5875,25 @@ fn execute_update(
         for (index, value) in &assignment_values {
             values[*index] = value.clone();
         }
+        row_security::write(
+            state.tables.get(&table_name).expect("mutation table"),
+            row_id,
+            sequence,
+            state.request_identity.as_deref(),
+            SecurityAction::Update,
+            &assignment_values
+                .iter()
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>(),
+        )?;
         validate_row(&definition, &values)?;
         update_visible_row(state, &table_name, row_id, sequence, values.clone())?;
         changed.push(StoredRow {
+            security: row_security::stored(
+                state.tables.get(&table_name).expect("mutation table"),
+                row_id,
+                sequence,
+            )?,
             row_id,
             values: values.clone(),
         });
@@ -5599,7 +5920,12 @@ fn execute_update(
     )?;
     apply_referential_actions(state, sequence, parent_changes, mutations)?;
     if let Some(returning) = returning {
-        project_returning_rows(&definition, &changed, &returning)
+        project_returning_rows(
+            &definition,
+            &changed,
+            &returning,
+            state.request_identity.as_deref(),
+        )
     } else {
         Ok(SqlResult::Mutation { affected_rows })
     }
@@ -5652,9 +5978,15 @@ fn execute_delete(
             parameters,
             &mut cursor,
         )? {
+            let security = row_security::stored(
+                state.tables.get(&table_name).expect("mutation table"),
+                row_id,
+                sequence,
+            )?;
             delete_visible_row(state, &table_name, row_id, sequence)?;
             deleted.push(row_id);
             deleted_rows.push(StoredRow {
+                security,
                 row_id,
                 values: old_values.to_vec(),
             });
@@ -5672,7 +6004,12 @@ fn execute_delete(
     });
     apply_referential_actions(state, sequence, parent_changes, mutations)?;
     if let Some(returning) = returning {
-        project_returning_rows(&definition, &deleted_rows, &returning)
+        project_returning_rows(
+            &definition,
+            &deleted_rows,
+            &returning,
+            state.request_identity.as_deref(),
+        )
     } else {
         Ok(SqlResult::Mutation { affected_rows })
     }
@@ -5866,6 +6203,11 @@ fn apply_referential_actions(
                         mutations.push(RelationalMutation::Update {
                             table: child_name.clone(),
                             rows: vec![StoredRow {
+                                security: row_security::stored(
+                                    state.tables.get(&child_name).expect("cascade table"),
+                                    row_id,
+                                    sequence,
+                                )?,
                                 row_id,
                                 values: values.clone(),
                             }],
@@ -6042,6 +6384,14 @@ fn delete_visible_row(
         .get_mut(table_name)?
         .ok_or_else(|| invalid(format!("table {table_name} does not exist")))?;
     let table = Arc::make_mut(table);
+    row_security::write(
+        table,
+        row_id,
+        sequence,
+        state.request_identity.as_deref(),
+        SecurityAction::Delete,
+        &[],
+    )?;
     end_visible_row(table, row_id, sequence)
 }
 
@@ -6057,6 +6407,24 @@ fn update_visible_row(
         .get_mut(table_name)?
         .ok_or_else(|| invalid(format!("table {table_name} does not exist")))?;
     let table = Arc::make_mut(table);
+    let old = table
+        .rows
+        .visible(row_id, sequence)?
+        .ok_or(SecurityError::NotFound)?;
+    let changed = values
+        .iter()
+        .zip(old.values.iter())
+        .enumerate()
+        .filter_map(|(index, (new, old))| (new != old).then_some(index))
+        .collect::<Vec<_>>();
+    row_security::write(
+        table,
+        row_id,
+        sequence,
+        state.request_identity.as_deref(),
+        SecurityAction::Update,
+        &changed,
+    )?;
     replace_visible_row(table, row_id, sequence, values)
 }
 
@@ -6105,6 +6473,7 @@ fn replace_visible_row(
     } else {
         versions[position].end = Some(sequence);
         versions.push(RowVersion {
+            security: versions[position].security.clone(),
             begin: sequence,
             end: None,
             values: RowValues::copy(&values)?,
@@ -6390,6 +6759,7 @@ fn query_source_rows<'a>(
     table: &'a TableState,
     snapshot: u64,
     probe: Option<&IndexedSelectionProbe>,
+    identity: Option<&'a AuthenticatedIdentity>,
 ) -> Result<Box<dyn Iterator<Item = Result<RowValues>> + 'a>> {
     match probe {
         Some(IndexedSelectionProbe { key: None, .. }) => Ok(Box::new(std::iter::empty())),
@@ -6403,7 +6773,7 @@ fn query_source_rows<'a>(
                 .ok_or_else(|| invalid("missing scalar index"))?;
             let entries = index.entries(&table.index_segments, snapshot, Some(key))?;
             Ok(Box::new(entries.filter_map(move |entry| match entry {
-                Ok((_, id)) => match table.rows.visible(id, snapshot) {
+                Ok((_, id)) => match row_security::visible(table, id, snapshot, identity) {
                     Ok(Some(version)) => Some(Ok(version.values)),
                     Ok(None) => None,
                     Err(error) => Some(Err(error)),
@@ -6412,9 +6782,7 @@ fn query_source_rows<'a>(
             })))
         }
         None => Ok(Box::new(
-            table
-                .rows
-                .visible_rows(snapshot)
+            row_security::visible_rows(table, snapshot, identity)
                 .map(|row| row.map(|(_, values)| values)),
         )),
     }
@@ -6584,6 +6952,14 @@ fn execute_ordered_primary_range(
         let Some(version) = ordered_rows.visible(row_id, snapshot)? else {
             continue;
         };
+        if !row_security::readable(
+            &table.definition,
+            row_id,
+            &version,
+            state.request_identity.as_deref(),
+        )? {
+            continue;
+        }
         if index.key(&[&version.values[primary_index]])?.as_deref() != Some(key.as_slice()) {
             continue;
         }
@@ -6667,7 +7043,7 @@ fn execute_topk_query(
         })
         .collect::<Result<Vec<_>>>()?;
     if limit == 0 {
-        for row in query_source_rows(table, snapshot, row_ids)? {
+        for row in query_source_rows(table, snapshot, row_ids, state.request_identity.as_deref())? {
             check_sql_cancelled()?;
             let row = row?;
             let mut cursor = 0;
@@ -6693,7 +7069,9 @@ fn execute_topk_query(
     let mut heap = BinaryHeap::<RankedQueryRow<'_>>::new();
     let mut spills = None;
     let mut charged = 0_usize;
-    for (position, row) in query_source_rows(table, snapshot, row_ids)?.enumerate() {
+    for (position, row) in
+        query_source_rows(table, snapshot, row_ids, state.request_identity.as_deref())?.enumerate()
+    {
         check_sql_cancelled()?;
         let row = row?;
         let mut cursor = 0;
@@ -6863,7 +7241,7 @@ fn execute_streaming_count(
     };
     let (limit, offset) = aggregate_limit_offset(&query.limit_clause)?;
     let mut matched = 0_i64;
-    for row in query_source_rows(table, snapshot, row_ids)? {
+    for row in query_source_rows(table, snapshot, row_ids, state.request_identity.as_deref())? {
         check_sql_cancelled()?;
         let row = row?;
         let mut cursor = 0;
@@ -6919,7 +7297,7 @@ fn execute_streaming_query(
     let mut rows = Vec::new();
     let mut matched = 0_usize;
     let mut serialized_bytes = 0_usize;
-    for row in query_source_rows(table, snapshot, row_ids)? {
+    for row in query_source_rows(table, snapshot, row_ids, state.request_identity.as_deref())? {
         check_sql_cancelled()?;
         let row = row?;
         let mut cursor = 0;
@@ -7125,6 +7503,7 @@ fn materialize_ctes(
         let table_name = normalize_ident(&cte.alias.name.value);
         let table_id = allocate_catalog_id(&mut scoped)?;
         let definition = TableDefinition {
+            row_policy: None,
             table_id,
             security_incarnation: None,
             creator_principal_id: None,
@@ -7166,6 +7545,7 @@ fn materialize_ctes(
             table.rows.insert(
                 row_id,
                 VersionChain::single(RowVersion {
+                    security: None,
                     begin: snapshot,
                     end: None,
                     values: RowValues::adopt(values)?,
@@ -7804,7 +8184,7 @@ fn query_relation_with_row_ids(
     let (table, columns) = query_source(state, factor)?;
     let mut rows = Vec::new();
     let mut charged = 0;
-    for row in query_source_rows(table, snapshot, row_ids)? {
+    for row in query_source_rows(table, snapshot, row_ids, state.request_identity.as_deref())? {
         check_sql_cancelled()?;
         let row = row?;
         charge_query_operator_row(&mut charged, &row)?;
@@ -7925,7 +8305,7 @@ fn mutation_candidates(
     let mut candidates = Vec::new();
     let mut charged = 0;
     let Some(probe) = probe else {
-        for row in table.rows.visible_rows(snapshot) {
+        for row in row_security::visible_rows(table, snapshot, state.request_identity.as_deref()) {
             check_sql_cancelled()?;
             let (row_id, values) = row?;
             charge_query_operator_row(&mut charged, &values)?;
@@ -7943,7 +8323,9 @@ fn mutation_candidates(
     for entry in index.entries(&table.index_segments, snapshot, Some(&key))? {
         check_sql_cancelled()?;
         let (_, row_id) = entry?;
-        if let Some(version) = table.rows.visible(row_id, snapshot)? {
+        if let Some(version) =
+            row_security::visible(table, row_id, snapshot, state.request_identity.as_deref())?
+        {
             charge_query_operator_row(&mut charged, &version.values)?;
             candidates.push((row_id, version.values));
         }
@@ -8795,6 +9177,7 @@ fn table_definition(create: sqlparser::ast::CreateTable) -> Result<TableDefiniti
         primary_key_name = Some(format!("{table_name}_pkey"));
     }
     let definition = TableDefinition {
+        row_policy: None,
         table_id: 0,
         security_incarnation: None,
         creator_principal_id: None,
@@ -9899,7 +10282,8 @@ fn validate_mutations(
     if mutations.iter().any(|mutation| {
         !matches!(
             mutation,
-            RelationalMutation::Insert { .. }
+            RelationalMutation::RowSecurity { .. }
+                | RelationalMutation::Insert { .. }
                 | RelationalMutation::Update { .. }
                 | RelationalMutation::Delete { .. }
         )
@@ -9911,6 +10295,7 @@ fn validate_mutations(
     let mut removed_parent_keys = BTreeMap::<String, BTreeSet<u64>>::new();
     for mutation in mutations {
         match mutation {
+            RelationalMutation::RowSecurity { .. } => continue,
             RelationalMutation::Insert { table, rows } => {
                 written
                     .entry(table.clone())
@@ -10032,6 +10417,7 @@ fn validate_mutations(
                 }
             }
             current_rows.push(StoredRow {
+                security: None,
                 row_id,
                 values: row.to_vec(),
             });
@@ -11581,6 +11967,8 @@ fn restore_relational_checkpoint(
 ) -> Result<(RelationalState, u64)> {
     let checkpoint_sequence = checkpoint.sequence;
     let mut state = RelationalState {
+        request_identity: None,
+        request_identity_memory: None,
         directory: Arc::new(segment_dir.to_path_buf()),
         sequence: checkpoint_sequence,
         next_catalog_id: checkpoint.next_catalog_id,
@@ -11710,7 +12098,13 @@ fn rewrite_table_state_with_flush(
         .tables
         .get(&definition.name)
         .ok_or_else(|| invalid(format!("table {} does not exist", definition.name)))?;
+    if previous.definition.row_policy.is_some() && definition.row_policy.is_none() {
+        return Err(SecurityError::Invalid("rewrite cannot remove row authority".into()).into());
+    }
     let mut rewritten = TableState::empty(definition.clone(), Arc::clone(&state.directory))?;
+    if definition.row_policy == previous.definition.row_policy {
+        rewritten.policy_epoch = previous.policy_epoch.clone();
+    }
     rewritten.rows.mark_modified(sequence);
     rewritten.next_row_id = previous.next_row_id;
     state.tables.insert(&definition.name, Arc::new(rewritten))?;
@@ -11725,6 +12119,7 @@ fn rewrite_table_state_with_flush(
             return Err(invalid("table rewrite contains an invalid row identity"));
         }
         validate_row(&definition, &row.values)?;
+        row_security::validate_binding(&definition, row.row_id, row.security.as_ref(), true)?;
         rewritten.next_row_id =
             rewritten
                 .next_row_id
@@ -11734,6 +12129,11 @@ fn rewrite_table_state_with_flush(
         rewritten.rows.insert(
             row.row_id,
             VersionChain::single(RowVersion {
+                security: row
+                    .security
+                    .clone()
+                    .map(row_security::Metadata::adopt)
+                    .transpose()?,
                 begin: sequence,
                 end: None,
                 values: RowValues::copy(&row.values)?,
@@ -11779,6 +12179,10 @@ fn apply_batch_with_flush(
     let mut mutations = batch.mutations.iter().peekable();
     while let Some(mutation) = mutations.next() {
         match mutation {
+            RelationalMutation::RowSecurity { delta } => {
+                row_security::apply_delta(state, batch.sequence, delta)?;
+                flush(state)?;
+            }
             RelationalMutation::CreateTable { definition } => {
                 if state.tables.contains_key(&definition.name) {
                     return Err(invalid(format!("table {} already exists", definition.name)));
@@ -11865,6 +12269,12 @@ fn apply_batch_with_flush(
                         .get_mut(table_name)?
                         .ok_or_else(|| invalid(format!("table {table_name} does not exist")))?;
                     let table = Arc::make_mut(table);
+                    row_security::validate_binding(
+                        &table.definition,
+                        row.row_id,
+                        row.security.as_ref(),
+                        false,
+                    )?;
                     table.next_row_id = table.next_row_id.max(row.row_id.saturating_add(1));
                     let mut versions = table
                         .rows
@@ -11873,6 +12283,11 @@ fn apply_batch_with_flush(
                         .transpose()?
                         .unwrap_or_default();
                     versions.push(RowVersion {
+                        security: row
+                            .security
+                            .clone()
+                            .map(row_security::Metadata::adopt)
+                            .transpose()?,
                         begin: batch.sequence,
                         end: None,
                         values: RowValues::copy(&row.values)?,
@@ -11892,7 +12307,25 @@ fn apply_batch_with_flush(
                         .get_mut(table_name)?
                         .ok_or_else(|| invalid(format!("table {table_name} does not exist")))?;
                     let table = Arc::make_mut(table);
+                    row_security::validate_binding(
+                        &table.definition,
+                        row.row_id,
+                        row.security.as_ref(),
+                        false,
+                    )?;
+                    let security = row
+                        .security
+                        .clone()
+                        .map(row_security::Metadata::adopt)
+                        .transpose()?;
                     replace_visible_row(table, row.row_id, batch.sequence, row.values.clone())?;
+                    let mut versions = table
+                        .rows
+                        .get(&row.row_id)?
+                        .ok_or(SecurityError::NotFound)?
+                        .into_owned()?;
+                    versions.last_mut().ok_or(SecurityError::NotFound)?.security = security;
+                    table.rows.insert(row.row_id, versions)?;
                     flush(state)?;
                 }
             }
@@ -12489,10 +12922,20 @@ mod tests {
         assert!(committed.response.committed);
         let select = request("SELECT value FROM private_items WHERE id = 1");
         let _permit = engine.authorize_request(&identity, &select).unwrap();
-        let selected = engine
-            .execute_authorized_with_audit(select, &context)
+        let read_handle = engine
+            .begin_interactive_authorized(&context)
             .unwrap()
-            .response;
+            .handle;
+        let selected = engine
+            .execute_interactive_authorized_cancellable(
+                &read_handle,
+                select,
+                &context,
+                Arc::new(AtomicBool::new(false)),
+                &identity,
+            )
+            .unwrap();
+        engine.rollback_interactive(&read_handle, &context).unwrap();
         assert!(matches!(&selected.results[0], SqlResult::Rows { rows, .. }
             if rows == &vec![vec![RelationalValue::Text("committed".into())]]));
 

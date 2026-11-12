@@ -5221,7 +5221,11 @@ fn run_traversal_locked(
     let authority = authorization
         .map(|context| {
             super::security_graph_retrieval::TraversalAuthority::new(
-                context, resolver, request, cancelled,
+                context,
+                resolver,
+                graph_epoch,
+                request,
+                cancelled,
             )
         })
         .transpose()?;
@@ -5451,7 +5455,15 @@ fn graph_edge_row(
             GaussError::InvalidRequest("live graph edge has no properties".to_string())
         })?;
         identity.charge_output(Some(&properties))?;
-        Some(properties.into_owned())
+        Some(match identity.authorization {
+            Some(context) => context.project_edge_properties(
+                (mutable.epoch(), edge.edge_id),
+                &public_source,
+                &public_target,
+                &properties,
+            )?,
+            None => properties.into_owned(),
+        })
     } else {
         identity.charge_output(None)?;
         None

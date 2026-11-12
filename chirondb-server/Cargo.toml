@@ -75,7 +75,7 @@ path = "src/bin/chironmcp.rs"
 
 [dependencies]
 chrono = { version = "0.4.45", features = ["serde"] }
-rmcp = { version = "=3.3.0", default-features = false, features = ["server", "client", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "reqwest"] }
+rmcp = { version = "=3.9.0", default-features = false, features = ["server", "client", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "reqwest"] }
 tokio-util = "0.7"
 chirondb-types = { version = "=0.1.0-beta.3", path = "../chirondb-types" }
 chirondb-core = { version = "=0.1.0-beta.3", path = "../chirondb-core" }

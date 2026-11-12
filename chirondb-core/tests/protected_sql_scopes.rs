@@ -1,3 +1,6 @@
+#[path = "support/legacy_sql.rs"]
+mod legacy_sql;
+
 use chirondb_core::{
     Db, GaussError, SqlExecutionRequest,
     security::{Action, Classification, ScopeGrant, SecurityError, SubjectAttributes, onboarding},
@@ -138,17 +141,10 @@ fn migrated_names_bind_existing_tables_and_creator_transactions_are_atomic() {
     let mut db = Db::open(&data).unwrap();
     assert!(db.migrate_sql_scopes_offline().is_err());
     drop(db); // invalid migration fails closed; reopen preserves original authority
-    let mut db = Db::open(&data).unwrap();
+    legacy_sql::seed_tables(&data, &["docs", "ungranted"], false, false);
+    let db = Db::open(&data).unwrap();
     let authority = Arc::clone(db.identity_authority().unwrap());
     let admin = || authority.authenticate(secret.trim()).unwrap();
-    for name in ["docs", "ungranted"] {
-        db.execute_sql_authorized(
-            &admin(),
-            sql(&format!("CREATE TABLE {name} (id BIGINT PRIMARY KEY)")),
-            "test",
-        )
-        .unwrap();
-    }
     authority
         .create_user(
             &admin(),
@@ -172,9 +168,24 @@ fn migrated_names_bind_existing_tables_and_creator_transactions_are_atomic() {
         .unwrap();
     let mut old_insert = sql("INSERT INTO docs VALUES (1)");
     old_insert.idempotency_key = Some("legacy-receipt".into());
-    db.execute_sql_authorized(&reader(), old_insert.clone(), "test")
-        .unwrap();
-    db.migrate_table_authority_offline().unwrap();
+    let receipt_owner = reader();
+    drop(authority);
+    drop(db);
+    legacy_sql::seed_insert_receipt(&data, &receipt_owner, &old_insert);
+    let mut db = Db::open(&data).unwrap();
+    let authority = Arc::clone(db.identity_authority().unwrap());
+    let admin = || authority.authenticate(secret.trim()).unwrap();
+    let reader = || authority.authenticate(&key.secret).unwrap();
+    assert!(
+        db.execute_sql_authorized(&reader(), old_insert.clone(), "test")
+            .is_err()
+    );
+    assert_eq!(db.migrate_table_authority_offline().unwrap(), 2);
+    assert!(
+        db.execute_sql_authorized(&reader(), sql("SELECT * FROM docs"), "test")
+            .is_err()
+    );
+    legacy_sql::register_rows(&db, &admin(), "docs", &reader());
     let before = db.relational_tables();
     let mut bound_insert = sql("INSERT INTO docs VALUES (2)");
     bound_insert.idempotency_key = Some("bound-receipt".into());
@@ -281,11 +292,11 @@ fn migrated_names_bind_existing_tables_and_creator_transactions_are_atomic() {
     );
     db.execute_sql_authorized(&admin(), sql("ALTER TABLE docs RENAME TO renamed"), "test")
         .unwrap();
-    assert_eq!(
-        db.execute_sql_authorized(&reader(), bound_insert.clone(), "test")
-            .unwrap(),
-        receipt
-    );
+    // A rename preserves table grants, but fences old row-policy receipts.
+    assert!(matches!(
+        db.execute_sql_authorized(&reader(), bound_insert.clone(), "test"),
+        Err(GaussError::Security(SecurityError::Conflict))
+    ));
     db.execute_sql_authorized(
         &admin(),
         sql("CREATE TABLE docs (id BIGINT PRIMARY KEY); INSERT INTO docs VALUES (99)"),

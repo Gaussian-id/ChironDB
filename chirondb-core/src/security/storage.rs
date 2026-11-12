@@ -82,6 +82,15 @@ pub struct SecurityDelta {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProtectedContent {
+    /// Privileged binding of an existing edge; topology stays unchanged.
+    EdgeRegistration {
+        graph_epoch: crate::graph::GraphEpoch,
+        edge_id: crate::graph::EdgeId,
+    },
+    /// Metadata-only resource changes are fully contained in the security delta.
+    TemporalAssets {
+        ids: Vec<String>,
+    },
     Upsert {
         points: Vec<Point>,
     },
@@ -156,6 +165,16 @@ impl ProtectedBatch {
                 ));
             }
         }
+        if let ProtectedContent::TemporalAssets { ids: assets } = &self.content {
+            if assets.is_empty() || assets.len() > 1024 {
+                return Err(SecurityError::BudgetExceeded.into());
+            }
+            for id in assets {
+                if Uuid::parse_str(id).is_err() || !ids.insert(id) {
+                    return Err(invalid("invalid temporal asset content identity"));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -198,10 +217,15 @@ impl ProtectedContent {
             Self::GraphLifecycle { epoch, enabled } => {
                 WalEntry::GraphEpochAdvance { epoch, enabled }
             }
-            Self::Policy => return None,
+            Self::Policy | Self::TemporalAssets { .. } | Self::EdgeRegistration { .. } => {
+                return None;
+            }
         })
     }
     pub(crate) fn mutation_counts(&self) -> (usize, usize) {
+        if let Self::TemporalAssets { ids } = self {
+            return (ids.len(), 0);
+        }
         let (upserts, deletes) = self.point_ids();
         (upserts.len() + deletes.len(), deletes.len())
     }
@@ -261,10 +285,18 @@ impl ReplaySecurity {
         let changed_policy = delta.revision != delta.expected_revision;
         let mut created = BTreeSet::new();
         let mut retired = BTreeSet::new();
+        let mut asset_changes = BTreeSet::new();
+        let mut edge_changes = Vec::new();
         for record in &delta.bindings {
             match self.records.get(&record.key) {
                 Some(old) => {
-                    if old.storage_id != record.storage_id || old.retired {
+                    if old.storage_id != record.storage_id
+                        || old.retired
+                        || std::mem::discriminant(&old.content)
+                            != std::mem::discriminant(&record.content)
+                        || (matches!(old.content, ResourceContent::GraphEdge { .. })
+                            && old.content != record.content)
+                    {
                         return Err(invalid(
                             "resource identities cannot be reassigned or revived",
                         ));
@@ -277,7 +309,14 @@ impl ReplaySecurity {
                         }
                     }
                     if record.retired {
-                        retired.insert(record.storage_id);
+                        if record.content.is_point() {
+                            retired.insert(record.storage_id);
+                        } else if record.content.is_temporal_asset() {
+                            asset_changes.insert(record.storage_id);
+                        }
+                    }
+                    if old.content != record.content && record.content.is_temporal_asset() {
+                        asset_changes.insert(record.storage_id);
                     }
                 }
                 None => {
@@ -288,9 +327,85 @@ impl ReplaySecurity {
                     {
                         return Err(invalid("invalid new resource binding"));
                     }
-                    created.insert(record.storage_id);
+                    if record.content.is_point() {
+                        created.insert(record.storage_id);
+                    } else if record.content.is_temporal_asset() {
+                        asset_changes.insert(record.storage_id);
+                    }
                 }
             }
+            if matches!(record.content, ResourceContent::GraphEdge { .. })
+                && (record.retired || !self.records.contains_key(&record.key))
+            {
+                edge_changes.push(record);
+            }
+            if record.content.is_temporal_asset()
+                && matches!(batch.content, ProtectedContent::TemporalAssets { .. })
+            {
+                asset_changes.insert(record.storage_id);
+            }
+        }
+        if matches!(batch.content, ProtectedContent::EdgeRegistration { .. })
+            && edge_changes.len() != 1
+        {
+            return Err(invalid("edge registration has no new authority"));
+        }
+        for record in edge_changes {
+            let ResourceContent::GraphEdge {
+                edge_id,
+                graph_epoch,
+                source,
+                target,
+            } = record.content
+            else {
+                unreachable!()
+            };
+            let registration = matches!(&batch.content, ProtectedContent::EdgeRegistration { graph_epoch: epoch, edge_id: id }
+                if epoch.raw() == graph_epoch && id.raw() == edge_id && !record.retired
+                    && delta.bindings.len() == 1 && changed_policy);
+            let graph_matches = match &batch.content {
+                ProtectedContent::Graph { batch: graph } => {
+                    graph.graph_epoch.raw() == graph_epoch
+                        && graph.edge_mutations.iter().any(|mutation| match mutation {
+                            crate::graph::EdgeMutation::Relate(edge) => {
+                                !record.retired && edge.edge_id.raw() == edge_id
+                            }
+                            crate::graph::EdgeMutation::Unrelate(edge) => {
+                                record.retired && edge.edge_id.raw() == edge_id
+                            }
+                            _ => false,
+                        })
+                }
+                _ => false,
+            };
+            if !registration && !graph_matches {
+                return Err(invalid("edge content and authority disagree"));
+            }
+            for physical in [source, target] {
+                let endpoint = delta
+                    .bindings
+                    .iter()
+                    .find(|r| r.storage_id == physical)
+                    .or_else(|| {
+                        self.physical
+                            .get(&physical)
+                            .and_then(|key| self.records.get(key))
+                    })
+                    .ok_or_else(|| invalid("edge endpoint authority is absent"))?;
+                if !endpoint.content.is_point() || endpoint.key.tenant != record.key.tenant {
+                    return Err(invalid("edge endpoint crosses security domain"));
+                }
+            }
+        }
+        let declared_assets = match &batch.content {
+            ProtectedContent::TemporalAssets { ids } => ids
+                .iter()
+                .map(|id| Uuid::parse_str(id).map_err(|_| invalid("invalid asset identity")))
+                .collect::<Result<BTreeSet<_>>>()?,
+            _ => BTreeSet::new(),
+        };
+        if asset_changes != declared_assets {
+            return Err(invalid("temporal asset content and authority disagree"));
         }
         let (upserts, deletes) = batch.content.point_ids();
         let upserts: BTreeSet<_> = upserts
@@ -315,7 +430,7 @@ impl ReplaySecurity {
                 .get(id)
                 .ok_or_else(|| invalid("content has no security binding"))?;
             let record = updated.get(key).copied().unwrap_or(&self.records[key]);
-            if record.retired {
+            if record.retired || !record.content.is_point() {
                 return Err(invalid("content revives a retired resource"));
             }
         }
@@ -518,6 +633,7 @@ mod tests {
                 id: id.into(),
             },
             storage_id: Uuid::new_v4(),
+            content: ResourceContent::Point,
             labels: ResourceLabels {
                 owner: "writer".into(),
                 department: "Finance".into(),

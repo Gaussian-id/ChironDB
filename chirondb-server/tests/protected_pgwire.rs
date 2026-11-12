@@ -673,6 +673,8 @@ async fn scram_sql_password_authenticates_and_rotates_without_changing_bearer() 
         issued.id
     );
     assert!(authority.authenticate_sql("admin", &issued.id).is_ok());
+    assert_write_only_sql_is_not_a_read_channel(&db, bearer.trim()).await;
+    assert_native_row_authority_on_pg(&db, bearer.trim(), &issued.password).await;
     assert!(db.durability_ready(), "drop degraded durability");
     assert!(
         db.management_identity(&authority.authenticate_sql("admin", &issued.id).unwrap())
@@ -1256,4 +1258,318 @@ async fn assert_tls_gate(db: Db, root: &std::path::Path, password: &str) {
             .unwrap();
     assert!(matches!(plain_result, Ok(0) | Err(_)) || response[0] != b'R');
     server.abort();
+}
+
+async fn assert_write_only_sql_is_not_a_read_channel(db: &Db, bearer: &str) {
+    let authority = db.identity_authority().unwrap().clone();
+    let admin = || authority.authenticate(bearer).unwrap();
+    authority
+        .create_role(&admin(), authority.revision(), "blind_writer")
+        .unwrap();
+    authority
+        .create_user(
+            &admin(),
+            authority.revision(),
+            "blind_writer",
+            SubjectAttributes {
+                department: "Security".into(),
+                clearance: Classification::Internal,
+            },
+        )
+        .unwrap();
+    db.change_role_table_privileges_authorized(
+        &admin(),
+        authority.revision(),
+        "blind_writer",
+        "records",
+        BTreeSet::from([Action::Create, Action::Update, Action::Delete]),
+        true,
+    )
+    .unwrap();
+    authority
+        .assign_role(
+            &admin(),
+            authority.revision(),
+            "blind_writer",
+            "blind_writer",
+            true,
+        )
+        .unwrap();
+    let principal = authority.resolve_user(&admin(), "blind_writer").unwrap();
+    let credential = authority
+        .issue_sql_credential(&admin(), authority.revision(), &principal)
+        .unwrap();
+    let (mut client, mut server) = tokio::io::duplex(16 * 1024);
+    let server_db = db.clone();
+    let task = tokio::spawn(async move {
+        let mut prefix = [0; 8];
+        server.read_exact(&mut prefix).await.unwrap();
+        wire_postgres::handle_protected_connection(server_db, server, prefix)
+            .await
+            .unwrap();
+    });
+    assert!(login(&mut client, "blind_writer", &credential.password).await);
+    for sql in [
+        "SELECT value FROM records",
+        "UPDATE records SET value='forbidden' WHERE id=1 RETURNING value",
+        "DELETE FROM records WHERE id=1 RETURNING *",
+        "INSERT INTO records(id) VALUES(1) ON CONFLICT(id) DO UPDATE SET value=EXCLUDED.value RETURNING value",
+    ] {
+        send(&mut client, b'Q', format!("{sql}\0").as_bytes()).await;
+        let mut denied = false;
+        loop {
+            let (kind, body) = message(&mut client).await;
+            assert_ne!(kind, b'D', "write-only SQL returned a row: {sql}");
+            if kind == b'E' {
+                denied = true;
+                assert!(body.windows(5).any(|x| x == b"42501"), "{body:?}");
+            }
+            if kind == b'Z' {
+                break;
+            }
+        }
+        assert!(denied, "{sql}");
+        // The same statement must fail via Parse/Bind/Describe/Execute/Sync.
+        let mut parse = b"blind\0".to_vec();
+        parse.extend_from_slice(sql.as_bytes());
+        parse.extend_from_slice(b"\0\0\0");
+        send(&mut client, b'P', &parse).await;
+        send(&mut client, b'B', b"blind_portal\0blind\0\0\0\0\0\0\0").await;
+        send(&mut client, b'D', b"Pblind_portal\0").await;
+        send(&mut client, b'E', b"blind_portal\0\0\0\0\0").await;
+        send(&mut client, b'S', &[]).await;
+        let mut denied = false;
+        loop {
+            let (kind, body) = message(&mut client).await;
+            assert_ne!(kind, b'D', "extended write-only SQL returned a row: {sql}");
+            if kind == b'E' {
+                denied = true;
+                assert!(body.windows(5).any(|x| x == b"42501"), "{body:?}");
+            }
+            if kind == b'Z' {
+                break;
+            }
+        }
+        assert!(denied, "extended {sql}");
+    }
+    send(&mut client, b'Q', b"BEGIN\0").await;
+    loop {
+        let (kind, body) = message(&mut client).await;
+        assert_ne!(kind, b'E', "{body:?}");
+        if kind == b'Z' {
+            break;
+        }
+    }
+    send(
+        &mut client,
+        b'Q',
+        b"UPDATE records SET value='forbidden' WHERE id=1 RETURNING value\0",
+    )
+    .await;
+    let mut denied = false;
+    loop {
+        let (kind, body) = message(&mut client).await;
+        assert_ne!(kind, b'D');
+        if kind == b'E' {
+            denied = true;
+            assert!(body.windows(5).any(|x| x == b"42501"));
+        }
+        if kind == b'Z' {
+            assert_eq!(body, b"E");
+            break;
+        }
+    }
+    assert!(denied);
+    send(&mut client, b'Q', b"ROLLBACK\0").await;
+    loop {
+        let (kind, body) = message(&mut client).await;
+        assert_ne!(kind, b'E', "{body:?}");
+        if kind == b'Z' {
+            break;
+        }
+    }
+    drop(client);
+    task.await.unwrap();
+}
+
+async fn assert_native_row_authority_on_pg(db: &Db, bearer: &str, password: &str) {
+    let authority = db.identity_authority().unwrap();
+    let admin = || authority.authenticate(bearer).unwrap();
+    db.change_role_table_privileges_authorized(
+        &admin(),
+        authority.revision(),
+        "sql_reader",
+        "records",
+        BTreeSet::from([Action::Update]),
+        true,
+    )
+    .unwrap();
+    let original = {
+        let view = db
+            .relational_security_authorized(&admin(), "records", 0, 128)
+            .unwrap();
+        let chirondb::SqlResult::Rows { rows, .. } = &view.results[0] else {
+            panic!()
+        };
+        let chirondb::RelationalValue::Json(value) = &rows[0][0] else {
+            panic!()
+        };
+        value.clone()
+    };
+    let edit = |mode: usize| {
+        let view = db
+            .relational_security_authorized(&admin(), "records", 0, 128)
+            .unwrap();
+        let chirondb::SqlResult::Rows { rows, .. } = &view.results[0] else {
+            panic!()
+        };
+        let chirondb::RelationalValue::Json(value) = &rows[0][0] else {
+            panic!()
+        };
+        let mut policy: chirondb_types::RelationalRowPolicy =
+            serde_json::from_value(value["policy"].clone()).unwrap();
+        let expected_revision = policy.revision;
+        policy.revision += 1;
+        let records = original["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                let mut record: chirondb::security::ResourceRecord =
+                    serde_json::from_value(row["authority"].clone()).unwrap();
+                record.revision = policy.revision;
+                if mode < 2 {
+                    record.properties.get_mut("/value").unwrap().actions =
+                        BTreeSet::from([if mode == 0 {
+                            PropertyAction::Query
+                        } else {
+                            PropertyAction::Read
+                        }]);
+                } else if mode == 2 {
+                    record.labels.owner = authority.resolve_user(&admin(), "blind_writer").unwrap();
+                }
+                record
+            })
+            .collect();
+        db.change_relational_security_authorized(
+            &admin(),
+            chirondb_types::relational::RelationalSecurityDelta {
+                table: "records".into(),
+                incarnation: serde_json::from_value(value["incarnation"].clone()).unwrap(),
+                expected_revision,
+                policy,
+                records,
+            },
+        )
+        .unwrap();
+    };
+    let (mut client, mut server) = tokio::io::duplex(16 * 1024);
+    let server_db = db.clone();
+    let task = tokio::spawn(async move {
+        let mut prefix = [0; 8];
+        server.read_exact(&mut prefix).await.unwrap();
+        wire_postgres::handle_protected_connection(server_db, server, prefix)
+            .await
+            .unwrap();
+    });
+    assert!(login(&mut client, "admin", password).await);
+    // Prepare and describe while the column is readable. Execute must check
+    // current row authority even when a portal already has a RowDescription.
+    send(
+        &mut client,
+        b'P',
+        b"cached_native\0SELECT value FROM records\0\0\0",
+    )
+    .await;
+    send(
+        &mut client,
+        b'B',
+        b"cached_portal\0cached_native\0\0\0\0\0\0\0",
+    )
+    .await;
+    send(&mut client, b'D', b"Pcached_portal\0").await;
+    send(&mut client, b'S', &[]).await;
+    let described = pg_collect(&mut client).await;
+    assert!(described.iter().any(|(kind, _)| *kind == b'T'));
+    assert!(!described.iter().any(|(kind, _)| *kind == b'E'));
+    edit(0);
+    send(&mut client, b'E', b"cached_portal\0\0\0\0\0").await;
+    send(&mut client, b'S', &[]).await;
+    assert_pg_rows(&pg_collect(&mut client).await, None);
+    for (sql, allowed) in [
+        ("SELECT value FROM records", false),
+        ("SELECT id FROM records WHERE value IS NOT NULL", true),
+        ("UPDATE records SET value='forbidden' WHERE id=1", false),
+    ] {
+        pg_native_both(&mut client, sql, allowed.then_some(true)).await;
+    }
+    edit(1);
+    pg_native_both(&mut client, "SELECT value FROM records", Some(true)).await;
+    for sql in [
+        "SELECT id FROM records WHERE value IS NOT NULL",
+        "SELECT id FROM records ORDER BY value",
+    ] {
+        pg_native_both(&mut client, sql, None).await;
+    }
+    edit(2);
+    pg_native_both(&mut client, "SELECT value FROM records", Some(false)).await;
+    edit(3);
+    pg_native_both(&mut client, "SELECT value FROM records", Some(true)).await;
+    drop(client);
+    task.await.unwrap();
+    db.change_role_table_privileges_authorized(
+        &admin(),
+        authority.revision(),
+        "sql_reader",
+        "records",
+        BTreeSet::from([Action::Update]),
+        false,
+    )
+    .unwrap();
+}
+
+async fn pg_collect<S: AsyncRead + Unpin>(client: &mut S) -> Vec<(u8, Vec<u8>)> {
+    let mut replies = Vec::new();
+    loop {
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(10), message(client))
+            .await
+            .unwrap();
+        let done = reply.0 == b'Z';
+        replies.push(reply);
+        if done {
+            return replies;
+        }
+    }
+}
+fn assert_pg_rows(replies: &[(u8, Vec<u8>)], expected: Option<bool>) {
+    let denied = replies
+        .iter()
+        .any(|(kind, body)| *kind == b'E' && body.windows(5).any(|value| value == b"42501"));
+    let rows = replies.iter().any(|(kind, _)| *kind == b'D');
+    if let Some(rows_expected) = expected {
+        assert!(
+            !replies.iter().any(|(kind, _)| *kind == b'E'),
+            "{replies:?}"
+        );
+        assert_eq!(rows, rows_expected, "{replies:?}");
+    } else {
+        assert!(denied && !rows, "{replies:?}");
+    }
+}
+async fn pg_native_both<S: AsyncRead + AsyncWrite + Unpin>(
+    client: &mut S,
+    sql: &str,
+    expected: Option<bool>,
+) {
+    send(client, b'Q', format!("{sql}\0").as_bytes()).await;
+    assert_pg_rows(&pg_collect(client).await, expected);
+    let mut parse = b"\0".to_vec();
+    parse.extend_from_slice(sql.as_bytes());
+    parse.extend_from_slice(b"\0\0\0");
+    send(client, b'P', &parse).await;
+    send(client, b'B', b"\0\0\0\0\0\0\0\0").await;
+    send(client, b'D', b"P\0").await;
+    send(client, b'E', b"\0\0\0\0\0").await;
+    send(client, b'S', &[]).await;
+    assert_pg_rows(&pg_collect(client).await, expected);
 }

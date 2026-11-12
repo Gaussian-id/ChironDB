@@ -30,13 +30,15 @@ jobs:
           psql --version
           "$(go env GOPATH)/bin/grpcurl" --version
       - name: Build server and ChironWire client
-        run: cargo build --release --locked --bin chirondb --bin chironwirectl
+        run: cargo build --release --locked --bin chirondb --bin chironctl --bin chironwirectl
       - name: Resolve tested revision and trees
         id: trees
         run: |
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "core=$(git rev-parse HEAD:chirondb-core)" >> "$GITHUB_OUTPUT"
-          echo "server=$(git rev-parse HEAD:chirondb-server)" >> "$GITHUB_OUTPUT"
+          {
+            echo "sha=$(git rev-parse HEAD)"
+            echo "core=$(git rev-parse HEAD:chirondb-core)"
+            echo "server=$(git rev-parse HEAD:chirondb-server)"
+          } >> "$GITHUB_OUTPUT"
       - name: Run 60-minute external TLS rotation soak
         env:
           TESTED_SHA: ${{ steps.trees.outputs.sha }}
@@ -47,6 +49,7 @@ jobs:
           mkdir -p "$evidence"
           python3 -B .github/tools/security_tls_soak.py \
             --server target/release/chirondb \
+            --ctl target/release/chironctl \
             --wirectl target/release/chironwirectl \
             --proto-root proto \
             --grpcurl "$(go env GOPATH)/bin/grpcurl" \

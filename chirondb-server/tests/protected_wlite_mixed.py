@@ -107,8 +107,9 @@ def seed(admin, writer, rows, points, edges, dimensions):
         "owner_actions": ["read", "search", "update", "delete", "graph_read", "graph_write"],
         "templates": {"standard": {
             "department": "Ingestion", "classification": "internal",
-            "properties": {"/text": {"classification": "internal",
-                                     "actions": ["read", "query", "write"]}},
+            "properties": {path: {"classification": "internal",
+                                  "actions": ["read", "query", "write"]}
+                           for path in ["/text", "/edges/kind", "/edges/ordinal"]},
             "representations": {"dense": {"source_fields": ["/text"],
                                            "classification": "internal"}},
         }},

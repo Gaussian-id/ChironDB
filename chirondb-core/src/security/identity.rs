@@ -93,6 +93,9 @@ impl Epoch {
 #[derive(Clone, Debug)]
 pub struct IdentityCancellation(Arc<Epoch>);
 impl IdentityCancellation {
+    pub(crate) fn publication_permit(&self) -> Result<PublicationPermit> {
+        self.0.enter()
+    }
     pub fn is_cancelled(&self) -> bool {
         self.0.cancelled().load(Ordering::Acquire)
     }

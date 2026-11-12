@@ -103,10 +103,10 @@ pub mod wal_replication;
 // Crate-root re-exports (matching the original lib.rs)
 pub use chirondb_types::relational::{
     CheckConstraintDefinition, ForeignKeyAction, ForeignKeyDefinition, ForeignKeyMatch,
-    IdentityGeneration, RecordRef, ReferencedKeyKind, RelationalColumn, RelationalType,
-    RelationalValue, ScalarIndexDefinition, SqlExecutionRequest, SqlExecutionResponse, SqlOutcome,
-    SqlResult, SqlStatementRequest, SqlTransactionHandleResponse, SqlTransactionState,
-    TableDefinition, UniqueConstraint,
+    IdentityGeneration, RecordRef, ReferencedKeyKind, RelationalColumn, RelationalRowPolicy,
+    RelationalType, RelationalValue, ScalarIndexDefinition, SqlExecutionRequest,
+    SqlExecutionResponse, SqlOutcome, SqlResult, SqlStatementRequest, SqlTransactionHandleResponse,
+    SqlTransactionState, TableDefinition, UniqueConstraint,
 };
 pub use db::{
     Db, MultiModelInsertRequest, MultiModelReadSnapshot, MultiModelResponse,
@@ -124,8 +124,8 @@ pub use model::{
 };
 pub use ordinal::SegmentOrdinalSet;
 pub use relational::{
-    RelationalBatch, RelationalEngine, SqlResponse, SqlStatementAnalysis, SqlStatementClass,
-    SqlStatementKind,
+    RelationalBatch, RelationalEngine, SqlPublication, SqlResponse, SqlStatementAnalysis,
+    SqlStatementClass, SqlStatementKind,
 };
 pub use segment::{SoASegmentCache, SoAVectorStorage};
 pub use structural_embedding::StructuralUpsertReceipt;
