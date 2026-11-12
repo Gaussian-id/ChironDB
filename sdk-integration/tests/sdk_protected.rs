@@ -258,6 +258,20 @@ async fn protected_model_views_preserve_atomic_allocations_and_table_authority()
         .unwrap();
     let app = client.protected();
     let request = ChironQlRequest { query: "TRANSACTION { SQL INSERT INTO documents VALUES ('doc',$1,RECORD_REF('docs',NEW_RECORD('chunk')),RECORD_REF('docs',NEW_RECORD('source'))); EXPECT SQL ROWS 1; VECTOR CREATE POINTS INTO docs USING TEMPLATE finance {binding:'chunk',point:{vector:[1,0],payload:{text:'chunk'}}},{binding:'source',point:{vector:[0,1],payload:{text:'source'}}}; GRAPH CONNECT docs NEW chunk -> cites -> NEW source SET {kind:'source'}; };".into(), parameters: vec![V::Text("protected".into())], idempotency_key: Some("rust-protected-three-models".into()), ..Default::default() };
+    // Endpoint grants cannot authorize an unlabelled edge property. A rejected
+    // transaction must not publish its vector allocations either.
+    assert_eq!(
+        app.query(&request)
+            .await
+            .unwrap_err()
+            .api_details()
+            .unwrap()
+            .code
+            .as_deref(),
+        Some("security.forbidden")
+    );
+    assert_eq!(app.count("docs", None).await.unwrap(), 0);
+    lab.query("ALTER COLLECTION docs SET SECURITY POLICY {department_actions:[],owner_actions:['read','search','update','delete','graph_read','graph_write'],templates:{finance:{department:'Finance',classification:'internal',properties:{'/text':{classification:'internal',actions:['read','query','write']},'/edges/kind':{classification:'internal',actions:['read','query','write']}},representations:{dense:{source_fields:['/text'],classification:'internal'}}}}};");
     let result = app.query(&request).await.unwrap();
     let replay = app.query(&request).await.unwrap();
     assert_eq!(result.rows, replay.rows);
