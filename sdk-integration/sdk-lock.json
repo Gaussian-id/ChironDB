@@ -5,7 +5,7 @@
   },
   "python": {
     "repository": "Gaussian-id/chirondb-py",
-    "revision": "b1171136c34d77a68d4ff2032fbdefef7ebd7305"
+    "revision": "3a68b8759e3ba725670bfabf2f75e26ead7a04c7"
   },
   "node": {
     "repository": "Gaussian-id/chirondb-js",
