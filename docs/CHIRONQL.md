@@ -434,7 +434,10 @@ Explicit `SELECT ALL` preserves duplicates. `DISTINCT ON` remains outside the
 preview.
 
 Native relational SQL accepts at most 32 statements and 8 MiB of decoded input
-per request, including interactive requests. The combined serialized result is
+per request, including interactive requests. Expression trees are limited to
+32 levels, including flat boolean chains, so parsing, authorization and tree
+cleanup remain bounded. Set operations and array expressions remain unsupported.
+The combined serialized result is
 limited to 8 MiB, with at most 100,000 rows per result. Plain single-table
 SELECT and ungrouped COUNT scan visible rows without loading the full table.
 Equality predicates backed by a scalar index stream matching row identities

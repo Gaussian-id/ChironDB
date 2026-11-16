@@ -220,6 +220,12 @@ replies need no heap admission. Parser/authority and other catalog construction,
 TLS/socket and complete engine/process accounting remain separate qualification
 requirements.
 
+The pgvector SQL parser bounds expression nesting and tree depth to 32 levels,
+including boolean chains. Excessive expressions return SQLSTATE `54001`
+(`statement_too_complex`); the session remains usable for subsequent queries.
+Native relational SQL also bounds expression trees to 32 levels; see
+[native SQL limits](CHIRONQL.md).
+
 PostgreSQL catalog probes reserve classification text and a conservative
 producer bound before copying display fields. Catalog schemas share their existing
 admitted backing without pinning row generations; collection probes copy names,
