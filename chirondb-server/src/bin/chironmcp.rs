@@ -25,7 +25,7 @@ struct Args {
 
 struct Bridge(Peer<RoleClient>);
 impl ServerHandler for Bridge {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         chirondb::mcp::server_info()
     }
     fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
