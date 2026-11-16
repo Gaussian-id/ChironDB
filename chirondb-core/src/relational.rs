@@ -9306,6 +9306,9 @@ fn order_ascending(options: &OrderByOptions) -> Result<bool> {
 }
 
 fn relational_type(data_type: &DataType) -> Result<RelationalType> {
+    if matches!(data_type, DataType::Array(_)) {
+        return Err(unsupported("SQL array types are outside relational v1"));
+    }
     if let DataType::Custom(name, modifiers) = data_type
         && name.to_string().eq_ignore_ascii_case("record_ref")
     {
@@ -15334,6 +15337,14 @@ mod tests {
         engine
             .execute(request("INSERT INTO items VALUES(1)"))
             .unwrap();
+        engine
+            .execute(request(
+                "CREATE TABLE floats(id INTEGER PRIMARY KEY, value DOUBLE PRECISION)",
+            ))
+            .unwrap();
+        engine
+            .execute(request("INSERT INTO floats VALUES(1,1.5)"))
+            .unwrap();
         for sql in [
             "SELECT id FROM items ORDER BY id USING <",
             "SELECT id FROM items ORDER BY id USING > LIMIT 1",
@@ -15344,6 +15355,10 @@ mod tests {
             "INSERT INTO items OVERRIDING SYSTEM VALUE VALUES(2)",
             "INSERT INTO items OVERRIDING USER VALUE VALUES(2)",
             "CREATE UNLOGGED TABLE unsupported_table(id INTEGER)",
+            "CREATE TABLE unsupported_floats(value FLOAT ARRAY)",
+            "CREATE TABLE unsupported_floats(value DOUBLE PRECISION ARRAY)",
+            "UPDATE floats SET value=CAST(2.5 AS DOUBLE PRECISION ARRAY) WHERE id=1",
+            "UPDATE floats SET value=2.5::FLOAT ARRAY WHERE id=1",
         ] {
             let error = engine.execute(request(sql)).err().expect(sql);
             assert!(error.to_string().contains("unsupported"), "{sql}: {error}");
@@ -15354,6 +15369,12 @@ mod tests {
             .response;
         assert!(matches!(&response.results[0], SqlResult::Rows { rows, .. }
             if rows == &vec![vec![RelationalValue::Integer(1)]]));
+        let response = engine
+            .execute(request("SELECT id,value FROM floats"))
+            .unwrap()
+            .response;
+        assert!(matches!(&response.results[0], SqlResult::Rows { rows, .. }
+            if rows == &vec![vec![RelationalValue::Integer(1), RelationalValue::Float(1.5)]]));
     }
 
     #[test]
