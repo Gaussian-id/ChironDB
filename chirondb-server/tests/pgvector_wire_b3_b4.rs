@@ -1269,6 +1269,59 @@ fn parse_error_response(buf: &[u8]) -> Reply {
 }
 
 #[tokio::test]
+async fn excessive_pgvector_expression_depth_refuses_without_losing_the_session() {
+    let (db, _guard) = make_db();
+    let port = spawn_server(db, AuthConfig::disabled()).await;
+    let mut stream = connect(port).await;
+    let created = run_query(
+        &mut stream,
+        "CREATE TABLE nested_items(id INTEGER PRIMARY KEY, embedding vector(2))",
+    )
+    .await;
+    assert!(matches!(created.as_slice(), [Reply::CommandComplete(_)]));
+    for query in [
+        include_str!("../../fuzz/corpus/query_decoders/pgvector_nested_parentheses").to_owned(),
+        format!(
+            "SELECT id FROM nested_items WHERE {}true",
+            "NOT ".repeat(4000)
+        ),
+        format!(
+            "SELECT id FROM nested_items WHERE {}true",
+            "true AND ".repeat(4000)
+        ),
+        format!(
+            "SELECT id FROM nested_items WHERE {}true",
+            "true OR ".repeat(4000)
+        ),
+    ] {
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_query(&mut stream, &query),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(refused.as_slice(), [Reply::Error { sqlstate, .. }] if sqlstate=="54001"),
+            "{refused:?}"
+        );
+        let healthy = run_query(
+            &mut stream,
+            "INSERT INTO nested_items VALUES(1, '[1,0]'::vector)",
+        )
+        .await;
+        assert!(
+            matches!(healthy.as_slice(), [Reply::CommandComplete(_)]),
+            "{healthy:?}"
+        );
+        let clean = run_query(&mut stream, "DELETE FROM nested_items WHERE id=1").await;
+        assert!(
+            matches!(clean.as_slice(), [Reply::CommandComplete(_)]),
+            "{clean:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn select_round_trip_l2() {
     let (db, _g) = make_db();
     let port = spawn_server(db, AuthConfig::disabled()).await;

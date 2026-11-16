@@ -123,7 +123,16 @@ pub(in crate::relational) fn preflight(
                 projection(state, items, &columns, &ctes, &mut deps)?;
             }
             if let Some(OnInsert::OnConflict(conflict)) = &insert.on {
-                if let Some(ConflictTarget::Columns(targets)) = &conflict.conflict_target {
+                if let Some(ConflictTarget::Columns {
+                    columns: targets,
+                    predicate,
+                }) = &conflict.conflict_target
+                {
+                    if predicate.is_some() {
+                        return Err(unsupported(
+                            "ON CONFLICT index predicates are outside relational v1",
+                        ));
+                    }
                     for name in targets {
                         let origin = resolve(&Expr::Identifier(name.clone()), &columns, &mut deps)?;
                         deps.require(&origin, PropertyAction::Query)?;
@@ -336,7 +345,12 @@ fn expression(
             origins.extend(expression(state, high, columns, ctes, action, deps)?);
             origins
         }
-        Expr::InList { expr, list, .. } => {
+        Expr::In {
+            expr,
+            target: InTarget::List(list),
+            global: false,
+            ..
+        } => {
             let mut origins = expression(state, expr, columns, ctes, action, deps)?;
             for item in list {
                 origins.extend(expression(state, item, columns, ctes, action, deps)?);
@@ -350,7 +364,12 @@ fn expression(
             .into_iter()
             .flat_map(|column| column.origins)
             .collect(),
-        Expr::InSubquery { expr, subquery, .. } => {
+        Expr::In {
+            expr,
+            target: InTarget::Subquery(subquery),
+            global: false,
+            ..
+        } => {
             let mut origins = expression(state, expr, columns, ctes, action, deps)?;
             origins.extend(
                 query_columns(state, subquery, ctes, deps)?

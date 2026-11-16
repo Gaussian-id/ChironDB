@@ -2,13 +2,59 @@
 //! Token/AST allocation admission is separate from avoiding duplicate ownership.
 use super::{
     InteractiveControl, ParsedRelationalStatement, Result, SetConstraintsStatement,
-    SetConstraintsTarget, invalid, normalize_ident,
+    SetConstraintsTarget, invalid, normalize_ident, unsupported,
 };
 use sqlparser::{
+    ast::{Expr, Visit, Visitor},
     dialect::PostgreSqlDialect,
-    parser::Parser,
+    keywords::Keyword,
+    parser::{Parser, ParserError},
     tokenizer::{Token, TokenWithSpan, Tokenizer},
 };
+use std::ops::ControlFlow;
+
+// The upstream recursion limit bounds recursive descent, but not a flat
+// infix chain's left-deep AST. Stop expansion while the owned tree is still
+// small enough to walk and drop, including on a refused statement.
+mod bounded_dialect {
+    use super::{PostgreSqlDialect, infix_depth_guard};
+    sqlparser::derive_dialect!(
+        BoundedPostgreSqlDialect,
+        PostgreSqlDialect,
+        preserve_type_id = true,
+        overrides = { parse_infix = infix_depth_guard(_expr) }
+    );
+}
+use bounded_dialect::BoundedPostgreSqlDialect;
+
+const MAX_EXPRESSION_DEPTH: usize = 32;
+struct ExpressionDepth {
+    depth: usize,
+}
+impl Visitor for ExpressionDepth {
+    type Break = ();
+    fn pre_visit_expr(&mut self, _expr: &Expr) -> ControlFlow<()> {
+        if self.depth == MAX_EXPRESSION_DEPTH {
+            return ControlFlow::Break(());
+        }
+        self.depth += 1;
+        ControlFlow::Continue(())
+    }
+    fn post_visit_expr(&mut self, _expr: &Expr) -> ControlFlow<()> {
+        self.depth -= 1;
+        ControlFlow::Continue(())
+    }
+}
+
+fn infix_depth_guard(expr: &Expr) -> Option<std::result::Result<Expr, ParserError>> {
+    expr.visit(&mut ExpressionDepth { depth: 0 })
+        .is_break()
+        .then(|| {
+            Err(ParserError::ParserError(
+                "SQL expression depth limit exceeded".into(),
+            ))
+        })
+}
 
 fn tokenize(sql: &str) -> Result<Vec<TokenWithSpan>> {
     Tokenizer::new(&PostgreSqlDialect {}, sql)
@@ -18,6 +64,18 @@ fn tokenize(sql: &str) -> Result<Vec<TokenWithSpan>> {
 
 pub(super) fn parse_relational_statement(sql: &str) -> Result<ParsedRelationalStatement> {
     let mut tokens = tokenize(sql)?;
+    // These forms are already outside the native profile. Refuse them before
+    // constructing unbounded left-deep set-operation or postfix array ASTs.
+    for token in &tokens {
+        if matches!(&token.token, Token::LBracket)
+            || matches!(&token.token, Token::Word(word)
+                if matches!(word.keyword, Keyword::UNION | Keyword::INTERSECT | Keyword::EXCEPT))
+        {
+            return Err(unsupported(
+                "SQL set operations and array expressions are outside relational v1",
+            ));
+        }
+    }
     let mut significant = tokens
         .iter()
         .map(|token| &token.token)
@@ -36,7 +94,8 @@ pub(super) fn parse_relational_statement(sql: &str) -> Result<ParsedRelationalSt
     // Keep whitespace and original locations for the upstream grammar. Move
     // this buffer into Parser instead of tokenizing SQL again while retaining
     // the first buffer. Defaults match Parser::parse_sql (including unescape).
-    let mut parser = Parser::new(&PostgreSqlDialect {}).with_tokens_with_locations(tokens);
+    let dialect = BoundedPostgreSqlDialect::new();
+    let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens);
     while parser.consume_token(&Token::SemiColon) {}
     if matches!(parser.peek_token_ref().token, Token::EOF) {
         return Err(invalid(
@@ -45,6 +104,12 @@ pub(super) fn parse_relational_statement(sql: &str) -> Result<ParsedRelationalSt
     }
     let parse_error = |error| invalid(format!("SQL parse error: {error}"));
     let statement = parser.parse_statement().map_err(parse_error)?;
+    if statement
+        .visit(&mut ExpressionDepth { depth: 0 })
+        .is_break()
+    {
+        return Err(invalid("SQL expression depth limit exceeded"));
+    }
     let mut delimiter = false;
     while parser.consume_token(&Token::SemiColon) {
         delimiter = true;

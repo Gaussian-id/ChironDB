@@ -58,20 +58,19 @@ use std::{
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use sqlparser::{
-    ast::{
-        AlterColumnOperation, AlterTableOperation, AssignmentTarget, BinaryOperator, CastKind,
-        ColumnOption, ConflictTarget, ConstraintCharacteristics, ConstraintReferenceMatchKind,
-        DataType, DeferrableInitial, Distinct, DropBehavior, DuplicateTreatment, Expr,
-        ForeignKeyConstraint, FromTable, FunctionArg, FunctionArgExpr, FunctionArguments,
-        GeneratedAs, GroupByExpr, JoinConstraint, JoinOperator, LimitClause, ObjectName,
-        ObjectType, OnConflictAction, OnInsert, OrderByKind, Query, ReferentialAction,
-        RenameTableNameKind, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement,
-        TableConstraint, TableFactor, TableObject, Value,
-    },
-    dialect::PostgreSqlDialect,
-    parser::Parser,
+use sqlparser::ast::{
+    AlterColumnOperation, AlterTableOperation, AssignmentTarget, BinaryOperator, CastKind,
+    ColumnOption, ConflictTarget, ConstraintCharacteristics, ConstraintReferenceMatchKind,
+    DataType, DeferrableInitial, Distinct, DropBehavior, DuplicateTreatment, Expr,
+    ForeignKeyConstraint, FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, GeneratedAs,
+    GroupByExpr, InTarget, JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectType,
+    OnConflictAction, OnInsert, OrderByKind, OrderByOptions, OrderBySort, Query, ReferentialAction,
+    RenameTableNameKind, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement,
+    TableConstraint, TableFactor, TableObject, TypeModifier, Value,
 };
+
+#[cfg(test)]
+use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
 
 use crate::{
     CheckConstraintDefinition, ForeignKeyAction, ForeignKeyDefinition, ForeignKeyMatch, GaussError,
@@ -4972,6 +4971,8 @@ fn execute_insert(
     if insert.or.is_some()
         || insert.ignore
         || insert.overwrite
+        || insert.by_name
+        || insert.overriding.is_some()
         || !insert.assignments.is_empty()
         || insert.partitioned.is_some()
         || !insert.after_columns.is_empty()
@@ -5267,7 +5268,12 @@ fn conflict_target_columns(
     };
     match &conflict.conflict_target {
         None => Ok(declared()),
-        Some(ConflictTarget::Columns(columns)) => {
+        Some(ConflictTarget::Columns { columns, predicate }) => {
+            if predicate.is_some() {
+                return Err(unsupported(
+                    "ON CONFLICT index predicates are outside relational v1",
+                ));
+            }
             let columns = columns
                 .iter()
                 .map(|column| normalize_ident(&column.value))
@@ -5814,6 +5820,11 @@ fn execute_update(
     parameters: &[RelationalValue],
     mutations: &mut Vec<RelationalMutation>,
 ) -> Result<SqlResult> {
+    if update.on_cluster.is_some() || update.settings.is_some() {
+        return Err(unsupported(
+            "UPDATE cluster and settings modifiers are outside relational v1",
+        ));
+    }
     if !update.table.joins.is_empty() || update.from.is_some() {
         return Err(unsupported(
             "UPDATE joins and FROM are outside the current profile",
@@ -5938,6 +5949,11 @@ fn execute_delete(
     parameters: &[RelationalValue],
     mutations: &mut Vec<RelationalMutation>,
 ) -> Result<SqlResult> {
+    if delete.on_cluster.is_some() || delete.settings.is_some() {
+        return Err(unsupported(
+            "DELETE cluster and settings modifiers are outside relational v1",
+        ));
+    }
     if delete.using.is_some() || !delete.order_by.is_empty() {
         return Err(unsupported(
             "DELETE USING and ORDER BY are outside the current profile",
@@ -6644,7 +6660,7 @@ fn execute_query(
                 let key = query_order_key(&relation.columns, &projection, &expression.expr)?;
                 Ok(QueryOrderSpec {
                     index: key.source_index,
-                    ascending: expression.options.asc.unwrap_or(true),
+                    ascending: order_ascending(&expression.options)?,
                     nulls_first: expression.options.nulls_first,
                 })
             })
@@ -6863,7 +6879,7 @@ fn execute_ordered_primary_range(
     let [order] = expressions.as_slice() else {
         return Ok(None);
     };
-    if order.options.asc == Some(false) || order.with_fill.is_some() {
+    if !order_ascending(&order.options)? || order.with_fill.is_some() {
         return Ok(None);
     }
     let (table, columns) = query_source(state, &select.from[0].relation)?;
@@ -7037,7 +7053,7 @@ fn execute_topk_query(
             }
             Ok(QueryOrderSpec {
                 index: query_order_key(&columns, &projection, &expression.expr)?.source_index,
-                ascending: expression.options.asc.unwrap_or(true),
+                ascending: order_ascending(&expression.options)?,
                 nulls_first: expression.options.nulls_first,
             })
         })
@@ -7671,7 +7687,7 @@ fn execute_aggregate_query(
                 }
                 Ok((
                     aggregate_order_output_index(&projection, &expression.expr)?,
-                    expression.options.asc.unwrap_or(true),
+                    order_ascending(&expression.options)?,
                     expression.options.nulls_first,
                 ))
             })
@@ -8606,10 +8622,11 @@ fn query_predicate_result(
                 !rows.is_empty()
             }))
         }
-        Expr::InSubquery {
+        Expr::In {
             expr,
-            subquery,
+            target: InTarget::Subquery(subquery),
             negated,
+            global: false,
         } => {
             let index = query_column_index(columns, expr)?;
             let SqlResult::Rows {
@@ -8632,10 +8649,11 @@ fn query_predicate_result(
                 .collect::<Vec<_>>();
             Ok(in_list_predicate(&row[index], &values, *negated))
         }
-        Expr::InList {
+        Expr::In {
             expr,
-            list,
+            target: InTarget::List(list),
             negated,
+            global: false,
         } => {
             let index = query_column_index(columns, expr)?;
             let values = list
@@ -8956,7 +8974,16 @@ fn relational_id(value: &RelationalValue) -> String {
 }
 
 fn table_definition(create: sqlparser::ast::CreateTable) -> Result<TableDefinition> {
-    if create.or_replace || create.temporary || create.external || create.query.is_some() {
+    if create.or_replace
+        || create.temporary
+        || create.external
+        || create.query.is_some()
+        || create.unlogged
+        || create.with_connection.is_some()
+        || create.with_data.is_some()
+        || create.fallback.is_some()
+        || create.multiset.is_some()
+    {
         return Err(unsupported(
             "CREATE TABLE modifiers and AS SELECT are outside relational v1",
         ));
@@ -9270,15 +9297,28 @@ fn static_default_value(expression: &Expr, data_type: &RelationalType) -> Result
     Ok(value)
 }
 
+fn order_ascending(options: &OrderByOptions) -> Result<bool> {
+    match &options.sort {
+        None | Some(OrderBySort::Asc) => Ok(true),
+        Some(OrderBySort::Desc) => Ok(false),
+        Some(OrderBySort::Using(_)) => Err(unsupported("ORDER BY USING is outside relational v1")),
+    }
+}
+
 fn relational_type(data_type: &DataType) -> Result<RelationalType> {
     if let DataType::Custom(name, modifiers) = data_type
         && name.to_string().eq_ignore_ascii_case("record_ref")
     {
-        if modifiers.len() != 1 || modifiers[0].trim().is_empty() {
+        let namespace = match modifiers.as_slice() {
+            [TypeModifier::Identifier(name)] => name.to_string(),
+            [TypeModifier::String(name) | TypeModifier::Number(name, _)] => name.clone(),
+            _ => return Err(invalid("RECORD_REF requires exactly one namespace")),
+        };
+        if namespace.trim().is_empty() {
             return Err(invalid("RECORD_REF requires exactly one namespace"));
         }
         return Ok(RelationalType::RecordRef {
-            namespace: modifiers[0].to_ascii_lowercase(),
+            namespace: namespace.to_ascii_lowercase(),
         });
     }
     let text = data_type.to_string().to_ascii_lowercase();
@@ -9505,11 +9545,9 @@ fn expression_value(
             kind,
             expr,
             data_type,
-            array,
             format,
         } => {
-            if !matches!(kind, CastKind::Cast | CastKind::DoubleColon) || *array || format.is_some()
-            {
+            if !matches!(kind, CastKind::Cast | CastKind::DoubleColon) || format.is_some() {
                 return Err(unsupported(
                     "only CAST(expr AS type) and expr::type are supported",
                 ));
@@ -9694,10 +9732,11 @@ fn predicate_result(
         Expr::UnaryOp { op, expr } if op.to_string().eq_ignore_ascii_case("not") => Ok(
             predicate_result(Some(expr), definition, row, parameters, cursor)?.map(|value| !value),
         ),
-        Expr::InList {
+        Expr::In {
             expr,
-            list,
+            target: InTarget::List(list),
             negated,
+            global: false,
         } => {
             let index = column_index(definition, &expression_column_name(expr)?)?;
             let values = list
@@ -10782,18 +10821,19 @@ fn validate_row(definition: &TableDefinition, row: &[RelationalValue]) -> Result
 }
 
 fn parse_check_expression(expression: &str) -> Result<Expr> {
-    let dialect = PostgreSqlDialect {};
-    let mut statements = Parser::parse_sql(&dialect, &format!("SELECT 1 WHERE {expression}"))
-        .map_err(|error| invalid(format!("invalid CHECK expression: {error}")))?;
-    let Some(Statement::Query(query)) = statements.pop() else {
+    let ParsedRelationalStatement::Sql(statement) =
+        parsing::parse_relational_statement(&format!("SELECT 1 WHERE {expression}"))?
+    else {
         return Err(invalid("invalid CHECK expression"));
     };
-    let SetExpr::Select(select) = query.body.as_ref() else {
+    let Statement::Query(query) = *statement else {
+        return Err(invalid("invalid CHECK expression"));
+    };
+    let SetExpr::Select(select) = *query.body else {
         return Err(invalid("invalid CHECK expression"));
     };
     select
         .selection
-        .clone()
         .ok_or_else(|| invalid("CHECK expression is empty"))
 }
 
@@ -10817,7 +10857,12 @@ fn expression_references_column(expression: &Expr, column_name: &str) -> bool {
             expression_references_column(left, column_name)
                 || expression_references_column(right, column_name)
         }
-        Expr::InList { expr, list, .. } => {
+        Expr::In {
+            expr,
+            target: InTarget::List(list),
+            global: false,
+            ..
+        } => {
             expression_references_column(expr, column_name)
                 || list
                     .iter()
@@ -10879,7 +10924,12 @@ fn rename_expression_column(expression: &mut Expr, old_name: &str, new_name: &st
             rename_expression_column(left, old_name, new_name);
             rename_expression_column(right, old_name, new_name);
         }
-        Expr::InList { expr, list, .. } => {
+        Expr::In {
+            expr,
+            target: InTarget::List(list),
+            global: false,
+            ..
+        } => {
             rename_expression_column(expr, old_name, new_name);
             for value in list {
                 rename_expression_column(value, old_name, new_name);
@@ -10916,7 +10966,12 @@ fn rename_expression_table(expression: &mut Expr, old_name: &str, new_name: &str
             rename_expression_table(left, old_name, new_name);
             rename_expression_table(right, old_name, new_name);
         }
-        Expr::InList { expr, list, .. } => {
+        Expr::In {
+            expr,
+            target: InTarget::List(list),
+            global: false,
+            ..
+        } => {
             rename_expression_table(expr, old_name, new_name);
             for value in list {
                 rename_expression_table(value, old_name, new_name);
@@ -10970,10 +11025,11 @@ fn check_constraint_result(
                 _ => None,
             })
         }
-        Expr::InList {
+        Expr::In {
             expr,
-            list,
+            target: InTarget::List(list),
             negated,
+            global: false,
         } => {
             let index = column_index(definition, &expression_column_name(expr)?)?;
             let mut cursor = 0;
@@ -11353,7 +11409,12 @@ fn expression_base_tables(
         } => {
             tables.extend(query_base_tables(query, visible_ctes)?);
         }
-        Expr::InSubquery { expr, subquery, .. } => {
+        Expr::In {
+            expr,
+            target: InTarget::Subquery(subquery),
+            global: false,
+            ..
+        } => {
             tables.extend(expression_base_tables(expr, visible_ctes)?);
             tables.extend(query_base_tables(subquery, visible_ctes)?);
         }
@@ -11367,7 +11428,12 @@ fn expression_base_tables(
         | Expr::IsNotNull(expr) => {
             tables.extend(expression_base_tables(expr, visible_ctes)?);
         }
-        Expr::InList { expr, list, .. } => {
+        Expr::In {
+            expr,
+            target: InTarget::List(list),
+            global: false,
+            ..
+        } => {
             tables.extend(expression_base_tables(expr, visible_ctes)?);
             for item in list {
                 tables.extend(expression_base_tables(item, visible_ctes)?);
@@ -15192,6 +15258,102 @@ mod tests {
             .kind,
             SqlStatementKind::AlterTable
         );
+    }
+
+    #[test]
+    fn parser_upgrade_preserves_native_sql_semantics() {
+        let directory = tempdir().unwrap();
+        let journal = TransactionJournal::open(directory.path()).unwrap();
+        let engine = RelationalEngine::open(directory.path(), journal).unwrap();
+        for sql in [
+            "CREATE TABLE items(id INTEGER PRIMARY KEY, value INTEGER CHECK(value IN (10,20)))",
+            "INSERT INTO items VALUES(1,10),(2,20),(3,NULL)",
+            "INSERT INTO items VALUES(1,20) ON CONFLICT(id) DO UPDATE SET value=excluded.value",
+            "ALTER TABLE items RENAME COLUMN value TO amount",
+        ] {
+            engine.execute(request(sql)).unwrap();
+        }
+        for sql in [
+            "SELECT id FROM items WHERE amount IN (10,20) ORDER BY id DESC",
+            "SELECT id FROM items WHERE amount IN (SELECT amount FROM items WHERE id=1) ORDER BY id DESC",
+        ] {
+            let response = engine.execute(request(sql)).unwrap().response;
+            assert!(matches!(&response.results[0], SqlResult::Rows { rows, .. }
+                if rows == &vec![vec![RelationalValue::Integer(2)],vec![RelationalValue::Integer(1)]]));
+        }
+        let response = engine
+            .execute(request(
+                "SELECT id FROM items ORDER BY amount ASC NULLS FIRST, id DESC",
+            ))
+            .unwrap()
+            .response;
+        assert!(matches!(&response.results[0], SqlResult::Rows { rows, .. }
+            if rows == &vec![vec![RelationalValue::Integer(3)],vec![RelationalValue::Integer(2)],vec![RelationalValue::Integer(1)]]));
+        assert!(
+            engine
+                .execute(request("UPDATE items SET amount=30 WHERE id=1"))
+                .is_err()
+        );
+        engine
+            .execute(request(
+                "UPDATE items SET amount=CAST(10 AS INTEGER) WHERE id=1",
+            ))
+            .unwrap();
+        for (modifier, expected) in [
+            ("Docs", "docs"),
+            ("'Docs'", "docs"),
+            ("42", "42"),
+            ("\"Docs\"", "\"docs\""),
+        ] {
+            let statement = Parser::parse_sql(
+                &PostgreSqlDialect {},
+                &format!("CREATE TABLE refs(r RECORD_REF({modifier}))"),
+            )
+            .unwrap()
+            .remove(0);
+            let Statement::CreateTable(create) = statement else {
+                panic!()
+            };
+            assert_eq!(
+                relational_type(&create.columns[0].data_type).unwrap(),
+                RelationalType::RecordRef {
+                    namespace: expected.into()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn parser_upgrade_rejects_unsupported_syntax_without_mutation() {
+        let directory = tempdir().unwrap();
+        let journal = TransactionJournal::open(directory.path()).unwrap();
+        let engine = RelationalEngine::open(directory.path(), journal).unwrap();
+        engine
+            .execute(request("CREATE TABLE items(id INTEGER PRIMARY KEY)"))
+            .unwrap();
+        engine
+            .execute(request("INSERT INTO items VALUES(1)"))
+            .unwrap();
+        for sql in [
+            "SELECT id FROM items ORDER BY id USING <",
+            "SELECT id FROM items ORDER BY id USING > LIMIT 1",
+            "SELECT COUNT(*) FROM items ORDER BY 1 USING <",
+            "INSERT INTO items VALUES(2) ON CONFLICT(id) WHERE id>0 DO NOTHING",
+            "INSERT INTO items VALUES(1) ON CONFLICT(id) WHERE id>0 DO UPDATE SET id=2",
+            "UPDATE items SET id=CAST(1 AS INTEGER[]) WHERE id=1",
+            "INSERT INTO items OVERRIDING SYSTEM VALUE VALUES(2)",
+            "INSERT INTO items OVERRIDING USER VALUE VALUES(2)",
+            "CREATE UNLOGGED TABLE unsupported_table(id INTEGER)",
+        ] {
+            let error = engine.execute(request(sql)).err().expect(sql);
+            assert!(error.to_string().contains("unsupported"), "{sql}: {error}");
+        }
+        let response = engine
+            .execute(request("SELECT id FROM items"))
+            .unwrap()
+            .response;
+        assert!(matches!(&response.results[0], SqlResult::Rows { rows, .. }
+            if rows == &vec![vec![RelationalValue::Integer(1)]]));
     }
 
     #[test]

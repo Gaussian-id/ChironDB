@@ -866,6 +866,12 @@ fn native_column_read_query_write_are_separate_before_index_and_cte_evaluation()
     for query in [
         "SELECT id FROM docs WHERE secret='hidden'",
         "SELECT id FROM docs WHERE secret='not-present'",
+        "SELECT id FROM docs WHERE secret IN ('hidden')",
+        "SELECT id FROM docs WHERE secret NOT IN ('not-present')",
+        "SELECT id FROM docs WHERE secret IN (SELECT secret FROM docs)",
+        "SELECT id FROM docs WHERE id IN (SELECT id FROM docs WHERE secret='hidden')",
+        "UPDATE docs SET id=2 WHERE secret IN ('hidden')",
+        "DELETE FROM docs WHERE secret NOT IN ('not-present')",
         "SELECT secret FROM docs ORDER BY secret LIMIT 1",
         "SELECT secret AS s FROM docs ORDER BY s LIMIT 1",
         "SELECT secret AS s FROM docs ORDER BY 1 LIMIT 1",
@@ -921,6 +927,14 @@ fn native_column_read_query_write_are_separate_before_index_and_cte_evaluation()
             PropertyAction::Write,
         ],
     );
+    for query in [
+        "SELECT id FROM docs WHERE secret IN ('changed')",
+        "SELECT id FROM docs WHERE secret IN (SELECT secret FROM docs)",
+        "SELECT id FROM docs WHERE id IN (SELECT id FROM docs WHERE secret='changed')",
+    ] {
+        let result = run(&mut state, &identity, query).unwrap();
+        assert!(matches!(&result[0], SqlResult::Rows { rows, .. } if rows.len()==1));
+    }
     let rows = run(&mut state, &identity, "SELECT secret FROM docs WHERE id=1").unwrap();
     assert!(
         matches!(&rows[0], SqlResult::Rows { rows, .. } if rows[0][0] == RelationalValue::Text("changed".into()))

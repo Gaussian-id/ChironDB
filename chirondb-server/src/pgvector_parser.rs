@@ -227,7 +227,7 @@ pub enum CmpOp {
     Ge,
 }
 
-/// Parser errors. Three kinds:
+/// Parser errors. Four kinds:
 /// 1. `Syntax` — the client wrote something we couldn't parse at all (SQLSTATE
 ///    `42601`).
 /// 2. `Unsupported` — the parser understood the shape but it is explicitly
@@ -237,11 +237,14 @@ pub enum CmpOp {
 ///    `NaN` / `Infinity` inside a `vector` literal). Maps to SQLSTATE `22023`
 ///    (`invalid_parameter_value`), the closest match to pgvector's own
 ///    behaviour.
+/// 4. `LimitExceeded` — expression nesting or tree depth exceeds the fixed
+///    parser safety bound (SQLSTATE `54001`, `statement_too_complex`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParseError {
     Syntax { message: String },
     Unsupported { message: String, hint: &'static str },
     InvalidData { message: String },
+    LimitExceeded { message: String },
 }
 
 impl fmt::Display for ParseError {
@@ -249,7 +252,9 @@ impl fmt::Display for ParseError {
         match self {
             Self::Syntax { message } => write!(f, "syntax error: {message}"),
             Self::Unsupported { message, .. } => write!(f, "{message}"),
-            Self::InvalidData { message } => write!(f, "{message}"),
+            Self::InvalidData { message } | Self::LimitExceeded { message } => {
+                write!(f, "{message}")
+            }
         }
     }
 }
@@ -260,13 +265,14 @@ impl ParseError {
             Self::Syntax { .. } => "42601",
             Self::Unsupported { .. } => "0A000",
             Self::InvalidData { .. } => "22023",
+            Self::LimitExceeded { .. } => "54001",
         }
     }
     pub fn hint(&self) -> Option<&'static str> {
         match self {
             Self::Syntax { .. } => None,
             Self::Unsupported { hint, .. } => Some(*hint),
-            Self::InvalidData { .. } => None,
+            Self::InvalidData { .. } | Self::LimitExceeded { .. } => None,
         }
     }
 }
@@ -768,9 +774,55 @@ fn unquoted_statement_words(src: &str) -> Vec<Vec<String>> {
 // Parser
 // =========================================================================
 
+// Both parsing recursion and AST depth are bounded. A flat boolean chain
+// creates a deep tree even without nested parentheses; its later clone, walk,
+// formatting and drop must be safe on a worker stack too.
+const MAX_EXPRESSION_DEPTH: usize = 32;
+
+fn expression_limit() -> ParseError {
+    ParseError::LimitExceeded {
+        message: format!("expression nesting limit exceeded (maximum {MAX_EXPRESSION_DEPTH})"),
+    }
+}
+
+fn expression_depth(expr: &Expr) -> usize {
+    match expr {
+        Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::Compare { left, right, .. }
+        | Expr::Distance { left, right, .. } => {
+            1 + expression_depth(left).max(expression_depth(right))
+        }
+        Expr::Not(inner) | Expr::Aliased { inner, .. } => 1 + expression_depth(inner),
+        Expr::Func { args, .. } => 1 + args.iter().map(expression_depth).max().unwrap_or(0),
+        Expr::InList { expr, list, .. } => {
+            1 + expression_depth(expr).max(list.iter().map(expression_depth).max().unwrap_or(0))
+        }
+        Expr::Ident(_)
+        | Expr::QualifiedIdent(_, _)
+        | Expr::Number(_)
+        | Expr::Integer(_)
+        | Expr::String(_)
+        | Expr::Bool(_)
+        | Expr::Null
+        | Expr::VectorLiteral(_) => 0,
+    }
+}
+
+fn checked_expression(expr: Expr) -> ParseResult<Expr> {
+    // Each child has already been checked. This walk and any rejected value's
+    // destructor therefore recurse at most one level beyond the fixed bound.
+    if expression_depth(&expr) > MAX_EXPRESSION_DEPTH {
+        Err(expression_limit())
+    } else {
+        Ok(expr)
+    }
+}
+
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    expression_depth: usize,
 }
 
 impl Parser {
@@ -785,7 +837,11 @@ impl Parser {
                 break;
             }
         }
-        Ok(Self { tokens, pos: 0 })
+        Ok(Self {
+            tokens,
+            pos: 0,
+            expression_depth: 0,
+        })
     }
 
     fn peek(&self) -> &Token {
@@ -1440,14 +1496,21 @@ impl Parser {
     // ===== Expression parser =====
 
     fn parse_expr(&mut self) -> ParseResult<Expr> {
-        self.parse_or()
+        // The root expression is depth zero; allow 32 nested expressions.
+        if self.expression_depth > MAX_EXPRESSION_DEPTH {
+            return Err(expression_limit());
+        }
+        self.expression_depth += 1;
+        let result = self.parse_or();
+        self.expression_depth -= 1;
+        result
     }
 
     fn parse_or(&mut self) -> ParseResult<Expr> {
         let mut left = self.parse_and()?;
         while self.consume_keyword("or") {
             let right = self.parse_and()?;
-            left = Expr::Or(Box::new(left), Box::new(right));
+            left = checked_expression(Expr::Or(Box::new(left), Box::new(right)))?;
         }
         Ok(left)
     }
@@ -1456,17 +1519,24 @@ impl Parser {
         let mut left = self.parse_not()?;
         while self.consume_keyword("and") {
             let right = self.parse_not()?;
-            left = Expr::And(Box::new(left), Box::new(right));
+            left = checked_expression(Expr::And(Box::new(left), Box::new(right)))?;
         }
         Ok(left)
     }
 
     fn parse_not(&mut self) -> ParseResult<Expr> {
-        if self.consume_keyword("not") {
-            let inner = self.parse_not()?;
-            return Ok(Expr::Not(Box::new(inner)));
+        let mut count = 0;
+        while self.consume_keyword("not") {
+            count += 1;
+            if count > MAX_EXPRESSION_DEPTH {
+                return Err(expression_limit());
+            }
         }
-        self.parse_compare()
+        let mut expression = self.parse_compare()?;
+        for _ in 0..count {
+            expression = checked_expression(Expr::Not(Box::new(expression)))?;
+        }
+        Ok(expression)
     }
 
     fn parse_compare(&mut self) -> ParseResult<Expr> {
@@ -1483,7 +1553,7 @@ impl Parser {
                 let negated = self.consume_keyword("not");
                 self.expect_keyword("null")?;
                 let cmp = if negated { CmpOp::Ne } else { CmpOp::Eq };
-                return Ok(Expr::Compare {
+                return checked_expression(Expr::Compare {
                     left: Box::new(left),
                     op: cmp,
                     right: Box::new(Expr::Null),
@@ -1506,7 +1576,7 @@ impl Parser {
                     }
                 }
                 self.expect(&Token::RParen)?;
-                return Ok(Expr::InList {
+                return checked_expression(Expr::InList {
                     expr: Box::new(left),
                     list,
                     negated: false,
@@ -1516,7 +1586,7 @@ impl Parser {
         };
         self.pos += 1;
         let right = self.parse_distance()?;
-        Ok(Expr::Compare {
+        checked_expression(Expr::Compare {
             left: Box::new(left),
             op,
             right: Box::new(right),
@@ -1539,7 +1609,7 @@ impl Parser {
         };
         self.pos += 1;
         let right = self.parse_primary()?;
-        Ok(Expr::Distance {
+        checked_expression(Expr::Distance {
             left: Box::new(left),
             op,
             right: Box::new(right),
@@ -1595,7 +1665,7 @@ impl Parser {
                         }
                     }
                     self.expect(&Token::RParen)?;
-                    return Ok(Expr::Func { name: lower, args });
+                    return checked_expression(Expr::Func { name: lower, args });
                 }
                 // Qualified identifier `t.col`.
                 if self.consume(&Token::Dot) {
