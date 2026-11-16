@@ -177,6 +177,41 @@ fn stats(response: &chirondb::grpc::pb::WireChironQlResponse) -> Value {
 }
 
 #[tokio::test]
+async fn native_relation_batch_frame_preserves_order_and_idempotency() {
+    let harness = Harness::start(true, AuthConfig::disabled()).await;
+    let request = json!({"edges": (0..50).map(|ordinal| json!({
+        "source_point_id": "root", "target_point_id": "child", "edge_type": "CITES",
+        "properties": {"ordinal": ordinal},
+    })).collect::<Vec<_>>(), "idempotency_key": "wire-batch"})
+    .to_string();
+    let mut first = None;
+    for id in 1..=2 {
+        let response = common::send_wire(
+            &harness.endpoint,
+            id,
+            wire_request::Operation::RelateBatch(chirondb::grpc::pb::WireGraphRelateBatchRequest {
+                collection: COLLECTION.into(),
+                request_json: request.clone(),
+                no_wait: false,
+            }),
+        )
+        .await;
+        assert!(response.error_code.is_empty(), "{}", response.error_message);
+        let Some(wire_response::Payload::RelateBatch(result)) = response.payload else {
+            panic!("missing batch receipt");
+        };
+        let result: Value = serde_json::from_str(&result.response_json).unwrap();
+        assert_eq!(result["edge_ids"].as_array().unwrap().len(), 50);
+        if let Some(first) = &first {
+            assert_eq!(*first, result["edge_ids"]);
+            assert_eq!(result["receipt"]["replayed"], true);
+        } else {
+            first = Some(result["edge_ids"].clone());
+        }
+    }
+}
+
+#[tokio::test]
 async fn relational_chironql_preserves_typed_parameters_and_metadata() {
     use chirondb::RelationalValue;
 
@@ -619,4 +654,30 @@ async fn wire_collection_hnsw_one_is_rejected_and_zero_retains_default_contract(
     assert_eq!(config.hnsw_m, None);
     assert_eq!(config.hnsw_ef_construction, None);
     assert_eq!(config.hnsw_ef_search, None);
+}
+
+#[path = "common/temporal.rs"]
+mod temporal_case;
+
+#[tokio::test]
+async fn temporal_wire_returns_exact_history() {
+    let h = Harness::start(false, AuthConfig::disabled()).await;
+    for (idx, s) in temporal_case::statements(COLLECTION).iter().enumerate() {
+        let r = chironql_payload(common::send_wire(&h.endpoint, idx as u64 + 1, query(s)).await);
+        let rows: Vec<Value> = r
+            .rows_json
+            .iter()
+            .map(|v| serde_json::from_str(v).unwrap())
+            .collect();
+        assert_eq!(rows, temporal_case::rows(COLLECTION, idx));
+        assert_eq!(r.domains, ["temporal"]);
+    }
+    let bad = temporal_case::statements(COLLECTION)[1]
+        .replace("1700000000000000002", "9223372036854775808");
+    let r = common::send_wire_with_key(&h.endpoint, 4, "", query(bad)).await;
+    assert!(
+        r.error_details_json
+            .unwrap_or_default()
+            .contains("chironql.invalid_timestamp")
+    );
 }

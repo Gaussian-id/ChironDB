@@ -35,6 +35,7 @@ pub(crate) enum Output {
 pub(crate) enum PublicationGuard {
     Data(AccessContext),
     Multi(Vec<AccessContext>),
+    TemporalPipeline(Vec<AccessContext>, crate::db::MultiModelReadSnapshot),
     Identity(AuthenticatedIdentity),
     Acknowledgement,
 }
@@ -45,11 +46,16 @@ impl PublicationGuard {
                 let _permit = context.publication_permit()?;
                 Ok(publish())
             }
-            Self::Multi(contexts) => {
+            Self::Multi(contexts) | Self::TemporalPipeline(contexts, _) => {
                 let _permits = contexts
                     .iter()
                     .map(AccessContext::publication_permit)
                     .collect::<std::result::Result<Vec<_>, _>>()?;
+                if let Self::TemporalPipeline(_, snapshot) = self
+                    && !snapshot.validate()?
+                {
+                    return Err(SecurityError::Conflict.into());
+                }
                 Ok(publish())
             }
             Self::Identity(identity) => {
@@ -159,6 +165,8 @@ pub(crate) fn map_error(query_id: &str, failure: GaussError) -> ChironQlError {
 fn action(statement: &Statement) -> std::result::Result<Option<Action>, ()> {
     use Statement::*;
     Ok(match statement {
+        TemporalRead(_) => Some(Action::TemporalRead),
+        TemporalAppend { .. } => Some(Action::TemporalAppend),
         Get(_) | Count(_) | Scroll(_) | Use { .. } => Some(Action::Read),
         Search(_) => Some(Action::Search),
         Hybrid(hybrid) if hybrid.text.is_some() => Some(Action::Search),
@@ -330,6 +338,27 @@ pub(crate) fn execute(
         .map_err(|failure| map_error(&query_id, failure))?;
     let mut memory = QueryMemory::new().map_err(|e| receiving::error(&query_id, e))?;
     memory.cancel_identity(&identity);
+    if matches!(
+        statement,
+        Statement::TemporalRead(_) | Statement::TemporalAppend { .. }
+    ) {
+        let mut value = crate::chironql_exec::temporal::execute(
+            db,
+            chirondb_core::db::temporal::TemporalAccess::Authorized(&context),
+            &statement,
+            &query_id,
+            &mut memory,
+            |e| map_error(&query_id, e),
+        )?;
+        value.stats.took_ms = started.elapsed().as_secs_f64() * 1000.;
+        memory
+            .metadata(&value)
+            .map_err(|e| receiving::error(&query_id, e))?;
+        return Ok(Output::Query(
+            PublicationGuard::Data(context),
+            QueryResult::new(value, memory),
+        ));
+    }
     let result: Result<(AccessContext, ChironQlResponse)> = match statement {
         Statement::Traverse(traverse) => {
             let defaults = TraversalBudget::default();
@@ -518,27 +547,41 @@ fn execute_pipeline(
     }) {
         return Err(error(query_id, "chironql.protected_unsupported"));
     }
-    if pipeline.explain {
+    if pipeline.explain && pipeline.temporal.is_none() {
         return Err(error(query_id, "chironql.protected_unsupported"));
     }
-    match pipeline.vector.as_ref() {
-        Statement::Search(search) if search.graph.is_none() => {}
-        Statement::Hybrid(hybrid) if hybrid.text.is_some() => {}
+    match pipeline.vector.as_deref() {
+        Some(Statement::Search(search)) if search.graph.is_none() => {}
+        Some(Statement::Hybrid(hybrid)) if hybrid.text.is_some() => {}
+        None => {}
         _ => return Err(error(query_id, "chironql.protected_unsupported")),
     }
     let vector_collection = pipeline
         .vector
-        .collection()
-        .or(request.collection.as_deref())
-        .ok_or_else(|| error(query_id, "chironql.no_collection"))?;
-    let vector_context = db
-        .bind_access(
-            identity,
-            vector_collection,
-            &identity.principal().tenant,
-            Action::Search,
-        )
-        .map_err(|failure| map_error(query_id, failure))?;
+        .as_deref()
+        .map(|v| {
+            v.collection()
+                .or(request.collection.as_deref())
+                .ok_or_else(|| error(query_id, "chironql.no_collection"))
+        })
+        .transpose()?;
+    let vector_context = vector_collection
+        .map(|name| db.bind_access(identity, name, &identity.principal().tenant, Action::Search))
+        .transpose()
+        .map_err(|e| map_error(query_id, e))?;
+    let temporal_context = pipeline
+        .temporal
+        .as_ref()
+        .map(|t| {
+            db.bind_access(
+                identity,
+                &t.query.collection,
+                &identity.principal().tenant,
+                Action::TemporalRead,
+            )
+        })
+        .transpose()
+        .map_err(|e| map_error(query_id, e))?;
     let graph_context = pipeline
         .graph
         .as_ref()
@@ -563,6 +606,20 @@ fn execute_pipeline(
     // Bind every protected resource before the first stage can observe data.
     db.authorize_sql_request(identity, &sql_request)
         .map_err(|failure| map_error(query_id, failure))?;
+    if pipeline.explain {
+        let mut contexts = Vec::new();
+        contexts.extend(vector_context);
+        contexts.extend(graph_context);
+        contexts.extend(temporal_context);
+        let value = crate::chironql_exec::explain_pipeline(pipeline, query_id, &mut memory)?;
+        memory
+            .metadata(&value)
+            .map_err(|e| receiving::error(query_id, e))?;
+        return Ok(Output::Query(
+            PublicationGuard::Multi(contexts),
+            QueryResult::new(value, memory),
+        ));
+    }
     let snapshot = db
         .begin_multimodel_read()
         .map_err(|failure| map_error(query_id, failure))?
@@ -576,61 +633,68 @@ fn execute_pipeline(
         },
         _ => Err(error(query_id, "chironql.protected_unsupported")),
     };
-    let vector_response = match pipeline.vector.as_ref() {
-        Statement::Search(search) => db.search_authorized(
-            &vector_context,
-            SearchRequest {
-                vector: search
-                    .vector
-                    .as_ref()
-                    .map(vector_value)
-                    .transpose()?
-                    .ok_or_else(|| error(query_id, "chironql.protected_unsupported"))?,
-                vector_name: search.vector_name.clone(),
-                k: search.limit.unwrap_or(10),
-                filter: search.filter.clone(),
-                graph: None,
-                budget_ms: search.budget_ms,
-                consistency: None,
-                ef_search: search.ef_search,
-                recall_target: search.recall_target,
-                with_payload: search.with_payload,
-            },
-            Some(identity.cancelled()),
-        ),
-        Statement::Hybrid(hybrid) => {
-            let text = hybrid.text.as_ref().expect("text pipeline admitted above");
-            db.text_hybrid_search_authorized(
-                &vector_context,
-                crate::TextHybridSearchRequest {
-                    vector: hybrid
+    let vector_rows = if let (Some(vector), Some(context)) =
+        (pipeline.vector.as_deref(), vector_context.as_ref())
+    {
+        let vector_response = match vector {
+            Statement::Search(search) => db.search_authorized(
+                context,
+                SearchRequest {
+                    vector: search
                         .vector
                         .as_ref()
                         .map(vector_value)
                         .transpose()?
-                        .unwrap_or_default(),
-                    query: text.query.clone(),
-                    text_field: text.field.clone(),
-                    k: hybrid.limit.unwrap_or(10),
-                    filter: hybrid.filter.clone(),
-                    budget_ms: hybrid.budget_ms,
+                        .ok_or_else(|| error(query_id, "chironql.protected_unsupported"))?,
+                    vector_name: search.vector_name.clone(),
+                    k: search.limit.unwrap_or(10),
+                    filter: search.filter.clone(),
+                    graph: None,
+                    budget_ms: search.budget_ms,
+                    consistency: None,
+                    ef_search: search.ef_search,
+                    recall_target: search.recall_target,
+                    with_payload: search.with_payload,
                 },
                 Some(identity.cancelled()),
-            )
+            ),
+            Statement::Hybrid(hybrid) => {
+                let text = hybrid.text.as_ref().expect("text pipeline admitted above");
+                db.text_hybrid_search_authorized(
+                    context,
+                    crate::TextHybridSearchRequest {
+                        vector: hybrid
+                            .vector
+                            .as_ref()
+                            .map(vector_value)
+                            .transpose()?
+                            .unwrap_or_default(),
+                        query: text.query.clone(),
+                        text_field: text.field.clone(),
+                        k: hybrid.limit.unwrap_or(10),
+                        filter: hybrid.filter.clone(),
+                        budget_ms: hybrid.budget_ms,
+                    },
+                    Some(identity.cancelled()),
+                )
+            }
+            _ => unreachable!("pipeline retrieval admitted above"),
         }
-        _ => unreachable!("pipeline retrieval admitted above"),
-    }
-    .and_then(|output| output.publish(|hits| retrieval::hits(hits, query_id, &mut memory))?)
-    .map_err(|failure| map_error(query_id, failure))?;
-    let vector_rows = crate::chironql_exec::qualify_pipeline_rows(
-        &pipeline.vector_alias,
-        vector_response,
-        Some(vector_collection),
-        &mut memory,
-    )?;
+        .and_then(|output| output.publish(|hits| retrieval::hits(hits, query_id, &mut memory))?)
+        .map_err(|failure| map_error(query_id, failure))?;
+        Some(crate::chironql_exec::qualify_pipeline_rows(
+            &pipeline.vector_alias,
+            vector_response,
+            vector_collection,
+            &mut memory,
+        )?)
+    } else {
+        None
+    };
     let graph_rows = if let (Some(graph), Some(context)) = (&pipeline.graph, &graph_context) {
         memory.ql(4096 + pipeline.vector_alias.len() as u64, query_id)?;
         let anchor_key = format!("{}.id", pipeline.vector_alias);
+        let vector_rows = vector_rows.as_ref().expect("validated graph source");
         let anchor_bytes = vector_rows
             .rows
             .iter()
@@ -712,21 +776,43 @@ fn execute_pipeline(
         .sql_reference_publication_context(identity, &relational_response.results)
         .map_err(|failure| map_error(query_id, failure))?;
     let relational_snapshot = relational_response.snapshot;
-    let relational_rows = crate::chironql_exec::qualify_pipeline_rows(
-        &pipeline.relational_alias,
-        crate::chironql_exec::sql_execution_admitted(relational_response, query_id, &mut memory)?,
-        None,
-        &mut memory,
-    )?;
+    let rel =
+        crate::chironql_exec::sql_execution_admitted(relational_response, query_id, &mut memory)?;
+    let relational_rows =
+        crate::chironql_exec::temporal::relational_seed(pipeline, rel, &mut memory)?;
     let mut trace = QueryTrace {
         query_id: query_id.into(),
         stages: Vec::new(),
+    };
+    let temporal_rows = if let Some(ctx) = temporal_context.as_ref() {
+        crate::chironql_exec::temporal::stage_rows(
+            db,
+            chirondb_core::db::temporal::TemporalAccess::Authorized(ctx),
+            pipeline,
+            [
+                vector_rows
+                    .as_ref()
+                    .map(|r| (pipeline.vector_alias.as_str(), r)),
+                pipeline
+                    .graph
+                    .as_ref()
+                    .zip(graph_rows.as_ref())
+                    .map(|(g, r)| (g.alias.as_str(), r)),
+                Some((&pipeline.relational_alias, &relational_rows)),
+            ],
+            query_id,
+            &mut memory,
+            |e| map_error(query_id, e),
+        )?
+    } else {
+        None
     };
     let mut result = crate::chironql_exec::assemble_pipeline_response(
         pipeline,
         vector_rows,
         graph_rows,
         relational_rows,
+        temporal_rows,
         query_id,
         &mut trace,
         crate::rbac::Role::ReadOnly,
@@ -738,15 +824,16 @@ fn execute_pipeline(
     {
         return Err(error(query_id, "security.conflict"));
     }
-    result.domains = if pipeline.graph.is_some() {
-        vec![
-            ExecutionDomain::Relational,
-            ExecutionDomain::Vector,
-            ExecutionDomain::Graph,
-        ]
-    } else {
-        vec![ExecutionDomain::Relational, ExecutionDomain::Vector]
-    };
+    result.domains = vec![ExecutionDomain::Relational];
+    if vector_context.is_some() {
+        result.domains.push(ExecutionDomain::Vector);
+    }
+    if graph_context.is_some() {
+        result.domains.push(ExecutionDomain::Graph);
+    }
+    if temporal_context.is_some() {
+        result.domains.push(ExecutionDomain::Temporal);
+    }
     result.snapshot_id = Some(format!(
         "multimodel:{frontier}:relational:{relational_snapshot}"
     ));
@@ -754,14 +841,20 @@ fn execute_pipeline(
     if request.trace {
         result.trace = Some(trace);
     }
-    let mut contexts = vec![vector_context];
+    let mut contexts = Vec::new();
+    contexts.extend(vector_context);
+    contexts.extend(temporal_context);
     contexts.extend(graph_context);
     contexts.extend(sql_reference);
     memory
         .metadata(&result)
         .map_err(|e| receiving::error(query_id, e))?;
     Ok(Output::Query(
-        PublicationGuard::Multi(contexts),
+        if pipeline.temporal.is_some() {
+            PublicationGuard::TemporalPipeline(contexts, snapshot)
+        } else {
+            PublicationGuard::Multi(contexts)
+        },
         QueryResult::new(result, memory),
     ))
 }
@@ -1875,3 +1968,6 @@ pub(crate) mod tests {
 #[cfg(test)]
 #[path = "chironql_protected/atomic_insert_tests.rs"]
 mod atomic_insert_tests;
+
+#[cfg(test)]
+mod temporal_tests;

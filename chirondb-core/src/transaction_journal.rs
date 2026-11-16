@@ -35,6 +35,7 @@ pub use idempotency::{
     IdempotencyAdmission, IdempotencyGuard, IdempotencyReceipt, IdempotencyRecord,
 };
 pub(crate) use projection::StorageTarget;
+pub(crate) use recovery::retained_collection_was_dropped;
 pub(crate) use recovery::{CatalogChange, RecoveryDecision};
 pub use scan::{CommittedTransactions, CommittedTransactionsIter};
 const IDEMPOTENT_JOURNAL_VERSION: u16 = 2;

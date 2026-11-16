@@ -638,15 +638,6 @@ async fn async_main() -> anyhow::Result<()> {
         chirondb::storage_layout::initialize_empty(&config.data_dir)
             .context("secure mode requires generation-based storage")?;
     }
-    if secure_profile {
-        chirondb::encryption::verify_tree(
-            encryption_keyring
-                .as_ref()
-                .expect("secure profile validation requires a keyring"),
-            &config.data_dir,
-        )
-        .context("secure startup refused plaintext or invalid encrypted persistence")?;
-    }
     if let Some(keyring) = encryption_keyring {
         install_process_keyring(keyring, secure_profile)
             .context("failed to install encryption keyring")?;

@@ -725,3 +725,31 @@ async fn console_and_http_agree_on_rejects() {
 
     server.abort();
 }
+
+#[path = "common/temporal.rs"]
+mod temporal_case;
+
+#[tokio::test]
+async fn temporal_console_and_http_return_exact_history() {
+    let h = Harness::start().await;
+    let tmp = TempDir::new().unwrap();
+    let mut console = LocalSink::new(seeded_db(tmp.path()), Role::Admin);
+    for (idx, s) in temporal_case::statements(COLLECTION).iter().enumerate() {
+        let local = console.execute(s, traced()).unwrap();
+        let (status, body) = h.query(json!({"query":s})).await;
+        assert!(status.is_success(), "{body}");
+        let expected = temporal_case::rows(COLLECTION, idx);
+        assert_eq!(local.rows, expected);
+        assert_eq!(
+            body["rows"].as_array().map_or(&[][..], Vec::as_slice),
+            expected.as_slice()
+        );
+    }
+    let bad = temporal_case::statements(COLLECTION)[1]
+        .replace("1700000000000000002", "9223372036854775808");
+    let local = console.execute(&bad, traced()).unwrap_err();
+    let (status, body) = h.query(json!({"query":bad})).await;
+    assert!(!status.is_success());
+    assert_eq!(local.code, "chironql.invalid_timestamp");
+    assert_eq!(body["code"], local.code);
+}

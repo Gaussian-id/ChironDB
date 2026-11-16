@@ -21,6 +21,56 @@ fn point(id: &str, text: &str, tenant: &str) -> Point {
 type Ranking = Vec<(String, f32)>;
 
 #[test]
+fn graph_upserts_publish_text_statistics_once_and_preserve_recovery_rankings() {
+    let root = TempDir::new().unwrap();
+    let reference_root = TempDir::new().unwrap();
+    let db = Db::open(root.path()).unwrap();
+    let reference = Db::open(reference_root.path()).unwrap();
+    for engine in [&db, &reference] {
+        engine
+            .create_collection(
+                serde_json::from_value(json!({"name":"docs","vector_dim":2})).unwrap(),
+            )
+            .unwrap();
+    }
+    db.set_graph_lifecycle_scoped("docs", true, true, &TenantScope::system())
+        .unwrap();
+    for engine in [&db, &reference] {
+        engine
+            .upsert(
+                "docs",
+                vec![
+                    point("a1", "refund refund", "a"),
+                    point("a2", "policy", "a"),
+                    point("b1", "refund policy delivery", "b"),
+                ],
+            )
+            .unwrap();
+        engine.set_tenant_enforcement(crate::TenantEnforcement::Enforced);
+    }
+    assert_eq!(signature(&db), signature(&reference));
+    for engine in [&db, &reference] {
+        engine
+            .upsert_scoped(
+                "docs",
+                vec![
+                    point("a1", "superseded", "a"),
+                    point("a1", "refund policy policy", "a"),
+                ],
+                true,
+                &TenantScope::tenant("alice", "a"),
+            )
+            .unwrap();
+    }
+    let expected = signature(&reference);
+    assert_eq!(signature(&db), expected);
+    drop(db);
+    let reopened = Db::open(root.path()).unwrap();
+    reopened.set_tenant_enforcement(crate::TenantEnforcement::Enforced);
+    assert_eq!(signature(&reopened), expected);
+}
+
+#[test]
 fn replicated_mutations_and_background_seal_preserve_text_statistics() {
     let root = TempDir::new().unwrap();
     let db = Db::open(root.path()).unwrap();

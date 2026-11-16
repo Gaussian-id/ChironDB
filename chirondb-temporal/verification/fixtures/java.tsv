@@ -1,0 +1,70 @@
+range -11 -6 -10 -10 All
+range 0 5 -10 -10 Skip
+range 5 10 -10 -10 Skip
+range 10 15 -10 -10 Skip
+range 20 25 -10 -10 Skip
+range -11 -6 -10 -5 Partial
+range 0 5 -10 -5 Skip
+range 5 10 -10 -5 Skip
+range 10 15 -10 -5 Skip
+range 20 25 -10 -5 Skip
+range -11 -6 -10 0 Partial
+range 0 5 -10 0 Partial
+range 5 10 -10 0 Skip
+range 10 15 -10 0 Skip
+range 20 25 -10 0 Skip
+range -11 -6 0 0 Skip
+range 0 5 0 0 All
+range 5 10 0 0 Skip
+range 10 15 0 0 Skip
+range 20 25 0 0 Skip
+range -11 -6 0 5 Skip
+range 0 5 0 5 Partial
+range 5 10 0 5 Partial
+range 10 15 0 5 Skip
+range 20 25 0 5 Skip
+range -11 -6 0 10 Skip
+range 0 5 0 10 Partial
+range 5 10 0 10 Partial
+range 10 15 0 10 Partial
+range 20 25 0 10 Skip
+range -11 -6 5 5 Skip
+range 0 5 5 5 Skip
+range 5 10 5 5 All
+range 10 15 5 5 Skip
+range 20 25 5 5 Skip
+range -11 -6 5 10 Skip
+range 0 5 5 10 Skip
+range 5 10 5 10 Partial
+range 10 15 5 10 Partial
+range 20 25 5 10 Skip
+range -11 -6 5 15 Skip
+range 0 5 5 15 Skip
+range 5 10 5 15 Partial
+range 10 15 5 15 Partial
+range 20 25 5 15 Skip
+range -11 -6 10 10 Skip
+range 0 5 10 10 Skip
+range 5 10 10 10 Skip
+range 10 15 10 10 All
+range 20 25 10 10 Skip
+range -11 -6 10 15 Skip
+range 0 5 10 15 Skip
+range 5 10 10 15 Skip
+range 10 15 10 15 Partial
+range 20 25 10 15 Skip
+range -11 -6 10 20 Skip
+range 0 5 10 20 Skip
+range 5 10 10 20 Skip
+range 10 15 10 20 Partial
+range 20 25 10 20 Partial
+latest DOUBLE empty -9223372036854775808 empty
+latest DOUBLE -10,0,8 8 4008000000000000
+latest DOUBLE 8,0,-10 8 3ff0000000000000
+latest DOUBLE 1,7,-2,3 7 4000000000000000
+latest DOUBLE -9223372036854775808 -9223372036854775808 0
+latest BOOLEAN empty -9223372036854775808 empty
+latest BOOLEAN -10,0,8 8 1
+latest BOOLEAN 8,0,-10 8 1
+latest BOOLEAN 1,7,-2,3 7 0
+latest BOOLEAN -9223372036854775808 -9223372036854775808 0

@@ -113,6 +113,9 @@ jobs:
         shell: bash
         run: cargo build --release --locked --bins --target ${{ matrix.target }} -j 2
 
+      - name: Native binary startup and durable restart
+        run: python3 .github/tools/smoke_binary.py --bin-dir "target/${{ matrix.target }}/release"
+
   required-platforms:
     name: required-platforms
     if: always()

@@ -1241,8 +1241,9 @@ impl RelationalEngine {
     ) -> Result<RelationalExecution> {
         let _admission = SQL_ADMISSION.acquire()?;
         check_sql_cancelled()?;
+        let read_only = Self::request_is_read_only(&request)?;
         let idempotency = if let Some(key) = request.idempotency_key.as_deref() {
-            if Self::request_is_read_only(&request)? {
+            if read_only {
                 return Err(invalid("idempotency_key requires a mutating SQL request"));
             }
             match self.journal.begin_idempotent(
@@ -1261,6 +1262,9 @@ impl RelationalEngine {
             None
         };
         self.collect_mvcc_garbage()?;
+        if !read_only {
+            self.wait_for_checkpoint_headroom()?;
+        }
         let statement_count = request.statements.len();
         let retry_id = request.retry_id.clone();
         let base = self.state.read().clone();

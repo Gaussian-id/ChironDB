@@ -26,10 +26,15 @@ with resource owner `Gaussian-id`, repository access limited to `chirondb-rust`,
 `chirondb-py`, and `chirondb-js`, and repository permission **Contents: read**.
 Choose an expiration and complete organization approval when required.
 
-Store the value as the Actions repository secret `SDK_REPOS_READ_TOKEN` in both
-[gauss-db settings](https://github.com/Gaussian-id/gauss-db/settings/secrets/actions)
-and [ChironDB settings](https://github.com/Gaussian-id/ChironDB/settings/secrets/actions),
+Store the value as the Actions repository secret `SDK_REPOS_READ_TOKEN` in
+[ChironDB settings](https://github.com/Gaussian-id/ChironDB/settings/secrets/actions),
 using **New repository secret**. An organization secret with that same name and
-access to both server repositories also works. See
+access to this repository also works. See
 [GitHub's secret setup](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets).
 The workflow already limits authenticated jobs to trusted repository code.
+
+The Node pin includes the published `@gaussian-id/chirondb` beta.3 scope and
+package consumer checks. SDK and server version numbers are independent.
+Unreleased SDK batch helpers and early-stage temporal decoder changes must be
+qualified and committed in their SDK repositories before advancing these pins.
+The public fixture does not certify ChironQL 1.5 time series.

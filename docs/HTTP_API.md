@@ -1,5 +1,7 @@
 # ChironDB HTTP API
 
+ChironQL 1.5 supports durable sensor batches and event-time history on the existing query interface. Exact nanosecond timestamps travel as decimal strings. [Time series examples](CHIRONQL.md#time-series-chironql-15)
+
 Protected user/role/key syntax, every statement example, revision semantics and
 working TLS/API recipes: [ChironQL security reference](CHIRONQL_SECURITY.md).
 
@@ -424,6 +426,20 @@ error. COMMIT freezes the statement set; a later EXECUTE cannot append to that d
 A racing COMMIT and ROLLBACK have one winning terminal operation. Expired idle handles release
 their snapshot pins during subsequent SQL, transaction-handle or checkpoint activity; an
 executing operation is not expired mid-statement.
+
+The isolation level is **snapshot isolation**: a transaction reads its starting
+snapshot plus its own writes. Other transactions cannot read its uncommitted
+writes. Concurrent changes to the same row conflict at commit; disjoint row
+writes can both commit after revalidation of declared constraints. This does
+not provide serializable isolation: two transactions can read the same
+cross-row condition and change different rows, causing write skew. Applications
+must coordinate those decisions or express the invariant with supported
+database constraints. No serializable mode is exposed.
+
+Atomicity covers one SQL request/transaction and the supported SQL/vector/graph
+ChironQL transaction block. Time-series APPEND is atomic within its own batch;
+it cannot join that transaction block or an interactive SQL handle. Separate
+requests across those boundaries are separate commits.
 
 BEGIN returns `transaction_id` equal to the session `handle`; save it before
 sending COMMIT. Execute responses carry that reserved ID without claiming a
@@ -999,6 +1015,40 @@ replaces the complete property document. `DELETE` removes the edge and takes
 `wait` as a query parameter. All edge mutations require a write-capable role
 plus `graph:write`.
 
+Create several edges atomically with
+`POST /v1/collections/{name}/edges/batch` (also `/collections/{name}/edges/batch`):
+
+```bash
+curl --fail http://127.0.0.1:7401/v1/collections/products/edges/batch \
+  -H "Authorization: Bearer $CHIRONDB_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"edges":[{"source_point_id":"phone","target_point_id":"book","edge_type":"related_to","properties":{"source":"catalog"}}],"idempotency_key":"catalog-edges-1","wait":true}'
+```
+
+The response contains `edge_ids` in input order and one `receipt`. A request
+accepts 1–4,096 edges within the existing 16 MiB GraphBatch limit; HTTP body and
+process admission limits also apply. Every endpoint, type and tenant scope is
+validated before publishing any edge. The batch has one commit decision and
+requires the same graph write capability as single-edge creation. Per-edge
+idempotency keys are rejected; supply one batch key. Replaying the same key and
+payload under the same principal/tenant returns the original IDs with
+`receipt.replayed:true`; a changed payload is rejected. Retain the key and
+payload for ambiguous responses. The transaction journal retains batch receipts
+through edge deletion, compaction and restart; replay returns the prior IDs
+without recreating deleted edges. Current namespace permissions are rechecked.
+Batch receipts expire after 24 hours; their keys remain consumed and reject
+rather than silently creating another batch.
+
+The existing `wait`/durable-decision contract applies. A legacy `wait:false`
+request returns `202`, while its commit decision is still durable. Protected
+installations retain their existing ChironQL mutation surface. For bounded
+JSONL loading and restart reconciliation, see [bulk loading](BULK_LOADING.md).
+
+`GET /v1/collections/{name}/index_status` reports background index builds and
+segment sealing through `build_in_flight`. Wait for it to become false and
+verify application queries before serving loaded data. Small collections can
+use exact live search while `indexed_points` is below `total_points`.
+
 Traverse with one bounded request:
 
 ```bash
@@ -1124,6 +1174,13 @@ without a fused result.
 
 ### Create and restore a snapshot
 
+New snapshots use deterministic configuration checksums in marker version 3.
+Existing v1/v2 snapshots retain strict validation; ambiguous legacy map checksums
+can be verified against their retained transaction journal and converted into a
+separate copy with `chironctl security convert-snapshot`. See
+[snapshot compatibility and conversion](SNAPSHOTS.md) before upgrading readers
+or restoring an older backup. Existing live-data formats are unchanged.
+
 Snapshots are disabled until a root is configured. Stop the source-built
 server, then restart the same database with a separate backup directory:
 
@@ -1235,8 +1292,7 @@ API. Delete requires a write-capable API key. ML routes return 403 while
 tenant enforcement is active; this preview does not expose predictions through
 the protected tenant executor.
 
-ChironQL 1.4 is ChironDB's unified vector, graph, and native relational query
-language: one statement per request. The full language reference is
+ChironQL 1.5 supports vector, graph, relational and time-series queries. Send one statement per request. The full language reference is
 [CHIRONQL.md](CHIRONQL.md).
 
 ```bash
@@ -1407,7 +1463,7 @@ curl --fail -X POST http://127.0.0.1:7401/v1/chironql/parse \
 ```
 
 ```json
-{"ok": true, "language_version": "1.4", "kind": "write", "class": "write", "statement": "DELETE", "domains": ["vector"], "resources": {"tables": [], "collections": ["products"]}}
+{"ok": true, "language_version": "1.5", "kind": "write", "class": "write", "statement": "DELETE", "domains": ["vector"], "resources": {"tables": [], "collections": ["products"]}}
 ```
 
 `kind` classifies the statement. Collection DDL — `CREATE COLLECTION` and
@@ -1441,6 +1497,7 @@ Every path below is also served without the `/v1` prefix during the beta.
 | `GET` | `/v1/collections/{name}/graph/types` | List edge types |
 | `PUT` | `/v1/collections/{name}/graph/types/{type}` | Configure an edge type |
 | `POST` | `/v1/collections/{name}/edges` | Create an edge |
+| `POST` | `/v1/collections/{name}/edges/batch` | Atomically create ordered edges |
 | `PATCH`, `PUT`, `DELETE` | `/v1/collections/{name}/edges/{edge_id}` | Merge/replace properties or remove an edge |
 | `POST` | `/v1/collections/{name}/graph/traverse` | Run bounded exact traversal |
 | `POST` | `/v1/collections/{name}/graph/deferred-sessions` | Open a deferred endpoint session |

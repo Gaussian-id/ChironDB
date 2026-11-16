@@ -10,13 +10,13 @@ COPY . .
 RUN --mount=type=cache,id=chirondb-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
     --mount=type=cache,id=chirondb-cargo-git-${TARGETARCH},target=/usr/local/cargo/git \
     --mount=type=cache,id=chirondb-target-${TARGETARCH},target=/app/target,sharing=locked \
-    cargo clean -p chirondb -p chirondb-core -p chirondb-types \
+    cargo clean --release -p chirondb -p chirondb-core -p chirondb-types -p chirondb-temporal \
     && cargo build --release --locked -p chirondb --features jemalloc --bins --jobs 1 \
     && mkdir -p /app/release \
     && for bin in chirondb chironql chironmcp chironctl chironbench chirondrill chironrecall chirongrpcctl chironwirectl gaussdb gaussctl gaussbench gaussdrill gaussrecall gaussgrpcctl gausswirectl; do cp "target/release/$bin" /app/release/; done
 
 FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
-ARG CHIRONDB_VERSION=0.1.0-beta.2
+ARG CHIRONDB_VERSION=0.1.0-beta.3
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.title="ChironDB" \
       org.opencontainers.image.description="ChironDB public beta vector database" \
@@ -33,7 +33,10 @@ RUN mkdir -p /etc/chirondb/secrets /run/chirondb-bootstrap \
     && chown 10001:10001 /etc/chirondb/secrets /run/chirondb-bootstrap \
     && chmod 0700 /etc/chirondb/secrets /run/chirondb-bootstrap
 COPY --from=build /app/release/ /usr/local/bin/
-COPY LICENSE LICENSE-APACHE-2.0 NOTICE TRADEMARKS.md /usr/share/licenses/chirondb/
+COPY LICENSE NOTICE TRADEMARKS.md /usr/share/licenses/chirondb/
+COPY chirondb-temporal/THIRD_PARTY.md /usr/share/licenses/chirondb/chirondb-temporal/
+COPY chirondb-temporal/licenses/ /usr/share/licenses/chirondb/chirondb-temporal/licenses/
+COPY chirondb-temporal/verification/sources.json /usr/share/licenses/chirondb/chirondb-temporal/verification/
 COPY --chmod=755 deploy/docker-entrypoint.sh /usr/local/bin/chirondb-entrypoint
 USER chirondb
 VOLUME ["/var/lib/chirondb"]

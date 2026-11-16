@@ -1,7 +1,7 @@
 # Getting started with ChironDB
 
 Run ChironDB locally, write your first points, and try dense and hybrid search.
-This guide follows the `0.1.0-beta.2` source tree and uses a small collection of
+This guide follows the `0.1.0-beta.3` source tree and uses a small collection of
 demonstration vectors. Generate real embeddings in your application before
 sending them to ChironDB.
 
@@ -64,7 +64,7 @@ curl --fail --retry 15 --retry-connrefused --retry-delay 1 --retry-max-time 30 \
 Expected response:
 
 ```json
-{"status":"ok","version":"0.1.0-beta.2"}
+{"status":"ok","version":"0.1.0-beta.3"}
 ```
 
 By default, HTTP uses port `7401`, gRPC uses `7402`, and ChironWire plus the
@@ -134,7 +134,7 @@ profile for an externally reachable service. Wait for the health request above
 to succeed; inspect startup with `docker logs chirondb` if needed.
 
 The repository's [Compose file](../docker-compose.yml) instead pulls
-`ghcr.io/gaussian-id/chirondb:0.1.0-beta.2`. Use it only when that image is
+`ghcr.io/gaussian-id/chirondb:0.1.0-beta.3`. Use it only when that image is
 published and accessible to you. Available signed binaries will be listed on
 the [Releases page](https://github.com/Gaussian-id/ChironDB/releases); a source
 version number alone does not mean release artifacts have been published.
@@ -470,6 +470,38 @@ Take a recoverable backup before reopening alpha data with ChironDB. Legacy plai
 metadata remain readable in local compatibility mode. ChironDB and the offline
 migration tools acquire the same exclusive data-directory lock; never run two
 processes against one directory.
+
+A catalogued collection must retain its WAL directory and active segment,
+including a legitimate empty segment after compaction. Startup rejects a
+missing required WAL with its collection/path and backup guidance; do not create
+an empty replacement to silence the error. Restore a verified backup or use an
+operator-reviewed recovery procedure that retains acknowledged data.
+
+Opening a writable WAL upgrades its `wal.base` metadata to `GAUSSWB2`. The
+CRC-protected metadata records both the retained prefix and the last required
+segment; rotation publishes this frontier durably before appending to its
+successor. A missing final segment therefore rejects startup even when earlier
+segments survive. Existing `GAUSSWB1` metadata remains readable, and immutable
+WAL archives retain their original metadata and checksums. A legacy store's
+suffix cannot be reconstructed if it was already lost before this upgrade.
+Older binaries reject `GAUSSWB2`; use a verified pre-upgrade backup for a
+downgrade. Do not delete or replace `wal.base` to bypass that protection.
+
+An interrupted offline key rotation also blocks server startup before recovery
+can modify storage. Keep the old and new keys in the external keyring, retain
+the same active target key, and resume the original command with the server
+stopped:
+
+```bash
+./target/release/chironctl security rotate-key \
+  --data-dir /path/to/gaussdb-data --keyring /run/secrets/chirondb/keyring.json
+```
+
+Run `security verify-encryption` afterward. Retire the old key only after all
+local references and independently configured external archives/cold storage
+have been verified. Startup reclaims recognized unpublished atomic-write
+temporary files under its exclusive lock; corruption in authoritative files
+continues to reject startup.
 
 Encrypted generation storage is an explicit offline migration. First pause
 application writes and compact **every collection** while the plaintext server

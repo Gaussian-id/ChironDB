@@ -1,14 +1,13 @@
 # ChironDB self-hosted CI runners
 
-The public OSS workflows use GitHub-hosted native runners for the four required
-Linux/macOS architectures. No self-hosted registration is needed for those gates.
-The setup below describes optional self-hosted infrastructure for private workflows
-and operator-managed qualification; it is not the OSS PR runner configuration.
+The required CI/security workflows now use GitHub-hosted native Linux
+x86-64/ARM64 and macOS Intel/ARM64 runners. All four platforms remain required;
+Windows is best-effort. Branch provenance is checked before trusted SDK jobs
+receive `SDK_REPOS_READ_TOKEN`.
 
-The required workflows use two repository runners on one Apple Silicon Mac.
-They execute only repository-owned branches and pull requests. Fork pull
-requests fail the trust-boundary job before any checkout reaches a privileged
-runner.
+The following optional self-hosted setup is retained for controlled local
+qualification. It executes only repository-owned branches and pull requests.
+Do not expose a privileged runner to public fork code.
 
 The runner release is pinned to `actions/runner` 2.337.0. Registration tokens
 are one-time inputs and must never be stored in this repository, shell history,
@@ -31,7 +30,8 @@ The script asks for the token without echoing it or placing it in shell
 history.
 
 The registered labels must include `self-hosted`, `macOS`, `ARM64`, and
-`chirondb-ci`. The x86_64 Darwin matrix uses this same runner through Rosetta.
+`chirondb-ci`. With this optional setup, x86_64 Darwin qualification uses the same host
+through Rosetta.
 
 ## privileged Linux X64 runner
 

@@ -23,4 +23,4 @@ Without written permission from Gaussian-id, do not use a protected mark as the 
 
 Modified versions and derivative distributions must use independent branding. Acceptable descriptions include “Forked from ChironDB,” “Based on ChironDB,” and “Compatible with ChironDB.”
 
-Contact Gaussian-id for permission outside this policy. Policy updates do not reduce permissions granted by AGPL-3.0-only or by historical Apache-2.0 releases.
+Contact Gaussian-id for permission outside this policy. Policy updates do not reduce permissions granted by the software license applicable to a release.

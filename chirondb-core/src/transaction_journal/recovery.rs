@@ -4,6 +4,46 @@
 use super::*;
 use crate::relational::wal_decode;
 
+/// Only a committed lifecycle decision may exempt a stale catalog entry from
+/// the required-WAL preflight. Inspect the retained journal without rebuilding
+/// caches, truncating tails, or opening a replacement collection WAL.
+pub(crate) fn retained_collection_was_dropped(data_dir: &Path, name: &str) -> Result<bool> {
+    TransactionJournal::validate_existing_format(data_dir)?;
+    let mut pending = None;
+    let mut dropped = false;
+    Wal::inspect_recovery_prefix(&data_dir.join(TRANSACTION_JOURNAL_DIR), 0, |record| {
+        match record.entry {
+            WalEntry::TransactionPrepare { prepare }
+                if catalog(&prepare).is_some_and(|(found, _)| found == name) =>
+            {
+                validate_version(prepare.version)?;
+                let (_, created) = catalog(&prepare).expect("matched catalog change");
+                pending = Some((
+                    prepare.transaction_id,
+                    prepare.commit_sequence,
+                    prepare.version,
+                    !created,
+                ));
+            }
+            WalEntry::TransactionCommit { commit } => {
+                if let Some((id, sequence, version, is_drop)) = pending
+                    && commit.transaction_id == id
+                {
+                    validate_version(commit.version)?;
+                    if commit.commit_sequence != sequence || commit.version != version {
+                        return Err(corrupt("catalog lifecycle COMMIT differs from PREPARE"));
+                    }
+                    dropped = is_drop;
+                    pending = None;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    })?;
+    Ok(dropped)
+}
+
 const VERSION: u16 = 1;
 
 #[derive(Debug, Deserialize, Serialize)]

@@ -38,6 +38,7 @@ service ChironDb {
   rpc ListEdgeTypes(ListEdgeTypesRequest) returns (ListEdgeTypesResponse);
   rpc ConfigureEdgeType(ConfigureEdgeTypeRequest) returns (ConfigureEdgeTypeResponse);
   rpc Relate(GraphRelateRequest) returns (GraphRelateResponse);
+  rpc RelateBatch(GraphRelateBatchRequest) returns (GraphRelateBatchResponse);
   rpc Unrelate(GraphUnrelateRequest) returns (GraphUnrelateResponse);
   rpc UpdateEdge(GraphUpdateEdgeRequest) returns (GraphMutationReceipt);
   rpc Traverse(GraphTraverseRequest) returns (GraphTraverseResponse);
@@ -273,6 +274,26 @@ message GraphRelateRequest {
 message GraphRelateResponse {
   // Opaque EdgeId token. Clients must not parse or sort it.
   string edge_id = 1;
+  GraphMutationReceipt receipt = 2;
+}
+
+message GraphRelateBatchEdge {
+  string source_point_id = 1;
+  string target_point_id = 2;
+  string edge_type = 3;
+  string properties_json = 4;
+  string scope = 5;
+}
+
+message GraphRelateBatchRequest {
+  string collection = 1;
+  repeated GraphRelateBatchEdge edges = 2;
+  optional string idempotency_key = 3;
+  bool no_wait = 4;
+}
+
+message GraphRelateBatchResponse {
+  repeated string edge_ids = 1;
   GraphMutationReceipt receipt = 2;
 }
 

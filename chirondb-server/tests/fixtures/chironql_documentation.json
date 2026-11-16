@@ -1,5 +1,5 @@
 {
-  "language": "1.4",
+  "language": "1.5",
   "examples": [
     {
       "id": "current-user",
@@ -1459,6 +1459,69 @@
       "section": "Traditional ML evaluation",
       "description": "Parse optional Decision Tree regression syntax; ML execution requires an unprotected installation and a separately provisioned worker.",
       "sql": "ML MATERIALIZE demo_regression FROM ml_demo TARGET amount FEATURES (price) TASK REGRESSION USING DECISION_TREE;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "temporal-Append",
+      "variant": "base:TemporalAppend",
+      "section": "ChironQL 1.5 temporal",
+      "description": "Append a batch",
+      "sql": "APPEND INTO armada [\n  {asset: 'truk-7', property: 'suhu', time_ns: '1700000000000000000', value: 24.5},\n  {asset: 'truk-7', property: 'suhu', time_ns: '1700000000000000001', value: 25.0}\n];",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "temporal-History",
+      "variant": "base:TemporalRead",
+      "section": "ChironQL 1.5 temporal",
+      "description": "Read event history",
+      "sql": "HISTORY armada ASSET 'truk-7' PROPERTY 'suhu'\n  FROM '1700000000000000000' TO '1700000000000000002' LIMIT 100;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "temporal-Latest",
+      "variant": "base:TemporalRead",
+      "section": "ChironQL 1.5 temporal",
+      "description": "Read newest event",
+      "sql": "LATEST armada ASSET 'truk-7' PROPERTY 'suhu';",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "temporal-Pipeline",
+      "variant": "base:Pipeline",
+      "section": "ChironQL 1.5 temporal",
+      "description": "Select trucks from SQL",
+      "sql": "PIPELINE\nRELATIONAL r { SQL SELECT id FROM trucks LIMIT 2 }\nTEMPORAL t { HISTORY armada ASSET r.record_ref PROPERTY 'suhu' FROM '1700000000000000000' TO '1700000000000000002' LIMIT 2 }\nLEFT JOIN t ON t.asset_ref = r.record_ref\nRETURN r.id,t.time_ns,t.value\nORDER BY r.id ASC\nLIMIT 8;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "temporal-RejectNumericTime",
+      "variant": "base:RejectNumericTime",
+      "section": "ChironQL 1.5 temporal",
+      "description": "Require exact signed timestamp strings",
+      "sql": "HISTORY armada ASSET 'a' PROPERTY 'p' FROM 1700000000000000000 TO '2' LIMIT 1;",
+      "mode": "reject",
+      "actor": "admin"
+    },
+    {
+      "id": "action-temporal_read",
+      "variant": "RolePrivileges",
+      "section": "Action vocabulary",
+      "description": "Grant access to temporal observations in this collection.",
+      "sql": "GRANT TEMPORAL_READ ON COLLECTION docs TO ROLE operations;",
+      "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "action-temporal_append",
+      "variant": "RolePrivileges",
+      "section": "Action vocabulary",
+      "description": "Grant access to temporal observations in this collection.",
+      "sql": "GRANT TEMPORAL_APPEND ON COLLECTION docs TO ROLE operations;",
       "mode": "syntax",
       "actor": "admin"
     }

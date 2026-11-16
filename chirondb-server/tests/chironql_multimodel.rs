@@ -626,3 +626,42 @@ fn native_multimodel_fingerprint_ignores_named_vector_map_order() {
         first = Some(response.sql.transaction_id);
     }
 }
+
+#[test]
+fn temporal_history_of_graph_selected_asset_matches_direct_history() {
+    let (_dir, db) = fixture();
+    let exec = |s: &str| run(&db, Role::Admin, s, Vec::new());
+    exec(
+        "APPEND INTO chunks [{asset:'child',property:'temp',time_ns:'12',value:false},{asset:'child',property:'temp',time_ns:'11',value:true}];",
+    );
+    let direct = exec("HISTORY chunks ASSET 'child' PROPERTY 'temp' FROM '0' TO '20' LIMIT 2;");
+    let rows = exec(
+        "PIPELINE
+VECTOR v { SEARCH chunks NEAR [1,0] LIMIT 1 }
+GRAPH g { TRAVERSE chunks FROM v.record_ref VIA CITES DEPTH 1 RETURN NODES LIMIT 2 }
+RELATIONAL r { SQL SELECT chunk_ref,source_ref FROM documents LIMIT 1 }
+TEMPORAL t { HISTORY chunks ASSET g.record_ref PROPERTY 'temp' FROM '0' TO '20' LIMIT 2 }
+INNER JOIN r ON r.chunk_ref = v.record_ref
+INNER JOIN g ON g.record_ref = r.source_ref
+INNER JOIN t ON t.asset_ref = g.record_ref
+RETURN t.time_ns,t.value
+LIMIT 2;",
+    );
+    assert_eq!(
+        rows.rows,
+        direct
+            .rows
+            .iter()
+            .map(|r| json!({"time_ns":r["time_ns"],"value":r["value"]}))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        rows.domains,
+        [
+            ExecutionDomain::Relational,
+            ExecutionDomain::Vector,
+            ExecutionDomain::Graph,
+            ExecutionDomain::Temporal
+        ]
+    );
+}

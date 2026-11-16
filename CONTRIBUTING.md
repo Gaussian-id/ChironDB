@@ -50,7 +50,7 @@ request and avoid unrelated cleanup.
 | `chirondb-core/` | Storage, indexes, search, recovery, and the shared engine |
 | `chirondb-server/` | HTTP, gRPC, ChironWire, ChironQL, authentication, and CLI tools |
 | `chirondb-ui-server/` | Preview UI backend |
-| `clients/` | Python and Rust clients, including compatibility facades |
+| `sdk-integration/` | Compatibility tests for the independently versioned Rust, Python and JavaScript SDKs; see [SDK setup](docs/SDKS.md) |
 | `proto/` | Versioned RPC schemas and retained compatibility messages |
 | `docs/` | Public usage documentation |
 

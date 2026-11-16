@@ -21,6 +21,8 @@ pub enum Action {
     Ingest,
     Update,
     Delete,
+    TemporalRead,
+    TemporalAppend,
     GraphRead,
     GraphWrite,
     Traverse,
@@ -52,6 +54,8 @@ impl Action {
                 | Self::Ingest
                 | Self::Update
                 | Self::Delete
+                | Self::TemporalRead
+                | Self::TemporalAppend
                 | Self::GraphRead
                 | Self::GraphWrite
                 | Self::Traverse

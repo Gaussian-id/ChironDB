@@ -1223,13 +1223,13 @@ fn dispatch_request_inner(
             Status::permission_denied("operation is not permitted"),
         );
     }
+    let graph_capability = if matches!(operation, wire_request::Operation::RelateBatch(_)) {
+        crate::graph::GraphCapability::Write
+    } else {
+        crate::graph::GraphCapability::Read
+    };
     if let Some(graph_collection) = wire_graph_collection(operation)
-        && authorize_graph(
-            &principal,
-            crate::graph::GraphCapability::Read,
-            graph_collection,
-        )
-        .is_err()
+        && authorize_graph(&principal, graph_capability, graph_collection).is_err()
     {
         if db
             .audit_access_event(
@@ -1249,7 +1249,7 @@ fn dispatch_request_inner(
         }
         return error_response(
             request_id,
-            graph_permission_denied_status(crate::graph::GraphCapability::Read, graph_collection),
+            graph_permission_denied_status(graph_capability, graph_collection),
         );
     }
     if !auth.allows_principal_request(&principal) {
@@ -1331,6 +1331,7 @@ fn wire_policy(operation: &wire_request::Operation) -> (Action, Option<&str>) {
             (Action::Admin, Some(&request.collection))
         }
         wire_request::Operation::Upsert(request) => (Action::Write, Some(&request.collection)),
+        wire_request::Operation::RelateBatch(request) => (Action::Write, Some(&request.collection)),
         wire_request::Operation::Delete(request) => (Action::Write, Some(&request.collection)),
         wire_request::Operation::Search(request) => (Action::Read, Some(&request.collection)),
         wire_request::Operation::HybridSearch(request) => (Action::Read, Some(&request.collection)),
@@ -1366,6 +1367,7 @@ fn wire_policy(operation: &wire_request::Operation) -> (Action, Option<&str>) {
 /// constraint fields still require the same explicit graph read grant.
 fn wire_graph_collection(operation: &wire_request::Operation) -> Option<&str> {
     match operation {
+        wire_request::Operation::RelateBatch(request) => Some(&request.collection),
         wire_request::Operation::Search(request)
             if request.query.as_ref().is_some_and(|query| {
                 query
@@ -1775,6 +1777,20 @@ fn dispatch_operation(
                     })
                 })
                 .map_err(grpc::status_from_error)
+        }
+        wire_request::Operation::RelateBatch(request) => {
+            let batch =
+                serde_json::from_str::<crate::graph::RelateBatchRequest>(&request.request_json)
+                    .map_err(|_| Status::invalid_argument("invalid relation batch request_json"))?;
+            let scope = principal.tenant_scope(principal.id.clone());
+            let result = db
+                .relate_batch_scoped(&request.collection, batch, !request.no_wait, &scope)
+                .map_err(grpc::status_from_error)?;
+            let (response_json, admission) = crate::response_output::wire_json(&result)?;
+            *output_admission = Some(admission);
+            Ok(wire_response::Payload::RelateBatch(
+                pb::WireGraphRelateBatchResponse { response_json },
+            ))
         }
         wire_request::Operation::ShardMove(_) => {
             db.audit_admin_event(

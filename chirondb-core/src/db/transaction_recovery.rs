@@ -422,6 +422,10 @@ pub(super) fn materialize_suffix(
             match &prepare.target {
                 TransactionTarget::Collection { name } => {
                     if !incarnations.retired(name, prepare.commit_sequence)? {
+                        super::temporal::prepare_restore_checkpoint(
+                            &collection_dir(root, name),
+                            prepare.mutation.as_ref(),
+                        )?;
                         project(
                             crate::transaction_journal::StorageTarget::Collection(name),
                             collection_dir(root, name).join("wal"),

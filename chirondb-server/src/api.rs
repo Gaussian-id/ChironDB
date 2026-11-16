@@ -31,7 +31,7 @@ use std::collections::HashSet;
 use chirondb_types::chironql::{ChironQlError, ChironQlRequest};
 use chirondb_types::graph::{
     ConfigureEdgeTypeRequest, EdgePropertyMode, EdgeToken, GraphCapability, GraphDeferredSessionId,
-    GraphTraversalQueryRequest, RelateRequest, UpdateEdgeRequest,
+    GraphTraversalQueryRequest, RelateBatchRequest, RelateRequest, UpdateEdgeRequest,
 };
 
 use crate::{
@@ -171,6 +171,10 @@ fn protected_routes() -> Router<AppState> {
             post(abort_graph_deferred_session),
         )
         .route("/collections/{collection}/edges", post(relate_graph))
+        .route(
+            "/collections/{collection}/edges/batch",
+            post(relate_graph_batch),
+        )
         .route(
             "/collections/{collection}/edges/{edge_id}",
             delete(unrelate_graph)
@@ -814,6 +818,14 @@ struct GraphRelateBody {
 }
 
 #[derive(Debug, serde::Deserialize)]
+struct GraphRelateBatchBody {
+    #[serde(flatten)]
+    request: RelateBatchRequest,
+    #[serde(default = "default_graph_wait")]
+    wait: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct GraphEdgePropertiesBody {
     #[serde(default)]
     properties: serde_json::Value,
@@ -937,6 +949,27 @@ async fn relate_graph(
         .db
         .relate_scoped(&collection, body.request, body.wait, &scope)?;
     Ok((graph_mutation_status(body.wait), Json(result)))
+}
+
+async fn relate_graph_batch(
+    State(state): State<AppState>,
+    Extension(perm): Extension<Permission>,
+    Path(collection): Path<String>,
+    work: Option<Extension<Arc<crate::auth::WorkPermit>>>,
+    Json(body): Json<GraphRelateBatchBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_graph_capability(&state.db, &perm, GraphCapability::Write, &collection)?;
+    let scope = perm.tenant_scope(perm.id.clone());
+    let wait = body.wait;
+    let db = state.db.clone();
+    let result = run_blocking(move || {
+        // Blocking commits continue after an HTTP disconnect. Admission must
+        // cover that work until it finishes, including an ambiguous ACK.
+        let _work = work;
+        db.relate_batch_scoped(&collection, body.request, wait, &scope)
+    })
+    .await?;
+    Ok((graph_mutation_status(wait), Json(result)))
 }
 
 async fn unrelate_graph(

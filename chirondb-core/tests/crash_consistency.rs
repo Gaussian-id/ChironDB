@@ -18,7 +18,7 @@ use chirondb_core::{
     fs_util,
     graph::{
         ConfigureEdgeTypeRequest, GraphDirection, GraphRelationScope, GraphTraverseRequest,
-        RelateRequest, TraversalBudget,
+        RelateBatchRequest, RelateRequest, TraversalBudget,
     },
     storage_layout,
     tenant::TenantScope,
@@ -26,6 +26,277 @@ use chirondb_core::{
 use serde_json::json;
 
 const CHILD_MODE: &str = "CHIRONDB_CRASH_CHILD_MODE";
+
+#[cfg(unix)]
+#[test]
+#[ignore = "release qualification: 1000 physical SIGKILL/reopen cycles per encryption mode"]
+fn release_recovery_campaign_checks_acknowledged_sql_vector_and_graph() {
+    const TEST: &str = "release_recovery_campaign_checks_acknowledged_sql_vector_and_graph";
+    if std::env::var_os(CHILD_MODE).is_some() {
+        let data = required_path("CHIRONDB_DATA_DIR");
+        if std::env::var("CHIRONDB_CAMPAIGN_ENCRYPTED").unwrap() == "true" {
+            encryption::install_process_keyring(
+                Keyring::load(required_path("CHIRONDB_KEYRING")).unwrap(),
+                true,
+            )
+            .unwrap();
+        }
+        if child_mode("campaign-init") {
+            storage_layout::initialize_empty(&data).unwrap();
+            let db = Db::open(&data).unwrap();
+            db.create_collection(collection_config()).unwrap();
+            let scope = TenantScope::tenant("restore-writer", "acme");
+            db.set_graph_lifecycle_scoped("docs", true, true, &scope)
+                .unwrap();
+            db.configure_edge_type_scoped(
+                "docs",
+                ConfigureEdgeTypeRequest {
+                    name: "cites".into(),
+                    weight_property: None,
+                },
+                true,
+                &scope,
+            )
+            .unwrap();
+            restore_sql(&db, "CREATE TABLE documents (id BIGINT PRIMARY KEY)");
+            restore_knowledge(&db, 1);
+            let batch = db
+                .relate_batch_scoped(
+                    "docs",
+                    campaign_edges(false),
+                    true,
+                    &TenantScope::tenant("restore-writer", "acme"),
+                )
+                .unwrap();
+            assert!(batch.receipt.durable);
+            fs::write(
+                required_path("CHIRONDB_CAMPAIGN_ACKS"),
+                serde_json::to_vec(&batch.edge_ids).unwrap(),
+            )
+            .unwrap();
+            db.flush_wals().unwrap();
+        } else {
+            let db = Db::open(&data).unwrap();
+            assert_restored_knowledge(&db, &[1]);
+            if child_mode("campaign-work") {
+                db.relate_batch_scoped(
+                    "docs",
+                    campaign_edges(true),
+                    true,
+                    &TenantScope::tenant("restore-writer", "acme"),
+                )
+                .unwrap();
+            } else {
+                let acked: Vec<chirondb_core::graph::EdgeToken> = serde_json::from_slice(
+                    &fs::read(required_path("CHIRONDB_CAMPAIGN_ACKS")).unwrap(),
+                )
+                .unwrap();
+                let replay = db
+                    .relate_batch_scoped(
+                        "docs",
+                        campaign_edges(false),
+                        true,
+                        &TenantScope::tenant("restore-writer", "acme"),
+                    )
+                    .unwrap();
+                assert!(replay.receipt.replayed);
+                assert_eq!(replay.edge_ids, acked);
+                let query = serde_json::from_value(json!({
+                    "anchors": ["document-1"], "edge_types": ["cites"], "direction": "outgoing", "returns": "edges", "with_payload": true,
+                    "budget": TraversalBudget { max_depth: 1, ..Default::default() }
+                })).unwrap();
+                let traversal = db
+                    .traverse_query_scoped(
+                        "docs",
+                        query,
+                        &TenantScope::tenant("restore-reader", "acme"),
+                    )
+                    .unwrap();
+                assert!(traversal.truncation.is_none() && traversal.warnings.is_empty());
+                let chirondb_core::graph::GraphTraversalRows::Edges(edges) = traversal.result
+                else {
+                    panic!("expected edge rows")
+                };
+                assert!(
+                    matches!(edges.len(), 51 | 101),
+                    "partial graph batch: {}",
+                    edges.len()
+                );
+                let mut ordinals = std::collections::BTreeSet::new();
+                let mut edge_ids = std::collections::HashSet::new();
+                for edge in edges {
+                    assert!(edge_ids.insert(edge.id.clone()));
+                    assert_eq!(edge.source, "document-1");
+                    assert_eq!(edge.target, "source-1");
+                    assert_eq!(edge.edge_type, "cites");
+                    if let Some(ordinal) = edge
+                        .properties
+                        .unwrap()
+                        .get("campaign_ordinal")
+                        .and_then(serde_json::Value::as_u64)
+                    {
+                        assert!(ordinals.insert(ordinal));
+                        if ordinal < 50 {
+                            assert_eq!(edge.id, acked[ordinal as usize]);
+                        }
+                    }
+                }
+                let expected = (0..50)
+                    .chain(if ordinals.len() == 100 {
+                        100..150
+                    } else {
+                        100..100
+                    })
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(ordinals, expected);
+                let points = db
+                    .get_points("docs", &["document-1".into(), "source-1".into()])
+                    .unwrap();
+                assert!(points.iter().all(|point| point.vector == [1.0, 2.0]
+                    && point.payload == json!({"source": point.id})));
+                audit::verify_hash_chain(&data).unwrap();
+            }
+        }
+        return;
+    }
+    let cycles = std::env::var("CHIRONDB_RECOVERY_CYCLES")
+        .map(|value| value.parse::<usize>().unwrap())
+        .unwrap_or(1000);
+    assert!(cycles > 0);
+    for encrypted in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base");
+        let keyring = temp.path().join("keys.json");
+        let acknowledgments = temp.path().join("acks.json");
+        write_keyring(&keyring, "key-old1");
+        let init = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--ignored"])
+            .env(CHILD_MODE, "campaign-init")
+            .env("CHIRONDB_CAMPAIGN_ENCRYPTED", encrypted.to_string())
+            .env("CHIRONDB_KEYRING", &keyring)
+            .env("CHIRONDB_CAMPAIGN_ACKS", &acknowledgments)
+            .env("CHIRONDB_DATA_DIR", &base)
+            .env_remove("CHIRONDB_FAILPOINT")
+            .output()
+            .unwrap();
+        assert_succeeded(init);
+        for cycle in 0..cycles {
+            let case = tempfile::tempdir_in(temp.path()).unwrap();
+            let data = case.path().join("data");
+            copy_campaign_fixture(&base, &data);
+            let boundary = [
+                "atomic.before_temp_sync",
+                "atomic.after_temp_sync",
+                "transaction.after_commit",
+                "graph_batch.after_prepare",
+            ][cycle % 4];
+            // Ignored parent must pass --ignored to each exact child too.
+            let marker = case.path().join("marker");
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", TEST, "--ignored", "--nocapture"])
+                .env(CHILD_MODE, "campaign-work")
+                .env("CHIRONDB_CAMPAIGN_ENCRYPTED", encrypted.to_string())
+                .env("CHIRONDB_KEYRING", &keyring)
+                .env("CHIRONDB_CAMPAIGN_ACKS", &acknowledgments)
+                .env("CHIRONDB_DATA_DIR", &data)
+                .env("CHIRONDB_FAILPOINT", format!("pause:{boundary}"))
+                .env("CHIRONDB_FAILPOINT_MARKER", &marker)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = command.spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !marker.exists() && Instant::now() < deadline {
+                if child.try_wait().unwrap().is_some() {
+                    let output = child.wait_with_output().unwrap();
+                    panic!(
+                        "campaign child missed {boundary}: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(marker.exists(), "campaign did not reach {boundary}");
+            child.kill().unwrap();
+            assert_sigkilled(child.wait_with_output().unwrap());
+            let verified = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--ignored"])
+                .env(CHILD_MODE, "campaign-verify")
+                .env("CHIRONDB_CAMPAIGN_ENCRYPTED", encrypted.to_string())
+                .env("CHIRONDB_KEYRING", &keyring)
+                .env("CHIRONDB_CAMPAIGN_ACKS", &acknowledgments)
+                .env("CHIRONDB_DATA_DIR", &data)
+                .env_remove("CHIRONDB_FAILPOINT")
+                .output()
+                .unwrap();
+            if !verified.status.success() {
+                let retained = case.keep();
+                panic!(
+                    "encrypted={encrypted} cycle={} boundary={boundary} status={} retained={} stdout={} stderr={}",
+                    cycle + 1,
+                    verified.status,
+                    retained.display(),
+                    String::from_utf8_lossy(&verified.stdout),
+                    String::from_utf8_lossy(&verified.stderr)
+                );
+            }
+            if let Some(path) = std::env::var_os("CHIRONDB_CRASH_CAMPAIGN_EVIDENCE") {
+                use std::io::Write;
+                let mut file = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .unwrap();
+                writeln!(file, "{}", json!({"encrypted": encrypted, "cycle": cycle + 1, "boundary": boundary, "oracle": "pass"})).unwrap();
+            }
+            if (cycle + 1) % 100 == 0 {
+                eprintln!(
+                    "encrypted={encrypted}: {}/{cycles} physical kills and full oracle checks passed",
+                    cycle + 1
+                );
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn campaign_edges(inflight: bool) -> RelateBatchRequest {
+    RelateBatchRequest {
+        edges: (0..50)
+            .map(|ordinal| RelateRequest {
+                source_point_id: "document-1".into(),
+                target_point_id: "source-1".into(),
+                edge_type: "cites".into(),
+                properties: json!({"campaign_ordinal": ordinal + if inflight {100} else {0}}),
+                scope: GraphRelationScope::Local,
+                idempotency_key: None,
+            })
+            .collect(),
+        idempotency_key: Some(
+            if inflight {
+                "campaign-inflight"
+            } else {
+                "campaign-acknowledged"
+            }
+            .into(),
+        ),
+    }
+}
+
+#[cfg(unix)]
+fn copy_campaign_fixture(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination).unwrap();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let target = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_campaign_fixture(&entry.path(), &target);
+        } else {
+            assert!(entry.file_type().unwrap().is_file());
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
 
 #[test]
 fn atomic_write_is_old_or_new_at_every_crash_boundary() {
@@ -300,6 +571,92 @@ fn key_rotation_resumes_before_and_after_tree_verification() {
             ["key-new1".to_string()].into_iter().collect()
         );
         assert!(!root.join(".key-rotation.json").exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn interrupted_rotation_blocks_db_start_and_resumes_with_old_key_retired() {
+    const TEST: &str = "interrupted_rotation_blocks_db_start_and_resumes_with_old_key_retired";
+    if std::env::var_os(CHILD_MODE).is_some() {
+        let data = required_path("CHIRONDB_DATA_DIR");
+        let keys = Keyring::load(required_path("CHIRONDB_KEYRING")).unwrap();
+        if child_mode("rotation-db-rotate") {
+            encryption::rewrap_tree_resumable(&keys, &data).unwrap();
+        } else {
+            encryption::install_process_keyring(keys, true).unwrap();
+            if child_mode("rotation-db-init") {
+                prepare_database(&data, "old-point");
+            } else if child_mode("rotation-db-blocked") {
+                let Err(error) = Db::open(&data) else {
+                    panic!("rotation allowed startup");
+                };
+                assert!(error.to_string().contains("resume offline"), "{error}");
+            } else {
+                let db = Db::open(&data).unwrap();
+                let points = db.get_points("docs", &["old-point".into()]).unwrap();
+                assert_eq!(points.len(), 1);
+                assert_eq!(points[0].vector, [1.0, 2.0]);
+            }
+        }
+        return;
+    }
+    for boundary in ["rotation.after_journal", "rotation.after_verify"] {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let old = temp.path().join("old.json");
+        let new = temp.path().join("new.json");
+        let only_new = temp.path().join("only-new.json");
+        write_keyring(&old, "key-old1");
+        write_keyring(&new, "key-new1");
+        write_keyring(&only_new, "key-new1");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&only_new).unwrap()).unwrap();
+        value["keys"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|key| key["id"] == "key-new1");
+        fs::write(&only_new, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_succeeded(run_child(
+            TEST,
+            "rotation-db-init",
+            "unused",
+            &[("CHIRONDB_DATA_DIR", &data), ("CHIRONDB_KEYRING", &old)],
+        ));
+        assert_sigkilled(run_sigkill_child(
+            TEST,
+            "rotation-db-rotate",
+            boundary,
+            &temp.path().join("marker"),
+            &[("CHIRONDB_DATA_DIR", &data), ("CHIRONDB_KEYRING", &new)],
+            &[],
+        ));
+        let keys = Keyring::load(&new).unwrap();
+        let before = encryption::logical_tree_digest(&data, Some(&keys)).unwrap();
+        assert_succeeded(run_child(
+            TEST,
+            "rotation-db-blocked",
+            "unused",
+            &[("CHIRONDB_DATA_DIR", &data), ("CHIRONDB_KEYRING", &old)],
+        ));
+        assert_eq!(
+            before,
+            encryption::logical_tree_digest(&data, Some(&keys)).unwrap()
+        );
+        encryption::rewrap_tree_resumable(&keys, &data).unwrap();
+        assert_eq!(
+            encryption::referenced_key_ids(&data).unwrap(),
+            ["key-new1".to_string()].into_iter().collect()
+        );
+        assert_succeeded(run_child(
+            TEST,
+            "rotation-db-verify",
+            "unused",
+            &[
+                ("CHIRONDB_DATA_DIR", &data),
+                ("CHIRONDB_KEYRING", &only_new),
+            ],
+        ));
     }
 }
 
@@ -921,7 +1278,8 @@ fn assert_crashed(output: Output) {
 fn assert_succeeded(output: Output) {
     assert!(
         output.status.success(),
-        "child failed; stdout={} stderr={}",
+        "child failed ({}) ; stdout={} stderr={}",
+        output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

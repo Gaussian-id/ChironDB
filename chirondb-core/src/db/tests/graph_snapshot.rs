@@ -158,7 +158,7 @@ fn graph_snapshots_bind_generations_and_restore_both_layouts_plaintext_and_encry
     db.snapshot(&source).unwrap();
     assert!(!source.join(GRAPH_IDENTITY_FILE).exists());
     let marker = snapshot::read_snapshot_marker(&source).unwrap().unwrap();
-    assert_eq!(marker.version, 2);
+    assert_eq!(marker.version, 3);
     let marked = &marker.collections[0];
     assert_eq!(marked.collection, "docs");
     assert!(marked.graph.as_ref().unwrap().manifest_sha256.is_some());
@@ -444,7 +444,7 @@ fn legacy_graph_snapshot_retains_wal_authority_without_a_v2_binding() {
     let source = temp.path().join("legacy-snapshot");
     db.snapshot(&source).unwrap();
     let mut marker = snapshot::read_snapshot_marker(&source).unwrap().unwrap();
-    assert_eq!(marker.version, 2);
+    assert_eq!(marker.version, 3);
     assert!(
         marker.collections[0]
             .graph
@@ -456,6 +456,8 @@ fn legacy_graph_snapshot_retains_wal_authority_without_a_v2_binding() {
     // Reproduce the pre-D2a marker bytes; graph data remains in the old WAL.
     marker.version = 1;
     marker.collections[0].graph = None;
+    marker.collections[0].config_crc =
+        snapshot::config_crc(&db.get_coll("docs").unwrap().read().config, 1).unwrap();
     snapshot::write_snapshot_marker(&source, &marker).unwrap();
     db.unrelate_scoped("docs", &edge.edge_id, true, &scope)
         .unwrap();

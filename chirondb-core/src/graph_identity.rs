@@ -68,7 +68,34 @@ impl GraphIdentitySnapshot {
 #[derive(Debug)]
 pub(crate) struct GraphIdentityStore {
     path: PathBuf,
-    state: Mutex<GraphIdentitySnapshot>,
+    state: Mutex<AllocatorState>,
+}
+
+/// The persisted high waters reserve IDs; the issued cursors only move inside
+/// those durable leases. Reopen burns the epoch before any ID can be returned.
+#[derive(Debug)]
+struct AllocatorState {
+    issued: GraphIdentitySnapshot,
+    node_reserved: u64,
+    edge_reserved: u64,
+}
+
+impl AllocatorState {
+    fn new(issued: GraphIdentitySnapshot) -> Self {
+        Self {
+            node_reserved: issued.node_high_water,
+            edge_reserved: issued.edge_high_water,
+            issued,
+        }
+    }
+
+    fn durable_snapshot(&self) -> GraphIdentitySnapshot {
+        GraphIdentitySnapshot {
+            node_high_water: self.node_reserved,
+            edge_high_water: self.edge_reserved,
+            ..self.issued
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -142,22 +169,22 @@ impl GraphIdentityStore {
         crate::failpoint::check("graph_identity.after_open_epoch_reservation")?;
         Ok(Self {
             path,
-            state: Mutex::new(state),
+            state: Mutex::new(AllocatorState::new(state)),
         })
     }
 
     pub(crate) fn snapshot(&self) -> GraphIdentitySnapshot {
-        *self.state.lock()
+        self.state.lock().issued
     }
 
     /// Burn the current allocation range before installing a collection PITR
     /// state. Failure leaves the in-memory epoch unchanged.
     pub(crate) fn reserve_new_epoch(&self) -> Result<u32> {
         let mut state = self.state.lock();
-        let next = state.successor_epoch()?;
+        let next = state.issued.successor_epoch()?;
         write_state(&self.path, next)?;
         crate::failpoint::check("graph_identity.after_explicit_epoch_reservation")?;
-        *state = next;
+        *state = AllocatorState::new(next);
         Ok(next.allocator_epoch)
     }
 
@@ -190,28 +217,47 @@ impl GraphIdentityStore {
         let count = count.get();
         let mut state = self.state.lock();
         let high_water = match kind {
-            CounterKind::Node => state.node_high_water,
-            CounterKind::Edge => state.edge_high_water,
+            CounterKind::Node => state.issued.node_high_water,
+            CounterKind::Edge => state.issued.edge_high_water,
         };
         let next_high_water = high_water.checked_add(count).ok_or_else(exhausted)?;
         if next_high_water > GRAPH_ALLOCATOR_MAX_COUNTER {
             return Err(exhausted().into());
         }
 
-        let mut next = *state;
-        match kind {
-            CounterKind::Node => next.node_high_water = next_high_water,
-            CounterKind::Edge => next.edge_high_water = next_high_water,
+        let reserved = match kind {
+            CounterKind::Node => state.node_reserved,
+            CounterKind::Edge => state.edge_reserved,
+        };
+        if next_high_water > reserved {
+            // Lease in units of the existing maximum graph batch. This bounds
+            // metadata publication by capacity, rather than by request count;
+            // unused IDs are burned on restart, never returned in a new epoch.
+            let block = crate::graph::MAX_GRAPH_EDGES_PER_BATCH as u64;
+            let high_water = next_high_water
+                .div_ceil(block)
+                .saturating_mul(block)
+                .min(GRAPH_ALLOCATOR_MAX_COUNTER);
+            let mut durable = state.durable_snapshot();
+            match kind {
+                CounterKind::Node => durable.node_high_water = high_water,
+                CounterKind::Edge => durable.edge_high_water = high_water,
+            }
+            write_state(&self.path, durable)?;
+            state.node_reserved = durable.node_high_water;
+            state.edge_reserved = durable.edge_high_water;
         }
-        write_state(&self.path, next)?;
         crate::failpoint::check(match kind {
             CounterKind::Node => "graph_identity.after_node_range_reservation",
             CounterKind::Edge => "graph_identity.after_edge_range_reservation",
         })?;
-        *state = next;
+        match kind {
+            CounterKind::Node => state.issued.node_high_water = next_high_water,
+            CounterKind::Edge => state.issued.edge_high_water = next_high_water,
+        }
 
         Ok(AllocatedGraphIdRange {
-            epoch: next.allocator_epoch,
+            epoch: state.issued.allocator_epoch,
             first_counter: high_water + 1,
             last_counter: next_high_water,
         })
@@ -221,7 +267,10 @@ impl GraphIdentityStore {
     /// installation metadata from the live store into staging; never trust or
     /// import identity from the snapshot being restored.
     pub(crate) fn preserve_for_root_swap(&self, staged_root: &Path) -> Result<()> {
-        write_state(&staged_root.join(GRAPH_IDENTITY_FILE), self.snapshot())
+        write_state(
+            &staged_root.join(GRAPH_IDENTITY_FILE),
+            self.state.lock().durable_snapshot(),
+        )
     }
 
     /// Snapshot input is collection state, never installation state. Remove a
@@ -437,7 +486,47 @@ mod tests {
             &read_persistent(&temp.path().join(GRAPH_IDENTITY_FILE)).unwrap(),
         )
         .unwrap();
-        assert_eq!(stored, store.snapshot());
+        assert_eq!(stored.database_id, store.snapshot().database_id);
+        assert_eq!(stored.allocator_epoch, store.snapshot().allocator_epoch);
+        assert!(stored.node_high_water >= store.snapshot().node_high_water);
+        assert!(stored.edge_high_water >= store.snapshot().edge_high_water);
+    }
+
+    #[test]
+    fn cached_leases_keep_root_swap_and_materialized_frontier_high_waters() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = GraphIdentityStore::open(temp.path()).unwrap();
+        let path = temp.path().join(GRAPH_IDENTITY_FILE);
+        let first = store.allocate_nids(NonZeroU64::new(50).unwrap()).unwrap();
+        assert_eq!(first.nids().last().unwrap().counter(), 50);
+        let lease = fs::read(&path).unwrap();
+        let cached = store.allocate_nids(NonZeroU64::new(4046).unwrap()).unwrap();
+        assert_eq!(cached.nids().next().unwrap().counter(), 51);
+        assert_eq!(cached.nids().last().unwrap().counter(), 4096);
+        assert_eq!(fs::read(&path).unwrap(), lease);
+        store
+            .allocate_edge_ids(NonZeroU64::new(1).unwrap())
+            .unwrap();
+        let materialized = temp.path().join("materialized");
+        fs::create_dir(&materialized).unwrap();
+        store.preserve_for_root_swap(&materialized).unwrap();
+        assert_eq!(
+            fs::read(materialized.join(GRAPH_IDENTITY_FILE)).unwrap(),
+            fs::read(&path).unwrap()
+        );
+        validate_materialized_allocator(temp.path(), &materialized).unwrap();
+        let next = store.allocate_nids(NonZeroU64::new(2).unwrap()).unwrap();
+        assert_eq!(next.nids().next().unwrap().counter(), 4097);
+        let durable = decode(&path, &read_persistent(&path).unwrap()).unwrap();
+        assert_eq!(durable.node_high_water, 8192);
+        assert_eq!(durable.edge_high_water, 4096);
+        validate_materialized_allocator(temp.path(), &materialized).unwrap();
+        let old_epoch = store.snapshot().allocator_epoch;
+        drop(store);
+        let reopened = GraphIdentityStore::open(temp.path()).unwrap();
+        let fresh = reopened.allocate_nids(NonZeroU64::new(1).unwrap()).unwrap();
+        assert_ne!(fresh.nids().next().unwrap().epoch(), old_epoch);
+        validate_materialized_allocator(temp.path(), &materialized).unwrap();
     }
 
     #[test]

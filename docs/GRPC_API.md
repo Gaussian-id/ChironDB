@@ -1,5 +1,7 @@
 # ChironDB gRPC API
 
+ChironQL 1.5 supports durable sensor batches and event-time history on the existing query interface. Exact nanosecond timestamps travel as decimal strings. [Time series examples](CHIRONQL.md#time-series-chironql-15)
+
 Protected user/role/key syntax, every statement example, revision semantics and
 working TLS/API recipes: [ChironQL security reference](CHIRONQL_SECURITY.md).
 
@@ -286,6 +288,10 @@ COMMIT freezes its statements while running; a consumed handle excludes later
 EXECUTE/ROLLBACK. Idle expiry releases
 snapshot pins during subsequent SQL, handle or checkpoint activity.
 
+SQL transactions use snapshot isolation. Disjoint writes can exhibit write skew;
+serializable isolation is not exposed. See the [HTTP transaction contract](HTTP_API.md)
+for isolation and atomicity boundaries, shared by all transports.
+
 If COMMIT fails before PREPARE, including receipt memory admission returning
 `RESOURCE_EXHAUSTED`, the live session keeps its private statements and original
 handle. Retry `CommitSqlTransaction` explicitly or roll back that handle before
@@ -526,7 +532,7 @@ query. Sparse `indices` and `values` must have equal lengths.
 
 Graph RPCs exist only on `chirondb.v1.ChironDb`; the deprecated
 `gaussdb.v1.GaussDb` service remains frozen. The primary service exposes
-`EnableGraph`, `DropGraph`, `ListEdgeTypes`, `ConfigureEdgeType`, `Relate`,
+`EnableGraph`, `DropGraph`, `ListEdgeTypes`, `ConfigureEdgeType`, `Relate`, `RelateBatch`,
 `Unrelate`, `UpdateEdge`, `Traverse`, and the five explicit deferred-session
 operations. All call the same scoped engine as HTTP and ChironQL.
 
@@ -564,6 +570,27 @@ to `UpdateEdge` or `Unrelate`; do not parse, sort, or infer topology from it.
 Mutation receipts carry the actual `graphEpoch`, optional `operationLsn`,
 `durable`, and `replayed` values. As elsewhere in the gRPC API,
 `noWait:false` is the durable default.
+
+`RelateBatch` creates an atomic batch in one collection:
+
+```json
+{
+  "collection":"products",
+  "edges":[{"sourcePointId":"phone","targetPointId":"book","edgeType":"references","propertiesJson":"{\"strength\":0.8}","scope":"local"}],
+  "idempotencyKey":"catalog-edges-1",
+  "noWait":false
+}
+```
+
+`edgeIds` preserves input order and `receipt` describes the single commit.
+The core admits 1–4,096 edges within 16 MiB, with endpoint/type/tenant validation
+before publication. The optional batch key replays the same logical request and
+IDs for its 24-hour retention; conflicting payloads and expired keys reject.
+These are additive primary-service messages; the frozen legacy service is
+unchanged. ChironWire exposes the same operation through `WireRequest.relate_batch`
+(tag 35), with collection, tagged request JSON and `no_wait`, and
+`WireResponse.relate_batch` (tag 28) carrying `response_json`. Both façades call
+the same core as [HTTP batch edges](HTTP_API.md#property-graph-overlay).
 
 `Traverse.requestJson` contains one JSON-encoded
 `GraphTraversalQueryRequest`, preserving the HTTP/ChironQL fields and caps:
@@ -640,7 +667,7 @@ truncation remains explicit and unchanged.
 
 ### ExecuteQuery (ChironQL)
 
-One top-level ChironQL 1.4 statement per call. A typed `TRANSACTION { ... }`
+Send one top-level ChironQL 1.5 statement per call. A typed `TRANSACTION { ... }`
 block remains one statement and atomically combines SQL DML, vector UPSERT/DELETE or protected CREATE POINTS,
 and graph relations. `parameters` carries typed `$1…$n` values; `retry_id` is
 audit correlation. Optional `idempotency_key` (field 7; ChironWire field 8) uses
@@ -776,6 +803,9 @@ Use this message with `PruneWalArchive`:
 ```
 
 Snapshot and restore need the [snapshot root setup](HTTP_API.md#create-and-restore-a-snapshot).
+New snapshots use marker version 3 with deterministic configuration checksums.
+See [reader compatibility and legacy conversion](SNAPSHOTS.md) before restoring
+v1/v2 backups or downgrading a binary. RPC request schemas are unchanged.
 The name below is relative to that root. Create the snapshot first, and restore
 only when you intend to replace the live database with its saved state.
 
@@ -903,9 +933,9 @@ and remains a preview enabled with `--enable-grpc-web` plus explicit allowed
 origins. Do not put a shared server API key in browser JavaScript; use the
 preview BFF or another trusted gateway for browser authentication.
 
-### Protected ChironQL 1.4 local preview
+### Protected ChironQL 1.5 local preview
 
-ChironQL **1.4** also exposes protected collection provisioning and typed policy
+ChironQL also exposes protected collection provisioning and typed policy
 administration through this same RPC. Initialize the first administrator offline
 using the [deployment runbook](../deploy/protected/README.md). Collection creation
 uses `SHOW CATALOG REVISION`; policy updates use the collection security revision.

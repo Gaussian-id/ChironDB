@@ -45,7 +45,9 @@ use chirondb_types::{
 /// language it answers is not. At 1.1 the statements, clause names, error
 /// codes and rejection taxonomy are stable — anything removed goes through a
 /// deprecation cycle rather than disappearing between releases.
-pub const LANGUAGE_VERSION: &str = "1.4";
+mod temporal;
+pub use temporal::{AssetSelector, TemporalRead, TemporalStage};
+pub const LANGUAGE_VERSION: &str = "1.5";
 
 mod security;
 pub use security::{NamedSubject, SecurityCommand, SecurityStatement};
@@ -117,6 +119,11 @@ pub type ParseResult<T> = Result<T, ParseError>;
 /// collection set by `USE`", which only the executor can resolve.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Statement {
+    TemporalAppend {
+        collection: String,
+        samples: Vec<chirondb_core::db::temporal::TemporalSample>,
+    },
+    TemporalRead(TemporalRead),
     Security(SecurityStatement),
     MlMaterialize(MlMaterialize),
     Search(Search),
@@ -253,7 +260,8 @@ impl TransactionGraph {
 pub struct Pipeline {
     pub explain: bool,
     pub vector_alias: String,
-    pub vector: Box<Statement>,
+    pub vector: Option<Box<Statement>>,
+    pub temporal: Option<Box<TemporalStage>>,
     pub graph: Option<PipelineGraph>,
     pub relational_alias: String,
     pub relational: SqlStatement,
@@ -295,6 +303,8 @@ impl Statement {
     pub fn class(&self) -> StatementClass {
         match self {
             Self::Security(statement) => statement.class(),
+            Self::TemporalAppend { .. } => StatementClass::Write,
+            Self::TemporalRead(_) => StatementClass::Read,
             Self::MlMaterialize(_) => StatementClass::Write,
             Self::Search(_)
             | Self::Hybrid(_)
@@ -332,6 +342,8 @@ impl Statement {
     pub fn collection(&self) -> Option<&str> {
         match self {
             Self::Security(statement) => statement.collection(),
+            Self::TemporalAppend { collection, .. } => Some(collection),
+            Self::TemporalRead(query) => Some(&query.collection),
             Self::MlMaterialize(_) => None,
             Self::Search(s) => s.collection.as_deref(),
             Self::Hybrid(s) => s.collection.as_deref(),
@@ -363,6 +375,14 @@ impl Statement {
     pub fn kind_name(&self) -> &'static str {
         match self {
             Self::Security(statement) => statement.kind_name(),
+            Self::TemporalAppend { .. } => "APPEND",
+            Self::TemporalRead(query) => {
+                if query.range.is_some() {
+                    "HISTORY"
+                } else {
+                    "LATEST"
+                }
+            }
             Self::MlMaterialize(_) => "ML MATERIALIZE",
             Self::Search(_) => "SEARCH",
             Self::Hybrid(_) => "HYBRID",
@@ -394,12 +414,19 @@ impl Statement {
         use ExecutionDomain::{Catalog, Graph, Relational, Security, Vector};
         match self {
             Self::Security(_) => vec![Security],
+            Self::TemporalAppend { .. } | Self::TemporalRead(_) => vec![ExecutionDomain::Temporal],
             Self::MlMaterialize(_) => vec![Relational],
             Self::Sql(_) => vec![Relational],
             Self::Pipeline(pipeline) => {
-                let mut domains = vec![Relational, Vector];
+                let mut domains = vec![Relational];
+                if pipeline.vector.is_some() {
+                    domains.push(Vector);
+                }
                 if pipeline.graph.is_some() {
                     domains.push(Graph);
+                }
+                if pipeline.temporal.is_some() {
+                    domains.push(ExecutionDomain::Temporal);
                 }
                 domains
             }
@@ -443,12 +470,16 @@ impl Statement {
             Self::Pipeline(pipeline) => {
                 let mut collections = pipeline
                     .vector
-                    .collection()
+                    .as_deref()
+                    .and_then(Statement::collection)
                     .map(str::to_owned)
                     .into_iter()
                     .collect::<Vec<_>>();
                 if let Some(graph) = &pipeline.graph {
                     collections.push(graph.traverse.collection.clone());
+                }
+                if let Some(t) = &pipeline.temporal {
+                    collections.push(t.query.collection.clone());
                 }
                 collections.sort();
                 collections.dedup();
@@ -1617,24 +1648,29 @@ fn parse_pipeline(input: &str, at: usize, explain: bool) -> ParseResult<Statemen
     let mut rest = input[at + prefix.len()..].trim();
     rest = rest.strip_suffix(';').unwrap_or(rest).trim();
 
-    let (vector_alias, vector_body, after_vector) = take_pipeline_stage(rest, "VECTOR", at)?;
-    let vector = parse(vector_body.trim())?;
-    let bounded = match &vector {
-        Statement::Search(value) => value.limit.is_some(),
-        Statement::Hybrid(value) => value.limit.is_some(),
-        Statement::Multi(value) => value.limit.is_some(),
-        Statement::Recommend(value) => value.limit.is_some(),
-        _ => false,
-    };
-    if !bounded {
-        return Err(ParseError::with_hint(
-            "chironql.unbounded_pipeline",
-            "VECTOR stage must be a bounded SEARCH, HYBRID, MULTI, or RECOMMEND",
-            "Add LIMIT to the vector stage.",
-            at,
-        ));
-    }
+    let (vector_alias, vector, after_vector) = if starts_keyword(rest, "VECTOR") {
+        let (vector_alias, vector_body, after_vector) = take_pipeline_stage(rest, "VECTOR", at)?;
+        let vector = parse(vector_body.trim())?;
+        let bounded = match &vector {
+            Statement::Search(value) => value.limit.is_some(),
+            Statement::Hybrid(value) => value.limit.is_some(),
+            Statement::Multi(value) => value.limit.is_some(),
+            Statement::Recommend(value) => value.limit.is_some(),
+            _ => false,
+        };
+        if !bounded {
+            return Err(ParseError::with_hint(
+                "chironql.unbounded_pipeline",
+                "VECTOR stage must be a bounded SEARCH, HYBRID, MULTI, or RECOMMEND",
+                "Add LIMIT to the vector stage.",
+                at,
+            ));
+        }
 
+        (vector_alias, Some(Box::new(vector)), after_vector)
+    } else {
+        (String::new(), None, rest)
+    };
     let after_vector = after_vector.trim_start();
     let (graph, after_graph) = if starts_keyword(after_vector, "GRAPH") {
         let (alias, body, after) = take_pipeline_stage(after_vector, "GRAPH", at)?;
@@ -1691,6 +1727,43 @@ fn parse_pipeline(input: &str, at: usize, explain: bool) -> ParseResult<Statemen
         ));
     }
 
+    let (temporal, tail) = if starts_keyword(tail.trim_start(), "TEMPORAL") {
+        let (alias, body, next) = take_pipeline_stage(tail.trim_start(), "TEMPORAL", at)?;
+        let Statement::TemporalRead(query) = parse(body.trim())? else {
+            return Err(ParseError::new(
+                "chironql.invalid_pipeline_clause",
+                "TEMPORAL requires HISTORY or LATEST",
+                at,
+            ));
+        };
+        let AssetSelector::Field(source) = &query.asset else {
+            return Err(ParseError::new(
+                "chironql.invalid_pipeline_anchor",
+                "TEMPORAL requires an earlier RECORD_REF field",
+                at,
+            ));
+        };
+        if source.alias != relational_alias
+            && (vector.is_none() || source.alias != vector_alias)
+            && graph.as_ref().is_none_or(|g| g.alias != source.alias)
+        {
+            return Err(ParseError::new(
+                "chironql.invalid_pipeline_anchor",
+                "unknown temporal source",
+                at,
+            ));
+        }
+        (Some(Box::new(TemporalStage { alias, query })), next)
+    } else {
+        (None, tail)
+    };
+    if temporal.is_none() && vector.is_none() {
+        return Err(ParseError::new(
+            "chironql.invalid_pipeline_clause",
+            "PIPELINE requires VECTOR or TEMPORAL",
+            at,
+        ));
+    }
     let mut joins = Vec::new();
     let mut projection = Vec::new();
     let mut order_by = None;
@@ -1772,14 +1845,18 @@ fn parse_pipeline(input: &str, at: usize, explain: bool) -> ParseResult<Statemen
         ));
     }
     let declared = [
-        Some(vector_alias.as_str()),
+        vector.as_ref().map(|_| vector_alias.as_str()),
+        temporal.as_ref().map(|t| t.alias.as_str()),
         graph.as_ref().map(|g| g.alias.as_str()),
         Some(relational_alias.as_str()),
     ]
     .into_iter()
     .flatten()
     .collect::<std::collections::HashSet<_>>();
-    if declared.len() != if graph.is_some() { 3 } else { 2 }
+    if declared.len()
+        != 1 + usize::from(vector.is_some())
+            + usize::from(graph.is_some())
+            + usize::from(temporal.is_some())
         || joins.iter().any(|join| {
             !declared.contains(join.alias.as_str())
                 || !declared.contains(join.left.alias.as_str())
@@ -1798,7 +1875,8 @@ fn parse_pipeline(input: &str, at: usize, explain: bool) -> ParseResult<Statemen
     Ok(Statement::Pipeline(Pipeline {
         explain,
         vector_alias,
-        vector: Box::new(vector),
+        vector,
+        temporal,
         graph,
         relational_alias,
         relational,
@@ -2237,6 +2315,13 @@ impl Parser {
             ));
         };
 
+        if self.surface == LanguageSurface::GraphV1_1
+            && ["APPEND", "HISTORY", "LATEST"]
+                .iter()
+                .any(|key| word.eq_ignore_ascii_case(key))
+        {
+            return self.parse_temporal();
+        }
         // Reject taxonomy first: these are recognised precisely so they get a
         // specific answer instead of "unexpected token".
         let next = match self.tokens.get(self.pos + 1).map(|token| &token.tok) {
@@ -4784,7 +4869,7 @@ mod tests {
 
     #[test]
     fn production_parser_is_v1_4_and_frozen_v1_0_stays_closed() {
-        assert_eq!(LANGUAGE_VERSION, "1.4");
+        assert_eq!(LANGUAGE_VERSION, "1.5");
         assert!(matches!(
             ok("RELATE docs a -> CITES -> b;"),
             Statement::Relate(_)

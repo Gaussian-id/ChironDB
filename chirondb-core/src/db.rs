@@ -1,3 +1,4 @@
+pub mod temporal;
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
@@ -47,7 +48,7 @@ use crate::{
         ColdMaterializeScope, ColdObjectStoreConfig, SoASegmentCache,
         materialize_missing_cold_segments_from_object_store,
     },
-    snapshot::{SnapshotCollection, SnapshotMarker, read_snapshot_marker, write_snapshot_marker},
+    snapshot::{SnapshotMarker, read_snapshot_marker, write_snapshot_marker},
     snapshot_journal::{self, SnapshotJournal, SnapshotPhase},
     transaction_journal::{
         CommittedTransaction, ProjectionKind, TransactionAudit, TransactionId, TransactionJournal,
@@ -98,7 +99,10 @@ mod security_lifecycle;
 mod security_retrieval;
 mod security_runtime;
 mod security_text;
+mod snapshot_compat;
 mod snapshot_control;
+mod startup;
+pub use snapshot_compat::{SnapshotConversionReceipt, convert_legacy_snapshot};
 mod transaction_recovery;
 #[cfg(test)]
 use transaction_recovery::recover_transaction_storage_projections;
@@ -602,6 +606,7 @@ struct DbInner {
 
 #[derive(Debug)]
 struct Collection {
+    temporal: temporal::TemporalState,
     security: Option<Arc<crate::security::CollectionAuthority>>,
     config: CollectionConfig,
     /// The mutable streamer: live points + their in-memory dense indexes
@@ -681,7 +686,7 @@ struct Collection {
 
 impl Collection {
     fn checkpoint(
-        &self,
+        &mut self,
         last_applied_lsn: u64,
         points: usize,
         segment_id: Option<String>,
@@ -699,6 +704,10 @@ impl Collection {
                 .map(|searcher| searcher.id.clone())
                 .collect(),
         );
+        checkpoint.temporal_runs = self.temporal.checkpoint()?;
+        if checkpoint.temporal_runs.is_some() {
+            checkpoint.temporal_wal_lsn = Some(self.wal.len()?);
+        }
         checkpoint.wal_watermark = self.wal_watermark;
         Ok(checkpoint)
     }
@@ -1196,8 +1205,10 @@ impl Db {
     ) -> Result<Self> {
         let data_dir_lock = Arc::new(DataDirLock::acquire(root.as_ref())?);
         let data_dir = data_dir_lock.root().to_path_buf();
+        startup::preflight(&data_dir)?;
         crate::security::onboarding::validate_identity_ready(&data_dir)?;
         TransactionJournal::validate_existing_format(&data_dir)?;
+        startup::cleanup_and_verify(&data_dir)?;
         if crate::security::onboarding::has_common_frontier(&data_dir)? {
             // Protected installations cannot perform native content rollback.
             // Refuse an unexpected restore journal before it can change CURRENT.
@@ -2008,7 +2019,7 @@ impl Db {
             }),
         );
         drop(collection);
-        self.refresh_metrics();
+        self.refresh_storage_metrics();
         result
     }
 
@@ -2223,7 +2234,7 @@ impl Db {
             Ok(response)
         });
         drop(collection);
-        self.refresh_metrics();
+        self.refresh_storage_metrics();
         result
     }
 
@@ -2842,17 +2853,42 @@ impl Db {
         audit: TransactionAudit,
         decision_started: Option<&AtomicBool>,
     ) -> Result<(CommittedTransaction, u64)> {
+        self.commit_collection_transaction_claimed(
+            collection_name,
+            collection,
+            mutation,
+            audit,
+            decision_started,
+            None,
+        )
+    }
+
+    fn commit_collection_transaction_claimed(
+        &self,
+        collection_name: &str,
+        collection: &mut Collection,
+        mutation: WalEntry,
+        audit: TransactionAudit,
+        decision_started: Option<&AtomicBool>,
+        claim: Option<graph_runtime::GraphBatchClaim<'_>>,
+    ) -> Result<(CommittedTransaction, u64)> {
         let target = TransactionTarget::Collection {
             name: collection_name.to_string(),
         };
-        let transaction = match decision_started {
-            Some(started) => self.transaction_journal.commit_with_decision(
+        let transaction = match (claim, decision_started) {
+            (Some((claim, response)), started) => response.consume(|response| match started {
+                Some(started) => {
+                    claim.commit_with_decision(target, mutation.clone(), audit, response, started)
+                }
+                None => claim.commit(target, mutation.clone(), audit, response),
+            }),
+            (None, Some(started)) => self.transaction_journal.commit_with_decision(
                 target,
                 mutation.clone(),
                 audit,
                 started,
             ),
-            None => self
+            (None, None) => self
                 .transaction_journal
                 .commit(target, mutation.clone(), audit),
         }
@@ -3417,7 +3453,7 @@ impl Db {
                 "session_mutations": session_mutations,
             }),
         );
-        self.refresh_metrics();
+        self.refresh_storage_metrics();
         Ok(receipt)
     }
 
@@ -3467,6 +3503,27 @@ impl Db {
         context: &audit::AuditContext,
         decision_started: Option<&AtomicBool>,
     ) -> Result<GraphBatchCommitReceipt> {
+        self.commit_graph_batch_context_locked(
+            collection,
+            batch,
+            wait,
+            security,
+            graph_runtime::GraphBatchCommitContext {
+                audit: context,
+                decision_started,
+                claim: None,
+            },
+        )
+    }
+
+    fn commit_graph_batch_context_locked(
+        &self,
+        collection: &mut Collection,
+        batch: crate::wal::GraphBatch,
+        wait: bool,
+        security: Option<crate::security::SecurityDelta>,
+        context: graph_runtime::GraphBatchCommitContext<'_>,
+    ) -> Result<GraphBatchCommitReceipt> {
         self.require_sync_durability(wait)?;
         let record_lsn = collection.wal.len()?;
         let prepared = prepare_graph_batch(
@@ -3497,14 +3554,14 @@ impl Db {
                 batch: batch.clone(),
             },
         };
-        let (transaction, operation_lsn) = self.commit_collection_transaction_with_decision(
+        let (transaction, operation_lsn) = self.commit_collection_transaction_claimed(
             &collection.config.name.clone(),
             collection,
             entry,
             TransactionAudit::mutation(
                 "graph_batch",
                 Some(&collection.config.name),
-                context,
+                context.audit,
                 serde_json::json!({
                     "graph_epoch": graph_epoch.raw(),
                     "wait_requested": wait,
@@ -3512,7 +3569,8 @@ impl Db {
                     "edge_mutations": batch.edge_mutations.len(),
                 }),
             ),
-            decision_started,
+            context.decision_started,
+            context.claim,
         )?;
         if let Err(error) = crate::failpoint::check("graph_batch.after_wal_append") {
             self.mark_durability_degraded("graph_batch_after_wal_append", &error);
@@ -3852,6 +3910,7 @@ impl Db {
             (None, None) => {}
             _ => return Err(crate::security::SecurityError::Unavailable.into()),
         }
+        col.temporal = state.temporal;
         col.config = state.config;
         col.schema_epoch = state.schema_epoch;
         col.streamer = state.streamer;
@@ -4051,7 +4110,7 @@ impl Db {
             self.mark_durability_degraded("transaction_catalog_marker", &error);
         }
         self.project_transaction_audit(&transaction);
-        self.refresh_metrics();
+        self.refresh_storage_metrics();
         Ok(collection_name.to_string())
     }
 
@@ -4111,11 +4170,8 @@ impl Db {
             // before publishing it to readers or advancing the epoch.
             collection.config = candidate.clone();
             collection.schema_epoch = schema_epoch;
-            let checkpoint = match collection.checkpoint(
-                last_applied_lsn,
-                collection.live_points(),
-                collection.last_segment_id.clone(),
-            ) {
+            let (count, id) = (collection.live_points(), collection.last_segment_id.clone());
+            let checkpoint = match collection.checkpoint(last_applied_lsn, count, id) {
                 Ok(checkpoint) => Some(checkpoint),
                 Err(error) => {
                     self.mark_durability_degraded("schema_checkpoint_build", &error);
@@ -4787,7 +4843,7 @@ impl Db {
             spawn_index_build(build);
         }
         observe_points_upserted(requested_points);
-        self.refresh_metrics();
+        self.refresh_storage_metrics();
         operation_metrics.succeed();
         Ok(receipt)
     }
@@ -5069,7 +5125,7 @@ impl Db {
         drop(collection);
         observe_points_deleted(deleted);
         observe_graph_edges_orphaned_by_delete(orphaned_edges);
-        self.refresh_metrics();
+        self.refresh_storage_metrics();
         operation_metrics.succeed();
         Ok(deleted)
     }
@@ -5326,7 +5382,7 @@ impl Db {
             );
             observe_points_deleted(deleted);
             observe_graph_edges_orphaned_by_delete(orphaned_edges);
-            self.refresh_metrics();
+            self.refresh_storage_metrics();
             operation_metrics.succeed();
             return Ok(deleted);
         }
@@ -5423,7 +5479,7 @@ impl Db {
             );
         }
         observe_points_deleted(deleted);
-        self.refresh_metrics();
+        self.refresh_storage_metrics();
         operation_metrics.succeed();
         Ok(deleted)
     }
@@ -6410,7 +6466,8 @@ impl Db {
         };
         Ok(IndexStatusResponse {
             build_in_flight: collection.index_build_in_flight
-                || collection.generation_build_in_flight,
+                || collection.generation_build_in_flight
+                || collection.sealing.is_some(),
             indexed_points,
             total_points: collection.live_points(),
         })
@@ -6800,7 +6857,7 @@ impl Db {
         collections.sort_by(|left, right| left.0.cmp(&right.0));
         for (name, has_graph_history) in collections {
             if has_graph_history {
-                self.seal_graph_for_encryption_migration(&name)?;
+                self.seal_graph_wal_prefix(&name)?;
             } else {
                 self.compact_collection(&name).map_err(|error| {
                     GaussError::InvalidRequest(format!(
@@ -6838,7 +6895,7 @@ impl Db {
         )
     }
 
-    fn seal_graph_for_encryption_migration(&self, collection_name: &str) -> Result<()> {
+    fn seal_graph_wal_prefix(&self, collection_name: &str) -> Result<()> {
         let _lifecycle = self.lifecycle_gate.read();
         self.ensure_storage_mutations_available()?;
         let _admission = self.maintenance_barrier.read();
@@ -6918,12 +6975,10 @@ impl Db {
             restore_failed_seal(Arc::clone(&seal.coll), Arc::clone(&seal.frozen));
             return Err(error);
         }
-        let collection = coll.read();
-        if !collection.wal.is_empty()? {
-            return Err(GaussError::InvalidRequest(format!(
-                "collection '{collection_name}' WAL remained non-empty after graph seal"
-            )));
-        }
+        // The committed cut retires only its prefix. Concurrent mutations,
+        // including graph-handle backfill, may have appended a durable tail.
+        // Offline encryption preparation checks every WAL is empty after all
+        // collections are sealed; online compaction must retain that tail.
         Ok(())
     }
 
@@ -6998,7 +7053,7 @@ impl Db {
         // sealer first. D3 then replaces that complete generation while newer
         // writes remain a WAL/overlay tail during the off-lock build.
         if graph_history {
-            self.seal_graph_for_encryption_migration(collection_name)?;
+            self.seal_graph_wal_prefix(collection_name)?;
         }
 
         // A threshold-crossing upsert may have staged a background index
@@ -8179,7 +8234,7 @@ impl Db {
                 "wal_auto_pruned_bytes": response.wal_auto_pruned_bytes,
             }),
         );
-        self.refresh_metrics();
+        self.refresh_storage_metrics();
         operation_metrics.succeed();
         Ok(response)
     }
@@ -8368,6 +8423,7 @@ impl Db {
                     |record| {
                         let (entries, deletes) = match record.entry {
                             WalEntry::Upsert { .. } | WalEntry::SetPayload { .. } => (1, 0),
+                            WalEntry::TemporalBatch { .. } => (0, 0),
                             WalEntry::UpsertBatch { points } => (points.len(), 0),
                             WalEntry::ProtectedBatch { batch } => batch.content.mutation_counts(),
                             WalEntry::Delete { .. } => (1, 1),
@@ -8695,6 +8751,7 @@ impl Db {
 
         let snapshot_marker = read_snapshot_marker(source)?;
         validate_restore_wal_targets(
+            source,
             snapshot_marker.as_ref(),
             target_wal_lsns,
             target_wal_unix_ms,
@@ -9054,7 +9111,7 @@ impl Db {
                 "wal_replayed_archive_schema_records": wal_archive_replay.schema_records,
             }));
         self.rebuild_recovered_streamer_indexes();
-        self.refresh_metrics();
+        self.refresh_storage_metrics();
         operation_metrics.succeed();
         Ok(())
     }
@@ -9113,6 +9170,7 @@ impl Db {
 
         let snapshot_marker = read_snapshot_marker(source)?;
         validate_restore_wal_targets(
+            source,
             snapshot_marker.as_ref(),
             target_wal_lsns,
             target_wal_unix_ms,
@@ -9423,7 +9481,7 @@ impl Db {
             "wal_replayed_archive_schema_records": wal_archive_replay.schema_records,
         }));
         self.rebuild_recovered_streamer_indexes();
-        self.refresh_metrics();
+        self.refresh_storage_metrics();
         operation_metrics.succeed();
         Ok(())
     }
@@ -9880,37 +9938,14 @@ impl Db {
         Ok(crate::sparse_index::encode_bm25(&corpus, text))
     }
 
+    /// Refresh process samples at an explicit observation boundary. Mutation
+    /// paths update storage gauges without walking OS page tables per commit.
     pub fn refresh_metrics(&self) {
-        let profile = crate::resource_profile::current();
-        metrics::gauge!("chirondb_resource_effective_memory_bytes")
-            .set(profile.effective_memory_bytes as f64);
-        metrics::gauge!("chirondb_resource_engine_budget_bytes")
-            .set(profile.engine_budget_bytes as f64);
-        metrics::gauge!("chirondb_resource_sql_pool_bytes").set(profile.sql_pool_bytes as f64);
-        metrics::gauge!("chirondb_resource_effective_cores").set(profile.effective_cores as f64);
-        metrics::gauge!("chirondb_resource_query_workers").set(profile.query_workers as f64);
-        metrics::gauge!("chirondb_resource_background_workers")
-            .set(profile.background_workers as f64);
-        metrics::gauge!("chirondb_query_arena_high_water_bytes")
-            .set(crate::query_arena::high_water_bytes() as f64);
-        let usage = crate::resource_profile::process_usage();
-        if let Some(value) = usage.rss_bytes {
-            metrics::gauge!("chirondb_process_rss_bytes").set(value as f64);
-        }
-        if let Some(value) = usage.pss_bytes {
-            metrics::gauge!("chirondb_process_pss_bytes").set(value as f64);
-        }
-        if let Some(value) = usage.cgroup_memory_bytes {
-            metrics::gauge!("chirondb_cgroup_memory_current_bytes").set(value as f64);
-        }
-        if let Some(value) = usage.thread_count {
-            metrics::gauge!("chirondb_process_threads").set(value as f64);
-        }
-        let (persistent_cache_bytes, persistent_cache_high_water_bytes) =
-            crate::encryption::persistent_cache_usage_bytes();
-        metrics::gauge!("chirondb_persistent_cache_bytes").set(persistent_cache_bytes as f64);
-        metrics::gauge!("chirondb_persistent_cache_high_water_bytes")
-            .set(persistent_cache_high_water_bytes as f64);
+        crate::observability::refresh_runtime_gauges();
+        self.refresh_storage_metrics();
+    }
+
+    fn refresh_storage_metrics(&self) {
         let inner = self.inner.read();
         let collections = inner.collections.len();
         let points = inner
@@ -10054,7 +10089,7 @@ fn validate_snapshot_marker(
             ))
         })?;
         let collection = arc_coll.read();
-        if marker.version == 2 && marked.graph != collection.snapshot_graph()? {
+        if marker.version >= 2 && marked.graph != collection.snapshot_graph()? {
             return Err(GaussError::InvalidRequest(format!(
                 "snapshot marker graph binding mismatch for collection '{}'",
                 marked.collection
@@ -10078,16 +10113,7 @@ fn validate_snapshot_marker(
                 marked.collection
             )));
         }
-        if marked.config_crc
-            != SnapshotCollection::new(
-                &collection.config,
-                collection.schema_epoch,
-                marked.wal_lsn,
-                marked.points,
-                marked.segment_id.clone(),
-            )?
-            .config_crc
-        {
+        if marked.config_crc != crate::snapshot::config_crc(&collection.config, marker.version)? {
             return Err(GaussError::InvalidRequest(format!(
                 "snapshot marker config checksum mismatch for collection '{}'",
                 marked.collection
@@ -10104,6 +10130,7 @@ fn validate_snapshot_marker(
 }
 
 fn validate_restore_wal_targets(
+    source: &Path,
     marker: Option<&SnapshotMarker>,
     target_wal_lsns: &HashMap<String, u64>,
     target_wal_unix_ms: &HashMap<String, u64>,
@@ -10117,6 +10144,18 @@ fn validate_restore_wal_targets(
             "target WAL restore requires a snapshot marker".to_string(),
         ));
     };
+    for marked in &marker.collections {
+        if (target_wal_lsns.contains_key(&marked.collection)
+            || target_wal_unix_ms.contains_key(&marked.collection))
+            && read_checkpoint(&collection_dir(source, &marked.collection))?
+                .is_some_and(|cp| cp.temporal_runs.is_some())
+        {
+            return Err(GaussError::InvalidRequest(format!(
+                "targeted WAL restore for temporal collection '{}' requires a time-aware generation manifest",
+                marked.collection
+            )));
+        }
+    }
     for collection in target_wal_lsns.keys() {
         if target_wal_unix_ms.contains_key(collection) {
             return Err(GaussError::InvalidRequest(format!(
@@ -10318,6 +10357,7 @@ fn load_restore_collections(
             },
         )?;
         let LoadedCollectionState {
+            temporal,
             security,
             config,
             schema_epoch,
@@ -10339,6 +10379,7 @@ fn load_restore_collections(
         collections.insert(
             collection_name,
             Arc::new(RwLock::new(Collection {
+                temporal,
                 security,
                 config,
                 streamer,
@@ -10391,12 +10432,13 @@ fn write_restore_metadata(
     write_catalog_state(root, collections, catalog_wal)?;
     if rewrite_restore_metadata {
         for collection in collections.values() {
-            let collection = collection.read();
-            let checkpoint = collection.checkpoint(
+            let mut collection = collection.write();
+            let args = (
                 collection.wal.len()?,
                 collection.live_points(),
                 collection.last_segment_id.clone(),
-            )?;
+            );
+            let checkpoint = collection.checkpoint(args.0, args.1, args.2)?;
             write_checkpoint(&collection_dir(root, &collection.config.name), &checkpoint)?;
         }
     }
@@ -11060,11 +11102,8 @@ fn run_segment_seal(seal: &PendingSeal) -> Result<()> {
     if seal.graph.is_some() {
         crate::failpoint::check("graph_generation.after_install")?;
     }
-    let checkpoint = collection.checkpoint(
-        collection.wal.len()?,
-        collection.live_points(),
-        Some(segment_id.clone()),
-    )?;
+    let (lsn, count) = (collection.wal.len()?, collection.live_points());
+    let checkpoint = collection.checkpoint(lsn, count, Some(segment_id.clone()))?;
     write_checkpoint(&seal.collection_dir, &checkpoint)?;
     if !retain_graph_wal {
         collection.wal.drop_prefix(seal.end_lsn)?;
@@ -12390,6 +12429,7 @@ fn graph_replication_unavailable(collection: &str) -> GaussError {
 }
 
 struct WalReplayIndexes<'a> {
+    temporal: &'a mut temporal::TemporalState,
     protected: bool,
     id_index: &'a mut HashMap<String, crate::searcher::SegLoc>,
     graph_lifecycle: &'a mut crate::graph_lifecycle::GraphLifecycleState,
@@ -12410,6 +12450,12 @@ fn apply_wal_record(
     let record_lsn = record.lsn;
     let entry = match record.entry {
         WalEntry::TransactionApply { entry, .. } => *entry,
+        WalEntry::TemporalBatch { .. } => {
+            return Err(GaussError::WalCorruption {
+                path: config.name.clone(),
+                message: "uncommitted temporal WAL record".into(),
+            });
+        }
         entry => entry,
     };
     let entry = match entry {
@@ -12430,10 +12476,17 @@ fn apply_wal_record(
             generation,
             segments,
         },
+        WalEntry::TemporalBatch { batch } => {
+            if indexes.protected != batch.incarnation.is_some() {
+                return Err(crate::security::SecurityError::Unavailable.into());
+            }
+            WalEntry::TemporalBatch { batch }
+        }
         _ if indexes.protected => return Err(crate::security::SecurityError::Unavailable.into()),
         entry => entry,
     };
     match entry {
+        WalEntry::TemporalBatch { batch } => indexes.temporal.replay(&batch)?,
         WalEntry::Upsert { point } => {
             apply_wal_upsert(
                 streamer,
@@ -12643,6 +12696,7 @@ fn projected_wal_entry(entry: &WalEntry) -> &WalEntry {
 /// independent searchers, WAL tail replayed into the streamer, and the
 /// global indexes over the union.
 struct LoadedCollectionState {
+    temporal: temporal::TemporalState,
     security: Option<Arc<crate::security::CollectionAuthority>>,
     config: CollectionConfig,
     schema_epoch: u64,
@@ -12696,7 +12750,7 @@ fn load_db_root_with_journal(
         validate_config(&config)?;
         let collection_name = config.name.clone();
         let collection_dir = collection_dir(root, &collection_name);
-        fs::create_dir_all(collection_dir.join("wal"))?;
+        Wal::validate_existing(&collection_dir.join("wal"))?;
         fs::create_dir_all(collection_dir.join("searchers"))?;
         let checkpoint = read_checkpoint(&collection_dir)?;
         let schema_epoch = checkpoint
@@ -12717,6 +12771,7 @@ fn load_db_root_with_journal(
             journal,
         )?;
         let LoadedCollectionState {
+            temporal,
             security,
             config,
             schema_epoch,
@@ -12746,6 +12801,7 @@ fn load_db_root_with_journal(
         collections.insert(
             collection_name,
             Arc::new(RwLock::new(Collection {
+                temporal,
                 security,
                 config,
                 streamer,
@@ -12903,10 +12959,12 @@ fn load_collection_state_with_journal(
         wal_watermark
     };
     let manifest_generation = manifest.as_ref().map_or(0, |manifest| manifest.generation);
+    let mut checkpoint = read_checkpoint(collection_dir)?;
     let installed_segments = match manifest.as_ref() {
         Some(manifest) => Some(manifest.segments.iter().cloned().collect::<HashSet<_>>()),
-        None => read_checkpoint(collection_dir)?
-            .and_then(|checkpoint| checkpoint.segments)
+        None => checkpoint
+            .as_mut()
+            .and_then(|cp| cp.segments.take())
             .map(|segments| segments.into_iter().collect::<HashSet<_>>()),
     };
     if let Some(installed) = &installed_segments {
@@ -13017,6 +13075,18 @@ fn load_collection_state_with_journal(
             id_index.insert(id.to_string(), crate::searcher::SegLoc::Searcher(i as u32));
         }
     }
+    let temporal_cut = checkpoint.as_ref().and_then(|cp| cp.temporal_wal_lsn);
+    let mut temporal =
+        temporal::TemporalState::load(collection_dir, checkpoint.and_then(|cp| cp.temporal_runs))?;
+    let wal_dir = collection_dir.join("wal");
+    if let Some(cut) = temporal_cut
+        && cut < Wal::retained_base_lsn(&wal_dir)?
+    {
+        return Err(GaussError::WalCorruption {
+            path: wal_dir.display().to_string(),
+            message: "temporal checkpoint cutoff outside retained WAL".into(),
+        });
+    }
     let mut streamer = crate::streamer::Streamer::with_base_lsn(wal_watermark);
     let recovered = graph_generation
         .as_mut()
@@ -13046,7 +13116,26 @@ fn load_collection_state_with_journal(
             .filter(|searcher| searcher.ordinal_payload_index.is_none())
             .flat_map(|searcher| searcher.store.iter_aux_index_points()),
     )?;
-    Wal::recover_from(&collection_dir.join("wal"), wal_watermark, |record| {
+    let replay_start = temporal_cut.map_or(wal_watermark, |cut| cut.min(wal_watermark));
+    let scanned = Wal::recover_from(&wal_dir, replay_start, |record| {
+        let is_temporal = matches!(
+            projected_wal_entry(&record.entry),
+            WalEntry::TemporalBatch { .. }
+        );
+        if is_temporal && !matches!(record.entry, WalEntry::TransactionApply { .. }) {
+            return Err(GaussError::WalCorruption {
+                path: wal_dir.display().to_string(),
+                message: "uncommitted temporal WAL record".into(),
+            });
+        }
+        let covered = if is_temporal {
+            temporal_cut.unwrap_or(wal_watermark)
+        } else {
+            wal_watermark
+        };
+        if record.lsn < covered {
+            return Ok(());
+        }
         if let (
             Some(journal),
             WalEntry::TransactionApply {
@@ -13067,6 +13156,7 @@ fn load_collection_state_with_journal(
             &mut streamer,
             &mut searchers,
             WalReplayIndexes {
+                temporal: &mut temporal,
                 protected,
                 id_index: &mut id_index,
                 graph_lifecycle: &mut graph_lifecycle,
@@ -13077,6 +13167,12 @@ fn load_collection_state_with_journal(
             record,
         )
     })?;
+    if temporal_cut.is_some_and(|cut| cut > scanned.end_lsn) {
+        return Err(GaussError::WalCorruption {
+            path: wal_dir.display().to_string(),
+            message: "temporal checkpoint cutoff exceeds WAL end".into(),
+        });
+    }
     // Overlay records whose originating WAL prefix has already been covered
     // by the checkpoint are not replayed. Remove those final hidden sealed
     // locations now, without removing a later WAL upsert that moved the same
@@ -13154,6 +13250,7 @@ fn load_collection_state_with_journal(
         })
         .transpose()?;
     Ok(LoadedCollectionState {
+        temporal,
         security,
         config,
         schema_epoch,
@@ -22300,12 +22397,14 @@ mod tests {
             vec![ls_vec_point("a", 1.0, "old"), ls_vec_point("b", 2.0, "old")],
         )
         .unwrap();
+        assert!(!db.index_status("docs").unwrap().build_in_flight);
         let coll = db.get_coll("docs").unwrap();
         let frozen = {
             let mut collection = coll.write();
             let end_lsn = collection.wal.len().unwrap();
             freeze_streamer_for_seal(&mut collection, end_lsn)
         };
+        assert!(db.index_status("docs").unwrap().build_in_flight);
 
         assert_eq!(db.get_points("docs", &["b".to_string()]).unwrap().len(), 1);
         db.upsert("docs", vec![ls_vec_point("a", 0.0, "new")])
@@ -22319,6 +22418,7 @@ mod tests {
         assert_eq!(hit.payload, json!({"version": "new"}));
 
         restore_failed_seal(Arc::clone(&coll), frozen);
+        assert!(!db.index_status("docs").unwrap().build_in_flight);
         let collection = coll.read();
         assert!(collection.sealing.is_none());
         assert_eq!(collection.id_index["a"], crate::searcher::SegLoc::Streamer);
@@ -26146,12 +26246,13 @@ mod tests {
             .unwrap()
             .collect::<std::io::Result<Vec<_>>>()
             .unwrap();
-        assert_eq!(wal_segments.len(), 2);
+        assert_eq!(wal_segments.len(), 3);
         let names = wal_segments
             .iter()
             .map(|entry| entry.file_name())
             .collect::<HashSet<_>>();
         assert!(names.contains(std::ffi::OsStr::new("000000.gdwal")));
+        assert!(names.contains(std::ffi::OsStr::new("wal.base")));
         assert!(names.contains(std::ffi::OsStr::new("wal.manifest.json")));
         assert_eq!(
             wal_segments

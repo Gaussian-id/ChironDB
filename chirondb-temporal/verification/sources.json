@@ -1,0 +1,19 @@
+{
+  "influx/tsdb/engine/tsm1/timestamp.go": "d6f601ebc859549dea99eb50a674ed4434dc141e6bcb8b53d0089676f912556e",
+  "influx/tsdb/engine/tsm1/float.go": "93391f07d083c38f8ff32546bf79a07c91a8b62ae1561cb99e9fe521756c49f4",
+  "influx/tsdb/engine/tsm1/bool.go": "c672a2d414042820d533e0e59734f3f13ae4ccca16d3a2793213bfe5f586f973",
+  "influx/tsdb/engine/tsm1/bit_reader.go": "8adf722a4c3aec79047641dc982decce92cbf17cc64eaa1411d0b1bb5e5ae745",
+  "influx/tsdb/engine/tsm1/writer.go": "b67fa9a3c27eac0e11fa3b388915cb6d6650ec25560d8e3f82b7b74f2601d314",
+  "influx/tsdb/engine/tsm1/reader.go": "55e7153c505ff4bfd0ab48624ce404b9f629bbc48696a352f36dead3d3ee28d1",
+  "influx/tsdb/engine/tsm1/encoding.go": "8d7e40d5c7ed85602d477c521200aec91ecf0adfc9dd62fed4d61cd8e018db2b",
+  "iotdb/iotdb-core/datanode/src/main/java/org/apache/iotdb/db/queryengine/execution/aggregation/LastValueAccumulator.java": "f2525ffbfb3c2de3721a8a89f1c9d6a798847474b0522c5b65e1a870ff959626",
+  "tsfile/java/tsfile/src/main/java/org/apache/tsfile/read/filter/basic/TimeFilter.java": "48ec595066f50e4055bbaa045439cf61efe791ffec97b76a4256a81443c6d0ec",
+  "jars": {
+    "org/apache/iotdb:calc-commons:2.0.11": "03b41464f5c2fa6e9dc7bd37402c9f02e32b3906c788f0bda3256849d3b6be7b",
+    "org/apache/iotdb:iotdb-server:2.0.11": "49ede6930a9e9c6af1a211cd33c8dbd513c4529c661ccb50b8cfe14b2b47389f",
+    "org/apache/tsfile:tsfile:2.5.0": "7b205704a32117a0fb07029cab5e74e12f1e9024dad5dded89954398f85b48a7",
+    "org/apache/tsfile:common:2.5.0": "219872c741c076a4acd52c5cdc139d566019ac1e5dda1c77b985fdd16267e75c",
+    "com/google/guava:guava:33.4.8-jre": "f3d7f57f67fd622f4d468dfdd692b3a5e3909246c28017ac3263405f0fe617ed",
+    "org/slf4j:slf4j-api:2.0.16": "a12578dde1ba00bd9b816d388a0b879928d00bab3c83c240f7013bf4196c579a"
+  }
+}

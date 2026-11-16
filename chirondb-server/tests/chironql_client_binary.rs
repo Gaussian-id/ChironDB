@@ -705,3 +705,25 @@ async fn a_failure_reports_the_trace_without_being_asked() {
     );
     assert!(output.stdout.contains("trace"), "{}", output.stdout);
 }
+
+#[path = "common/temporal.rs"]
+mod temporal_case;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn temporal_cli_reads_nanosecond_history() {
+    let server = Server::start().await;
+    let url = server.url.clone();
+    tokio::task::spawn_blocking(move || {
+        for (idx, s) in temporal_case::statements("products").iter().enumerate() {
+            let out = run_client(&["--url", &url, "--exec", s], "");
+            assert_eq!(out.code, 0, "{}", out.stdout);
+            let r: Value = serde_json::from_str(&out.stdout).unwrap();
+            assert_eq!(
+                r["rows"].as_array().map_or(&[][..], Vec::as_slice),
+                temporal_case::rows("products", idx).as_slice()
+            );
+        }
+    })
+    .await
+    .unwrap();
+}

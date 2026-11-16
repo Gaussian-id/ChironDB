@@ -614,6 +614,10 @@ fn response_json(response: chirondb::grpc::pb::WireResponse) -> anyhow::Result<V
             "trace": response.trace_json.as_deref()
                 .and_then(|trace| serde_json::from_str::<Value>(trace).ok()),
         }),
+        wire_response::Payload::RelateBatch(response) => {
+            serde_json::from_str(&response.response_json)
+                .context("server returned invalid graph batch response JSON")?
+        }
         wire_response::Payload::Sql(response) => serde_json::from_str(&response.response_json)
             .context("server returned invalid SQL response JSON")?,
     })

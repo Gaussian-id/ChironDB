@@ -2,7 +2,7 @@ name: chirondb
 
 services:
   chirondb:
-    image: ghcr.io/gaussian-id/chirondb:0.1.0-beta.2
+    image: ghcr.io/gaussian-id/chirondb:0.1.0-beta.3
     pull_policy: always
     restart: unless-stopped
     stop_grace_period: 15s

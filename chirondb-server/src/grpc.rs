@@ -1765,6 +1765,42 @@ macro_rules! impl_chiron_service {
                     .map_err(status_from_error)
             }
 
+            async fn relate_batch(
+                &self,
+                request: Request<chiron_pb::GraphRelateBatchRequest>,
+            ) -> Result<Response<chiron_pb::GraphRelateBatchResponse>, Status> {
+                let principal = grpc_principal(&request)?;
+                let work = request.extensions().get::<std::sync::Arc<crate::auth::WorkPermit>>().cloned();
+                let request = request.into_inner();
+                authorize_graph_grpc(&self.db, &principal, crate::graph::GraphCapability::Write, &request.collection)?;
+                let scope = principal.tenant_scope(principal.id.clone());
+                let edges = request.edges.into_iter().map(|edge| {
+                    graph_relate_request_from_proto(chiron_pb::GraphRelateRequest {
+                        source_point_id: edge.source_point_id,
+                        target_point_id: edge.target_point_id,
+                        edge_type: edge.edge_type,
+                        properties_json: edge.properties_json,
+                        scope: edge.scope,
+                        ..Default::default()
+                    })
+                }).collect::<Result<Vec<_>, _>>()?;
+                let db = self.db.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let _work = work;
+                    db.relate_batch_scoped(
+                        &request.collection,
+                        crate::graph::RelateBatchRequest { edges, idempotency_key: request.idempotency_key },
+                        !request.no_wait,
+                        &scope,
+                    )
+                }).await.map_err(|error| Status::internal(format!("graph batch task failed: {error}")))?
+                    .map_err(status_from_error)?;
+                Ok(Response::new(chiron_pb::GraphRelateBatchResponse {
+                    edge_ids: result.edge_ids.into_iter().map(|id| id.into_encoded()).collect(),
+                    receipt: Some(graph_receipt_to_proto(result.receipt)),
+                }))
+            }
+
             async fn unrelate(
                 &self,
                 request: Request<chiron_pb::GraphUnrelateRequest>,

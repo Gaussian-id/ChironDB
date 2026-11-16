@@ -286,6 +286,40 @@ fn otel_enabled_from_env() -> bool {
         || env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_some()
 }
 
+/// Process and cache gauges are sampled when metrics/health are observed,
+/// rather than adding procfs/syscall work to every durable mutation.
+pub(crate) fn refresh_runtime_gauges() {
+    let profile = crate::resource_profile::current();
+    metrics::gauge!("chirondb_resource_effective_memory_bytes")
+        .set(profile.effective_memory_bytes as f64);
+    metrics::gauge!("chirondb_resource_engine_budget_bytes")
+        .set(profile.engine_budget_bytes as f64);
+    metrics::gauge!("chirondb_resource_sql_pool_bytes").set(profile.sql_pool_bytes as f64);
+    metrics::gauge!("chirondb_resource_effective_cores").set(profile.effective_cores as f64);
+    metrics::gauge!("chirondb_resource_query_workers").set(profile.query_workers as f64);
+    metrics::gauge!("chirondb_resource_background_workers").set(profile.background_workers as f64);
+    metrics::gauge!("chirondb_query_arena_high_water_bytes")
+        .set(crate::query_arena::high_water_bytes() as f64);
+    let usage = crate::resource_profile::process_usage();
+    if let Some(value) = usage.rss_bytes {
+        metrics::gauge!("chirondb_process_rss_bytes").set(value as f64);
+    }
+    if let Some(value) = usage.pss_bytes {
+        metrics::gauge!("chirondb_process_pss_bytes").set(value as f64);
+    }
+    if let Some(value) = usage.cgroup_memory_bytes {
+        metrics::gauge!("chirondb_cgroup_memory_current_bytes").set(value as f64);
+    }
+    if let Some(value) = usage.thread_count {
+        metrics::gauge!("chirondb_process_threads").set(value as f64);
+    }
+    let (persistent_cache_bytes, persistent_cache_high_water_bytes) =
+        crate::encryption::persistent_cache_usage_bytes();
+    metrics::gauge!("chirondb_persistent_cache_bytes").set(persistent_cache_bytes as f64);
+    metrics::gauge!("chirondb_persistent_cache_high_water_bytes")
+        .set(persistent_cache_high_water_bytes as f64);
+}
+
 pub fn observe_operation(operation: &'static str, started: Instant, status: &'static str) {
     metrics::counter!(
         "gaussdb_operations_total",

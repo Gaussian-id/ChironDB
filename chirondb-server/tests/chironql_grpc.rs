@@ -464,3 +464,27 @@ async fn grpc_collection_hnsw_one_is_rejected_and_zero_retains_default_contract(
     );
     handle.abort();
 }
+
+#[path = "common/temporal.rs"]
+mod temporal_case;
+
+#[tokio::test]
+async fn temporal_grpc_returns_exact_history() {
+    let (_d, url, handle) = start().await;
+    let mut client = ChironDbClient::connect(url).await.unwrap();
+    for (idx, s) in temporal_case::statements("products").iter().enumerate() {
+        let r = client.execute_query(request(s)).await.unwrap().into_inner();
+        let rows: Vec<Value> = r
+            .rows_json
+            .iter()
+            .map(|v| serde_json::from_str(v).unwrap())
+            .collect();
+        assert_eq!(rows, temporal_case::rows("products", idx));
+        assert_eq!(r.domains, ["temporal"]);
+    }
+    let bad = temporal_case::statements("products")[1]
+        .replace("1700000000000000002", "9223372036854775808");
+    let e = client.execute_query(request(&bad)).await.unwrap_err();
+    assert!(String::from_utf8_lossy(e.details()).contains("chironql.invalid_timestamp"));
+    handle.abort();
+}

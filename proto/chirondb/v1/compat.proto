@@ -361,6 +361,7 @@ message WireRequest {
     // Interactive native relational transaction lifecycle. `action` is one
     // of begin, execute, commit, or rollback; execute carries request_json.
     WireSqlTransactionRequest sql_transaction = 34;
+    WireGraphRelateBatchRequest relate_batch = 35;
   }
 }
 
@@ -408,6 +409,18 @@ message WireSqlTransactionRequest {
   optional string request_json = 3;
 }
 
+message WireGraphRelateBatchRequest {
+  string collection = 1;
+  // RelateBatchRequest JSON: edges and one batch idempotency_key.
+  string request_json = 2;
+  bool no_wait = 3;
+}
+
+message WireGraphRelateBatchResponse {
+  // RelateBatchResult JSON: ordered edge_ids and one commit receipt.
+  string response_json = 1;
+}
+
 message WireResponse {
   uint64 request_id = 1;
   string error_code = 2;
@@ -425,6 +438,7 @@ message WireResponse {
     DeleteByFilterResponse delete_by_filter = 25;
     WireChironQlResponse chironql = 26;
     WireSqlResponse sql = 27;
+    WireGraphRelateBatchResponse relate_batch = 28;
     SearchResponse search = 15;
     MultiSearchResponse multi_search = 16;
     CountResponse count = 17;

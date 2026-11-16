@@ -89,6 +89,20 @@ def main():
         if decoded.request_id != 501 or decoded.WhichOneof("operation") != "health":
             raise AssertionError("generated WireRequest round-trip failed")
 
+        batch = primary.GraphRelateBatchRequest(collection="docs", idempotency_key="batch-1")
+        batch.edges.add(source_point_id="a", target_point_id="b", edge_type="cites", properties_json="{}")
+        if primary.GraphRelateBatchRequest.FromString(batch.SerializeToString()) != batch:
+            raise AssertionError("generated relation batch round-trip failed")
+        batch_wire = generated.WireRequest(request_id=502)
+        batch_wire.relate_batch.collection = "docs"
+        batch_wire.relate_batch.request_json = '{"edges":[]}'
+        if generated.WireRequest.DESCRIPTOR.fields_by_name["relate_batch"].number != 35:
+            raise AssertionError("batch wire request tag changed")
+        if generated.WireResponse.DESCRIPTOR.fields_by_name["relate_batch"].number != 28:
+            raise AssertionError("batch wire response tag changed")
+        if generated.WireRequest.FromString(batch_wire.SerializeToString()).WhichOneof("operation") != "relate_batch":
+            raise AssertionError("additive batch wire operation round-trip failed")
+
         create = generated.CreateCollectionRequest()
         create.config.name = "compat"
         create.config.vector_dim = 3
@@ -205,6 +219,7 @@ def validate_descriptor(descriptor_path):
         "ListEdgeTypes",
         "ConfigureEdgeType",
         "Relate",
+        "RelateBatch",
         "Unrelate",
         "UpdateEdge",
         "Traverse",

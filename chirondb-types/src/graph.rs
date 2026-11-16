@@ -207,6 +207,15 @@ pub struct RelateRequest {
     pub idempotency_key: Option<String>,
 }
 
+/// One atomic collection-local relation batch. Per-edge idempotency keys are
+/// unavailable; the batch key binds the ordered request and all returned IDs.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RelateBatchRequest {
+    pub edges: Vec<RelateRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct UpdateEdgeRequest {
     pub mode: EdgePropertyMode,
@@ -643,6 +652,12 @@ pub struct GraphLifecycleResult {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RelateResult {
     pub edge_id: EdgeToken,
+    pub receipt: GraphMutationReceipt,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RelateBatchResult {
+    pub edge_ids: Vec<EdgeToken>,
     pub receipt: GraphMutationReceipt,
 }
 

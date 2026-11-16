@@ -498,6 +498,7 @@ pub(crate) fn chironql(
     for domain in value.domains {
         domains.push(
             match domain {
+                ExecutionDomain::Temporal => "temporal",
                 ExecutionDomain::Relational => "relational",
                 ExecutionDomain::Vector => "vector",
                 ExecutionDomain::Graph => "graph",
