@@ -380,7 +380,23 @@ fetch('https://127.0.0.1:{self.args.grpc_port}/chirondb.v1.ChironDb/ExecuteQuery
             stderr=subprocess.DEVNULL,
             text=True,
         )
-        time.sleep(0.5)
+        expected_page = self.browser_page.read_bytes()
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            if self.page_server.poll() is not None:
+                raise RuntimeError("browser origin exited during startup")
+            connection = http.client.HTTPConnection("127.0.0.1", self.page_port, timeout=1)
+            try:
+                connection.request("GET", "/")
+                response = connection.getresponse()
+                if response.status == 200 and response.read(len(expected_page) + 1) == expected_page:
+                    return
+            except (OSError, http.client.HTTPException):
+                pass
+            finally:
+                connection.close()
+            time.sleep(0.05)
+        raise RuntimeError("browser origin did not serve the expected page within 45 seconds")
 
     def curl(self, mtls: bool = False) -> None:
         argv = [
@@ -490,7 +506,21 @@ fetch('https://127.0.0.1:{self.args.grpc_port}/chirondb.v1.ChironDb/ExecuteQuery
         finally:
             shutil.rmtree(profile, ignore_errors=True)
         if not re.search(r"<body[^>]*>\s*grpc-web-passed\s*</body>", result.stdout):
-            raise RuntimeError("browser gRPC-Web probe failed")
+            # Never include the DOM or client stderr: the page embeds the API key.
+            state = "unrecognized-document"
+            for marker in ("pending", "grpc-web-failed", "grpc-web-error"):
+                if re.search(rf"<body[^>]*>\s*{marker}(?:\s|<)", result.stdout):
+                    state = marker
+                    break
+            network_error = "none"
+            for code in (
+                "ERR_CONNECTION_REFUSED", "ERR_CONNECTION_RESET", "ERR_CERT_AUTHORITY_INVALID",
+                "ERR_SSL_PROTOCOL_ERROR", "ERR_HTTP2_PROTOCOL_ERROR", "ERR_TIMED_OUT",
+            ):
+                if code in result.stdout or code in getattr(result, "stderr", ""):
+                    network_error = code
+                    break
+            raise RuntimeError(f"browser gRPC-Web probe failed (state={state}, network={network_error})")
 
     def worker(self, name: str, operation: Callable[[], None], interval: float) -> None:
         with self.lock:
@@ -503,7 +533,8 @@ fetch('https://127.0.0.1:{self.args.grpc_port}/chirondb.v1.ChironDb/ExecuteQuery
                 outcome = "failure"
                 with self.lock:
                     if len(self.failures) < 100:
-                        self.failures.append(f"{name}: {error}")
+                        timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                        self.failures.append(f"{name}: {error} (at={timestamp})")
             with self.lock:
                 self.counts[name][outcome] += 1
             self.stop.wait(interval)

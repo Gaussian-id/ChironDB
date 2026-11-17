@@ -1,16 +1,64 @@
 #!/usr/bin/env python3
 """Reject false browser successes and credential-bearing client diagnostics."""
 from pathlib import Path
+import http.client
+import socket
 import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import security_tls_soak as soak
 
 
 class TlsFixtureTests(unittest.TestCase):
+    def test_origin_waits_for_delayed_page(self):
+        with tempfile.TemporaryDirectory(prefix="chiron-origin-ready-") as directory:
+            root = Path(directory)
+            with socket.socket() as reservation:
+                reservation.bind(("127.0.0.1", 0))
+                port = reservation.getsockname()[1]
+            probe = soak.Soak(SimpleNamespace(output=root / "evidence.json", page_port=port), root, {})
+            probe.browser_page.parent.mkdir()
+            probe.browser_page.write_text("the expected fixture page")
+            real_popen = subprocess.Popen
+
+            def delayed_origin(argv, **kwargs):
+                code = ("import runpy,sys,time;time.sleep(1);"
+                        "sys.argv=['http.server',*sys.argv[1:]];"
+                        "runpy.run_module('http.server',run_name='__main__')")
+                return real_popen([argv[0], "-c", code, *argv[3:]], **kwargs)
+
+            try:
+                with patch.object(soak.subprocess, "Popen", side_effect=delayed_origin):
+                    probe.start_browser_origin()
+                connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.2)
+                try:
+                    connection.request("GET", "/")
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.read(), probe.browser_page.read_bytes())
+                finally:
+                    connection.close()
+            finally:
+                probe.close()
+
+    def test_origin_rejects_exited_child(self):
+        with tempfile.TemporaryDirectory(prefix="chiron-origin-exit-") as directory:
+            root = Path(directory)
+            probe = soak.Soak(SimpleNamespace(output=root / "evidence.json", page_port=18080), root, {})
+            probe.browser_page.parent.mkdir()
+            probe.browser_page.write_text("the expected fixture page")
+            child = Mock()
+            child.poll.return_value = 1
+            try:
+                with patch.object(soak.subprocess, "Popen", return_value=child):
+                    with self.assertRaisesRegex(RuntimeError, "origin exited"):
+                        probe.start_browser_origin()
+            finally:
+                probe.close()
+
     def test_generated_chains_pass_strict_certificate_validation(self):
         with tempfile.TemporaryDirectory(prefix="chiron-tls-pki-") as directory:
             pki = soak.generate_pki(Path(directory), "openssl")
@@ -58,6 +106,27 @@ class TlsFixtureTests(unittest.TestCase):
                 client.return_value = SimpleNamespace(returncode=0, stderr="")
                 with self.assertRaises(RuntimeError):
                     probe.tls_version_matrix()
+
+    def test_browser_failure_states_do_not_disclose_page_or_stderr(self):
+        secret = "synthetic-" + "sensitive-value"
+        with tempfile.TemporaryDirectory(prefix="chiron-browser-state-") as directory:
+            root = Path(directory)
+            args = SimpleNamespace(output=root / "evidence.json", page_port=18080, chrome="chrome", openssl="openssl")
+            probe = soak.Soak(args, root, {"initial_cert": root / "initial.crt",
+                                         "replacement_cert": root / "replacement.crt"})
+            with patch.object(soak, "spki_pin", return_value="synthetic-pin"), \
+                    patch.object(soak, "command") as client:
+                for state in ("pending", "grpc-web-failed", "grpc-web-error"):
+                    with self.subTest(state=state):
+                        client.return_value = SimpleNamespace(
+                            stdout=f'<body>{state}<script>const key="{secret}";</script></body>',
+                            stderr=secret + " ERR_CONNECTION_REFUSED",
+                        )
+                        with self.assertRaises(RuntimeError) as raised:
+                            probe.browser()
+                        self.assertIn(f"state={state}", str(raised.exception))
+                        self.assertIn("network=ERR_CONNECTION_REFUSED", str(raised.exception))
+                        self.assertNotIn(secret, str(raised.exception))
 
     def test_failed_client_diagnostics_do_not_disclose_credentials(self):
         secret = "synthetic-" + "sensitive-value"
