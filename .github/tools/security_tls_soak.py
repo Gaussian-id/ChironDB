@@ -214,6 +214,132 @@ class LongLivedHttp:
         self.connection.close()
 
 
+def start_browser_driver():
+    # Keep the optional external-client dependency out of engine/unit imports.
+    from playwright.sync_api import sync_playwright
+
+    return sync_playwright().start()
+
+
+class BrowserProbe:
+    """One managed Chrome process, with a fresh network context per RPC probe."""
+
+    states = {"grpc-web-passed", "grpc-web-failed", "grpc-web-error", "pending"}
+    phases = {"fetch", "body", "frame", "rows-json", "identity"}
+    errors = {"TypeError", "SyntaxError", "RangeError", "Error", "AbortError", "SecurityError", "other"}
+    network_errors = {
+        "ERR_CONNECTION_REFUSED", "ERR_CONNECTION_RESET", "ERR_CONNECTION_CLOSED",
+        "ERR_SOCKET_NOT_CONNECTED", "ERR_CERT_AUTHORITY_INVALID", "ERR_SSL_PROTOCOL_ERROR",
+        "ERR_HTTP2_PROTOCOL_ERROR", "ERR_TIMED_OUT", "ERR_NETWORK_CHANGED",
+        "ERR_CERT_VERIFIER_CHANGED", "ERR_FAILED", "ERR_ABORTED", "ERR_EMPTY_RESPONSE",
+    }
+    completed_state = """() => {
+      const body = document.body;
+      const text = body?.textContent?.trim();
+      if (!['grpc-web-passed', 'grpc-web-failed', 'grpc-web-error'].includes(text)) return false;
+      return {state: text, phase: body.dataset.probePhase, error: body.dataset.probeError};
+    }"""
+
+    def __init__(self, chrome: str, origin: str, target: str, pins: str, netlog: Path):
+        self.chrome, self.origin, self.target = chrome, origin, target
+        self.pins, self.netlog = pins, netlog
+        self.playwright = None
+        self.browser = None
+        self.metadata: dict[str, object] = {"driver": "playwright", "processes_started": 0, "contexts_created": 0}
+
+    def __enter__(self):
+        from importlib.metadata import version
+        try:
+            self.playwright = start_browser_driver()
+            self.browser = self.playwright.chromium.launch(
+                executable_path=self.chrome, headless=True, chromium_sandbox=False, timeout=30000,
+                args=[f"--ignore-certificate-errors-spki-list={self.pins}",
+                      f"--log-net-log={self.netlog}", "--disable-gpu"],
+            )
+            self.metadata.update(
+                processes_started=1, playwright_version=version("playwright"),
+                browser_version=self.browser.version,
+            )
+            return self
+        except Exception:
+            self.__exit__(None, None, None)
+            raise RuntimeError("browser driver startup failed") from None
+
+    def __exit__(self, *_):
+        failed = False
+        try:
+            if self.browser:
+                try:
+                    self.browser.close()
+                except Exception:
+                    failed = True
+            self.metadata["target_net_errors"] = browser_target_net_errors(self.netlog, self.target)
+        finally:
+            self.netlog.unlink(missing_ok=True)
+            if self.playwright:
+                try:
+                    self.playwright.stop()
+                except Exception:
+                    failed = True
+        if failed:
+            raise RuntimeError("browser driver cleanup failed") from None
+
+    def check(self) -> None:
+        context = None
+        observed = {"state": "pending", "phase": "none", "error": "none"}
+        network = set()
+        http_status = None
+        failure = None
+        stage = "context"
+
+        def response_seen(response):
+            nonlocal http_status
+            if response.url == self.target and response.request.method == "POST":
+                http_status = response.status
+
+        def request_failed(request):
+            if request.url == self.target:
+                code = (request.failure or "").removeprefix("net::")
+                network.add(code if code in self.network_errors else "unclassified")
+
+        try:
+            context = self.browser.new_context(ignore_https_errors=False)
+            self.metadata["contexts_created"] += 1
+            page = context.new_page()
+            page.on("response", response_seen)
+            page.on("requestfailed", request_failed)
+            stage = "navigation"
+            page.goto(self.origin, wait_until="domcontentloaded", timeout=30000)
+            stage = "response"
+            state = page.wait_for_function(self.completed_state, timeout=10000)
+            result = state.json_value()
+            state.dispose()
+            if isinstance(result, dict):
+                observed = {
+                    "state": result.get("state") if result.get("state") in self.states else "unrecognized-document",
+                    "phase": result.get("phase") if result.get("phase") in self.phases else "none",
+                    "error": result.get("error") if result.get("error") in self.errors else "none",
+                }
+            if observed["state"] != "grpc-web-passed" or http_status is None or not 200 <= http_status < 300:
+                failure = True
+        except Exception:
+            failure = True
+        finally:
+            if context:
+                try:
+                    context.close()
+                except Exception:
+                    failure = True
+                    stage = "cleanup"
+        if failure:
+            # Never expose Playwright exception text, DOM, headers or response values.
+            codes = ",".join(sorted(network)) or "none"
+            raise RuntimeError(
+                f"browser gRPC-Web probe failed (state={observed['state']}, network={codes}, "
+                f"phase={observed['phase']}, error={observed['error']}, driver_stage={stage})"
+            )
+
+
 class Soak:
     def __init__(self, args: argparse.Namespace, root: Path, pki: dict[str, Path]) -> None:
         self.args = args
@@ -223,6 +349,9 @@ class Soak:
         self.lock = threading.Lock()
         self.counts: dict[str, dict[str, int]] = {}
         self.failures: list[str] = []
+        self.browser_ready = threading.Event()
+        self.browser_start_error = False
+        self.browser_metadata: dict[str, object] = {}
         self.server: subprocess.Popen[str] | None = None
         args.output.parent.mkdir(parents=True, exist_ok=True)
         self.server_log = args.output.parent / "tls-soak-server.log"
@@ -506,61 +635,28 @@ fetch('https://127.0.0.1:{self.args.grpc_port}/chirondb.v1.ChironDb/ExecuteQuery
         if len(rows) != 1 or rows[0].get("name") != "tls-soak-admin":
             raise RuntimeError("ChironWire protected identity response was invalid")
 
-    def browser(self) -> None:
-        profile = self.root / f"chrome-{time.time_ns()}"
-        netlog = profile / "netlog.json"
-        pins = ",".join(
-            [
-                spki_pin(self.args.openssl, self.pki["initial_cert"]),
-                spki_pin(self.args.openssl, self.pki["replacement_cert"]),
-            ]
-        )
-        profile.mkdir(mode=0o700)
+    def browser_worker(self) -> None:
+        name = "browser_grpc_web"
+        probe = None
         try:
-            result = command(
-                [
-                    self.args.chrome,
-                    "--headless=new",
-                    "--no-sandbox",
-                    "--disable-gpu",
-                    f"--user-data-dir={profile}",
-                    f"--log-net-log={netlog}",
-                    f"--ignore-certificate-errors-spki-list={pins}",
-                    "--virtual-time-budget=10000",
-                    "--dump-dom",
-                    f"http://127.0.0.1:{self.page_port}/",
-                ]
+            pins = ",".join(spki_pin(self.args.openssl, self.pki[key])
+                            for key in ("initial_cert", "replacement_cert"))
+            probe = BrowserProbe(
+                self.args.chrome, f"http://127.0.0.1:{self.page_port}/",
+                f"https://127.0.0.1:{self.args.grpc_port}/chirondb.v1.ChironDb/ExecuteQuery",
+                pins, self.root / "browser-netlog.json",
             )
-            if not re.search(r"<body[^>]*>\s*grpc-web-passed\s*</body>", result.stdout):
-                # Never include the DOM or client stderr: the page embeds the API key.
-                state = "unrecognized-document"
-                for marker in ("pending", "grpc-web-failed", "grpc-web-error"):
-                    if re.search(rf"<body[^>]*>\s*{marker}(?:\s|<)", result.stdout):
-                        state = marker
-                        break
-                network_error = "none"
-                for code in (
-                    "ERR_CONNECTION_REFUSED", "ERR_CONNECTION_RESET", "ERR_CERT_AUTHORITY_INVALID",
-                    "ERR_SSL_PROTOCOL_ERROR", "ERR_HTTP2_PROTOCOL_ERROR", "ERR_TIMED_OUT",
-                ):
-                    if code in result.stdout or code in getattr(result, "stderr", ""):
-                        network_error = code
-                        break
-                # Extract only finite categories from the body, never exception text.
-                body = re.search(r"<body\b[^>]*>", result.stdout)
-                attributes = body.group(0) if body else ""
-                phase = re.search(r'data-probe-phase="(fetch|body|frame|rows-json|identity)"', attributes)
-                kind = re.search(r'data-probe-error="(TypeError|SyntaxError|RangeError|Error|AbortError|SecurityError|other)"', attributes)
-                target_errors = browser_target_net_errors(
-                    netlog, f"https://127.0.0.1:{self.args.grpc_port}/chirondb.v1.ChironDb/ExecuteQuery",
-                )
-                raise RuntimeError(
-                    f"browser gRPC-Web probe failed (state={state}, network={network_error}, "
-                    f"phase={phase.group(1) if phase else 'none'}, "
-                    f"error={kind.group(1) if kind else 'none'}, target_net_errors={target_errors})"
-                )
+            with probe:
+                self.browser_ready.set()
+                self.worker(name, probe.check, 30.0)
+        except Exception:
+            with self.lock:
+                self.counts.setdefault(name, {"success": 0, "failure": 0})["failure"] += 1
+                self.failures.append(f"{name}: browser driver lifecycle failed")
+                self.browser_start_error = not self.browser_ready.is_set()
         finally:
-            shutil.rmtree(profile, ignore_errors=True)
+            self.browser_metadata = dict(probe.metadata) if probe else {}
+            self.browser_ready.set()
 
     def worker(self, name: str, operation: Callable[[], None], interval: float) -> None:
         with self.lock:
@@ -654,15 +750,22 @@ fetch('https://127.0.0.1:{self.args.grpc_port}/chirondb.v1.ChironDb/ExecuteQuery
         if long_connection.health() != 200:
             raise RuntimeError("initial long-lived health request failed")
 
+        browser_worker = threading.Thread(target=self.browser_worker, daemon=True)
+        browser_worker.start()
+        if not self.browser_ready.wait(45) or self.browser_start_error:
+            self.stop.set()
+            long_connection.close()
+            browser_worker.join(timeout=45)
+            raise RuntimeError("browser driver did not initialize")
         workers = [
             threading.Thread(target=self.worker, args=("curl", self.curl, 1.0), daemon=True),
             threading.Thread(target=self.worker, args=("grpcurl", self.grpcurl, 1.0), daemon=True),
             threading.Thread(target=self.worker, args=("psql", self.psql, 1.0), daemon=True),
             threading.Thread(target=self.worker, args=("chironwire", self.wire, 1.0), daemon=True),
-            threading.Thread(target=self.worker, args=("browser_grpc_web", self.browser, 30.0), daemon=True),
         ]
         for worker in workers:
             worker.start()
+        workers.append(browser_worker)
         started = time.monotonic()
         first_rotation = started + self.args.duration_seconds / 3
         invalid_rotation = started + self.args.duration_seconds * 2 / 3
@@ -726,6 +829,7 @@ fetch('https://127.0.0.1:{self.args.grpc_port}/chirondb.v1.ChironDb/ExecuteQuery
             "tls_versions": {"1.2": "passed", "1.3": "passed", "1.1": "rejected"},
             "mtls_external_clients": ["curl", "grpcurl", "psql/libpq", "chironwirectl"],
             "browser_grpc_web": "passed",
+            "browser_driver": self.browser_metadata,
             "failures": [],
         }
 
@@ -775,6 +879,9 @@ def parse_args() -> argparse.Namespace:
     )
     if not args.chrome:
         parser.error("Chrome/Chromium is required for the real browser gRPC-Web probe")
+    import importlib.util
+    if importlib.util.find_spec("playwright") is None:
+        parser.error("Playwright is required; install .github/tools/requirements-tls-soak.txt")
     for path in (args.server, args.ctl, args.wirectl, args.proto_root):
         if not path.exists():
             parser.error(f"required path does not exist: {path}")
@@ -810,6 +917,7 @@ def main() -> int:
             "actions_run_id": os.environ.get("GITHUB_RUN_ID"),
             "error": str(error),
             "load_counts": soak.counts if soak else {},
+            "browser_driver": soak.browser_metadata if soak else {},
             "work_dir": str(root),
         }
         write_report(args.output, report)
