@@ -40,6 +40,20 @@ def command(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[st
 
 
 
+def browser_target_net_errors(path: Path, url: str) -> list[int]:
+    """Return only numeric errors for this probe, never URLs or headers."""
+    try:
+        events = json.loads(path.read_text())["events"]
+        sources = {event["source"]["id"] for event in events
+                   if event.get("params", {}).get("url") == url}
+        return sorted({event["params"]["net_error"] for event in events
+                       if event["source"]["id"] in sources
+                       and type(event.get("params", {}).get("net_error")) is int
+                       and -1000 < event["params"]["net_error"] < 0})[:10]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return []
+
+
 def require_tool(name: str) -> str:
     resolved = shutil.which(name)
     if not resolved:
@@ -242,13 +256,16 @@ class Soak:
         frame = bytes([0]) + len(message).to_bytes(4, "big") + message
         self.browser_page.write_text(
             rf"""<!doctype html><meta charset=utf-8><body>pending<script>
+let phase = 'fetch';
 const body = new Uint8Array({list(frame)});
 fetch('https://127.0.0.1:{self.args.grpc_port}/chirondb.v1.ChironDb/ExecuteQuery', {{
   method: 'POST', mode: 'cors',
   headers: {{'content-type': 'application/grpc-web+proto', 'x-grpc-web': '1',
              'x-chirondb-api-key': {json.dumps(self.api_key)}}}, body
 }}).then(async response => {{
+  phase = 'body';
   const bytes = new Uint8Array(await response.arrayBuffer());
+  phase = 'frame';
   const decoder = new TextDecoder();
   const rows = [];
   let ok = false, kind = '';
@@ -279,13 +296,21 @@ fetch('https://127.0.0.1:{self.args.grpc_port}/chirondb.v1.ChironDb/ExecuteQuery
         if (cursor + length > payload.length) throw Error('field size');
         const value = decoder.decode(payload.subarray(cursor, cursor + length)); cursor += length;
         if ((tag >>> 3) === 1) kind = value;
-        if ((tag >>> 3) === 3) rows.push(JSON.parse(value));
+        if ((tag >>> 3) === 3) {{
+          phase = 'rows-json'; rows.push(JSON.parse(value)); phase = 'frame';
+        }}
       }}
     }} else throw Error('frame flags');
   }}
+  phase = 'identity';
   document.body.textContent = response.ok && ok && kind === 'rows' && rows.length === 1 &&
     rows[0].name === 'tls-soak-admin' ? 'grpc-web-passed' : 'grpc-web-failed';
-}}).catch(() => {{ document.body.textContent = 'grpc-web-error'; }});
+}}).catch(error => {{
+  document.body.dataset.probePhase = phase;
+  document.body.dataset.probeError = ['TypeError', 'SyntaxError', 'RangeError', 'Error',
+    'AbortError', 'SecurityError'].includes(error?.name) ? error.name : 'other';
+  document.body.textContent = 'grpc-web-error';
+}});
 </script>"""
         )
 
@@ -483,12 +508,14 @@ fetch('https://127.0.0.1:{self.args.grpc_port}/chirondb.v1.ChironDb/ExecuteQuery
 
     def browser(self) -> None:
         profile = self.root / f"chrome-{time.time_ns()}"
+        netlog = profile / "netlog.json"
         pins = ",".join(
             [
                 spki_pin(self.args.openssl, self.pki["initial_cert"]),
                 spki_pin(self.args.openssl, self.pki["replacement_cert"]),
             ]
         )
+        profile.mkdir(mode=0o700)
         try:
             result = command(
                 [
@@ -497,30 +524,43 @@ fetch('https://127.0.0.1:{self.args.grpc_port}/chirondb.v1.ChironDb/ExecuteQuery
                     "--no-sandbox",
                     "--disable-gpu",
                     f"--user-data-dir={profile}",
+                    f"--log-net-log={netlog}",
                     f"--ignore-certificate-errors-spki-list={pins}",
                     "--virtual-time-budget=10000",
                     "--dump-dom",
                     f"http://127.0.0.1:{self.page_port}/",
                 ]
             )
+            if not re.search(r"<body[^>]*>\s*grpc-web-passed\s*</body>", result.stdout):
+                # Never include the DOM or client stderr: the page embeds the API key.
+                state = "unrecognized-document"
+                for marker in ("pending", "grpc-web-failed", "grpc-web-error"):
+                    if re.search(rf"<body[^>]*>\s*{marker}(?:\s|<)", result.stdout):
+                        state = marker
+                        break
+                network_error = "none"
+                for code in (
+                    "ERR_CONNECTION_REFUSED", "ERR_CONNECTION_RESET", "ERR_CERT_AUTHORITY_INVALID",
+                    "ERR_SSL_PROTOCOL_ERROR", "ERR_HTTP2_PROTOCOL_ERROR", "ERR_TIMED_OUT",
+                ):
+                    if code in result.stdout or code in getattr(result, "stderr", ""):
+                        network_error = code
+                        break
+                # Extract only finite categories from the body, never exception text.
+                body = re.search(r"<body\b[^>]*>", result.stdout)
+                attributes = body.group(0) if body else ""
+                phase = re.search(r'data-probe-phase="(fetch|body|frame|rows-json|identity)"', attributes)
+                kind = re.search(r'data-probe-error="(TypeError|SyntaxError|RangeError|Error|AbortError|SecurityError|other)"', attributes)
+                target_errors = browser_target_net_errors(
+                    netlog, f"https://127.0.0.1:{self.args.grpc_port}/chirondb.v1.ChironDb/ExecuteQuery",
+                )
+                raise RuntimeError(
+                    f"browser gRPC-Web probe failed (state={state}, network={network_error}, "
+                    f"phase={phase.group(1) if phase else 'none'}, "
+                    f"error={kind.group(1) if kind else 'none'}, target_net_errors={target_errors})"
+                )
         finally:
             shutil.rmtree(profile, ignore_errors=True)
-        if not re.search(r"<body[^>]*>\s*grpc-web-passed\s*</body>", result.stdout):
-            # Never include the DOM or client stderr: the page embeds the API key.
-            state = "unrecognized-document"
-            for marker in ("pending", "grpc-web-failed", "grpc-web-error"):
-                if re.search(rf"<body[^>]*>\s*{marker}(?:\s|<)", result.stdout):
-                    state = marker
-                    break
-            network_error = "none"
-            for code in (
-                "ERR_CONNECTION_REFUSED", "ERR_CONNECTION_RESET", "ERR_CERT_AUTHORITY_INVALID",
-                "ERR_SSL_PROTOCOL_ERROR", "ERR_HTTP2_PROTOCOL_ERROR", "ERR_TIMED_OUT",
-            ):
-                if code in result.stdout or code in getattr(result, "stderr", ""):
-                    network_error = code
-                    break
-            raise RuntimeError(f"browser gRPC-Web probe failed (state={state}, network={network_error})")
 
     def worker(self, name: str, operation: Callable[[], None], interval: float) -> None:
         with self.lock:

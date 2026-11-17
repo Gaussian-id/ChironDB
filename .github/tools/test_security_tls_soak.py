@@ -2,6 +2,7 @@
 """Reject false browser successes and credential-bearing client diagnostics."""
 from pathlib import Path
 import http.client
+import json
 import socket
 import subprocess
 import tempfile
@@ -76,7 +77,7 @@ class TlsFixtureTests(unittest.TestCase):
     def test_browser_requires_completed_body(self):
         with tempfile.TemporaryDirectory(prefix="chiron-tls-fixture-") as directory:
             root = Path(directory)
-            args = SimpleNamespace(output=root / "evidence.json", page_port=18080, chrome="chrome", openssl="openssl")
+            args = SimpleNamespace(output=root / "evidence.json", page_port=18080, grpc_port=17402, chrome="chrome", openssl="openssl")
             probe = soak.Soak(args, root, {"initial_cert": root / "initial.crt",
                                            "replacement_cert": root / "replacement.crt"})
             with patch.object(soak, "spki_pin", return_value="synthetic-pin"), \
@@ -111,7 +112,7 @@ class TlsFixtureTests(unittest.TestCase):
         secret = "synthetic-" + "sensitive-value"
         with tempfile.TemporaryDirectory(prefix="chiron-browser-state-") as directory:
             root = Path(directory)
-            args = SimpleNamespace(output=root / "evidence.json", page_port=18080, chrome="chrome", openssl="openssl")
+            args = SimpleNamespace(output=root / "evidence.json", page_port=18080, grpc_port=17402, chrome="chrome", openssl="openssl")
             probe = soak.Soak(args, root, {"initial_cert": root / "initial.crt",
                                          "replacement_cert": root / "replacement.crt"})
             with patch.object(soak, "spki_pin", return_value="synthetic-pin"), \
@@ -127,6 +128,106 @@ class TlsFixtureTests(unittest.TestCase):
                         self.assertIn(f"state={state}", str(raised.exception))
                         self.assertIn("network=ERR_CONNECTION_REFUSED", str(raised.exception))
                         self.assertNotIn(secret, str(raised.exception))
+
+    def test_netlog_ignores_other_requests_and_unsafe_values(self):
+        url = "https://127.0.0.1:17402/chirondb.v1.ChironDb/ExecuteQuery"
+        with tempfile.TemporaryDirectory(prefix="chiron-netlog-") as directory:
+            path = Path(directory) / "trace.json"
+            events = [
+                {"source": {"id": 1}, "params": {"url": url}},
+                {"source": {"id": 1}, "params": {"net_error": -21}},
+                {"source": {"id": 2}, "params": {"url": "https://background.invalid", "net_error": -102}},
+            ]
+            for value in [True, "sensitive-value", -1001, 0, 200, -21]:
+                events.append({"source": {"id": 1}, "params": {"net_error": value}})
+            path.write_text(json.dumps({"events": events}))
+            self.assertEqual(soak.browser_target_net_errors(path, url), [-21])
+            for payload in ["{", "{}", '{"events":[null]}']:
+                path.write_text(payload)
+                self.assertEqual(soak.browser_target_net_errors(path, url), [])
+            path.unlink()
+            self.assertEqual(soak.browser_target_net_errors(path, url), [])
+
+    def test_browser_reports_only_safe_categories_and_removes_netlog(self):
+        secret = "synthetic-" + "sensitive-value"
+        with tempfile.TemporaryDirectory(prefix="chiron-browser-netlog-") as directory:
+            root = Path(directory)
+            args = SimpleNamespace(output=root / "evidence.json", page_port=18080,
+                                   grpc_port=17402, chrome="chrome", openssl="openssl")
+            probe = soak.Soak(args, root, {"initial_cert": root / "initial.crt",
+                                         "replacement_cert": root / "replacement.crt"})
+            traces = []
+
+            def browser(argv):
+                trace = Path(next(value.split("=", 1)[1] for value in argv if value.startswith("--log-net-log=")))
+                traces.append(trace)
+                self.assertEqual(trace.parent.stat().st_mode & 0o777, 0o700)
+                url = "https://127.0.0.1:17402/chirondb.v1.ChironDb/ExecuteQuery"
+                trace.write_text(json.dumps({"events": [
+                    {"source": {"id": 1}, "params": {"url": url, "headers": secret}},
+                    {"source": {"id": 1}, "params": {"net_error": -102}},
+                ]}))
+                return SimpleNamespace(
+                    stdout='<body data-probe-phase="fetch" data-probe-error="TypeError">grpc-web-error</body>',
+                    stderr=secret,
+                )
+
+            with patch.object(soak, "spki_pin", return_value="synthetic-pin"), \
+                    patch.object(soak, "command", side_effect=browser):
+                with self.assertRaises(RuntimeError) as raised:
+                    probe.browser()
+                message = str(raised.exception)
+                self.assertIn("phase=fetch, error=TypeError, target_net_errors=[-102]", message)
+                self.assertNotIn(secret, message)
+            self.assertTrue(traces)
+            self.assertTrue(all(not path.parent.exists() for path in traces))
+
+    def test_browser_removes_private_trace_on_success_or_client_error(self):
+        with tempfile.TemporaryDirectory(prefix="chiron-browser-cleanup-") as directory:
+            root = Path(directory)
+            args = SimpleNamespace(output=root / "evidence.json", page_port=18080,
+                                   grpc_port=17402, chrome="chrome", openssl="openssl")
+            probe = soak.Soak(args, root, {"initial_cert": root / "initial.crt",
+                                         "replacement_cert": root / "replacement.crt"})
+            for failure in (False, True):
+                traces = []
+
+                def browser(argv):
+                    trace = Path(next(value.split("=", 1)[1] for value in argv if value.startswith("--log-net-log=")))
+                    traces.append(trace)
+                    trace.write_text("synthetic-sensitive-value")
+                    if failure:
+                        raise RuntimeError("external client chrome failed: TimeoutExpired")
+                    return SimpleNamespace(stdout="<body>grpc-web-passed</body>")
+
+                with self.subTest(client_failure=failure), \
+                        patch.object(soak, "spki_pin", return_value="synthetic-pin"), \
+                        patch.object(soak, "command", side_effect=browser):
+                    if failure:
+                        with self.assertRaises(RuntimeError):
+                            probe.browser()
+                    else:
+                        probe.browser()
+                self.assertTrue(traces)
+                self.assertTrue(all(not path.parent.exists() for path in traces))
+
+    def test_unknown_browser_exception_text_is_not_published(self):
+        with tempfile.TemporaryDirectory(prefix="chiron-browser-category-") as directory:
+            root = Path(directory)
+            args = SimpleNamespace(output=root / "evidence.json", page_port=18080,
+                                   grpc_port=17402, chrome="chrome", openssl="openssl")
+            probe = soak.Soak(args, root, {"initial_cert": root / "initial.crt",
+                                         "replacement_cert": root / "replacement.crt"})
+            secret = "synthetic-" + "sensitive-value"
+            with patch.object(soak, "spki_pin", return_value="synthetic-pin"), \
+                    patch.object(soak, "command", return_value=SimpleNamespace(
+                        stdout=f'<body data-probe-phase="{secret}" data-probe-error="{secret}">grpc-web-error</body>',
+                        stderr=secret,
+                    )):
+                with self.assertRaises(RuntimeError) as raised:
+                    probe.browser()
+                self.assertIn("phase=none, error=none", str(raised.exception))
+                self.assertNotIn(secret, str(raised.exception))
 
     def test_failed_client_diagnostics_do_not_disclose_credentials(self):
         secret = "synthetic-" + "sensitive-value"
