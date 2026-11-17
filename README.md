@@ -76,6 +76,10 @@ authentication plus RBAC.
 
 ## Status
 
+**Source version status (2026-11-17):** the server workspace, Docker build default, and pinned Compose image use **`0.1.0-beta.3`**. Standalone SDKs have their own package versions and compatibility pins.
+
+This source includes standalone SDK compatibility updates, row and field authority across supported models, and bounded SQL parsing. The existing `v0.1.0-beta.3` tag is an earlier snapshot; source builds from `main` include later changes. Consult the commit and workflow results when evaluating a source build.
+
 Current source builds include the **ChironQL 1.5 time-series preview**; the
 published `v0.1.0-beta.3` tag does not include this feature. Temporal writes are
 atomic per batch and are separate from SQL/vector/graph transactions. Collections
