@@ -4,7 +4,18 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+  # RUSTSEC-2026-0542 (humantime) and RUSTSEC-2026-0543 (chrono) are
+  # informational "unmaintained" notices, not vulnerabilities, and no patched
+  # release exists. Both arrive transitively (object_store pulls humantime and
+  # chrono; rmcp and schemars pull chrono), so no version bump removes them.
+  # Authorized by Kevin on 2026-11-20, reversing the earlier strict-gate hold
+  # on OSS PR #11. Only these two IDs; keep in sync with .cargo/audit.toml.
+  # TIME-BOXED: revisit when object_store/rmcp drop chrono/humantime or a
+  # maintained successor lands.
+  "RUSTSEC-2026-0542",
+  "RUSTSEC-2026-0543",
+]
 
 [licenses]
 version = 2

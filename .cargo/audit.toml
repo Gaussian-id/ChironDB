@@ -1,0 +1,7 @@
+# cargo-audit policy. Mirrors the [advisories] ignore list in deny.toml.
+[advisories]
+# RUSTSEC-2026-0542 (humantime) and RUSTSEC-2026-0543 (chrono): informational
+# "unmaintained" notices, not vulnerabilities; no patched release; transitive
+# via object_store, rmcp and schemars. Authorized by Kevin on 2026-11-20.
+# TIME-BOXED: revisit when those crates drop chrono/humantime.
+ignore = ["RUSTSEC-2026-0542", "RUSTSEC-2026-0543"]
