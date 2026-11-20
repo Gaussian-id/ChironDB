@@ -18,6 +18,7 @@ pub mod dispatch;
 pub mod events;
 pub mod grpc;
 pub(crate) mod grpc_protected;
+pub(crate) mod log_sanitize;
 pub mod ml_runtime;
 pub mod pg_catalog;
 pub mod pgvector_exec;

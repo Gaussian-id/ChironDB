@@ -45,6 +45,9 @@ fn collection_config(name: &str, dim: usize, recall_sla: Option<f32>) -> Collect
         hnsw_ef_construction: None,
         hnsw_ef_search: None,
         recall_sla,
+        max_vector_norm: None,
+        max_sparse_nnz: None,
+        max_sparse_weight: None,
         index_kind: None,
         streamer_max_bytes: 0,
     }

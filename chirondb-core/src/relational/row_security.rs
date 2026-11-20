@@ -432,7 +432,9 @@ pub(super) fn returning(
             let index = match &item.source {
                 QueryProjectionSource::Column(index) => *index,
                 QueryProjectionSource::RecordRef { id_column, .. } => *id_column,
-                QueryProjectionSource::Scalar(_) => continue,
+                // RETURNING projects only stored columns. A precomputed value
+                // has no field lineage to authorize, so it must not pass.
+                QueryProjectionSource::Scalar(_) => return Err(SecurityError::Forbidden.into()),
             };
             if !policy::field_allowed(
                 record,

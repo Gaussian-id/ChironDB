@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="docs/releases/0.1.0-beta.3.md"><img alt="Version: 0.1.0-beta.3" src="https://img.shields.io/badge/version-0.1.0--beta.3-1677F0?style=flat-square"></a>
+  <a href="docs/releases/0.4.0.md"><img alt="Version: 0.4.0" src="https://img.shields.io/badge/version-0.4.0-1677F0?style=flat-square"></a>
   <a href="rust-toolchain.toml"><img alt="Rust: 1.92" src="https://img.shields.io/badge/Rust-1.92-0D213B?style=flat-square"></a>
   <a href="LICENSE"><img alt="License: AGPL-3.0-only" src="https://img.shields.io/badge/license-AGPL--3.0--only-1677F0?style=flat-square"></a>
 </p>
@@ -76,7 +76,7 @@ authentication plus RBAC.
 
 ## Status
 
-**Source version status (2026-11-17):** the server workspace, Docker build default, and pinned Compose image use **`0.1.0-beta.3`**. Standalone SDKs have their own package versions and compatibility pins.
+**Source version status (2026-11-20):** the server workspace, Docker build default, and pinned Compose image use **`0.4.0`**. No `v0.4.0` tag or image is published yet; see the [0.4.0 release notes](docs/releases/0.4.0.md). Standalone SDKs have their own package versions and compatibility pins.
 
 This source includes standalone SDK compatibility updates, row and field authority across supported models, and bounded SQL parsing. The existing `v0.1.0-beta.3` tag is an earlier snapshot; source builds from `main` include later changes. Consult the commit and workflow results when evaluating a source build.
 
@@ -87,7 +87,7 @@ have a 4,096 temporal-run limit, and compaction currently retains existing runs.
 Mixed-load, loaded-recovery and sustained-soak qualification remain open.
 See [time-series usage and limits](docs/CHIRONQL.md#time-series-chironql-15).
 
-The current source version is **`0.1.0-beta.3`**. ChironDB is under active beta
+The current source version is **`0.4.0`**. ChironDB is under active beta
 development and **is not production ready**. Features are available for evaluation;
 this is not a stable compatibility or uptime SLA. Start with a
 source build. Tagged binary releases and prebuilt images should be used

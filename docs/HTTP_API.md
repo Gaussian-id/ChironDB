@@ -750,6 +750,28 @@ curl --fail -X POST http://127.0.0.1:7401/v1/collections \
 Supported metrics are `cosine`, `l2`, and `dot`. LS-VEC is the sole/default
 index path; clients do not select HNSW as a separate persisted index.
 
+Optional write bounds, all unset (unbounded) by default and fixed once the
+collection exists:
+
+- `max_vector_norm` (finite, > 0): rejects a dense or named vector whose L2
+  norm is above the limit.
+- `max_sparse_nnz` (> 0): rejects a sparse vector with more non-zero entries.
+- `max_sparse_weight` (finite, > 0): rejects a sparse vector with any weight
+  whose absolute value is above the limit.
+
+A rejected write returns 400 and names the bound. Consider `max_vector_norm` for
+`dot` collections: there, a single vector with a huge norm outranks every other
+point for almost every query. Pick a value comfortably above your embedding
+model's largest legitimate norm. When it is unset on a `dot` collection, the
+server logs a rate-limited warning for accepted vectors with an extremely large
+norm. Follower replay of leader writes does not re-check these bounds.
+
+```bash
+curl --fail -X POST http://127.0.0.1:7401/v1/collections \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"ranked","vector_dim":3,"metric":"dot","max_vector_norm":100.0}'
+```
+
 Legacy `hnsw_m`, `hnsw_ef_construction` and `hnsw_ef_search` fields retain
 zero-as-default compatibility. A supplied `hnsw_m=1` is invalid and is rejected
 before collection mutation; omit these fields to use the engine defaults.

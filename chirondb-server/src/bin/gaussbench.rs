@@ -840,6 +840,9 @@ fn run_lifecycle(args: LifecycleArgs) -> Result<()> {
         hnsw_ef_construction: None,
         hnsw_ef_search: None,
         recall_sla: None,
+        max_vector_norm: None,
+        max_sparse_nnz: None,
+        max_sparse_weight: None,
         index_kind: Some(args.index_kind.clone()),
         streamer_max_bytes: args.streamer_max_bytes,
     })
@@ -984,6 +987,9 @@ fn run_synthetic(args: SyntheticArgs) -> Result<()> {
         hnsw_ef_construction: None,
         hnsw_ef_search: None,
         recall_sla: None,
+        max_vector_norm: None,
+        max_sparse_nnz: None,
+        max_sparse_weight: None,
         index_kind: None,
         streamer_max_bytes: 0,
     };
@@ -1496,6 +1502,9 @@ mod tests {
             hnsw_ef_construction: Some(200),
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: Some("lsvec".to_string()),
             streamer_max_bytes: 1024 * 1024,
         })

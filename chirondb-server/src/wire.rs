@@ -27,7 +27,10 @@ use crate::{
         pb::{self, wire_request, wire_response},
     },
     model::{HybridSearchRequest, MultiSearchRequest, RecommendRequest},
-    rbac::{Action, Permission, authorize, authorize_graph},
+    rbac::{
+        Action, AuthorizationError, INSTALLATION_DENIED_MESSAGE, Permission, authorize,
+        authorize_graph, authorize_installation,
+    },
     security_paths::StoragePolicy,
     wire_postgres,
 };
@@ -208,7 +211,7 @@ pub async fn serve_listener_with_policy_until(
             if let Err(error) =
                 dispatch_by_first_bytes(db, auth, storage_policy, stream, false).await
             {
-                tracing::warn!(%error, %peer, "GaussWire connection failed");
+                tracing::warn!(error = %crate::log_sanitize::untrusted(&error), %peer, "GaussWire connection failed");
             }
         });
     }
@@ -546,7 +549,7 @@ async fn serve_tls_listener_with_acceptor_until(
             }
             .await;
             if let Err(error) = result {
-                tracing::warn!(%error, %peer, "GaussWire TLS connection failed");
+                tracing::warn!(error = %crate::log_sanitize::untrusted(&error), %peer, "GaussWire TLS connection failed");
             }
         });
     }
@@ -1199,7 +1202,26 @@ fn dispatch_request_inner(
     {
         return error_response(request_id, Status::unavailable("audit unavailable"));
     }
-    if authorize(&principal, action, collection.as_deref()).is_err() {
+    // Admin frames other than collection creation act on every tenant's rows
+    // or the whole installation (SQL keeps its own legacy boundary).
+    let installation_operation = action == Action::Admin
+        && !matches!(
+            operation,
+            wire_request::Operation::CreateCollection(_)
+                | wire_request::Operation::Sql(_)
+                | wire_request::Operation::SqlTransaction(_)
+        );
+    let decision = if installation_operation {
+        authorize_installation(
+            &principal,
+            db.tenant_enforcement(),
+            collection.as_deref(),
+            &format!("wire {}", wire_installation_operation_name(operation)),
+        )
+    } else {
+        authorize(&principal, action, collection.as_deref())
+    };
+    if let Err(error) = decision {
         if db
             .audit_access_event(
                 "authorization",
@@ -1218,7 +1240,13 @@ fn dispatch_request_inner(
         }
         return error_response(
             request_id,
-            Status::permission_denied("operation is not permitted"),
+            Status::permission_denied(
+                if error == AuthorizationError::InstallationAuthorityRequired {
+                    INSTALLATION_DENIED_MESSAGE
+                } else {
+                    "operation is not permitted"
+                },
+            ),
         );
     }
     let graph_capability = if matches!(operation, wire_request::Operation::RelateBatch(_)) {
@@ -1313,6 +1341,20 @@ fn dispatch_request_inner(
             payload: Some(payload),
         },
         Err(status) => error_response(request_id, status),
+    }
+}
+
+/// Frame name for the installation dry-run warning; never formats the payload.
+fn wire_installation_operation_name(operation: &wire_request::Operation) -> &'static str {
+    match operation {
+        wire_request::Operation::UpdatePayloadSchema(_) => "update_payload_schema",
+        wire_request::Operation::Compact(_) => "compact",
+        wire_request::Operation::TierCold(_) => "tier_cold",
+        wire_request::Operation::PruneWalArchive(_) => "prune_wal_archive",
+        wire_request::Operation::Snapshot(_) => "snapshot",
+        wire_request::Operation::Restore(_) => "restore",
+        wire_request::Operation::ShardMove(_) => "shard_move",
+        _ => "admin",
     }
 }
 

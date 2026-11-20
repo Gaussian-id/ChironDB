@@ -55,6 +55,12 @@ message CollectionConfig {
   optional float recall_sla = 11;
   // LS-Vec mutable-streamer logical-byte cap. Zero = engine default (512 MiB).
   uint64 streamer_max_bytes = 12;
+  // RT-20/RT-21 opt-in write-path bounds. Unset = unbounded (previous
+  // behavior). When set: max_vector_norm and max_sparse_weight must be finite
+  // and > 0; max_sparse_nnz must be > 0. Defaults are a pending policy decision.
+  optional float max_vector_norm = 13;
+  optional uint32 max_sparse_nnz = 14;
+  optional float max_sparse_weight = 15;
 }
 
 message CreateCollectionRequest {

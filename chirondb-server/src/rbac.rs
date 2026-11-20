@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 
 use chirondb_core::{
     graph::GraphCapability,
-    tenant::{TenantCapability, TenantScope},
+    tenant::{TenantCapability, TenantEnforcement, TenantScope},
 };
 use subtle::ConstantTimeEq;
 
@@ -54,8 +54,14 @@ pub struct ApiKeyEntry {
     #[serde(default)]
     pub max_collections: Option<usize>,
     /// Explicit capabilities by name: `tenant:cross_read`,
-    /// `tenant:cross_write`, `graph:read`, `graph:write`, `graph:admin`, and
-    /// `graph:type_configure`.
+    /// `tenant:cross_write`, `graph:read`, `graph:write`, `graph:admin`,
+    /// `graph:type_configure`, and `installation:admin`.
+    ///
+    /// `installation:admin` lets a tenant-bound `admin` key run
+    /// installation-wide operations (snapshot, restore, collection
+    /// delete/schema/compaction and other collection maintenance, shard moves,
+    /// metrics and event streams) while tenant enforcement is `enforced`. An
+    /// `admin` key without a `tenant_id` already holds that authority.
     ///
     /// Deliberately not implied by `role`. An admin key administers the
     /// cluster; reading another tenant's rows is a separate grant, so the
@@ -63,6 +69,59 @@ pub struct ApiKeyEntry {
     /// somebody had to write down.
     #[serde(default)]
     pub capabilities: Vec<String>,
+}
+
+/// Capability name granting installation-wide administration to a
+/// tenant-bound admin key. See [`authorize_installation`].
+pub const INSTALLATION_ADMIN_CAPABILITY: &str = "installation:admin";
+
+/// Where operators find the RT-11 upgrade procedure. Shared by the 403 body,
+/// the dry-run warning and `chironctl security installation-check`.
+pub const INSTALLATION_MIGRATION_DOC: &str =
+    "docs/TENANT_ISOLATION.md#installation-wide-administration-needs-installation-authority";
+
+/// Body of the 403 / `PERMISSION_DENIED` an admin key gets on an
+/// installation-wide operation under enforcement. Names only the remedy, never
+/// the tenant or the rows involved.
+pub const INSTALLATION_DENIED_MESSAGE: &str = "installation-wide operation requires the \
+'installation:admin' capability for tenant-bound admin keys; run `chironctl security \
+installation-check --rbac-config-file <file>` or see \
+docs/TENANT_ISOLATION.md#installation-wide-administration-needs-installation-authority";
+
+/// Why an `admin` key will be refused installation-wide operations once
+/// tenant enforcement is `enforced`. Mirrors [`authorize_installation`]; the
+/// unit tests pin the two together.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstallationGap {
+    /// Tenant-bound without `installation:admin`: every installation-wide
+    /// operation is refused.
+    MissingCapability,
+    /// Has installation authority but an `allowed_collections` list: the
+    /// operations without a collection (snapshot, restore, shard move,
+    /// metrics, event streams) are refused.
+    CollectionAllowlist,
+}
+
+impl InstallationGap {
+    /// The one-line fix, identical in the scan tool and the dry-run warning.
+    pub fn fix(self) -> &'static str {
+        match self {
+            Self::MissingCapability => {
+                "add \"installation:admin\" to this key's capabilities, or remove its tenant_id"
+            }
+            Self::CollectionAllowlist => {
+                "remove allowed_collections from this key, or use a separate operator key \
+                 for snapshot/restore/shard move/metrics"
+            }
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingCapability => "missing_installation_capability",
+            Self::CollectionAllowlist => "collection_allowlist",
+        }
+    }
 }
 
 /// The top-level RBAC configuration loaded from a JSON file.
@@ -126,6 +185,7 @@ impl RbacConfig {
             for capability in &entry.capabilities {
                 if TenantCapability::parse(capability).is_none()
                     && GraphCapability::parse(capability).is_none()
+                    && capability != INSTALLATION_ADMIN_CAPABILITY
                 {
                     return Err(format!("unknown RBAC capability: {capability}"));
                 }
@@ -153,6 +213,7 @@ pub struct Principal {
     allowed: CollectionAccess,
     tenant_capabilities: Vec<TenantCapability>,
     graph_capabilities: Vec<GraphCapability>,
+    installation_admin: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -177,6 +238,9 @@ pub enum AuthorizationError {
     InsufficientRole,
     MissingGraphCapability(GraphCapability),
     CollectionDenied,
+    /// The operation spans every tenant of the installation, and the
+    /// principal is bound to one tenant without `installation:admin`.
+    InstallationAuthorityRequired,
 }
 
 pub fn authorize(
@@ -196,6 +260,52 @@ pub fn authorize(
         && !principal.allows_collection(collection)
     {
         return Err(AuthorizationError::CollectionDenied);
+    }
+    Ok(())
+}
+
+/// Authorize an installation-wide operation: snapshot, restore, collection
+/// deletion, payload-schema change, compaction and other whole-collection
+/// maintenance, shard moves, and installation metrics/event streams.
+///
+/// Collections are a global namespace whose rows carry a `tenant_id`, so these
+/// operations act on every tenant's rows at once. Beyond the `admin` role they
+/// therefore require installation authority while tenant enforcement blocks:
+/// a key with no `tenant_id`, or one granted `installation:admin`. With
+/// enforcement `disabled` or `dry_run` the admin role alone suffices, exactly
+/// as before (dry-run logs the would-be denial).
+pub fn authorize_installation(
+    principal: &Principal,
+    enforcement: TenantEnforcement,
+    collection: Option<&str>,
+    operation: &str,
+) -> Result<(), AuthorizationError> {
+    authorize(principal, Action::Admin, collection)?;
+    // An operation with no collection (snapshot, restore, shard move,
+    // metrics) reaches every collection, which a collection allowlist does
+    // not grant.
+    let whole_installation_denied = collection.is_none() && principal.is_restricted();
+    if principal.has_installation_authority() && !whole_installation_denied {
+        return Ok(());
+    }
+    if enforcement.blocks() {
+        return Err(AuthorizationError::InstallationAuthorityRequired);
+    }
+    if enforcement.active() {
+        let gap = if principal.has_installation_authority() {
+            InstallationGap::CollectionAllowlist
+        } else {
+            InstallationGap::MissingCapability
+        };
+        tracing::warn!(
+            principal = %principal.id,
+            tenant = principal.tenant_id.as_deref().unwrap_or_default(),
+            operation,
+            reason = gap.as_str(),
+            fix = gap.fix(),
+            doc = INSTALLATION_MIGRATION_DOC,
+            "tenant dry-run: installation-wide operation would be denied under enforcement"
+        );
     }
     Ok(())
 }
@@ -244,6 +354,7 @@ impl Principal {
                 GraphCapability::Admin,
                 GraphCapability::TypeConfigure,
             ],
+            installation_admin: true,
         }
     }
 
@@ -282,6 +393,10 @@ impl Principal {
             allowed,
             tenant_capabilities,
             graph_capabilities,
+            installation_admin: entry
+                .capabilities
+                .iter()
+                .any(|name| name == INSTALLATION_ADMIN_CAPABILITY),
         }
     }
 
@@ -322,6 +437,36 @@ impl Principal {
 
     pub fn has_graph_capability(&self, capability: GraphCapability) -> bool {
         self.graph_capabilities.contains(&capability)
+    }
+
+    /// Whether this principal may administer the whole installation rather
+    /// than one tenant: the `admin` role plus either no tenant binding or the
+    /// explicit `installation:admin` capability.
+    pub fn has_installation_authority(&self) -> bool {
+        self.allows_admin() && (self.tenant_id.is_none() || self.installation_admin)
+    }
+
+    /// What, if anything, stops this `admin` key from running installation-wide
+    /// operations under `enforced`. `None` for non-admin keys: they were never
+    /// allowed these operations, so the upgrade changes nothing for them.
+    pub fn installation_gap(&self) -> Option<InstallationGap> {
+        if !self.allows_admin() {
+            None
+        } else if !self.has_installation_authority() {
+            Some(InstallationGap::MissingCapability)
+        } else if self.is_restricted() {
+            Some(InstallationGap::CollectionAllowlist)
+        } else {
+            None
+        }
+    }
+
+    /// Whether installation-wide aggregates (row totals across tenants) may be
+    /// shown to this principal under `enforcement`.
+    pub fn sees_installation_aggregates(&self, enforcement: TenantEnforcement) -> bool {
+        !enforcement.blocks()
+            || self.has_installation_authority()
+            || self.has_capability(TenantCapability::CrossRead)
     }
 
     /// The tenant scope this principal acts under.
@@ -727,6 +872,159 @@ mod tests {
                 GraphCapability::Read
             ))
         );
+    }
+
+    #[test]
+    fn installation_operations_need_installation_authority_under_enforcement() {
+        fn principal(
+            tenant: Option<&str>,
+            role: Role,
+            allowed: &[&str],
+            caps: &[&str],
+        ) -> Principal {
+            Principal::from_entry(&ApiKeyEntry {
+                id: Some("principal".to_string()),
+                key: "key".to_string(),
+                tenant_id: tenant.map(str::to_string),
+                role,
+                allowed_collections: allowed.iter().map(|value| value.to_string()).collect(),
+                max_collections: None,
+                capabilities: caps.iter().map(|value| value.to_string()).collect(),
+            })
+        }
+        let enforced = TenantEnforcement::Enforced;
+        let tenant_admin = principal(Some("tenant-b"), Role::Admin, &[], &[]);
+        let cross_tenant_admin = principal(
+            Some("tenant-b"),
+            Role::Admin,
+            &[],
+            &["tenant:cross_read", "tenant:cross_write"],
+        );
+        let installation_admin = principal(
+            Some("tenant-b"),
+            Role::Admin,
+            &[],
+            &[INSTALLATION_ADMIN_CAPABILITY],
+        );
+        let operator = principal(None, Role::Admin, &[], &[]);
+        let scoped_operator = principal(None, Role::Admin, &["docs"], &[]);
+        let writer = principal(None, Role::ReadWrite, &[], &[INSTALLATION_ADMIN_CAPABILITY]);
+
+        for collection in [None, Some("docs")] {
+            for principal in [&tenant_admin, &cross_tenant_admin] {
+                assert_eq!(
+                    authorize_installation(principal, enforced, collection, "test"),
+                    Err(AuthorizationError::InstallationAuthorityRequired)
+                );
+            }
+            assert_eq!(
+                authorize_installation(&writer, enforced, collection, "test"),
+                Err(AuthorizationError::InsufficientRole)
+            );
+            for principal in [&installation_admin, &operator] {
+                assert_eq!(
+                    authorize_installation(principal, enforced, collection, "test"),
+                    Ok(())
+                );
+            }
+            assert_eq!(
+                authorize_installation(&Principal::unrestricted(), enforced, collection, "test"),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            authorize_installation(&scoped_operator, enforced, Some("docs"), "test"),
+            Ok(())
+        );
+        assert_eq!(
+            authorize_installation(&scoped_operator, enforced, None, "test"),
+            Err(AuthorizationError::InstallationAuthorityRequired)
+        );
+
+        // The migration scan reports exactly the keys enforcement refuses.
+        for principal in [
+            &tenant_admin,
+            &cross_tenant_admin,
+            &installation_admin,
+            &operator,
+            &scoped_operator,
+            &writer,
+        ] {
+            let gap = principal.installation_gap();
+            let whole = authorize_installation(principal, enforced, None, "test");
+            let scoped = authorize_installation(principal, enforced, Some("docs"), "test");
+            match gap {
+                None => assert!(
+                    whole.is_ok() || whole == Err(AuthorizationError::InsufficientRole),
+                    "{}",
+                    principal.id
+                ),
+                Some(InstallationGap::MissingCapability) => {
+                    assert_eq!(
+                        whole,
+                        Err(AuthorizationError::InstallationAuthorityRequired)
+                    );
+                    assert_eq!(
+                        scoped,
+                        Err(AuthorizationError::InstallationAuthorityRequired)
+                    );
+                }
+                Some(InstallationGap::CollectionAllowlist) => {
+                    assert_eq!(
+                        whole,
+                        Err(AuthorizationError::InstallationAuthorityRequired)
+                    );
+                    assert_eq!(scoped, Ok(()));
+                }
+            }
+        }
+        assert_eq!(
+            tenant_admin.installation_gap(),
+            Some(InstallationGap::MissingCapability)
+        );
+        assert_eq!(
+            cross_tenant_admin.installation_gap(),
+            Some(InstallationGap::MissingCapability)
+        );
+        assert_eq!(installation_admin.installation_gap(), None);
+        assert_eq!(operator.installation_gap(), None);
+        assert_eq!(
+            scoped_operator.installation_gap(),
+            Some(InstallationGap::CollectionAllowlist)
+        );
+        assert_eq!(writer.installation_gap(), None);
+        assert!(INSTALLATION_DENIED_MESSAGE.contains(INSTALLATION_ADMIN_CAPABILITY));
+        assert!(INSTALLATION_DENIED_MESSAGE.contains(INSTALLATION_MIGRATION_DOC));
+
+        // Disabled and dry-run keep the historical role-only rule.
+        for mode in [TenantEnforcement::Disabled, TenantEnforcement::DryRun] {
+            assert_eq!(
+                authorize_installation(&tenant_admin, mode, None, "test"),
+                Ok(())
+            );
+            assert_eq!(
+                authorize_installation(&scoped_operator, mode, None, "test"),
+                Ok(())
+            );
+            assert_eq!(
+                authorize_installation(&writer, mode, None, "test"),
+                Err(AuthorizationError::InsufficientRole)
+            );
+        }
+
+        RbacConfig {
+            keys: vec![ApiKeyEntry {
+                id: Some("ops".to_string()),
+                key: "k".repeat(32),
+                tenant_id: Some("tenant-b".to_string()),
+                role: Role::Admin,
+                allowed_collections: Vec::new(),
+                max_collections: None,
+                capabilities: vec![INSTALLATION_ADMIN_CAPABILITY.to_string()],
+            }],
+        }
+        .validate(true)
+        .expect("installation:admin is a known capability");
     }
 
     #[test]

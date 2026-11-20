@@ -42,6 +42,9 @@ async fn boot_server(n: usize, dim: usize) -> (TempDir, String, &'static str) {
         hnsw_ef_construction: None,
         hnsw_ef_search: None,
         recall_sla: None,
+        max_vector_norm: None,
+        max_sparse_nnz: None,
+        max_sparse_weight: None,
         index_kind: None,
         streamer_max_bytes: 0,
     })

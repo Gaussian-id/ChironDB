@@ -23,6 +23,9 @@ fn vamana_index_kind_is_rejected() {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: Some("vamana".to_string()),
             streamer_max_bytes: 0,
         })

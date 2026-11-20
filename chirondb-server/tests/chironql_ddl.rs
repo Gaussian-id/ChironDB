@@ -32,6 +32,9 @@ fn fixture() -> (TempDir, Db) {
         hnsw_ef_construction: None,
         hnsw_ef_search: None,
         recall_sla: None,
+        max_vector_norm: None,
+        max_sparse_nnz: None,
+        max_sparse_weight: None,
         index_kind: None,
         streamer_max_bytes: 0,
     })
@@ -202,6 +205,28 @@ fn with_carries_the_settings_that_have_no_keyword() {
     let described = admin(&db, "DESCRIBE fresh;").expect("describe");
     assert_eq!(field(&described, "shards"), json!(2));
     assert_eq!(field(&described, "payload.category"), json!("string"));
+}
+
+/// RT-20/RT-21 — the opt-in write bounds are ordinary `WITH` settings.
+#[test]
+fn with_sets_the_opt_in_write_bounds() {
+    let (_dir, db) = fixture();
+
+    admin(
+        &db,
+        "CREATE COLLECTION fresh DIM 3 WITH {max_vector_norm: 4.0, \
+         max_sparse_nnz: 8, max_sparse_weight: 2.5};",
+    )
+    .expect("create");
+
+    let config = db
+        .list_collections()
+        .into_iter()
+        .find(|config| config.name == "fresh")
+        .expect("created");
+    assert_eq!(config.max_vector_norm, Some(4.0));
+    assert_eq!(config.max_sparse_nnz, Some(8));
+    assert_eq!(config.max_sparse_weight, Some(2.5));
 }
 
 /// serde would drop a misspelt key and create a collection that quietly is not

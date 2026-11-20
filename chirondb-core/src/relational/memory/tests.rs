@@ -1127,3 +1127,45 @@ fn initial_controller_admission_overflow_preserves_empty_state() {
         assert_eq!(pool.used(), 0);
     });
 }
+
+// RT-40b follow-up: sqlparser 0.63 parses PostgreSQL `ORDER BY ... USING <op>`.
+// Relational v1 does not implement operator-class ordering, so it must be
+// rejected rather than silently sorted ascending.
+#[test]
+fn order_by_using_operator_fails_closed() {
+    let directory = tempdir().unwrap();
+    let engine = open(directory.path());
+    engine
+        .execute(request(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, body TEXT)",
+        ))
+        .unwrap();
+    engine
+        .execute(request("INSERT INTO items VALUES (2, 'b'), (1, 'a')"))
+        .unwrap();
+    for sql in [
+        "SELECT id FROM items ORDER BY id USING <",
+        "SELECT id FROM items ORDER BY id USING > LIMIT 1",
+        "SELECT body, COUNT(*) FROM items GROUP BY body ORDER BY body USING <",
+    ] {
+        let Err(error) = engine.execute(request(sql)) else {
+            panic!("{sql} must be rejected")
+        };
+        let error = error.to_string();
+        assert!(error.contains("USING"), "{sql}: {error}");
+    }
+    let response = engine
+        .execute(request("SELECT id FROM items ORDER BY id DESC"))
+        .unwrap()
+        .response;
+    let SqlResult::Rows { rows, .. } = &response.results[0] else {
+        unreachable!()
+    };
+    assert_eq!(
+        rows,
+        &vec![
+            vec![RelationalValue::Integer(2)],
+            vec![RelationalValue::Integer(1)]
+        ]
+    );
+}
