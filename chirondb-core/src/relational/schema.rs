@@ -23,6 +23,7 @@ impl Schema {
     /// Admit retention of an existing DTO, including unused Vec capacity.
     /// This does not admit the parser/DDL work that originally constructed it.
     pub(super) fn adopt(definition: TableDefinition) -> Result<Self> {
+        row_security::validate_policy(&definition)?;
         let memory = Self::reserve(heap_bytes(&definition, true)?)?;
         Ok(Self(Arc::new(Allocation {
             definition,
@@ -32,6 +33,7 @@ impl Schema {
 
     /// Admit a new independent copy before cloning any definition fields.
     pub(super) fn copy(definition: &TableDefinition) -> Result<Self> {
+        row_security::validate_policy(definition)?;
         let memory = Self::reserve(copy_bytes(definition)?)?;
         Ok(Self(Arc::new(Allocation {
             definition: definition.clone(),
@@ -121,6 +123,7 @@ impl Bytes {
         // Destructure exhaustively so new catalog fields require an ownership
         // review. Copies need length slots; adopted Vecs retain spare capacity.
         let TableDefinition {
+            row_policy,
             table_id: _,
             managed_by_ml: _,
             security_incarnation: _,
@@ -137,6 +140,24 @@ impl Bytes {
             indexes,
             reference_index_ids,
         } = definition;
+        if let Some(row_policy) = row_policy {
+            self.add(row_policy.default_template.capacity() as u64)?;
+            let policy = &row_policy.policy;
+            self.add((policy.owner_actions.len() + policy.department_actions.len()) as u64 * 128)?;
+            for (name, template) in &policy.templates {
+                // Conservative B-tree node + inline key/value ownership.
+                self.add(512 + name.capacity() as u64 + template.department.capacity() as u64)?;
+                for (path, rule) in &template.properties {
+                    self.add(512 + path.capacity() as u64 + rule.actions.len() as u64 * 128)?;
+                }
+                for (name, representation) in &template.representations {
+                    self.add(512 + name.capacity() as u64)?;
+                    for source in &representation.source_fields {
+                        self.add(128 + source.capacity() as u64)?;
+                    }
+                }
+            }
+        }
         self.optional_string(creator_principal_id)?;
         self.optional_string(tenant_id)?;
         self.add(name.capacity() as u64)?;

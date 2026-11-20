@@ -397,12 +397,8 @@ fn validate_listener_security(
             )
         }),
     ];
-    if configured_urls
-        .iter()
-        .flatten()
-        .any(|url| url.trim_start().starts_with("http://"))
-    {
-        bail!("secure mode requires HTTPS object-store URLs");
+    for url in configured_urls.iter().flatten() {
+        chirondb::segment::validate_secure_object_store_url(url)?;
     }
     Ok(())
 }
@@ -1663,6 +1659,34 @@ mod tests {
         let error =
             validate_listener_security(&config, true, true, true, true, true, true).unwrap_err();
         assert!(error.to_string().contains("wildcard CORS"));
+    }
+
+    #[test]
+    fn secure_profile_rejects_normalized_plaintext_object_store_urls() {
+        let mut config = effective_config(Args::try_parse_from(["chirondb"]).unwrap()).unwrap();
+        for url in [
+            "http://127.0.0.1:1/objects",
+            "HTTP://127.0.0.1:1/objects",
+            "hTtP://127.0.0.1:1/objects",
+            " \thTtP://127.0.0.1:1/objects\n",
+        ] {
+            config.cold_object_store_url = Some(url.into());
+            assert!(
+                validate_listener_security(&config, true, true, true, true, true, true).is_err(),
+                "plaintext cold storage passed the secure startup guard"
+            );
+            config.cold_object_store_url = None;
+            config.wal_object_store_url = Some(url.into());
+            assert!(
+                validate_listener_security(&config, true, true, true, true, true, true).is_err(),
+                "plaintext WAL storage passed the secure startup guard"
+            );
+            config.wal_object_store_url = None;
+        }
+        for url in ["https://objects.example/objects", "file:///tmp/objects"] {
+            config.cold_object_store_url = Some(url.into());
+            validate_listener_security(&config, true, true, true, true, true, true).unwrap();
+        }
     }
 
     /// Every doc and log line in the project spells these roles with an

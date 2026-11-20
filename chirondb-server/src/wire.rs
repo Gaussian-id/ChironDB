@@ -688,14 +688,16 @@ where
         // Unauthenticated frame buffers cannot consume authenticated work capacity.
         let work = if let Some(authority) = db.identity_authority() {
             if let Err(error) = authority.authenticate(&request.api_key) {
-                send_wire_response(
-                    &response_sender,
-                    error_response(
-                        request.request_id,
-                        crate::grpc_protected::authentication_error(error),
-                    ),
-                )
-                .await?;
+                let status = if matches!(error, crate::security::SecurityError::Unauthenticated)
+                    && crate::auth::denial::record(&db, crate::auth::denial::Transport::Wire)
+                        .is_err()
+                {
+                    Status::unavailable("audit unavailable")
+                } else {
+                    crate::grpc_protected::authentication_error(error)
+                };
+                send_wire_response(&response_sender, error_response(request.request_id, status))
+                    .await?;
                 continue;
             }
             Some(Arc::new(
@@ -815,12 +817,10 @@ fn is_read_only_operation(operation: &Option<wire_request::Operation>) -> bool {
 }
 
 fn wire_sql_action(request: &pb::WireSqlRequest) -> Action {
-    match serde_json::from_str::<crate::SqlExecutionRequest>(&request.request_json) {
-        Ok(request) if crate::RelationalEngine::request_is_read_only(&request).unwrap_or(false) => {
-            Action::Read
-        }
-        _ => Action::Write,
-    }
+    serde_json::from_str::<crate::SqlExecutionRequest>(&request.request_json)
+        .ok()
+        .and_then(|request| crate::sql_security::action(&request).ok())
+        .unwrap_or(Action::Admin)
 }
 
 fn wire_sql_transaction_action(request: &pb::WireSqlTransactionRequest) -> Action {
@@ -830,10 +830,8 @@ fn wire_sql_transaction_action(request: &pb::WireSqlTransactionRequest) -> Actio
             .request_json
             .as_deref()
             .and_then(|json| serde_json::from_str::<crate::SqlExecutionRequest>(json).ok())
-            .filter(|request| {
-                crate::RelationalEngine::request_is_read_only(request).unwrap_or(false)
-            })
-            .map_or(Action::Write, |_| Action::Read),
+            .and_then(|request| crate::sql_security::action(&request).ok())
+            .unwrap_or(Action::Admin),
         _ => Action::Write,
     }
 }
@@ -1010,18 +1008,25 @@ fn dispatch_protected_request(
                 let reference = db
                     .sql_reference_publication_context(&identity, &response.results)
                     .map_err(crate::grpc::status_from_error)?;
+                let sql_publication = response.publication_context();
                 let (response_json, admission) = crate::response_output::wire_json(&response)?;
                 output_admission = Some(admission);
                 (
                     wire_response::Payload::Sql(pb::WireSqlResponse { response_json }),
-                    match reference {
-                        Some(context) => crate::chironql_protected::PublicationGuard::Data(context),
-                        None => crate::chironql_protected::PublicationGuard::Identity(identity),
-                    },
+                    crate::chironql_protected::PublicationGuard::Sql(
+                        sql_publication,
+                        Box::new(match reference {
+                            Some(context) => {
+                                crate::chironql_protected::PublicationGuard::Data(context)
+                            }
+                            None => crate::chironql_protected::PublicationGuard::Identity(identity),
+                        }),
+                    ),
                 )
             }
             Some(wire_request::Operation::SqlTransaction(transaction)) => {
                 let mut reference = None;
+                let mut sql_publication = crate::SqlPublication::default();
                 let (response_json, admission) = match transaction.action.as_str() {
                     "begin" => crate::response_output::wire_json(
                         &db.begin_sql_transaction_authorized(&identity, "chironwire-protected")
@@ -1045,6 +1050,7 @@ fn dispatch_protected_request(
                                 "chironwire-protected",
                             )
                             .map_err(crate::grpc::status_from_error)?;
+                        sql_publication = response.publication_context();
                         reference = db
                             .sql_reference_publication_context(&identity, &response.results)
                             .map_err(crate::grpc::status_from_error)?;
@@ -1085,10 +1091,15 @@ fn dispatch_protected_request(
                 output_admission = Some(admission);
                 (
                     wire_response::Payload::Sql(pb::WireSqlResponse { response_json }),
-                    match reference {
-                        Some(context) => crate::chironql_protected::PublicationGuard::Data(context),
-                        None => crate::chironql_protected::PublicationGuard::Identity(identity),
-                    },
+                    crate::chironql_protected::PublicationGuard::Sql(
+                        sql_publication,
+                        Box::new(match reference {
+                            Some(context) => {
+                                crate::chironql_protected::PublicationGuard::Data(context)
+                            }
+                            None => crate::chironql_protected::PublicationGuard::Identity(identity),
+                        }),
+                    ),
                 )
             }
             _ => {
@@ -1151,20 +1162,7 @@ fn dispatch_request_inner(
     let request_id = request.request_id;
     let api_key = optional_api_key(&request.api_key);
     let Some(principal) = auth.permission_for(api_key) else {
-        if db
-            .audit_access_event(
-                "authentication",
-                "chironwire_authenticate",
-                "failure",
-                None,
-                "unknown",
-                None,
-                "chironwire",
-                Some(&request_id.to_string()),
-                Some("invalid_credential"),
-            )
-            .is_err()
-        {
+        if crate::auth::denial::record(db, crate::auth::denial::Transport::Wire).is_err() {
             return error_response(request_id, Status::unavailable("audit unavailable"));
         }
         return error_response(
@@ -1861,16 +1859,8 @@ fn dispatch_operation(
                 .map_err(|error| {
                     Status::invalid_argument(format!("invalid SQL request: {error}"))
                 })?;
-            let action = if db
-                .sql_request_is_read_only(&request)
-                .map_err(grpc::status_from_error)?
-            {
-                Action::Read
-            } else {
-                Action::Write
-            };
-            authorize(principal, action, None)
-                .map_err(|_| Status::permission_denied("operation is not permitted"))?;
+            crate::sql_security::authorize_request(db, principal, &request)
+                .map_err(grpc::status_from_error)?;
             let audit_context = chirondb_core::audit::AuditContext {
                 principal_id: principal.id.clone(),
                 tenant_id: principal.tenant_id.clone(),
@@ -1887,6 +1877,12 @@ fn dispatch_operation(
             }))
         }
         wire_request::Operation::SqlTransaction(request) => {
+            crate::sql_security::authorize_legacy(
+                db,
+                principal,
+                wire_sql_transaction_action(&request),
+            )
+            .map_err(grpc::status_from_error)?;
             let audit_context = chirondb_core::audit::AuditContext {
                 principal_id: principal.id.clone(),
                 tenant_id: principal.tenant_id.clone(),

@@ -1,3 +1,6 @@
+#[path = "support/legacy_sql.rs"]
+mod legacy_sql;
+
 use std::{collections::BTreeSet, sync::Arc};
 
 use chirondb_core::{
@@ -143,6 +146,9 @@ fn table_migration_crash_child() {
             .unwrap();
     }
     let secret = std::fs::read_to_string(&key_path).unwrap();
+    if role == "setup" {
+        legacy_sql::seed_tables(&data, &["first", "second"], true, true);
+    }
     let mut db = Db::open(&data).unwrap();
     if role == "migrate" {
         db.migrate_table_authority_offline().unwrap();
@@ -177,23 +183,6 @@ fn table_migration_crash_child() {
         authority
             .put_principal(&actor, actor.revision(), principal)
             .unwrap();
-        let actor = authority.authenticate(secret.trim()).unwrap();
-        for name in ["first", "second"] {
-            db.execute_sql_authorized(
-                &actor,
-                sql(&format!(
-                    "CREATE TABLE {name} (id BIGINT PRIMARY KEY, title TEXT)"
-                )),
-                "test",
-            )
-            .unwrap();
-            db.execute_sql_authorized(
-                &actor,
-                sql(&format!("INSERT INTO {name} VALUES (1, 'retained')")),
-                "test",
-            )
-            .unwrap();
-        }
     } else {
         assert_eq!(role, "verify");
         let published = std::env::var("CHIRONDB_TABLE_MIGRATION_PUBLISHED").unwrap() == "1";
@@ -205,15 +194,15 @@ fn table_migration_crash_child() {
             if published { 2 } else { 0 }
         );
         for name in ["first", "second"] {
-            let rows = db
-                .execute_sql_authorized(
+            assert!(
+                db.execute_sql_authorized(
                     &actor,
-                    sql(&format!("SELECT title FROM {name} WHERE id=1")),
-                    "test",
+                    sql(&format!("SELECT title FROM {name}")),
+                    "test"
                 )
-                .unwrap();
-            assert!(matches!(&rows.results[0], SqlResult::Rows { rows, .. }
-                if rows == &vec![vec![RelationalValue::Text("retained".into())]]));
+                .is_err(),
+                "historical rows require explicit registration even after table migration"
+            );
         }
         assert_eq!(
             db.migrate_table_authority_offline().unwrap(),
@@ -224,6 +213,18 @@ fn table_migration_crash_child() {
                 .iter()
                 .all(|table| table.security_incarnation.is_some())
         );
+        for name in ["first", "second"] {
+            legacy_sql::register_rows(&db, &actor, name, &actor);
+            let rows = db
+                .execute_sql_authorized(
+                    &actor,
+                    sql(&format!("SELECT title FROM {name} WHERE id=1")),
+                    "test",
+                )
+                .unwrap();
+            assert!(matches!(&rows.results[0], SqlResult::Rows { rows, .. }
+                if rows == &vec![vec![RelationalValue::Text("retained".into())]]));
+        }
     }
 }
 
@@ -241,15 +242,10 @@ fn sql_only_table_grants_follow_incarnation_across_rename_revoke_and_reopen() {
     let key_path = root.join("admin.key");
     onboarding::initialize(&data, "acme", "admin", &keyring, &key_path, false).unwrap();
     let secret = std::fs::read_to_string(&key_path).unwrap();
+    legacy_sql::seed_tables(&data, &["documents"], true, false);
     let mut db = Db::open(&data).unwrap();
     let authority = Arc::clone(db.identity_authority().unwrap());
     let admin = || authority.authenticate(secret.trim()).unwrap();
-    db.execute_sql_authorized(
-        &admin(),
-        sql("CREATE TABLE documents (id BIGINT PRIMARY KEY, title TEXT)"),
-        "test",
-    )
-    .unwrap();
     assert!(db.relational_tables()[0].security_incarnation.is_none());
     let transaction = db
         .begin_sql_transaction_authorized(&admin(), "test")
@@ -283,7 +279,7 @@ fn sql_only_table_grants_follow_incarnation_across_rename_revoke_and_reopen() {
             "ana",
             SubjectAttributes {
                 department: "Finance".into(),
-                clearance: Classification::Confidential,
+                clearance: Classification::Restricted,
             },
         )
         .unwrap();
@@ -304,22 +300,36 @@ fn sql_only_table_grants_follow_incarnation_across_rename_revoke_and_reopen() {
         .issue_credential(&admin(), authority.revision(), &principal)
         .unwrap();
     let reader = || authority.authenticate(&key.secret).unwrap();
+    assert!(
+        db.execute_sql_authorized(
+            &reader(),
+            sql("INSERT INTO documents VALUES (1, 'denied')"),
+            "test"
+        )
+        .is_err()
+    );
+    legacy_sql::register_rows(&db, &admin(), "documents", &reader());
     let mut insertion = sql("INSERT INTO documents VALUES (1, 'visible')");
     insertion.idempotency_key = Some("table-identity-insert".into());
     let receipt = db
         .execute_sql_authorized(&reader(), insertion.clone(), "test")
         .unwrap();
+    assert_eq!(
+        db.execute_sql_authorized(&reader(), insertion.clone(), "test")
+            .unwrap(),
+        receipt
+    );
     db.execute_sql_authorized(
         &admin(),
         sql("ALTER TABLE documents RENAME TO renamed"),
         "test",
     )
     .unwrap();
-    assert_eq!(
-        db.execute_sql_authorized(&reader(), insertion.clone(), "test")
-            .unwrap(),
-        receipt
-    );
+    // Schema changes retain table identity but invalidate saved row output.
+    assert!(matches!(
+        db.execute_sql_authorized(&reader(), insertion.clone(), "test"),
+        Err(GaussError::Security(SecurityError::Conflict))
+    ));
     let result = db
         .execute_sql_authorized(
             &reader(),
@@ -463,11 +473,11 @@ fn sql_only_table_grants_follow_incarnation_across_rename_revoke_and_reopen() {
     );
     db.execute_sql_authorized(&reader(), sql("SELECT title FROM renamed"), "test")
         .unwrap();
-    assert_eq!(
-        db.execute_sql_authorized(&reader(), insertion, "test")
-            .unwrap(),
-        receipt
-    );
+    // Schema changes retain table identity but invalidate saved row output.
+    assert!(matches!(
+        db.execute_sql_authorized(&reader(), insertion, "test"),
+        Err(GaussError::Security(SecurityError::Conflict))
+    ));
     db.execute_sql_authorized(&admin(), sql("DROP TABLE renamed"), "test")
         .unwrap();
     db.execute_sql_authorized(

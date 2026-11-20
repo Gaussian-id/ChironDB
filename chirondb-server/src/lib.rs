@@ -29,6 +29,7 @@ pub mod rbac;
 mod response_output;
 mod security_http;
 pub mod security_paths;
+mod sql_security;
 pub mod tls;
 pub mod wire;
 pub mod wire_postgres;

@@ -53,6 +53,7 @@ fn fixture() -> RelationalCheckpoint {
             rows: BTreeMap::from([(
                 1,
                 vec![RowVersion {
+                    security: None,
                     begin: 1,
                     end: None,
                     values: RowValues::adopt(vec![RelationalValue::Text("legacy".repeat(1024))])

@@ -89,6 +89,19 @@ pub(crate) trait TraversalAccess {
     fn check(&self) -> Result<()>;
     fn visible(&self, nid: Nid) -> Result<bool>;
     fn matches_node(&self, nid: Nid, payload: &Value) -> Result<bool>;
+    fn edge_visible(&self, _edge: EdgeId) -> Result<bool> {
+        Err(crate::security::SecurityError::Forbidden.into())
+    }
+    fn matches_edge(
+        &self,
+        _edge: EdgeId,
+        _source: Nid,
+        _target: Nid,
+        _filter: &Filter,
+        _properties: &Value,
+    ) -> Result<bool> {
+        Err(crate::security::SecurityError::Forbidden.into())
+    }
 }
 
 fn access_check(access: Option<&dyn TraversalAccess>) -> Result<()> {
@@ -385,7 +398,10 @@ where
                     }
                     // Both endpoints are authorized before property reads or
                     // errors from a hidden edge can affect this query.
-                    if !access_visible(access, neighbour)? {
+                    if !access_visible(access, neighbour)?
+                        || !access
+                            .map_or(Ok(true), |authority| authority.edge_visible(edge.edge_id))?
+                    {
                         continue;
                     }
                     if let Some(filter) = edge_filter {
@@ -413,7 +429,17 @@ where
                         let properties = graph.edge_properties(edge_id)?.ok_or_else(|| {
                             GaussError::InvalidRequest("live graph edge has no properties".into())
                         })?;
-                        if !filter.matches(&properties) {
+                        let matches = match access {
+                            Some(access) => access.matches_edge(
+                                edge.edge_id,
+                                edge.source,
+                                edge.target,
+                                filter,
+                                &properties,
+                            )?,
+                            None => filter.matches(&properties),
+                        };
+                        if !matches {
                             continue;
                         }
                     }
@@ -735,7 +761,10 @@ where
                     }
                     // Both endpoints are authorized before property reads or
                     // errors from a hidden edge can affect this query.
-                    if !access_visible(access, neighbour)? {
+                    if !access_visible(access, neighbour)?
+                        || !access
+                            .map_or(Ok(true), |authority| authority.edge_visible(edge.edge_id))?
+                    {
                         continue;
                     }
                     if let Some(filter) = edge_filter {
@@ -757,7 +786,17 @@ where
                         let properties = graph.edge_properties(edge.edge_id)?.ok_or_else(|| {
                             GaussError::InvalidRequest("live graph edge has no properties".into())
                         })?;
-                        if !filter.matches(&properties) {
+                        let matches = match access {
+                            Some(access) => access.matches_edge(
+                                edge.edge_id,
+                                edge.source,
+                                edge.target,
+                                filter,
+                                &properties,
+                            )?,
+                            None => filter.matches(&properties),
+                        };
+                        if !matches {
                             continue;
                         }
                     }
@@ -1669,6 +1708,9 @@ mod tests {
         use std::cell::Cell;
         struct Hide(Nid);
         impl TraversalAccess for Hide {
+            fn edge_visible(&self, _: EdgeId) -> Result<bool> {
+                Ok(true)
+            }
             fn check(&self) -> Result<()> {
                 Ok(())
             }
@@ -1784,6 +1826,9 @@ mod tests {
             revoked: bool,
         }
         impl TraversalAccess for Authority {
+            fn edge_visible(&self, _: EdgeId) -> Result<bool> {
+                Ok(true)
+            }
             fn check(&self) -> Result<()> {
                 Ok(())
             }

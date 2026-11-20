@@ -17,6 +17,38 @@ pub struct SecurityStatement {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SecurityCommand {
+    ShowRowSecurity {
+        table: String,
+        after: u64,
+        limit: usize,
+    },
+    ChangeRowSecurity {
+        delta: chirondb_types::relational::RelationalSecurityDelta,
+    },
+    RegisterEdge {
+        collection: String,
+        id: String,
+        template: String,
+    },
+    CreateTemporalAsset {
+        collection: String,
+        template: String,
+        metadata: Value,
+        id: Option<String>,
+    },
+    GetTemporalAsset {
+        collection: String,
+        id: String,
+    },
+    UpdateTemporalAsset {
+        collection: String,
+        id: String,
+        metadata: Value,
+    },
+    DeleteTemporalAsset {
+        collection: String,
+        id: String,
+    },
     ShowCatalogRevision,
     CreateProtectedCollection {
         name: String,
@@ -102,6 +134,7 @@ pub enum SecurityCommand {
         id: String,
     },
     ObjectPrivileges {
+        edge: bool,
         collection: String,
         id: String,
         subject: NamedSubject,
@@ -110,6 +143,7 @@ pub enum SecurityCommand {
         grant: bool,
     },
     AlterPoint {
+        edge: bool,
         collection: String,
         id: String,
         owner: Option<String>,
@@ -131,7 +165,9 @@ pub enum SecurityCommand {
 impl SecurityStatement {
     pub fn class(&self) -> StatementClass {
         match self.command {
-            SecurityCommand::ShowCatalogRevision
+            SecurityCommand::ShowRowSecurity { .. }
+            | SecurityCommand::ShowCatalogRevision
+            | SecurityCommand::GetTemporalAsset { .. }
             | SecurityCommand::ShowCollectionPolicy { .. }
             | SecurityCommand::ShowCurrentUser { .. }
             | SecurityCommand::ShowUsers
@@ -139,14 +175,21 @@ impl SecurityStatement {
             | SecurityCommand::ShowRolePrivileges { .. }
             | SecurityCommand::ShowCredentials { .. }
             | SecurityCommand::ShowRevision { .. } => StatementClass::Read,
-            SecurityCommand::CreatePoints { .. } | SecurityCommand::UpdatePoints { .. } => {
-                StatementClass::Write
-            }
+            SecurityCommand::CreatePoints { .. }
+            | SecurityCommand::UpdatePoints { .. }
+            | SecurityCommand::CreateTemporalAsset { .. }
+            | SecurityCommand::UpdateTemporalAsset { .. }
+            | SecurityCommand::DeleteTemporalAsset { .. } => StatementClass::Write,
             _ => StatementClass::Admin,
         }
     }
     pub fn requires_revision(&self) -> bool {
         self.class() == StatementClass::Admin
+            || matches!(
+                self.command,
+                SecurityCommand::UpdateTemporalAsset { .. }
+                    | SecurityCommand::DeleteTemporalAsset { .. }
+            )
     }
     pub fn requires_confirmation(&self) -> bool {
         matches!(
@@ -173,7 +216,12 @@ impl SecurityStatement {
         match &self.command {
             SecurityCommand::RolePrivileges { collection, .. }
             | SecurityCommand::ShowRevision { collection } => collection.as_deref(),
-            SecurityCommand::SetGraphLifecycle { collection, .. }
+            SecurityCommand::RegisterEdge { collection, .. }
+            | SecurityCommand::SetGraphLifecycle { collection, .. }
+            | SecurityCommand::CreateTemporalAsset { collection, .. }
+            | SecurityCommand::GetTemporalAsset { collection, .. }
+            | SecurityCommand::UpdateTemporalAsset { collection, .. }
+            | SecurityCommand::DeleteTemporalAsset { collection, .. }
             | SecurityCommand::SetEdgeType { collection, .. }
             | SecurityCommand::SetCollectionPolicy { collection, .. }
             | SecurityCommand::ShowCollectionPolicy { collection }
@@ -187,6 +235,14 @@ impl SecurityStatement {
     pub fn kind_name(&self) -> &'static str {
         use SecurityCommand::*;
         match self.command {
+            ShowRowSecurity { .. } => "SHOW ROW SECURITY",
+            ChangeRowSecurity { .. } => "ALTER ROW SECURITY",
+            RegisterEdge { .. } => "REGISTER EDGE",
+            CreateTemporalAsset { id: Some(_), .. } => "REGISTER ASSET",
+            CreateTemporalAsset { .. } => "CREATE ASSET",
+            GetTemporalAsset { .. } => "GET ASSET",
+            UpdateTemporalAsset { .. } => "UPDATE ASSET",
+            DeleteTemporalAsset { .. } => "DELETE ASSET",
             ShowCatalogRevision => "SHOW CATALOG REVISION",
             CreateProtectedCollection { .. } => "CREATE PROTECTED COLLECTION",
             SetGraphLifecycle { .. } => "ALTER COLLECTION GRAPH",
@@ -225,12 +281,28 @@ pub(super) fn parse(input: &str) -> Option<ParseResult<Statement>> {
     let (first, _, next) = leading_keyword(input)?;
     let first = first.to_ascii_uppercase();
     let recognized = match first.as_str() {
-        "CREATE" | "DROP" => matches!(next.as_str(), "USER" | "ROLE" | "POINTS" | "PROTECTED"),
-        "ALTER" => matches!(next.as_str(), "USER" | "POINT" | "COLLECTION"),
-        "UPDATE" => next == "POINTS",
+        "CREATE" | "DROP" => matches!(
+            next.as_str(),
+            "USER" | "ROLE" | "POINTS" | "PROTECTED" | "ASSET"
+        ),
+        "ALTER" => matches!(
+            next.as_str(),
+            "USER" | "POINT" | "ASSET" | "EDGE" | "COLLECTION" | "ROW"
+        ),
+        "UPDATE" => matches!(next.as_str(), "POINTS" | "ASSET"),
+        "GET" | "DELETE" => next == "ASSET",
+        "REGISTER" => matches!(next.as_str(), "ASSET" | "EDGE"),
         "SHOW" => matches!(
             next.as_str(),
-            "CATALOG" | "COLLECTION" | "CURRENT" | "USERS" | "ROLES" | "ROLE" | "API" | "SECURITY"
+            "CATALOG"
+                | "COLLECTION"
+                | "CURRENT"
+                | "USERS"
+                | "ROLES"
+                | "ROLE"
+                | "API"
+                | "SECURITY"
+                | "ROW"
         ),
         "GRANT" | "REVOKE" | "DENY" | "ISSUE" | "ROTATE" | "RENAME" => true,
         _ => false,
@@ -326,6 +398,94 @@ impl Parser {
     fn security_command(&mut self) -> ParseResult<SecurityCommand> {
         use SecurityCommand::*;
         let verb = self.expect_word()?.to_ascii_uppercase();
+        if matches!(verb.as_str(), "SHOW" | "ALTER") && self.eat_keyword("ROW") {
+            self.expect_keyword("SECURITY")?;
+            let table = self.security_name()?;
+            if verb == "SHOW" {
+                let after = if self.eat_keyword("AFTER") {
+                    self.expect_string()?
+                        .parse()
+                        .map_err(|_| self.security_error("AFTER requires a quoted row ID"))?
+                } else {
+                    0
+                };
+                let limit = if self.eat_keyword("LIMIT") {
+                    self.expect_usize()?
+                } else {
+                    64
+                };
+                return Ok(ShowRowSecurity {
+                    table,
+                    after,
+                    limit,
+                });
+            }
+            self.expect_keyword("APPLY")?;
+            self.expect_keyword("JSON")?;
+            let delta: chirondb_types::relational::RelationalSecurityDelta =
+                serde_json::from_str(&self.expect_string()?)
+                    .map_err(|_| self.security_error("invalid row security delta"))?;
+            if delta.table != table {
+                return Err(self.security_error("row security table mismatch"));
+            }
+            return Ok(ChangeRowSecurity { delta });
+        }
+        if matches!(
+            verb.as_str(),
+            "CREATE" | "REGISTER" | "GET" | "UPDATE" | "DELETE"
+        ) && self.eat_keyword("ASSET")
+        {
+            let collection = self.security_name()?;
+            let id = if verb != "CREATE" {
+                self.expect_keyword("ID")?;
+                Some(self.expect_string()?)
+            } else {
+                None
+            };
+            return match verb.as_str() {
+                "CREATE" | "REGISTER" => {
+                    self.expect_keyword("TEMPLATE")?;
+                    let template = self.security_name()?;
+                    self.expect_keyword("METADATA")?;
+                    let metadata = self.parse_json_value()?;
+                    Ok(CreateTemporalAsset {
+                        collection,
+                        template,
+                        metadata,
+                        id,
+                    })
+                }
+                "GET" => Ok(GetTemporalAsset {
+                    collection,
+                    id: id.unwrap(),
+                }),
+                "UPDATE" => {
+                    self.expect_keyword("METADATA")?;
+                    let metadata = self.parse_json_value()?;
+                    Ok(UpdateTemporalAsset {
+                        collection,
+                        id: id.unwrap(),
+                        metadata,
+                    })
+                }
+                _ => Ok(DeleteTemporalAsset {
+                    collection,
+                    id: id.unwrap(),
+                }),
+            };
+        }
+        if verb == "REGISTER" && self.eat_keyword("EDGE") {
+            let id = self.expect_id()?;
+            self.expect_keyword("IN")?;
+            let collection = self.security_name()?;
+            self.expect_keyword("TEMPLATE")?;
+            let template = self.security_name()?;
+            return Ok(RegisterEdge {
+                collection,
+                id,
+                template,
+            });
+        }
         match verb.as_str() {
             "CREATE" if self.eat_keyword("PROTECTED") => {
                 self.expect_keyword("COLLECTION")?;
@@ -437,7 +597,10 @@ impl Parser {
                 })
             }
             "ALTER" => {
-                self.expect_keyword("POINT")?;
+                let edge = self.eat_keyword("EDGE");
+                if !edge && !self.eat_keyword("ASSET") {
+                    self.expect_keyword("POINT")?;
+                }
                 let id = self.expect_id()?;
                 self.expect_keyword("IN")?;
                 let collection = self.security_name()?;
@@ -460,6 +623,7 @@ impl Parser {
                     return Err(self.security_error("point label change required"));
                 }
                 Ok(AlterPoint {
+                    edge,
                     collection,
                     id,
                     owner,
@@ -643,7 +807,8 @@ impl Parser {
         };
         let actions = self.security_actions()?;
         self.expect_keyword("ON")?;
-        if self.eat_keyword("POINT") {
+        let edge = self.eat_keyword("EDGE");
+        if edge || self.eat_keyword("POINT") || self.eat_keyword("ASSET") {
             if !grant && explicit_effect.is_none() {
                 return Err(self.security_error("use REVOKE GRANT or REVOKE DENY for a point"));
             }
@@ -663,6 +828,7 @@ impl Parser {
                 Effect::Permit
             });
             return Ok(ObjectPrivileges {
+                edge,
                 collection,
                 id,
                 subject,
@@ -818,5 +984,27 @@ mod tests {
             panic!()
         };
         assert_eq!(statement.expected_revision, Some(u64::MAX));
+    }
+}
+
+#[cfg(test)]
+mod authority_target_tests {
+    #[test]
+    fn edge_and_asset_administration_require_exact_revisions() {
+        for query in [
+            "REGISTER EDGE 'opaque' IN docs TEMPLATE edge IF REVISION 9007199254740993;",
+            "ALTER EDGE 'opaque' IN docs SET OWNER admin IF REVISION 9007199254740993;",
+            "DENY GRAPH_READ ON EDGE 'opaque' IN docs TO USER admin IF REVISION 9007199254740993;",
+            "REVOKE DENY GRAPH_READ ON EDGE 'opaque' IN docs FROM USER admin IF REVISION 9007199254740993;",
+            "ALTER ASSET 'asset' IN docs SET CLASSIFICATION RESTRICTED IF REVISION 9007199254740993;",
+            "GRANT TEMPORAL_READ ON ASSET 'asset' IN docs TO USER admin IF REVISION 9007199254740993;",
+        ] {
+            let statement = super::parse(query).unwrap().unwrap();
+            let super::Statement::Security(statement) = statement else {
+                panic!("security")
+            };
+            assert_eq!(statement.expected_revision, Some(9007199254740993));
+            assert!(statement.requires_revision());
+        }
     }
 }

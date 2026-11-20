@@ -6,9 +6,12 @@ use chirondb_core::{
         temporal::{SensorValue, TemporalAccess, TemporalSample},
     },
     encryption,
-    security::{Action, ScopeGrant, onboarding},
+    security::{
+        Action, Classification, CollectionPolicy, IngestTemplate, PropertyAction, PropertyRule,
+        RevisionUpdate, ScopeGrant, onboarding,
+    },
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[test]
 fn protected_journal_restore_recovers_temporal_activation_after_backup() {
@@ -41,6 +44,61 @@ fn protected_journal_restore_recovers_temporal_activation_after_backup() {
             serde_json::from_value(serde_json::json!({"name":"trucks","vector_dim":2})).unwrap(),
         )
         .unwrap();
+        let manager = db.management_identity(actor).unwrap();
+        let policy = db
+            .bind_access(&manager, "trucks", "fleet", Action::PolicyManage)
+            .unwrap();
+        db.replace_collection_policy_authorized(
+            &policy,
+            RevisionUpdate {
+                expected_revision: policy.policy_revision(),
+                value: CollectionPolicy {
+                    department_actions: BTreeSet::new(),
+                    owner_actions: BTreeSet::from([
+                        Action::Read,
+                        Action::TemporalRead,
+                        Action::TemporalAppend,
+                    ]),
+                    templates: BTreeMap::from([(
+                        "asset".into(),
+                        IngestTemplate {
+                            department: actor.principal().attributes.department.clone(),
+                            classification: Classification::Internal,
+                            representations: BTreeMap::new(),
+                            properties: ["/temperature", "/location"]
+                                .into_iter()
+                                .map(|path| {
+                                    (
+                                        path.into(),
+                                        PropertyRule {
+                                            classification: Classification::Internal,
+                                            actions: BTreeSet::from([
+                                                PropertyAction::Read,
+                                                PropertyAction::Query,
+                                                PropertyAction::Write,
+                                            ]),
+                                        },
+                                    )
+                                })
+                                .collect(),
+                        },
+                    )]),
+                },
+            },
+        )
+        .unwrap();
+        let create = db
+            .bind_access(actor, "trucks", "fleet", Action::Create)
+            .unwrap();
+        db.register_temporal_asset_authorized(
+            &create,
+            "truck-7".into(),
+            "asset",
+            serde_json::json!({"location":"cold-room"}),
+        )
+        .unwrap()
+        .publish(|_| ())
+        .unwrap();
     };
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
@@ -65,18 +123,24 @@ fn protected_journal_restore_recovers_temporal_activation_after_backup() {
         let db = Db::open(&live).unwrap();
         let authority = db.identity_authority().unwrap();
         let actor = authority.authenticate(secret.trim()).unwrap();
-        if lifecycle != "new" {
-            create(&db, &actor);
-        }
         let mut principal = actor.principal().clone();
         principal.grants.push(ScopeGrant {
             tenants: BTreeSet::from(["fleet".into()]),
             collections: BTreeSet::from(["trucks".into()]),
-            actions: BTreeSet::from([Action::TemporalAppend, Action::TemporalRead]),
+            actions: BTreeSet::from([
+                Action::Read,
+                Action::Create,
+                Action::TemporalAppend,
+                Action::TemporalRead,
+            ]),
         });
         authority
             .put_principal(&actor, actor.revision(), principal)
             .unwrap();
+        let actor = authority.authenticate(secret.trim()).unwrap();
+        if lifecycle != "new" {
+            create(&db, &actor);
+        }
         if matches!(lifecycle, "existing" | "recreated" | "dropped") {
             let actor = authority.authenticate(secret.trim()).unwrap();
             let ctx = db
@@ -157,6 +221,16 @@ fn protected_journal_restore_recovers_temporal_activation_after_backup() {
         let read = db
             .bind_access(&actor, "trucks", "fleet", Action::TemporalRead)
             .unwrap();
+        let metadata = db
+            .bind_access(&actor, "trucks", "fleet", Action::Read)
+            .unwrap();
+        assert_eq!(
+            db.get_temporal_asset_authorized(&metadata, "truck-7")
+                .unwrap()
+                .publish(|v| v)
+                .unwrap(),
+            serde_json::json!({"location":"cold-room"})
+        );
         let rows = db
             .scan_temporal(
                 "trucks",

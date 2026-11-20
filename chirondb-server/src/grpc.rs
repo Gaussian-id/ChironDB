@@ -2059,28 +2059,21 @@ macro_rules! impl_chiron_service {
                     .await
                     .map_err(|_| Status::unavailable("SQL worker failed"))?
                     .map_err(status_from_error)?;
+                    let sql_publication = response.publication_context();
                     let (message, admission) = crate::response_output::sql(response)?;
                     let mut response = Response::new(message);
                     response.extensions_mut().insert(admission);
-                    response.extensions_mut().insert(match reference {
+                    response.extensions_mut().insert(crate::chironql_protected::PublicationGuard::Sql(sql_publication, Box::new(match reference {
                         Some(context) => crate::chironql_protected::PublicationGuard::Data(context),
                         None => crate::chironql_protected::PublicationGuard::Identity(identity),
-                    });
+                    })));
                     response.extensions_mut().insert(work);
                     return Ok(response);
                 }
                 let principal = grpc_principal(&request)?;
                 let request = sql_request_from_proto(request.into_inner())?;
-                let read_only = self
-                    .db
-                    .sql_request_is_read_only(&request)
+                crate::sql_security::authorize_request(&self.db, &principal, &request)
                     .map_err(status_from_error)?;
-                authorize_grpc(
-                    &self.db,
-                    &principal,
-                    if read_only { Action::Read } else { Action::Write },
-                    None,
-                )?;
                 let audit_context = chirondb_core::audit::AuditContext {
                     principal_id: principal.id,
                     tenant_id: principal.tenant_id,
@@ -2138,6 +2131,8 @@ macro_rules! impl_chiron_service {
                     return Ok(response);
                 }
                 let principal = grpc_principal(&request)?;
+                crate::sql_security::authorize_legacy(&self.db, &principal, Action::Read)
+                    .map_err(status_from_error)?;
                 authorize_grpc(&self.db, &principal, Action::Read, None)?;
                 let audit_context = chirondb_core::audit::AuditContext {
                     principal_id: principal.id,
@@ -2194,13 +2189,14 @@ macro_rules! impl_chiron_service {
                     .await
                     .map_err(|_| Status::unavailable("SQL transaction worker failed"))?
                     .map_err(status_from_error)?;
+                    let sql_publication = response.publication_context();
                     let (message, admission) = crate::response_output::sql(response)?;
                     let mut response = Response::new(message);
                     response.extensions_mut().insert(admission);
-                    response.extensions_mut().insert(match reference {
+                    response.extensions_mut().insert(crate::chironql_protected::PublicationGuard::Sql(sql_publication, Box::new(match reference {
                         Some(context) => crate::chironql_protected::PublicationGuard::Data(context),
                         None => crate::chironql_protected::PublicationGuard::Identity(identity),
-                    });
+                    })));
                     response.extensions_mut().insert(work);
                     return Ok(response);
                 }
@@ -2211,16 +2207,8 @@ macro_rules! impl_chiron_service {
                         .request
                         .ok_or_else(|| Status::invalid_argument("SQL request is required"))?,
                 )?;
-                let read_only = self
-                    .db
-                    .sql_request_is_read_only(&sql_request)
+                crate::sql_security::authorize_request(&self.db, &principal, &sql_request)
                     .map_err(status_from_error)?;
-                authorize_grpc(
-                    &self.db,
-                    &principal,
-                    if read_only { Action::Read } else { Action::Write },
-                    None,
-                )?;
                 let audit_context = chirondb_core::audit::AuditContext {
                     principal_id: principal.id,
                     tenant_id: principal.tenant_id,
@@ -2283,6 +2271,8 @@ macro_rules! impl_chiron_service {
                     return Ok(response);
                 }
                 let principal = grpc_principal(&request)?;
+                crate::sql_security::authorize_legacy(&self.db, &principal, Action::Write)
+                    .map_err(status_from_error)?;
                 authorize_grpc(&self.db, &principal, Action::Write, None)?;
                 let handle = request.into_inner().handle;
                 let audit_context = chirondb_core::audit::AuditContext {

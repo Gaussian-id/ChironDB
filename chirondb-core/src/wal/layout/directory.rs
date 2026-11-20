@@ -7,6 +7,22 @@ pub(super) const BUFFER_BYTES: u64 = 64 * 1024;
 
 pub(super) struct Entry<'a> {
     pub(super) name: Cow<'a, OsStr>,
+    error: Option<std::io::Error>,
+}
+
+impl<'a> Entry<'a> {
+    pub(super) fn into_wal_name(self) -> Result<Option<Cow<'a, OsStr>>> {
+        if Path::new(&self.name)
+            .extension()
+            .is_none_or(|extension| extension != "gdwal")
+        {
+            return Ok(None);
+        }
+        if let Some(error) = self.error {
+            return Err(error.into());
+        }
+        Ok(Some(self.name))
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -35,7 +51,7 @@ mod native {
     }
 
     #[cfg(target_os = "linux")]
-    fn parse(bytes: &[u8]) -> Result<(usize, &[u8])> {
+    fn parse(bytes: &[u8]) -> Result<(usize, &[u8], Option<std::io::Error>)> {
         let length_offset = std::mem::offset_of!(libc::dirent64, d_reclen);
         let name_offset = std::mem::offset_of!(libc::dirent64, d_name);
         let length = bytes
@@ -52,14 +68,14 @@ mod native {
             .position(|b| *b == 0)
             .filter(|end| *end > 0)
             .ok_or_else(invalid)?;
-        Ok((length, &names[..end]))
+        Ok((length, &names[..end], None))
     }
 
     #[cfg(target_os = "macos")]
     const ATTR_CMN_ERROR: u32 = 0x2000_0000;
 
     #[cfg(target_os = "macos")]
-    fn parse(bytes: &[u8]) -> Result<(usize, &[u8])> {
+    fn parse(bytes: &[u8]) -> Result<(usize, &[u8], Option<std::io::Error>)> {
         fn word(bytes: &[u8], offset: usize) -> Result<u32> {
             Ok(u32::from_ne_bytes(
                 bytes
@@ -76,16 +92,18 @@ mod native {
             .ok_or_else(invalid)?;
         let attributes = word(record, 4)?;
         let mut reference = 4 + size_of::<libc::attribute_set_t>();
-        // ATTR_CMN_ERROR is packed immediately after returned attributes.
-        if attributes & ATTR_CMN_ERROR != 0 {
-            let error = word(record, reference)?;
-            if error != 0 {
-                return Err(std::io::Error::from_raw_os_error(error as i32).into());
-            }
+        // Preserve the per-entry error until the caller selects WAL names.
+        // Unrelated pins/atomic temps can disappear during getattrlistbulk;
+        // an error on an actual WAL entry must still fail closed.
+        let error = if attributes & ATTR_CMN_ERROR != 0 {
+            let code = word(record, reference)?;
             reference += 4;
-        }
+            (code != 0).then(|| std::io::Error::from_raw_os_error(code as i32))
+        } else {
+            None
+        };
         if attributes & libc::ATTR_CMN_NAME == 0 {
-            return Err(invalid());
+            return Err(error.map_or_else(invalid, GaussError::from));
         }
         let offset = word(record, reference)? as i32;
         let count = word(record, reference + 4)? as usize;
@@ -100,7 +118,7 @@ mod native {
         if start < reference + 8 || name[..name.len() - 1].contains(&0) {
             return Err(invalid());
         }
-        Ok((length, &name[..name.len() - 1]))
+        Ok((length, &name[..name.len() - 1], error))
     }
 
     impl DirectoryReader {
@@ -200,11 +218,12 @@ mod native {
             let bytes = unsafe {
                 std::slice::from_raw_parts(self.buffer.as_ptr().cast::<u8>(), self.buffer.len() * 8)
             };
-            let (length, name) = parse(&bytes[self.position..self.available])?;
+            let (length, name, error) = parse(&bytes[self.position..self.available])?;
             self.position += length;
             self.remaining -= 1;
             Ok(Some(Entry {
                 name: Cow::Borrowed(OsStr::from_bytes(name)),
+                error,
             }))
         }
     }
@@ -243,6 +262,51 @@ mod native {
         }
 
         #[test]
+        fn wal_name_selection_preserves_errors_on_actual_segments() {
+            for code in [libc::ENOENT, libc::EACCES] {
+                let auxiliary = Entry {
+                    name: Cow::Borrowed(OsStr::new(".released-pin")),
+                    error: Some(std::io::Error::from_raw_os_error(code)),
+                };
+                assert!(auxiliary.into_wal_name().unwrap().is_none());
+                let segment = Entry {
+                    name: Cow::Borrowed(OsStr::new("00000000000000000000.gdwal")),
+                    error: Some(std::io::Error::from_raw_os_error(code)),
+                };
+                assert!(matches!(
+                    segment.into_wal_name(),
+                    Err(GaussError::Io(error)) if error.raw_os_error() == Some(code)
+                ));
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn attribute_error_records_retain_their_validated_name_and_errno() {
+            let mut record = vec![0; 48];
+            record[..4].copy_from_slice(&48u32.to_ne_bytes());
+            record[4..8].copy_from_slice(&(libc::ATTR_CMN_NAME | ATTR_CMN_ERROR).to_ne_bytes());
+            record[24..28].copy_from_slice(&(libc::ENOENT as u32).to_ne_bytes());
+            record[28..32].copy_from_slice(&8i32.to_ne_bytes());
+            record[32..36].copy_from_slice(&8u32.to_ne_bytes());
+            record[36..44].copy_from_slice(b"0.gdwal\0");
+            let (length, name, error) = parse(&record).unwrap();
+            assert_eq!(length, 48);
+            assert_eq!(name, b"0.gdwal");
+            assert_eq!(error.unwrap().raw_os_error(), Some(libc::ENOENT));
+            record[28..32].copy_from_slice(&i32::MAX.to_ne_bytes());
+            assert!(
+                parse(&record).is_err(),
+                "error records still require a bounded name"
+            );
+            record[4..8].copy_from_slice(&ATTR_CMN_ERROR.to_ne_bytes());
+            assert!(
+                parse(&record).is_err(),
+                "nameless errors must not be discarded"
+            );
+        }
+
+        #[test]
         fn native_names_match_independent_filesystem_iterator_and_release_lease() {
             let temp = tempfile::tempdir().unwrap();
             for name in [OsStr::new("unicode-λ"), OsStr::new("plain")] {
@@ -271,6 +335,37 @@ mod native {
                 drop(reader);
                 assert_eq!(used(), 0);
             });
+        }
+
+        #[test]
+        fn unrelated_entry_cleanup_does_not_abort_wal_inventory() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            let temp = tempfile::tempdir().unwrap();
+            fs::write(temp.path().join("00000000000000000000.gdwal"), []).unwrap();
+            let stop = AtomicBool::new(false);
+            let result = std::thread::scope(|scope| {
+                let auxiliary = temp.path().join(".released-pin");
+                let cleanup_stop = &stop;
+                let cleanup = scope.spawn(move || {
+                    while !cleanup_stop.load(Ordering::Acquire) {
+                        fs::create_dir(&auxiliary).unwrap();
+                        fs::remove_dir(&auxiliary).unwrap();
+                    }
+                });
+                let result = (|| -> Result<()> {
+                    for _ in 0..1000 {
+                        let segments = crate::wal::layout::all_wal_segments(temp.path())?;
+                        assert_eq!(segments.len(), 1);
+                        assert_eq!(segments.iter().next().unwrap().index, 0);
+                    }
+                    Ok(())
+                })();
+                stop.store(true, Ordering::Release);
+                cleanup.join().unwrap();
+                result
+            });
+            result.unwrap();
         }
 
         #[test]
@@ -325,6 +420,7 @@ impl DirectoryReader {
             .map(|e| {
                 Ok(Entry {
                     name: Cow::Owned(e?.file_name()),
+                    error: None,
                 })
             })
             .transpose()

@@ -23,6 +23,8 @@ use crate::{
 
 pub(crate) mod binding;
 mod checkpoint;
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod fuzzing;
 mod reader;
 mod registry;
 

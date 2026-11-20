@@ -213,6 +213,24 @@ impl RowStore {
         self.scan(None)
     }
 
+    pub(super) fn visible_versions(
+        &self,
+        snapshot: u64,
+    ) -> impl Iterator<Item = Result<(u64, RowVersion)>> {
+        #[cfg(test)]
+        VISIBLE_ROW_SCANS.with(|scans| scans.set(scans.get() + 1));
+        self.scan(Some(snapshot)).map(|row| {
+            let (id, versions) = row?;
+            Ok((
+                id,
+                versions
+                    .last()
+                    .expect("visible scan emits one version")
+                    .clone(),
+            ))
+        })
+    }
+
     pub(super) fn visible_rows(
         &self,
         snapshot: u64,
@@ -375,6 +393,7 @@ mod tests {
                 .insert(
                     id,
                     VersionChain::single(RowVersion {
+                        security: None,
                         begin: 1,
                         end: None,
                         values: RowValues::adopt(vec![RelationalValue::Text(format!(
@@ -394,6 +413,7 @@ mod tests {
         versions[0].end = Some(2);
         versions
             .push(RowVersion {
+                security: None,
                 begin: 2,
                 end: None,
                 values: RowValues::adopt(vec![RelationalValue::Text("replacement".into())])
@@ -789,6 +809,7 @@ mod tests {
             let mut row = PersistedRowVersion {
                 row_id: 1,
                 version: RowVersion {
+                    security: None,
                     begin: 2,
                     end: None,
                     values: RowValues::adopt(vec![
@@ -812,6 +833,7 @@ mod tests {
                 &table.definition,
                 1,
                 &RowVersion {
+                    security: None,
                     begin: 2,
                     end: None,
                     values: RowValues::adopt(vec![

@@ -46,15 +46,18 @@ fn read(
     query_id: &str,
     map: &mut impl FnMut(GaussError) -> ChironQlError,
 ) -> ExecResult {
-    let points = if let Some((lo, hi, n)) = query.range {
-        db.scan_temporal(&query.collection, access, asset, &query.property, lo..hi, n)
-            .map_err(map)?
-    } else {
-        db.latest_temporal(&query.collection, access, asset, &query.property)
-            .map_err(map)?
-            .into_iter()
-            .collect()
-    };
+    let points = db
+        .query_temporal(
+            &query.collection,
+            access,
+            chirondb_core::db::temporal::TemporalQuery {
+                asset,
+                property: &query.property,
+                range: query.range,
+                filter: query.filter.as_ref(),
+            },
+        )
+        .map_err(map)?;
     let mut r = empty(query_id, &query.collection);
     for point in points {
         let value = match point.value {

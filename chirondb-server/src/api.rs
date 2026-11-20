@@ -463,20 +463,8 @@ async fn sql_execute(
     Extension(permission): Extension<Permission>,
     Json(request): Json<chirondb_core::SqlExecutionRequest>,
 ) -> Response {
-    let read_only = match state.db.sql_request_is_read_only(&request) {
-        Ok(read_only) => read_only,
-        Err(error) => return ApiError::from(error).into_response(),
-    };
-    if !read_only && !permission.role.allows_write() {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": "forbidden",
-                "code": "sql.permission_denied",
-                "message": "the authenticated role cannot mutate relational data",
-            })),
-        )
-            .into_response();
+    if let Err(error) = crate::sql_security::authorize_request(&state.db, &permission, &request) {
+        return ApiError::from(error).into_response();
     }
     let audit_context = chirondb_core::audit::AuditContext {
         principal_id: actor_name(&permission),
@@ -497,6 +485,7 @@ async fn sql_transaction_begin(
     State(state): State<AppState>,
     Extension(permission): Extension<Permission>,
 ) -> Result<Json<chirondb_core::SqlTransactionHandleResponse>, ApiError> {
+    crate::sql_security::authorize_legacy(&state.db, &permission, crate::rbac::Action::Read)?;
     let audit_context = chirondb_core::audit::AuditContext {
         principal_id: actor_name(&permission),
         tenant_id: permission.tenant_id.clone(),
@@ -512,20 +501,8 @@ async fn sql_transaction_execute(
     Extension(permission): Extension<Permission>,
     Json(request): Json<chirondb_core::SqlExecutionRequest>,
 ) -> Response {
-    let read_only = match state.db.sql_request_is_read_only(&request) {
-        Ok(read_only) => read_only,
-        Err(error) => return ApiError::from(error).into_response(),
-    };
-    if !read_only && !permission.role.allows_write() {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": "forbidden",
-                "code": "sql.permission_denied",
-                "message": "the authenticated role cannot mutate relational data",
-            })),
-        )
-            .into_response();
+    if let Err(error) = crate::sql_security::authorize_request(&state.db, &permission, &request) {
+        return ApiError::from(error).into_response();
     }
     let audit_context = chirondb_core::audit::AuditContext {
         principal_id: actor_name(&permission),
@@ -547,16 +524,10 @@ async fn sql_transaction_commit(
     Path(handle): Path<String>,
     Extension(permission): Extension<Permission>,
 ) -> Response {
-    if !permission.role.allows_write() {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": "forbidden",
-                "code": "sql.permission_denied",
-                "message": "the authenticated role cannot commit relational mutations",
-            })),
-        )
-            .into_response();
+    if let Err(error) =
+        crate::sql_security::authorize_legacy(&state.db, &permission, crate::rbac::Action::Write)
+    {
+        return ApiError::from(error).into_response();
     }
     let audit_context = chirondb_core::audit::AuditContext {
         principal_id: actor_name(&permission),

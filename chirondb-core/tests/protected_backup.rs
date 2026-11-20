@@ -76,8 +76,8 @@ fn offline_protected_backup_copies_authority_audit_and_sql_with_a_restore_fence(
     let mut admin = actor.principal().clone();
     admin.grants.push(ScopeGrant {
         tenants: BTreeSet::from(["acme".into()]),
-        collections: BTreeSet::from(["knowledge".into()]),
-        actions: BTreeSet::from([Action::Create, Action::Read]),
+        collections: BTreeSet::from(["knowledge".into(), "authority_probe".into()]),
+        actions: BTreeSet::from([Action::Create, Action::Read, Action::Update]),
     });
     admin.grants.push(ScopeGrant {
         tenants: BTreeSet::from(["acme".into()]),
@@ -105,6 +105,30 @@ fn offline_protected_backup_copies_authority_audit_and_sql_with_a_restore_fence(
         .execute_sql_authorized(&actor, select.clone(), "backup-test")
         .unwrap();
     assert!(matches!(&selected.results[0], SqlResult::Rows { rows, .. } if rows.len() == 1));
+    let probe_sql = |text: &str| {
+        serde_json::from_value::<chirondb_core::SqlExecutionRequest>(serde_json::json!({
+            "statements": [{"sql": text}]
+        }))
+        .unwrap()
+    };
+    db.execute_sql_authorized(
+        &actor,
+        probe_sql("CREATE TABLE authority_probe(id BIGINT PRIMARY KEY, secret TEXT)"),
+        "backup-test",
+    )
+    .unwrap();
+    let mut probe_insert =
+        probe_sql("INSERT INTO authority_probe VALUES(1,'restricted-value') RETURNING secret");
+    probe_insert.idempotency_key = Some("native-authority-backup".into());
+    db.execute_sql_authorized(&actor, probe_insert.clone(), "backup-test")
+        .unwrap();
+    replace_probe_column_authority(&db, &actor, PropertyAction::Read);
+    db.execute_sql_authorized(
+        &actor,
+        probe_sql("SELECT secret FROM authority_probe"),
+        "backup-test",
+    )
+    .unwrap();
     let schema = db
         .bind_access(&actor, "vectors", "acme", Action::Schema)
         .unwrap();
@@ -139,17 +163,22 @@ fn offline_protected_backup_copies_authority_audit_and_sql_with_a_restore_fence(
             IngestTemplate {
                 department: "Security".into(),
                 classification: Classification::Internal,
-                properties: BTreeMap::from([(
-                    "/text".into(),
-                    PropertyRule {
-                        classification: Classification::Internal,
-                        actions: BTreeSet::from([
-                            PropertyAction::Read,
-                            PropertyAction::Query,
-                            PropertyAction::Write,
-                        ]),
-                    },
-                )]),
+                properties: ["/text", "/edges/kind"]
+                    .into_iter()
+                    .map(|path| {
+                        (
+                            path.into(),
+                            PropertyRule {
+                                classification: Classification::Internal,
+                                actions: BTreeSet::from([
+                                    PropertyAction::Read,
+                                    PropertyAction::Query,
+                                    PropertyAction::Write,
+                                ]),
+                            },
+                        )
+                    })
+                    .collect(),
                 representations: BTreeMap::from([(
                     "dense".into(),
                     Representation {
@@ -339,6 +368,17 @@ fn offline_protected_backup_copies_authority_audit_and_sql_with_a_restore_fence(
         .unwrap();
     let later_transaction = later.sql.transaction_id;
     let later_refs = later.records;
+    // The backup has column Read; current journal authority revokes it while
+    // retaining Query. Restore must use this later decision for native rows.
+    let probe_revision = replace_probe_column_authority(&live, &actor, PropertyAction::Query);
+    assert!(
+        live.execute_sql_authorized(
+            &actor,
+            probe_sql("SELECT secret FROM authority_probe"),
+            "backup-test"
+        )
+        .is_err()
+    );
     let mut admin = actor.principal().clone();
     admin.grants.clear();
     authority
@@ -510,8 +550,8 @@ fn offline_protected_backup_copies_authority_audit_and_sql_with_a_restore_fence(
     let mut restored_admin = restored_actor.principal().clone();
     restored_admin.grants.push(ScopeGrant {
         tenants: BTreeSet::from(["acme".into()]),
-        collections: BTreeSet::from(["knowledge".into()]),
-        actions: BTreeSet::from([Action::Read, Action::Create]),
+        collections: BTreeSet::from(["knowledge".into(), "authority_probe".into()]),
+        actions: BTreeSet::from([Action::Read, Action::Create, Action::Update]),
     });
     restored_admin.grants.push(ScopeGrant {
         tenants: BTreeSet::from(["acme".into()]),
@@ -529,6 +569,40 @@ fn offline_protected_backup_copies_authority_audit_and_sql_with_a_restore_fence(
         .put_principal(&restored_actor, restored_actor.revision(), restored_admin)
         .unwrap();
     let restored_actor = restored_authority.authenticate(secret.trim()).unwrap();
+    let probe_view = restored
+        .relational_security_authorized(&restored_actor, "authority_probe", 0, 8)
+        .unwrap();
+    let SqlResult::Rows { rows, .. } = &probe_view.results[0] else {
+        panic!()
+    };
+    let RelationalValue::Json(view) = &rows[0][0] else {
+        panic!()
+    };
+    assert_eq!(view["policy"]["revision"], probe_revision);
+    for sql in [
+        "SELECT secret FROM authority_probe",
+        "UPDATE authority_probe SET secret='restricted-value' WHERE id=1",
+    ] {
+        assert!(matches!(
+            restored.execute_sql_authorized(&restored_actor, probe_sql(sql), "backup-test"),
+            Err(GaussError::Security(SecurityError::Forbidden))
+        ));
+    }
+    let query_only = restored
+        .execute_sql_authorized(
+            &restored_actor,
+            probe_sql("SELECT id FROM authority_probe WHERE secret='restricted-value'"),
+            "backup-test",
+        )
+        .unwrap();
+    assert!(
+        matches!(&query_only.results[0], SqlResult::Rows { rows, .. } if rows == &vec![vec![RelationalValue::Integer(1)]])
+    );
+    assert!(matches!(
+        restored.execute_sql_authorized(&restored_actor, probe_insert, "backup-test"),
+        Err(GaussError::Security(SecurityError::Conflict))
+    ));
+    drop(probe_view);
     let selected = restored
         .execute_sql_authorized(&restored_actor, restored_select, "backup-test")
         .unwrap();
@@ -713,4 +787,41 @@ fn offline_protected_backup_copies_authority_audit_and_sql_with_a_restore_fence(
                 .starts_with(".backup-interrupted.backup-")
         }));
     }
+}
+
+fn replace_probe_column_authority(
+    db: &Db,
+    actor: &chirondb_core::security::AuthenticatedIdentity,
+    action: PropertyAction,
+) -> u64 {
+    let view = db
+        .relational_security_authorized(actor, "authority_probe", 0, 8)
+        .unwrap();
+    let SqlResult::Rows { rows, .. } = &view.results[0] else {
+        panic!()
+    };
+    let RelationalValue::Json(value) = &rows[0][0] else {
+        panic!()
+    };
+    let mut policy: chirondb_core::RelationalRowPolicy =
+        serde_json::from_value(value["policy"].clone()).unwrap();
+    let expected_revision = policy.revision;
+    policy.revision += 1;
+    let mut record: chirondb_core::security::ResourceRecord =
+        serde_json::from_value(value["rows"][0]["authority"].clone()).unwrap();
+    record.revision = policy.revision;
+    record.properties.get_mut("/secret").unwrap().actions = BTreeSet::from([action]);
+    let revision = policy.revision;
+    db.change_relational_security_authorized(
+        actor,
+        chirondb_types::relational::RelationalSecurityDelta {
+            table: "authority_probe".into(),
+            incarnation: record.key.collection,
+            expected_revision,
+            policy,
+            records: vec![record],
+        },
+    )
+    .unwrap();
+    revision
 }

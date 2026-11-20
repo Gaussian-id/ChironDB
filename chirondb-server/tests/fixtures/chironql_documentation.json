@@ -772,7 +772,7 @@
     {
       "id": "base-create",
       "variant": "base:CreateCollection",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Legacy collection creation; protected installations require CREATE PROTECTED COLLECTION.",
       "sql": "CREATE COLLECTION products DIM 3 METRIC cosine WITH {named_vector_dims:{image:3}};",
       "mode": "syntax",
@@ -781,7 +781,7 @@
     {
       "id": "base-create-l2",
       "variant": "base:CreateCollection",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Alternative Euclidean distance metric.",
       "sql": "CREATE COLLECTION euclidean DIM 3 METRIC l2;",
       "mode": "syntax",
@@ -790,7 +790,7 @@
     {
       "id": "base-create-dot",
       "variant": "base:CreateCollection",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Alternative dot-product metric.",
       "sql": "CREATE COLLECTION dot_products DIM 3 METRIC dot;",
       "mode": "syntax",
@@ -799,7 +799,7 @@
     {
       "id": "base-upsert",
       "variant": "base:Upsert",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Explicit client IDs and asynchronous WAL acknowledgement on the legacy surface.",
       "sql": "UPSERT INTO products {id:'phone',vector:[1,0,0],vectors:{image:[0,1,0]},payload:{category:'electronics',price:699,title:'wireless phone',meta:{brand:'acme'}}}, {id:'book',vector:[0,1,0],payload:{category:'books',price:25}} NO WAIT;",
       "mode": "syntax",
@@ -808,7 +808,7 @@
     {
       "id": "base-search",
       "variant": "base:Search",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "All ordinary search control clauses; RECALL is a target, not a measured result. Protected dense search uses exact evaluation.",
       "sql": "SEARCH products NEAR [1,0,0] LIMIT 5 WITH PAYLOAD EF 64 RECALL 0.95 BUDGET 1000;",
       "mode": "syntax",
@@ -817,7 +817,7 @@
     {
       "id": "base-stored-vector",
       "variant": "base:Search",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Stored-vector references require a readable existing point; unavailable on protected ChironQL.",
       "sql": "SEARCH products NEAR @phone LIMIT 5;",
       "mode": "syntax",
@@ -826,7 +826,7 @@
     {
       "id": "base-named-vector",
       "variant": "base:Search",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Named vector space must be configured and populated.",
       "sql": "SEARCH products NEAR @phone USING image LIMIT 5;",
       "mode": "syntax",
@@ -835,7 +835,7 @@
     {
       "id": "base-filter-eq",
       "variant": "base:Search",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Equality, conjunction and a bounded numeric range.",
       "sql": "SEARCH products NEAR [1,0,0] WHERE category = 'electronics' AND price >= 100 AND price <= 700 LIMIT 5;",
       "mode": "syntax",
@@ -844,7 +844,7 @@
     {
       "id": "base-filter-ne",
       "variant": "base:Count",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Not-equal and strict numeric comparisons.",
       "sql": "COUNT products WHERE category != 'books' AND price > 100 AND price < 1000;",
       "mode": "syntax",
@@ -853,7 +853,7 @@
     {
       "id": "base-filter-in",
       "variant": "base:Scroll",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Single-field membership implements a disjunction without OR.",
       "sql": "SCROLL products WHERE category IN ['electronics','books'] LIMIT 10;",
       "mode": "syntax",
@@ -862,7 +862,7 @@
     {
       "id": "base-filter-contains",
       "variant": "base:Count",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Token intersection on a string field.",
       "sql": "COUNT products WHERE title CONTAINS 'wireless phone';",
       "mode": "syntax",
@@ -871,7 +871,7 @@
     {
       "id": "base-filter-nested",
       "variant": "base:Count",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Dotted nested payload path.",
       "sql": "COUNT products WHERE meta.brand = 'acme';",
       "mode": "syntax",
@@ -880,7 +880,7 @@
     {
       "id": "base-hybrid",
       "variant": "base:Hybrid",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Numeric sparse-vector fusion; TEXT is not a natural-language string or the native BM25 API.",
       "sql": "HYBRID products NEAR [1,0,0] TEXT {12:1.2,98:0.7} FUSION rrf LIMIT 5;",
       "mode": "syntax",
@@ -889,7 +889,7 @@
     {
       "id": "base-hybrid-weighted",
       "variant": "base:Hybrid",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Explicit dense/sparse weights.",
       "sql": "HYBRID products NEAR [1,0,0] TEXT {12:1.2} FUSION weighted DENSE 0.7 SPARSE 0.3 LIMIT 5;",
       "mode": "syntax",
@@ -898,7 +898,7 @@
     {
       "id": "base-hybrid-named",
       "variant": "base:Hybrid",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Named-vector hybrid with query filter.",
       "sql": "HYBRID products NEAR [0,1,0] USING image TEXT {12:1} WHERE price <= 700 LIMIT 5;",
       "mode": "syntax",
@@ -907,7 +907,7 @@
     {
       "id": "base-multi",
       "variant": "base:Multi",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Fuse multiple dense query vectors with matching weights.",
       "sql": "MULTI products NEAR [1,0,0], NEAR [0,1,0] FUSION weighted WEIGHTS 0.6,0.4 LIMIT 5;",
       "mode": "syntax",
@@ -916,7 +916,7 @@
     {
       "id": "base-multi-rrf",
       "variant": "base:Multi",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "RRF multi-query fusion.",
       "sql": "MULTI products NEAR [1,0,0], NEAR [0,1,0] FUSION rrf WHERE price <= 700 LIMIT 5;",
       "mode": "syntax",
@@ -925,7 +925,7 @@
     {
       "id": "base-recommend",
       "variant": "base:Recommend",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Positive and negative examples; existing points required.",
       "sql": "RECOMMEND products LIKE phone UNLIKE book LIMIT 5;",
       "mode": "syntax",
@@ -934,7 +934,7 @@
     {
       "id": "base-recommend-named",
       "variant": "base:Recommend",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Named-space recommendation.",
       "sql": "RECOMMEND products LIKE phone USING image WHERE price <= 700 LIMIT 5;",
       "mode": "syntax",
@@ -943,7 +943,7 @@
     {
       "id": "base-count",
       "variant": "base:Count",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Count matches on legacy authorization surface.",
       "sql": "COUNT products;",
       "mode": "syntax",
@@ -952,7 +952,7 @@
     {
       "id": "base-scroll",
       "variant": "base:Scroll",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "ID-based cursor; use the previous response cursor.",
       "sql": "SCROLL products AFTER 'phone' LIMIT 20;",
       "mode": "syntax",
@@ -961,7 +961,7 @@
     {
       "id": "base-get",
       "variant": "base:Get",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Batch point retrieval.",
       "sql": "GET products POINTS phone, book;",
       "mode": "syntax",
@@ -970,7 +970,7 @@
     {
       "id": "base-list",
       "variant": "base:ShowCollections",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Not exposed by protected ChironQL; use known protected collection names.",
       "sql": "SHOW COLLECTIONS;",
       "mode": "syntax",
@@ -979,7 +979,7 @@
     {
       "id": "base-describe",
       "variant": "base:Describe",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Legacy schema/config inspection; protected policy has SHOW COLLECTION ... SECURITY POLICY.",
       "sql": "DESCRIBE products;",
       "mode": "syntax",
@@ -988,7 +988,7 @@
     {
       "id": "base-update",
       "variant": "base:UpdatePayload",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Merge ordinary payload fields; protected partial update is not supported.",
       "sql": "UPDATE products POINT phone SET PAYLOAD {featured:true};",
       "mode": "syntax",
@@ -997,7 +997,7 @@
     {
       "id": "base-replace",
       "variant": "base:UpdatePayload",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Replace the legacy payload object.",
       "sql": "UPDATE products POINT phone SET PAYLOAD {category:'electronics',price:699} REPLACE;",
       "mode": "syntax",
@@ -1006,7 +1006,7 @@
     {
       "id": "base-delete",
       "variant": "base:DeletePoints",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Explicit ID deletion.",
       "sql": "DELETE FROM products POINTS phone, book;",
       "mode": "syntax",
@@ -1015,7 +1015,7 @@
     {
       "id": "base-delete-filter",
       "variant": "base:DeleteWhere",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Filtered deletion requires confirmation; legacy preview counts matches.",
       "sql": "DELETE FROM products WHERE category = 'archived';",
       "mode": "syntax",
@@ -1024,7 +1024,7 @@
     {
       "id": "base-relate",
       "variant": "base:Relate",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Requires graph lifecycle and edge-type setup via a native administrative API.",
       "sql": "RELATE products phone -> related_to -> book SET {strength:0.8} IDEMPOTENCY KEY 'relation-001' NO WAIT;",
       "mode": "syntax",
@@ -1033,7 +1033,7 @@
     {
       "id": "base-deferred",
       "variant": "base:Relate",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Conditional: requires a server-bound deferred session; stateless requests reject it.",
       "sql": "RELATE products phone -> related_to -> book WITH DEFERRED ENDPOINTS;",
       "mode": "syntax",
@@ -1042,7 +1042,7 @@
     {
       "id": "base-unrelate",
       "variant": "base:Unrelate",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Replace EDGE_ID with a returned opaque edge token, not a point ID.",
       "sql": "UNRELATE products EDGE 'EDGE_ID' NO WAIT;",
       "mode": "syntax",
@@ -1051,7 +1051,7 @@
     {
       "id": "base-edge-update",
       "variant": "base:UpdateEdge",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Merge edge properties.",
       "sql": "UPDATE products EDGE 'EDGE_ID' SET PROPERTIES {strength:0.9} NO WAIT;",
       "mode": "syntax",
@@ -1060,7 +1060,7 @@
     {
       "id": "base-edge-replace",
       "variant": "base:UpdateEdge",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Replace edge properties.",
       "sql": "UPDATE products EDGE 'EDGE_ID' SET PROPERTIES {strength:0.9} REPLACE NO WAIT;",
       "mode": "syntax",
@@ -1069,7 +1069,7 @@
     {
       "id": "base-traverse-nodes",
       "variant": "base:Traverse",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Exact traversal, requires enabled graph.",
       "sql": "TRAVERSE products FROM phone VIA related_to DIRECTION OUT DEPTH 2 LIMIT 20 WITH PAYLOAD RETURN NODES;",
       "mode": "syntax",
@@ -1078,7 +1078,7 @@
     {
       "id": "base-traverse-edges",
       "variant": "base:Traverse",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Incoming edges with a property filter.",
       "sql": "TRAVERSE products FROM phone DIRECTION IN DEPTH 1 EDGE WHERE strength >= 0.5 LIMIT 20 RETURN EDGES;",
       "mode": "syntax",
@@ -1087,7 +1087,7 @@
     {
       "id": "base-traverse-paths",
       "variant": "base:Traverse",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Simple paths require LIMIT; WHERE is not a protected security policy.",
       "sql": "TRAVERSE products FROM phone, book VIA related_to DIRECTION ANY DEPTH 2 WHERE price <= 700 EDGE WHERE strength >= 0.5 BUDGET 1000 MS LIMIT 20 WITH PAYLOAD RETURN PATHS;",
       "mode": "syntax",
@@ -1096,7 +1096,7 @@
     {
       "id": "base-connected-search",
       "variant": "base:Search",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Graph-constrained search; ALLOW DEGRADED does not bypass authorization.",
       "sql": "SEARCH products NEAR [1,0,0] CONNECTED TO phone VIA related_to DIRECTION OUT WITHIN 2 HOPS ALLOW DEGRADED LIMIT 10;",
       "mode": "syntax",
@@ -1105,7 +1105,7 @@
     {
       "id": "base-connected-hybrid",
       "variant": "base:Hybrid",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Graph-constrained numeric hybrid.",
       "sql": "HYBRID products NEAR [1,0,0] TEXT {12:1} CONNECTED TO phone VIA related_to DIRECTION ANY WITHIN 2 HOPS ALLOW DEGRADED LIMIT 10;",
       "mode": "syntax",
@@ -1114,7 +1114,7 @@
     {
       "id": "base-drop",
       "variant": "base:DropCollection",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Destructive legacy lifecycle operation; protected drop remains rejected.",
       "sql": "DROP COLLECTION products;",
       "mode": "syntax",
@@ -1123,7 +1123,7 @@
     {
       "id": "base-drop-if-before",
       "variant": "base:DropCollection",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Equivalent placement of IF EXISTS before the collection name.",
       "sql": "DROP COLLECTION IF EXISTS products;",
       "mode": "syntax",
@@ -1132,7 +1132,7 @@
     {
       "id": "base-drop-if",
       "variant": "base:DropCollection",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Suppress a missing legacy collection error, not authorization errors.",
       "sql": "DROP COLLECTION products IF EXISTS;",
       "mode": "syntax",
@@ -1141,7 +1141,7 @@
     {
       "id": "base-use",
       "variant": "base:Use",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Set the session collection.",
       "sql": "USE products;",
       "mode": "syntax",
@@ -1150,7 +1150,7 @@
     {
       "id": "base-session-search",
       "variant": "base:Search",
-      "section": "Legacy 1.0–1.1 reference",
+      "section": "Legacy 1.0\u20131.1 reference",
       "description": "Run after USE products in the same session or pass --collection products.",
       "sql": "SEARCH NEAR [1,0,0] LIMIT 5;",
       "mode": "syntax",
@@ -1523,6 +1523,114 @@
       "description": "Grant access to temporal observations in this collection.",
       "sql": "GRANT TEMPORAL_APPEND ON COLLECTION docs TO ROLE operations;",
       "mode": "syntax",
+      "actor": "admin"
+    },
+    {
+      "id": "native-row-inspect",
+      "variant": "ShowRowSecurity",
+      "section": "Native row, asset and edge authority",
+      "description": "Requires an existing protected table and PolicyManage; syntax checked by the documentation corpus.",
+      "sql": "SHOW ROW SECURITY documents LIMIT 16;",
+      "mode": "conditional",
+      "actor": "admin"
+    },
+    {
+      "id": "native-row-page",
+      "variant": "ShowRowSecurity",
+      "section": "Native row, asset and edge authority",
+      "description": "Continue metadata pagination after the returned internal row ID.",
+      "sql": "SHOW ROW SECURITY documents AFTER '16' LIMIT 16;",
+      "mode": "conditional",
+      "actor": "admin"
+    },
+    {
+      "id": "native-row-change",
+      "variant": "ChangeRowSecurity",
+      "section": "Native row, asset and edge authority",
+      "description": "Illustrative full delta for a one-column table; substitute current SHOW metadata and preserve all intended rules.",
+      "sql": "ALTER ROW SECURITY documents APPLY JSON '{\n  \"table\": \"documents\",\n  \"incarnation\": \"11111111-1111-4111-8111-111111111111\",\n  \"expected_revision\": 1,\n  \"policy\": {\n    \"revision\": 2,\n    \"default_template\": \"owner\",\n    \"policy\": {\n      \"owner_actions\": [\n        \"read\",\n        \"create\",\n        \"update\",\n        \"delete\",\n        \"labels_manage\",\n        \"grants_manage\"\n      ],\n      \"department_actions\": [],\n      \"templates\": {\n        \"owner\": {\n          \"department\": \"Finance\",\n          \"classification\": \"internal\",\n          \"properties\": {\n            \"/id\": {\n              \"classification\": \"internal\",\n              \"actions\": [\n                \"read\",\n                \"query\",\n                \"write\"\n              ]\n            }\n          },\n          \"representations\": {}\n        }\n      }\n    }\n  },\n  \"records\": []\n}' IF REVISION 1;",
+      "mode": "conditional",
+      "actor": "admin"
+    },
+    {
+      "id": "asset-create",
+      "variant": "CreateTemporalAsset",
+      "section": "Native row, asset and edge authority",
+      "description": "Requires the configured asset template and Create/Write authority.",
+      "sql": "CREATE ASSET assets TEMPLATE asset METADATA {location:'north'};",
+      "mode": "conditional",
+      "actor": "admin"
+    },
+    {
+      "id": "asset-get",
+      "variant": "GetTemporalAsset",
+      "section": "Native row, asset and edge authority",
+      "description": "Replace the allocated ID; Read applies to the asset and projected fields.",
+      "sql": "GET ASSET assets ID 'ASSET_ID';",
+      "mode": "conditional",
+      "actor": "admin"
+    },
+    {
+      "id": "asset-update",
+      "variant": "UpdateTemporalAsset",
+      "section": "Native row, asset and edge authority",
+      "description": "Use the current collection revision and allocated ID; requires Update/Write.",
+      "sql": "UPDATE ASSET assets ID 'ASSET_ID' METADATA {location:'south'} IF REVISION 7;",
+      "mode": "conditional",
+      "actor": "admin"
+    },
+    {
+      "id": "asset-delete",
+      "variant": "DeleteTemporalAsset",
+      "section": "Native row, asset and edge authority",
+      "description": "Use the current revision; permanently retires the binding.",
+      "sql": "DELETE ASSET assets ID 'ASSET_ID' IF REVISION 8;",
+      "mode": "conditional",
+      "actor": "admin"
+    },
+    {
+      "id": "asset-register",
+      "variant": "CreateTemporalAsset",
+      "section": "Native row, asset and edge authority",
+      "description": "Explicit migration requires installation PolicyManage and a configured metadata-only template.",
+      "sql": "REGISTER ASSET assets ID 'historic-truck' TEMPLATE asset METADATA {location:'north'};",
+      "mode": "conditional",
+      "actor": "admin"
+    },
+    {
+      "id": "edge-register",
+      "variant": "RegisterEdge",
+      "section": "Native row, asset and edge authority",
+      "description": "Replace the opaque token/revision and provision a metadata-only template at sufficient classification.",
+      "sql": "REGISTER EDGE '<edge-token>' IN docs TEMPLATE edge_metadata IF REVISION 10;",
+      "mode": "conditional",
+      "actor": "admin"
+    },
+    {
+      "id": "edge-classification",
+      "variant": "AlterPoint",
+      "section": "Native row, asset and edge authority",
+      "description": "Requires existing edge, current revision and LabelsManage.",
+      "sql": "ALTER EDGE '<edge-token>' IN docs SET CLASSIFICATION CONFIDENTIAL IF REVISION 7;",
+      "mode": "conditional",
+      "actor": "admin"
+    },
+    {
+      "id": "edge-deny",
+      "variant": "ObjectPrivileges",
+      "section": "Native row, asset and edge authority",
+      "description": "Requires existing edge/user, current revision and GrantsManage.",
+      "sql": "DENY GRAPH_READ, GRAPH_WRITE ON EDGE '<edge-token>' IN docs TO USER reader IF REVISION 8;",
+      "mode": "conditional",
+      "actor": "admin"
+    },
+    {
+      "id": "edge-revoke-deny",
+      "variant": "ObjectPrivileges",
+      "section": "Native row, asset and edge authority",
+      "description": "Remove the explicit deny under management authority; other policy checks remain.",
+      "sql": "REVOKE DENY GRAPH_READ, GRAPH_WRITE ON EDGE '<edge-token>' IN docs FROM USER reader IF REVISION 9;",
+      "mode": "conditional",
       "actor": "admin"
     }
   ],

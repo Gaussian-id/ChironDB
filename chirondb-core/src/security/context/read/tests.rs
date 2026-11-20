@@ -37,6 +37,7 @@ fn fixture() -> (
                 id: format!("public-{i:03}"),
             },
             storage_id: Uuid::from_u128(i),
+            content: ResourceContent::Point,
             labels: ResourceLabels {
                 owner: "reader".into(),
                 department: "Finance".into(),

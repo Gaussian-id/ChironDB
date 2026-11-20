@@ -24,19 +24,24 @@ jobs:
       - name: Install external clients
         run: |
           sudo apt-get update
-          sudo apt-get install -y postgresql-client protobuf-compiler
+          sudo apt-get install -y postgresql-client protobuf-compiler python3-venv
+          python3 -m venv "${RUNNER_TEMP}/tls-client-venv"
+          "${RUNNER_TEMP}/tls-client-venv/bin/python" -m pip install --only-binary=:all: --disable-pip-version-check --no-input -r .github/tools/requirements-tls-soak.txt
+          "${RUNNER_TEMP}/tls-client-venv/bin/python" -B -m unittest discover -s .github/tools -p test_security_tls_soak.py -v
           go install github.com/fullstorydev/grpcurl/cmd/grpcurl@v1.9.3
           google-chrome --version
           psql --version
           "$(go env GOPATH)/bin/grpcurl" --version
       - name: Build server and ChironWire client
-        run: cargo build --release --locked --bin chirondb --bin chironwirectl
+        run: cargo build --release --locked --bin chirondb --bin chironctl --bin chironwirectl
       - name: Resolve tested revision and trees
         id: trees
         run: |
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "core=$(git rev-parse HEAD:chirondb-core)" >> "$GITHUB_OUTPUT"
-          echo "server=$(git rev-parse HEAD:chirondb-server)" >> "$GITHUB_OUTPUT"
+          {
+            echo "sha=$(git rev-parse HEAD)"
+            echo "core=$(git rev-parse HEAD:chirondb-core)"
+            echo "server=$(git rev-parse HEAD:chirondb-server)"
+          } >> "$GITHUB_OUTPUT"
       - name: Run 60-minute external TLS rotation soak
         env:
           TESTED_SHA: ${{ steps.trees.outputs.sha }}
@@ -45,8 +50,9 @@ jobs:
         run: |
           evidence="${RUNNER_TEMP}/tls-soak"
           mkdir -p "$evidence"
-          python3 -B .github/tools/security_tls_soak.py \
+          "${RUNNER_TEMP}/tls-client-venv/bin/python" -B .github/tools/security_tls_soak.py \
             --server target/release/chirondb \
+            --ctl target/release/chironctl \
             --wirectl target/release/chironwirectl \
             --proto-root proto \
             --grpcurl "$(go env GOPATH)/bin/grpcurl" \
@@ -70,6 +76,10 @@ jobs:
               assert counts["success"] > 0, (client, counts)
               assert counts["failure"] == 0, (client, counts)
           assert report["browser_grpc_web"] == "passed", report
+          driver = report["browser_driver"]
+          assert driver["driver"] == "playwright", driver
+          assert driver["processes_started"] == 1, driver
+          assert driver["contexts_created"] == report["load_counts"]["browser_grpc_web"]["success"], driver
           PY
       - name: Upload TLS soak evidence
         if: always()

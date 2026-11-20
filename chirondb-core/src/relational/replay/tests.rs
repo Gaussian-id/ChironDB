@@ -119,6 +119,7 @@ fn batch_proof_streams_large_payloads_under_fixed_quota_and_distinguishes_float_
         mutations: vec![RelationalMutation::Insert {
             table: "items".into(),
             rows: vec![StoredRow {
+                security: None,
                 row_id: 1,
                 values: vec![
                     RelationalValue::Text("x".repeat(1024 * 1024)),

@@ -37,6 +37,10 @@ struct FingerprintPoint<'a> {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Authorization {
     incarnation: Uuid,
+    /// Old receipts do not record edge field dependencies. After any policy
+    /// revision, reject acknowledgement replay instead of reusing old rights.
+    #[serde(default)]
+    policy_revision: Option<u64>,
     sql: SqlAuthorization,
     vector_action: Action,
     #[serde(default)]
@@ -78,6 +82,7 @@ pub(super) struct CommitOptions<'a> {
     pub insert: Option<&'a InsertCommit<'a>>,
     pub decision_started: Option<&'a std::sync::atomic::AtomicBool>,
     pub expected_sql_rows: Option<u64>,
+    pub changes: Option<&'a crate::security::DataReferenceAuthorization<'a>>,
     pub references: Option<&'a crate::security::DataReferenceAuthorization<'a>>,
 }
 
@@ -96,16 +101,27 @@ impl CommitReceipt<'_> {
     pub(crate) fn commit(
         self,
         journal: &crate::transaction_journal::TransactionJournal,
-        target: TransactionTarget,
         mutation: WalEntry,
         audit: TransactionAudit,
-        sql: &SqlExecutionResponse,
+        sql: (&SqlExecutionResponse, Option<&SqlAuthorization>),
         validate_references: impl FnOnce(
             &crate::security::DataReferenceAuthorization<'_>,
             &mut BTreeSet<(String, Uuid)>,
             &BTreeSet<String>,
         ) -> Result<()>,
+        before_decision: impl FnOnce() -> Result<()>,
     ) -> Result<CommittedTransaction> {
+        let (sql, sql_authorization) = sql;
+        let WalEntry::MultiModelBatch { batch } = &mutation else {
+            return Err(SecurityError::Unavailable.into());
+        };
+        let target = TransactionTarget::MultiModel {
+            collections: batch
+                .collections
+                .iter()
+                .map(|projection| projection.collection.clone())
+                .collect(),
+        };
         if let Some(expected) = self.expected_sql_rows {
             let actual = sql.results.iter().try_fold(0_u64, |total, result| {
                 let rows = match result {
@@ -126,6 +142,24 @@ impl CommitReceipt<'_> {
             }
         }
         let mut authorization = self.authorization.cloned();
+        if let Some(proof) = &mut authorization {
+            proof.sql = sql_authorization.ok_or(SecurityError::Forbidden)?.clone();
+            let WalEntry::MultiModelBatch { batch } = &mutation else {
+                return Err(SecurityError::Unavailable.into());
+            };
+            let security = batch
+                .collections
+                .iter()
+                .filter_map(|c| c.security.as_ref())
+                .find(|security| security.incarnation == proof.incarnation)
+                .ok_or(SecurityError::Unavailable)?;
+            if proof.policy_revision != Some(security.expected_revision) {
+                return Err(SecurityError::Conflict.into());
+            }
+            // A deletion drains and advances the collection epoch itself.
+            // Its receipt binds the committed revision, not the pre-delete one.
+            proof.policy_revision = Some(security.revision);
+        }
         if let Some(references) = self.references {
             let proof = authorization.as_mut().ok_or(SecurityError::Unavailable)?;
             validate_references(references, &mut proof.read, &proof.retired)?;
@@ -164,13 +198,17 @@ impl CommitReceipt<'_> {
             })?;
             // Keep the receiving Value reservation until the journal finishes
             // consuming it and adopts its independently admitted PREPARE DTO.
-            response.consume(|response| match started {
-                Some(started) => {
-                    claim.commit_with_decision(target, mutation, audit, response, started)
+            response.consume(|response| {
+                before_decision()?;
+                match started {
+                    Some(started) => {
+                        claim.commit_with_decision(target, mutation, audit, response, started)
+                    }
+                    None => claim.commit(target, mutation, audit, response),
                 }
-                None => claim.commit(target, mutation, audit, response),
             })
         } else {
+            before_decision()?;
             match started {
                 Some(started) => journal.commit_with_decision(target, mutation, audit, started),
                 None => journal.commit(target, mutation, audit),
@@ -257,6 +295,7 @@ impl Db {
     ) -> Result<Authorization> {
         let mut proof = Authorization {
             incarnation: vector.incarnation(),
+            policy_revision: Some(graph.policy_revision()),
             sql: self
                 .relational
                 .read()
@@ -280,6 +319,13 @@ impl Db {
             proof.graph.insert((id.clone(), record.storage_id));
         }
         for relation in &request.relations {
+            graph.authorize_edge_properties_change(
+                &graph.authorize(&relation.source_point_id)?,
+                &graph.authorize(&relation.target_point_id)?,
+                &serde_json::json!({}),
+                &relation.properties,
+                Some(&relation.properties),
+            )?;
             for id in [&relation.source_point_id, &relation.target_point_id] {
                 let record = graph.authorize(id)?;
                 proof.graph.insert((id.clone(), record.storage_id));
@@ -312,15 +358,52 @@ impl Db {
             if endpoints.len() != edges.len() {
                 return Err(SecurityError::NotFound.into());
             }
-            for (source, target) in endpoints.values() {
+            for (edge, (source, target)) in &endpoints {
+                let mut records = Vec::with_capacity(2);
                 for nid in [source, target] {
                     let physical = resolver
                         .live_point_id(*nid)
                         .and_then(|id| id.parse::<Uuid>().ok())
                         .ok_or(SecurityError::NotFound)?;
                     let record = graph.authorize_physical(physical)?;
-                    proof.graph.insert((record.key.id, record.storage_id));
+                    proof
+                        .graph
+                        .insert((record.key.id.clone(), record.storage_id));
+                    records.push(record);
                 }
+                let old = mutable
+                    .edge_properties(*edge)?
+                    .ok_or(SecurityError::NotFound)?;
+                let mut new = serde_json::json!({});
+                let mut submitted = None;
+                for (token, update) in &request.edge_updates {
+                    if crate::edge_token::decode(self.graph_database_id(), token)? == *edge {
+                        submitted = Some(&update.properties);
+                        new = match update.mode {
+                            crate::graph::EdgePropertyMode::Replace => update.properties.clone(),
+                            crate::graph::EdgePropertyMode::Merge => {
+                                let mut value = old.as_ref().clone();
+                                let object =
+                                    value.as_object_mut().ok_or(SecurityError::Unavailable)?;
+                                let patch = update
+                                    .properties
+                                    .as_object()
+                                    .ok_or(SecurityError::Forbidden)?;
+                                object.extend(patch.iter().map(|(k, v)| (k.clone(), v.clone())));
+                                value
+                            }
+                        };
+                    }
+                }
+                let own = graph.authorize_edge(*edge, mutable.epoch())?;
+                graph.authorize_edge_fields_change(&own, &old, &new, submitted)?;
+                graph.authorize_edge_properties_change(
+                    &records[0],
+                    &records[1],
+                    &old,
+                    &new,
+                    submitted,
+                )?;
             }
         }
         Ok(proof)
@@ -361,6 +444,7 @@ impl Db {
         let mut decoded = crate::relational::wal_decode::borrowed::<Receipt>(encoded)?;
         // Stable UUID output is created only after receiving admission.
         decoded.reserve_extra(128)?;
+        let mut sql_publication = crate::SqlPublication::default();
         let decoded = decoded.try_map(|mut receipt| {
             if receipt.version != 1 {
                 return Err(GaussError::WalUnavailable(
@@ -369,7 +453,10 @@ impl Db {
             }
             match (protected, receipt.authorization) {
                 (Some((identity, collection, action)), Some(proof)) => {
-                    let _sql = proof.sql.authorize(identity)?;
+                    sql_publication = self
+                        .relational
+                        .read()
+                        .authorize_receipt(identity, &proof.sql)?;
                     let vector = self.bind_access(
                         identity,
                         collection,
@@ -386,6 +473,9 @@ impl Db {
                     let _graph = graph.publication_permit()?;
                     if vector.incarnation() != proof.incarnation || action != proof.vector_action {
                         return Err(SecurityError::Forbidden.into());
+                    }
+                    if proof.policy_revision != Some(graph.policy_revision()) {
+                        return Err(SecurityError::NotFound.into());
                     }
                     if proof.ingest {
                         self.bind_access(
@@ -424,7 +514,7 @@ impl Db {
             response.graph.replayed = true;
             Ok(response)
         })?;
-        Ok(MultiModelResponse::decoded(decoded))
+        Ok(MultiModelResponse::decoded(decoded).with_sql_publication(sql_publication))
     }
 }
 
@@ -466,6 +556,7 @@ mod receipt_admission_tests {
         let incarnation = Uuid::from_u128(17);
         let authorization = Authorization {
             incarnation,
+            policy_revision: Some(1),
             sql: serde_json::from_value(serde_json::json!({
                 "tenant":"tenant", "schema":false, "grants":[]
             }))

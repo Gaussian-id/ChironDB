@@ -126,13 +126,9 @@ pub(super) fn all_wal_segments(dir: &Path) -> Result<WalSegments> {
     if dir.exists() {
         let mut reader = DirectoryReader::open(dir)?;
         while let Some(entry) = reader.next_entry()? {
-            let name = entry.name;
-            if Path::new(&name)
-                .extension()
-                .is_none_or(|extension| extension != "gdwal")
-            {
+            let Some(name) = entry.into_wal_name()? else {
                 continue;
-            }
+            };
             let mut memory = MetadataCharge::default();
             memory.prepare(
                 (dir.as_os_str().len() as u64)

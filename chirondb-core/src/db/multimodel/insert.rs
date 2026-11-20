@@ -268,7 +268,7 @@ impl Db {
             &request.template,
             &points,
             &decision_started,
-            |created, generation| {
+            |created, generation, changes| {
                 let bindings = request
                     .records
                     .iter()
@@ -285,6 +285,7 @@ impl Db {
                     .collect::<BTreeMap<_, _>>();
                 let mut proof = Authorization {
                     incarnation: create.incarnation(),
+                    policy_revision: Some(create.policy_revision()),
                     sql: sql_authorization.clone(),
                     vector_action: Action::Create,
                     vector: BTreeSet::new(),
@@ -303,34 +304,46 @@ impl Db {
                         .read
                         .insert((record.key.id.clone(), record.storage_id));
                 }
-                let mut endpoint = |endpoint: &RecordEndpoint| -> Result<String> {
-                    let record = match endpoint {
-                        RecordEndpoint::New(binding) => {
-                            let position = request
-                                .records
-                                .iter()
-                                .position(|record| &record.binding == binding)
-                                .ok_or_else(|| {
-                                    GaussError::InvalidRequest(
-                                        "unknown graph record binding".into(),
-                                    )
-                                })?;
-                            let record = &created[position];
-                            graph.authorize_candidate(record)?;
-                            record.clone()
-                        }
-                        RecordEndpoint::Existing(id) => graph.authorize(id)?,
+                let mut endpoint =
+                    |endpoint: &RecordEndpoint| -> Result<crate::security::ResourceRecord> {
+                        let record = match endpoint {
+                            RecordEndpoint::New(binding) => {
+                                let position = request
+                                    .records
+                                    .iter()
+                                    .position(|record| &record.binding == binding)
+                                    .ok_or_else(|| {
+                                        GaussError::InvalidRequest(
+                                            "unknown graph record binding".into(),
+                                        )
+                                    })?;
+                                let record = &created[position];
+                                graph.authorize_candidate(record)?;
+                                record.clone()
+                            }
+                            RecordEndpoint::Existing(id) => graph.authorize(id)?,
+                        };
+                        proof
+                            .graph
+                            .insert((record.key.id.clone(), record.storage_id));
+                        Ok(record)
                     };
-                    proof.graph.insert((record.key.id, record.storage_id));
-                    Ok(record.storage_id.to_string())
-                };
                 let relations = request
                     .relations
                     .iter()
                     .map(|relation| {
+                        let source = endpoint(&relation.source)?;
+                        let target = endpoint(&relation.target)?;
+                        graph.authorize_edge_properties_change(
+                            &source,
+                            &target,
+                            &serde_json::json!({}),
+                            &relation.properties,
+                            Some(&relation.properties),
+                        )?;
                         Ok(RelateRequest {
-                            source_point_id: endpoint(&relation.source)?,
-                            target_point_id: endpoint(&relation.target)?,
+                            source_point_id: source.storage_id.to_string(),
+                            target_point_id: target.storage_id.to_string(),
                             edge_type: relation.edge_type.clone(),
                             properties: relation.properties.clone(),
                             scope: GraphRelationScope::Local,
@@ -387,6 +400,7 @@ impl Db {
                             decision_started: None,
                             expected_sql_rows,
                             references: None,
+                            changes: Some(changes),
                         }),
                     )?,
                 );

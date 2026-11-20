@@ -18,6 +18,7 @@ use super::{capacity, identity::Epoch, policy, *};
 
 type Result<T> = std::result::Result<T, SecurityError>;
 
+mod graph;
 mod read;
 pub(crate) use read::AuthorizedRecord;
 
@@ -119,6 +120,21 @@ impl PolicySnapshot {
         // Validate every chain at admission, including chains nobody currently
         // has permission to traverse. No malformed dormant grant may be saved.
         for record in resources.values() {
+            if let ResourceContent::GraphEdge { source, target, .. } = record.content {
+                for id in [source, target] {
+                    let endpoint = physical
+                        .get(&id)
+                        .and_then(|key| resources.get(key))
+                        .ok_or_else(|| {
+                            SecurityError::Invalid("edge endpoint authority is absent".into())
+                        })?;
+                    if !endpoint.content.is_point() || endpoint.key.tenant != record.key.tenant {
+                        return Err(SecurityError::Invalid(
+                            "edge endpoint crosses security domain".into(),
+                        ));
+                    }
+                }
+            }
             if let Some(receipt) = &record.create_receipt {
                 for id in &receipt.ids {
                     if !resources.contains_key(&PointKey {
@@ -185,9 +201,16 @@ pub struct CollectionAuthority {
 /// reference checks still use the current, unchanged resource policy.
 pub(crate) struct DataReferenceAuthorization<'a> {
     context: &'a AccessContext,
+    initial: &'a [ResourceRecord],
+    staged: std::cell::RefCell<Vec<ResourceRecord>>,
+    metadata_bytes: std::cell::Cell<Option<usize>>,
+    metadata_limit: usize,
 }
 
 impl DataReferenceAuthorization<'_> {
+    pub(crate) fn identity(&self) -> &AuthenticatedIdentity {
+        self.context.identity()
+    }
     pub(crate) fn tenant(&self) -> &str {
         self.context.tenant()
     }
@@ -216,6 +239,9 @@ impl DataReferenceAuthorization<'_> {
             id: reference.id.clone(),
         };
         let record = resources.records.get(&key).ok_or(SecurityError::NotFound)?;
+        if matches!(record.content, ResourceContent::GraphEdge { .. }) {
+            return Err(SecurityError::NotFound);
+        }
         policy::authorize_resource(
             context.identity.principal(),
             context.identity.groups(),
@@ -234,6 +260,7 @@ impl Drop for CollectionAuthority {
 }
 
 pub(crate) struct CreateOptions<'a> {
+    pub(crate) temporal_assets: bool,
     pub(crate) ids: Option<&'a [String]>,
     pub(crate) request: Option<(String, [u8; 32])>,
     pub(crate) decision_started: Option<&'a AtomicBool>,
@@ -363,11 +390,12 @@ impl CollectionAuthority {
             template,
             points,
             CreateOptions {
+                temporal_assets: false,
                 ids: explicit_ids,
                 request,
                 decision_started: None,
             },
-            commit,
+            |records, generation, _| commit(records, generation),
         )
     }
 
@@ -379,13 +407,18 @@ impl CollectionAuthority {
         template: &str,
         points: &[NewPoint],
         decision_started: &AtomicBool,
-        commit: impl FnOnce(&[ResourceRecord], u64) -> crate::Result<()>,
+        commit: impl FnOnce(
+            &[ResourceRecord],
+            u64,
+            &DataReferenceAuthorization<'_>,
+        ) -> crate::Result<()>,
     ) -> crate::Result<Vec<ResourceRecord>> {
         self.create_with_options(
             context,
             template,
             points,
             CreateOptions {
+                temporal_assets: false,
                 ids: None,
                 request: None,
                 decision_started: Some(decision_started),
@@ -400,9 +433,14 @@ impl CollectionAuthority {
         template: &str,
         points: &[NewPoint],
         options: CreateOptions<'_>,
-        commit: impl FnOnce(&[ResourceRecord], u64) -> crate::Result<()>,
+        commit: impl FnOnce(
+            &[ResourceRecord],
+            u64,
+            &DataReferenceAuthorization<'_>,
+        ) -> crate::Result<()>,
     ) -> crate::Result<Vec<ResourceRecord>> {
         let CreateOptions {
+            temporal_assets,
             ids: explicit_ids,
             request,
             decision_started,
@@ -416,7 +454,10 @@ impl CollectionAuthority {
             return Err(SecurityError::BudgetExceeded.into());
         }
         if explicit_ids.is_some_and(|ids| {
-            ids.len() != points.len() || ids.iter().any(|id| id.is_empty() || id.len() > 1024)
+            ids.len() != points.len()
+                || ids
+                    .iter()
+                    .any(|id| id.is_empty() || id.len() > 1024 || id.starts_with("@edge/"))
         }) {
             return Err(SecurityError::Invalid("invalid public point ID".into()).into());
         }
@@ -435,6 +476,19 @@ impl CollectionAuthority {
             .get(template)
             .ok_or(SecurityError::Forbidden)?;
         let attributes = &context.identity.principal().attributes;
+        if temporal_assets
+            && (!template.representations.is_empty()
+                || points.iter().any(|point| {
+                    !point.vector.is_empty()
+                        || !point.vectors.is_empty()
+                        || point.sparse_vector.is_some()
+                }))
+        {
+            return Err(SecurityError::Invalid(
+                "temporal assets cannot carry vector representations".into(),
+            )
+            .into());
+        }
         if attributes.clearance < template.classification {
             return Err(SecurityError::Forbidden.into());
         }
@@ -491,6 +545,13 @@ impl CollectionAuthority {
             let record = ResourceRecord {
                 key,
                 storage_id,
+                content: if temporal_assets {
+                    ResourceContent::TemporalAsset {
+                        metadata: point.payload.clone(),
+                    }
+                } else {
+                    ResourceContent::Point
+                },
                 labels: ResourceLabels {
                     owner: context.principal_id().into(),
                     department: template.department.clone(),
@@ -562,14 +623,16 @@ impl CollectionAuthority {
         // mutation/publication. Let preparation authorize existing references
         // against the old resource map without recursively taking its write lock.
         drop(resources);
-        if let Err(error) = commit(&created, generation) {
+        let changes = DataReferenceAuthorization::new(context, &created, self.metadata_limit());
+        if let Err(error) = commit(&created, generation, &changes) {
             if decision_started.is_none_or(|started| started.load(Ordering::Acquire)) {
                 snapshot.epoch.close();
             }
             return Err(error);
         }
         let mut resources = snapshot.resources.write();
-        for record in &created {
+        let staged = changes.staged.borrow();
+        for record in created.iter().chain(staged.iter()) {
             if let Some(receipt) = &record.create_receipt {
                 resources.create_requests.insert(
                     (
@@ -586,7 +649,9 @@ impl CollectionAuthority {
             resources.records.insert(record.key.clone(), record.clone());
         }
         resources.generation = generation;
-        resources.metadata_bytes = metadata_bytes;
+        resources.metadata_bytes = changes.metadata_bytes.get().unwrap_or(metadata_bytes);
+        drop(staged);
+        drop(changes);
         Ok(created)
     }
 
@@ -623,6 +688,7 @@ impl CollectionAuthority {
         &self,
         context: &AccessContext,
         retire: &[PointKey],
+        revoke: bool,
         decision_started: &AtomicBool,
         commit: impl FnOnce(
             &[ResourceRecord],
@@ -632,13 +698,14 @@ impl CollectionAuthority {
             &DataReferenceAuthorization<'_>,
         ) -> crate::Result<T>,
     ) -> crate::Result<T> {
-        self.data_with_options(context, retire, Some(decision_started), commit)
+        self.data_with_options(context, retire, revoke, Some(decision_started), commit)
     }
 
     fn data_with_options<T>(
         &self,
         context: &AccessContext,
         retire: &[PointKey],
+        revoke: bool,
         decision_started: Option<&AtomicBool>,
         commit: impl FnOnce(
             &[ResourceRecord],
@@ -666,6 +733,9 @@ impl CollectionAuthority {
                 return Err(SecurityError::NotFound.into());
             }
             let record = resources.records.get(key).ok_or(SecurityError::NotFound)?;
+            if !record.content.is_point() {
+                return Err(SecurityError::NotFound.into());
+            }
             policy::authorize_resource(
                 context.identity.principal(),
                 context.identity.groups(),
@@ -697,7 +767,8 @@ impl CollectionAuthority {
         // Removing a container also withdraws inherited grants. Conservatively
         // revoke the collection epoch on deletion; never leave queued results
         // authorized by a now-retired parent alive after acknowledgement.
-        let revision = if context.action == Action::Delete {
+        let revoke = revoke || context.action == Action::Delete;
+        let revision = if revoke {
             let revision = snapshot
                 .checkpoint
                 .revision
@@ -710,13 +781,13 @@ impl CollectionAuthority {
         };
         // The update lease excludes changes to this map through preparation.
         // Reference authorization must not recursively acquire its write lock.
-        let references = DataReferenceAuthorization { context };
+        let references = DataReferenceAuthorization::new(context, &retired, self.metadata_limit());
         let result = match commit(&retired, previous, next, revision, &references) {
             Ok(result) => result,
             Err(error) => {
                 if decision_started.is_none_or(|started| started.load(Ordering::Acquire)) {
                     snapshot.epoch.close();
-                } else if context.action == Action::Delete {
+                } else if revoke {
                     // Delete drained the old epoch before preparation. No
                     // durable decision was attempted and resources are still
                     // unchanged. Install a fresh epoch with the original
@@ -731,13 +802,16 @@ impl CollectionAuthority {
             }
         };
         let mut resources = snapshot.resources.write();
-        for record in retired {
-            resources.records.insert(record.key.clone(), record);
+        for record in retired.iter().chain(references.staged.borrow().iter()) {
+            resources
+                .physical
+                .insert(record.storage_id, record.key.clone());
+            resources.records.insert(record.key.clone(), record.clone());
         }
         resources.generation = next;
-        resources.metadata_bytes = metadata_bytes;
+        resources.metadata_bytes = references.metadata_bytes.get().unwrap_or(metadata_bytes);
         drop(resources);
-        if context.action == Action::Delete {
+        if revoke {
             let mut checkpoint = snapshot.checkpoint.clone();
             checkpoint.revision = revision;
             checkpoint.data_generation = next;
@@ -812,7 +886,7 @@ impl CollectionAuthority {
         Ok(result)
     }
 
-    /// Commit a bounded label/grant overlay without copying the collection's
+    /// Commit a bounded label/grant or metadata-only asset overlay without copying the collection's
     /// entire resource catalog. The collection write lock precedes this gate.
     pub(crate) fn change_resources(
         &self,
@@ -823,8 +897,10 @@ impl CollectionAuthority {
     ) -> crate::Result<u64> {
         let _update = self.update.lock();
         let snapshot = Arc::clone(&self.current.read());
-        if !matches!(context.action, Action::LabelsManage | Action::GrantsManage)
-            || !Arc::ptr_eq(&snapshot, &context.snapshot)
+        if !matches!(
+            context.action,
+            Action::LabelsManage | Action::GrantsManage | Action::Update | Action::Delete
+        ) || !Arc::ptr_eq(&snapshot, &context.snapshot)
         {
             return Err(SecurityError::Forbidden.into());
         }
@@ -851,8 +927,28 @@ impl CollectionAuthority {
                 .records
                 .get(&record.key)
                 .ok_or(SecurityError::NotFound)?;
+            match context.action {
+                Action::Update | Action::Delete => {
+                    if !old.content.is_temporal_asset() {
+                        return Err(SecurityError::Forbidden.into());
+                    }
+                    let mut expected = old.clone();
+                    expected.revision = revision;
+                    if context.action == Action::Update {
+                        expected.content = record.content.clone();
+                    } else {
+                        expected.retired = true;
+                    }
+                    if record != &expected || !record.content.is_temporal_asset() {
+                        return Err(SecurityError::Forbidden.into());
+                    }
+                }
+                _ if record.content != old.content || record.retired => {
+                    return Err(SecurityError::Forbidden.into());
+                }
+                _ => {}
+            }
             if old.retired
-                || record.retired
                 || old.storage_id != record.storage_id
                 || record.key.tenant != context.tenant
                 || record.revision != revision
@@ -1043,6 +1139,19 @@ impl AccessContext {
         };
         let resources = self.snapshot.resources.read();
         let record = resources.records.get(&key).ok_or(SecurityError::NotFound)?;
+        if matches!(record.content, ResourceContent::GraphEdge { .. })
+            && !matches!(self.action, Action::LabelsManage | Action::GrantsManage)
+        {
+            return Err(SecurityError::NotFound);
+        }
+        if !record.content.is_point()
+            && matches!(
+                self.action,
+                Action::Search | Action::GraphRead | Action::GraphWrite | Action::Ingest
+            )
+        {
+            return Err(SecurityError::NotFound);
+        }
         policy::authorize_resource(
             self.identity.principal(),
             self.identity.groups(),
@@ -1052,6 +1161,129 @@ impl AccessContext {
             &resources.records,
         )?;
         Ok(record.clone())
+    }
+
+    pub(crate) fn authorize_temporal_property(
+        &self,
+        public_id: &str,
+        property: &str,
+    ) -> Result<ResourceRecord> {
+        let action = match self.action {
+            Action::TemporalRead => PropertyAction::Read,
+            Action::TemporalAppend => PropertyAction::Write,
+            _ => return Err(SecurityError::Forbidden),
+        };
+        let record = self.authorize(public_id)?;
+        // Property names are literal components, never caller-supplied paths.
+        let path = format!("/{}", property.replace('~', "~0").replace('/', "~1"));
+        if !policy::field_allowed(
+            &record,
+            &self.identity.principal().attributes,
+            &path,
+            action,
+        ) {
+            return Err(SecurityError::Forbidden);
+        }
+        Ok(record)
+    }
+
+    /// Edge metadata has its own property namespace on both endpoint records.
+    /// Granting node payload access never implicitly grants edge-field access.
+    fn edge_properties_record(record: &ResourceRecord) -> ResourceRecord {
+        let mut scoped = record.clone();
+        scoped.properties = record
+            .properties
+            .iter()
+            .filter_map(|(path, rule)| {
+                path.strip_prefix("/edges/")
+                    .map(|tail| (format!("/{tail}"), rule.clone()))
+            })
+            .collect();
+        scoped
+    }
+
+    pub(crate) fn matches_edge_filter(
+        &self,
+        edge: (crate::graph::GraphEpoch, crate::graph::EdgeId),
+        source: &str,
+        target: &str,
+        filter: &SecurityFilter,
+        properties: &Value,
+    ) -> Result<bool> {
+        if self.action != Action::GraphRead {
+            return Err(SecurityError::Forbidden);
+        }
+        let source = Self::edge_properties_record(&self.authorize(source)?);
+        let target = Self::edge_properties_record(&self.authorize(target)?);
+        // Check both endpoints even when the first predicate is false: denied
+        // Query permission must not become a data-dependent boolean oracle.
+        let left = filter.matches(&source, &self.identity.principal().attributes, properties)?;
+        let right = filter.matches(&target, &self.identity.principal().attributes, properties)?;
+        let own = self.authorize_edge(edge.1, edge.0)?;
+        let own = filter.matches(&own, &self.identity.principal().attributes, properties)?;
+        Ok(left && right && own)
+    }
+
+    pub(crate) fn project_edge_properties(
+        &self,
+        edge: (crate::graph::GraphEpoch, crate::graph::EdgeId),
+        source: &str,
+        target: &str,
+        properties: &Value,
+    ) -> Result<Value> {
+        if self.action != Action::GraphRead {
+            return Err(SecurityError::Forbidden);
+        }
+        let own = self.authorize_edge(edge.1, edge.0)?;
+        let mut value = policy::project_payload(
+            &own,
+            &self.identity.principal().attributes,
+            properties,
+            PropertyAction::Read,
+        );
+        for id in [source, target] {
+            let record = Self::edge_properties_record(&self.authorize(id)?);
+            value = policy::project_payload(
+                &record,
+                &self.identity.principal().attributes,
+                &value,
+                PropertyAction::Read,
+            );
+        }
+        Ok(value)
+    }
+
+    pub(crate) fn authorize_edge_properties_change(
+        &self,
+        source: &ResourceRecord,
+        target: &ResourceRecord,
+        old: &Value,
+        new: &Value,
+        submitted: Option<&Value>,
+    ) -> Result<()> {
+        if self.action != Action::GraphWrite {
+            return Err(SecurityError::Forbidden);
+        }
+        for endpoint in [source, target] {
+            self.authorize_candidate(endpoint)?;
+            let record = Self::edge_properties_record(endpoint);
+            if let Some(submitted) = submitted {
+                // Even a no-op guess is a submitted write. Checking only the
+                // old/new diff would disclose equality of a hidden field.
+                policy::validate_payload_write(
+                    &record,
+                    &self.identity.principal().attributes,
+                    submitted,
+                )?;
+            }
+            policy::validate_payload_change(
+                &record,
+                &self.identity.principal().attributes,
+                old,
+                new,
+            )?;
+        }
+        Ok(())
     }
 
     /// Only the core's create lease supplies candidate bindings. They are not
@@ -1152,6 +1384,9 @@ impl AccessContext {
             })
             .enumerate()
         {
+            if !record.content.is_point() {
+                continue;
+            }
             if index % 64 == 0 {
                 check()?;
                 self.publication_permit()?;
@@ -1235,7 +1470,11 @@ impl AccessContext {
     ) -> Result<bool> {
         if !matches!(
             self.action,
-            Action::Read | Action::Search | Action::Delete | Action::GraphRead
+            Action::Read
+                | Action::Search
+                | Action::Delete
+                | Action::GraphRead
+                | Action::TemporalRead
         ) {
             return Err(SecurityError::Forbidden);
         }
@@ -1298,7 +1537,44 @@ impl AccessContext {
             return Err(SecurityError::Forbidden);
         }
         let record = self.authorize(public_id)?;
-        policy::validate_payload_change(&record, &self.identity.principal().attributes, old, new)
+        policy::validate_payload_replacement(
+            &record,
+            &self.identity.principal().attributes,
+            old,
+            new,
+            Some(self.read_context(public_id).is_ok()),
+        )
+    }
+
+    fn read_context(&self, public_id: &str) -> Result<Self> {
+        if !self
+            .identity
+            .allows(self.tenant(), self.collection(), Action::Read)
+        {
+            return Err(SecurityError::Forbidden);
+        }
+        let mut context = self.clone();
+        context.action = Action::Read;
+        context.authorize(public_id)?;
+        Ok(context)
+    }
+
+    pub(crate) fn authorize_representation_replacement(
+        &self,
+        public_id: &str,
+        name: &str,
+        unchanged: bool,
+    ) -> Result<()> {
+        if self.action != Action::Update {
+            return Err(SecurityError::Forbidden);
+        }
+        if unchanged
+            && let Ok(read) = self.read_context(public_id)
+            && read.authorize_representation(public_id, name).is_ok()
+        {
+            return Ok(());
+        }
+        self.authorize_representation_write(public_id, name)
     }
 
     pub fn authorize_representation_write(&self, public_id: &str, name: &str) -> Result<()> {

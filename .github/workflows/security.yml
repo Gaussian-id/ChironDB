@@ -35,6 +35,8 @@ jobs:
           components: clippy, rustfmt
       - name: Install policy tools
         run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
           cargo install cargo-audit --version 0.22.2 --locked
           cargo install cargo-deny --version 0.20.2 --locked
       - name: RustSec advisory gate
@@ -49,6 +51,10 @@ jobs:
         run: python3 .github/tools/check_ci_pinning.py
       - name: SDK fetch credential isolation
         run: python3 .github/tools/test_install_standalone_sdks.py
+      - name: Secret scanner failure and redaction regression
+        run: python3 .github/tools/test_secret_scan.py
+      - name: TLS fixture result and redaction regression
+        run: python3 -B .github/tools/test_security_tls_soak.py
       - name: Secret regression scan
         run: bash .github/tools/secret_scan.sh
       - name: Deterministic crash-consistency suite
@@ -156,6 +162,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler openssl python3-venv ripgrep
           python3 -m venv "$RUNNER_TEMP/chironql-python"
+          "$RUNNER_TEMP/chironql-python/bin/python" -m pip install --only-binary=:all: --upgrade pip==26.3
           "$RUNNER_TEMP/chironql-python/bin/python" -m pip install -r chirondb-server/tests/security_chironql_requirements.txt
       - name: Build real binaries and provision only the trust root
         env:
@@ -203,6 +210,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler openssl python3-venv ripgrep
           python3 -m venv "$RUNNER_TEMP/install-python"
+          "$RUNNER_TEMP/install-python/bin/python" -m pip install --only-binary=:all: --upgrade pip==26.3
           "$RUNNER_TEMP/install-python/bin/pip" install -r chirondb-server/tests/security_chironql_requirements.txt
       - name: Install pinned Python SDK for installation contracts
         env:
@@ -215,6 +223,10 @@ jobs:
       - name: Verify complete ChironQL reference and executable examples
         run: |
           "$RUNNER_TEMP/install-python/bin/python" chirondb-server/tests/security_documentation_examples.py --bin-dir target/debug --output "$RUNNER_TEMP/documentation-reference"
+      - name: Temporal authority and authentication denial contracts
+        run: |
+          "$RUNNER_TEMP/install-python/bin/python" chirondb-server/tests/security_temporal_e2e.py --bin-dir target/debug --output "$RUNNER_TEMP/security-temporal"
+          "$RUNNER_TEMP/install-python/bin/python" chirondb-server/tests/security_auth_denial_e2e.py --bin-dir target/debug --output "$RUNNER_TEMP/security-auth-denial"
       - name: Interrupted initialization, catalog activation and recovery
         run: |
           cargo build -p chirondb --bin chirondb --bin chironql --bin chironctl --features fault-injection --locked
@@ -228,6 +240,8 @@ jobs:
             ${{ runner.temp }}/installation-native/report.json
             ${{ runner.temp }}/documentation-reference/report.json
             ${{ runner.temp }}/documentation-reference/executed-examples.json
+            ${{ runner.temp }}/security-temporal/report.json
+            ${{ runner.temp }}/security-auth-denial/report.json
             ${{ runner.temp }}/installation-faults/*/report.json
             ${{ runner.temp }}/installation-faults/summary.json
           if-no-files-found: error
@@ -248,6 +262,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler openssl python3-venv ripgrep
           python3 -m venv "$RUNNER_TEMP/install-python"
+          "$RUNNER_TEMP/install-python/bin/python" -m pip install --only-binary=:all: --upgrade pip==26.3
           "$RUNNER_TEMP/install-python/bin/pip" install -r chirondb-server/tests/security_chironql_requirements.txt
       - name: Install pinned Python SDK for deployment contracts
         env:
@@ -291,7 +306,7 @@ jobs:
         run: cargo check --manifest-path fuzz/Cargo.toml --locked
       - name: Corpus regression and short smoke
         run: |
-          for target in protocol_decoders query_decoders storage_decoders index_decoders catalog_wal; do
+          for target in protocol_decoders query_decoders storage_decoders index_decoders temporal_decoders catalog_wal; do
             cargo fuzz run "$target" fuzz/corpus/"$target" -- -runs=256 -rss_limit_mb=2048
           done
 

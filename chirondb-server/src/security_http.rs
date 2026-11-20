@@ -422,7 +422,18 @@ async fn authenticate(
         })
     })();
     let mut response = match result {
-        Err(error) => error.into_response(),
+        Err(error) => {
+            if matches!(
+                &error.0,
+                GaussError::Security(SecurityError::Unauthenticated)
+            ) && crate::auth::denial::record(&state.db, crate::auth::denial::Transport::Http)
+                .is_err()
+            {
+                Failure(SecurityError::Unavailable.into()).into_response()
+            } else {
+                error.into_response()
+            }
+        }
         Ok(caller) => {
             let work = caller.work.clone();
             request.extensions_mut().insert(caller);

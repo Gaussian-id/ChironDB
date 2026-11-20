@@ -122,12 +122,14 @@ class InstallationLab:
     def certificates(self):
         self.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '2',
                   '-subj', '/CN=ChironDB installation test CA', '-addext', 'basicConstraints=critical,CA:TRUE',
-                  '-addext', 'keyUsage=critical,keyCertSign,cRLSign', '-keyout', self.root / 'ca.key',
+                  '-addext', 'keyUsage=critical,keyCertSign,cRLSign',
+                  '-addext', 'subjectKeyIdentifier=hash',
+                  '-addext', 'authorityKeyIdentifier=keyid:always', '-keyout', self.root / 'ca.key',
                   '-out', self.root / 'ca.pem'])
         self.run(['openssl', 'req', '-newkey', 'rsa:2048', '-nodes', '-subj', '/CN=localhost',
                   '-keyout', self.root / 'server.key', '-out', self.root / 'server.csr'])
         extensions = self.root / 'extensions.cnf'
-        extensions.write_text('subjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n')
+        extensions.write_text('subjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n')
         self.run(['openssl', 'x509', '-req', '-in', self.root / 'server.csr', '-CA', self.root / 'ca.pem',
                   '-CAkey', self.root / 'ca.key', '-CAcreateserial', '-days', '2', '-extfile', extensions,
                   '-out', self.root / 'server.pem'])
@@ -153,7 +155,7 @@ class InstallationLab:
             if child.isalive():
                 child.terminate(force=True)
 
-    def transport(self, kind, user, query, denied=False):
+    def transport(self, kind, user, query, denied=False, not_found=False):
         secret = self.keys[user].read_text().strip()
         tls = ssl.create_default_context(cafile=str(self.root / 'ca.pem'))
         if kind in ('http', 'http-v1'):
@@ -190,8 +192,10 @@ class InstallationLab:
                     rejected, status = False, 'OK'
                 except grpc.RpcError as error:
                     rejected, status, result = True, error.code().name, None
+                    expected = (grpc.StatusCode.NOT_FOUND,) if not_found else (
+                        grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.UNAUTHENTICATED)
                     self.check('gRPC explicit authorization error', error.code() in
-                               (grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.UNAUTHENTICATED))
+                               expected, status)
             else:
                 if user not in self.wires:
                     self.wires[user] = tls.wrap_socket(socket.create_connection(('127.0.0.1', self.args.port + 2), timeout=10), server_hostname='127.0.0.1')
@@ -213,6 +217,17 @@ class InstallationLab:
                 result = {'rows': [json.loads(row) for row in reply.chironql.rows_json]} if not rejected else None
         self.check(f'{kind} {user} allow/deny: {query}', rejected == denied,
                    {'status': status, 'result': result})
+        if denied:
+            if kind in ('http', 'http-v1'):
+                statuses = (404,) if not_found else (401, 403)
+                codes = ('security.not_found',) if not_found else (
+                    'security.forbidden', 'security.unauthenticated')
+                self.check(f'{kind} explicit authorization error',
+                           status in statuses and result.get('code') in codes,
+                           {'status': status, 'code': result.get('code')})
+            elif kind == 'wire':
+                codes = ('NOT_FOUND',) if not_found else ('PERMISSION_DENIED', 'UNAUTHENTICATED')
+                self.check('wire explicit authorization error', status in codes, status)
         return result
 
     def protected_retrieval(self, expected, users=None):

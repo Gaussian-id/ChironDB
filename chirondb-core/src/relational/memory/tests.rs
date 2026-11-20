@@ -449,6 +449,7 @@ fn row_admission_failure_preserves_values_and_gc_frontier() {
         rows.insert(
             1,
             VersionChain::single(RowVersion {
+                security: None,
                 begin: 1,
                 end: None,
                 values: RowValues::adopt(vec![RelationalValue::Text("x".repeat(32 * 1024))])
@@ -463,6 +464,7 @@ fn row_admission_failure_preserves_values_and_gc_frontier() {
             rows.insert(
                 1,
                 VersionChain::single(RowVersion {
+                    security: None,
                     begin: 2,
                     end: None,
                     values: RowValues::adopt(vec![RelationalValue::Text("y".repeat(32 * 1024))])
@@ -484,6 +486,7 @@ fn row_admission_failure_preserves_values_and_gc_frontier() {
         rows.insert(
             1,
             VersionChain::single(RowVersion {
+                security: None,
                 begin: 2,
                 end: None,
                 values: RowValues::adopt(vec![RelationalValue::Text("small".into())]).unwrap(),
@@ -891,7 +894,11 @@ fn legacy_add_column_update_image_replays_as_one_schema_generation() {
             let (row_id, source) = row.unwrap();
             let mut values = source.to_vec();
             values.push(RelationalValue::Text("ready".into()));
-            StoredRow { row_id, values }
+            StoredRow {
+                security: None,
+                row_id,
+                values,
+            }
         })
         .collect();
     let mutation = WalEntry::RelationalBatch {

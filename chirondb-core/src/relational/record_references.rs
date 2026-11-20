@@ -99,7 +99,7 @@ pub(super) fn replay_references<'a>(
                     }
                 }
             }
-            RelationalMutation::AlterTable { .. } => {}
+            RelationalMutation::AlterTable { .. } | RelationalMutation::RowSecurity { .. } => {}
         }
     }
     let mut references = BTreeSet::new();
@@ -188,6 +188,54 @@ pub(super) fn changed(
     Ok(references)
 }
 
+/// Authorize every participating reference domain before probing any value.
+/// Otherwise successful deletion versus Conflict exposes hidden SQL membership.
+pub(super) fn authorize_retirement(
+    state: &RelationalState,
+    identity: &AuthenticatedIdentity,
+    collection: &str,
+    ids: &BTreeSet<String>,
+) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let tenant = identity.principal().tenant.as_str();
+    let namespace = collection.to_ascii_lowercase();
+    for (name, table) in state.tables.iter() {
+        let definition = &table.definition;
+        if definition.tenant_id.as_deref() != Some(tenant) {
+            continue;
+        }
+        let columns = definition.columns.iter().filter(|column| {
+            matches!(&column.data_type, RelationalType::RecordRef { namespace: target } if target == &namespace)
+        }).map(|column| column.name.clone()).collect::<BTreeSet<_>>();
+        if columns.is_empty() {
+            continue;
+        }
+        let table_read = match definition.security_incarnation {
+            Some(incarnation) => {
+                identity.owns_table(tenant, definition.creator_principal_id.as_deref())
+                    || identity.allows_table(
+                        tenant,
+                        name,
+                        definition.table_id,
+                        incarnation,
+                        SecurityAction::Read,
+                    )
+            }
+            None => {
+                !identity.has_strict_sql_scopes()
+                    && identity.allows(tenant, name, SecurityAction::Read)
+            }
+        };
+        if !table_read {
+            return Err(SecurityError::Forbidden.into());
+        }
+        row_security::key_domain(table, state.sequence, &columns, identity)?;
+    }
+    Ok(())
+}
+
 pub(super) fn ensure_unreferenced(
     state: &RelationalState,
     tenant: &str,
@@ -258,15 +306,31 @@ pub(super) fn validate(
     reads: &mut BTreeSet<(String, uuid::Uuid)>,
     retired: &BTreeSet<String>,
 ) -> Result<()> {
-    if batch.mutations.iter().any(|mutation| {
-        !matches!(
-            mutation,
+    for mutation in &batch.mutations {
+        match mutation {
             RelationalMutation::Insert { .. }
-                | RelationalMutation::Update { .. }
-                | RelationalMutation::Delete { .. }
-        )
-    }) {
-        return Err(invalid("protected atomic data commit requires DML"));
+            | RelationalMutation::Update { .. }
+            | RelationalMutation::Delete { .. } => (),
+            RelationalMutation::RowSecurity { delta } => {
+                let mut policy = base
+                    .tables
+                    .get(&delta.table)
+                    .and_then(|table| table.definition.row_policy.clone())
+                    .ok_or(crate::security::SecurityError::Forbidden)?;
+                if policy.revision != delta.expected_revision || !delta.records.is_empty()
+                    || !batch.mutations.iter().any(|mutation| matches!(mutation, RelationalMutation::Delete { table, row_ids } if table == &delta.table && !row_ids.is_empty())) {
+                    return Err(crate::security::SecurityError::Forbidden.into());
+                }
+                policy.revision = policy
+                    .revision
+                    .checked_add(1)
+                    .ok_or(crate::security::SecurityError::Unavailable)?;
+                if policy != delta.policy {
+                    return Err(crate::security::SecurityError::Forbidden.into());
+                }
+            }
+            _ => return Err(invalid("protected atomic data commit requires DML")),
+        }
     }
     for reference in changed(base, candidate, &batch.mutations, candidate.sequence)? {
         if retired.contains(&reference.id) && access.matches_collection(&reference) {
@@ -280,6 +344,7 @@ pub(super) fn validate(
     }
     // The final candidate includes SQL unlink operations in this same atomic
     // commit, so a retiring point is tested against its post-mutation index.
+    authorize_retirement(candidate, access.identity(), access.collection(), retired)?;
     ensure_unreferenced(candidate, access.tenant(), access.collection(), retired)
 }
 
@@ -301,10 +366,12 @@ mod tests {
                         table: "docs".into(),
                         rows: vec![
                             StoredRow {
+                                security: None,
                                 row_id: 1,
                                 values: vec![RelationalValue::RecordRef(reference("replaced"))],
                             },
                             StoredRow {
+                                security: None,
                                 row_id: 2,
                                 values: vec![RelationalValue::RecordRef(reference("deleted"))],
                             },
@@ -313,6 +380,7 @@ mod tests {
                     RelationalMutation::Update {
                         table: "docs".into(),
                         rows: vec![StoredRow {
+                            security: None,
                             row_id: 1,
                             values: vec![RelationalValue::RecordRef(reference("live"))],
                         }],
@@ -385,6 +453,7 @@ mod tests {
             id: id.into(),
         };
         let row = |row_id, id: &str| StoredRow {
+            security: None,
             row_id,
             values: vec![RelationalValue::RecordRef(reference(id))],
         };

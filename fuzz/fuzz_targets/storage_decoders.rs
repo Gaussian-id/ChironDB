@@ -32,8 +32,7 @@ fuzz_target!(|data: &[u8]| {
             let _ = chirondb_core::seal::read_marker(&root.join(chirondb_core::seal::SEAL_FILE));
         }
         4 => {
-            let _ = fs::write(root.join("audit.jsonl"), data);
-            let _ = chirondb_core::audit::verify_hash_chain(root);
+            let _ = chirondb_core::audit::fuzzing::verify_input(root, data);
         }
         5 => {
             let _ = fs::write(root.join("envelope.enc"), data);

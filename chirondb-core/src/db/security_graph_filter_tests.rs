@@ -266,6 +266,12 @@ fn graph_filters_respect_field_authority_and_hidden_bridges_across_seal_and_reop
                 actions: BTreeSet::from([PropertyAction::Write]),
             },
         );
+    policy.templates.get_mut("standard").unwrap().properties.insert(
+        "/edges/secret".into(), PropertyRule {
+            classification: Classification::Internal,
+            actions: BTreeSet::from([PropertyAction::Write]),
+        },
+    );
     db.replace_collection_policy_authorized(
         &manage,
         RevisionUpdate {
@@ -327,18 +333,28 @@ fn graph_filters_respect_field_authority_and_hidden_bridges_across_seal_and_reop
                     source: RecordEndpoint::New(source.into()),
                     target: RecordEndpoint::New(target.into()),
                     edge_type: "cites".into(),
-                    properties: serde_json::json!({"kind":kind}),
+                    properties: serde_json::json!({"kind":kind,"secret":"edge-classified"}),
                 })
                 .collect(),
             },
             "test",
         )
         .unwrap();
+    let edge_token = response.edge_ids[0].clone();
     let ids: BTreeMap<_, _> = response
         .records
         .into_iter()
         .map(|(name, record)| (name, record.id))
         .collect();
+    let labels = db.bind_access(&identity, "docs", "acme", Action::LabelsManage).unwrap();
+    let mut root = labels.authorize(&ids["root"]).unwrap();
+    root.properties.get_mut("/edges/kind").unwrap().actions = BTreeSet::from([
+        PropertyAction::Read, PropertyAction::Query,
+    ]);
+    db.replace_object_labels_authorized(&labels, &ids["root"], RevisionUpdate {
+        expected_revision: labels.policy_revision(),
+        value: ObjectLabels { labels:root.labels, properties:root.properties },
+    }).unwrap();
     replace_permissions(
         &db,
         &identity,
@@ -366,6 +382,23 @@ fn graph_filters_respect_field_authority_and_hidden_bridges_across_seal_and_reop
     };
     let check = |db: &Db| {
         let identity = db.identity_authority().unwrap().authenticate(&key).unwrap();
+        let vector = db.bind_access(&identity, "docs", "acme", Action::Update).unwrap();
+        let graph = db.bind_access(&identity, "docs", "acme", Action::GraphWrite).unwrap();
+        for (mode, properties) in [
+            (crate::graph::EdgePropertyMode::Merge, serde_json::json!({"kind":"allow"})),
+            (crate::graph::EdgePropertyMode::Merge, serde_json::json!({"kind":"changed"})),
+            (crate::graph::EdgePropertyMode::Replace, serde_json::json!({"secret":"edge-classified"})),
+        ] {
+            let error = db.execute_multimodel_transaction_authorized(&identity, &vector, &graph,
+                MultiModelTransactionRequest {
+                    sql:sql("UPDATE docs SET id = 'denied' WHERE id = 'graph'"), collection:"docs".into(),
+                    points:vec![], point_deletes:vec![], relations:vec![], edge_deletes:vec![],
+                    edge_updates:vec![(edge_token.clone(), crate::graph::UpdateEdgeRequest {mode, properties})],
+                }, "test").expect_err("edge field denial before SQL commit");
+            assert!(matches!(error, GaussError::Security(SecurityError::Forbidden)));
+        }
+        let rows = db.execute_sql_authorized(&identity, sql("SELECT id FROM docs"), "test").unwrap();
+        assert!(!serde_json::to_string(&rows).unwrap().contains("denied"));
         let read = db
             .bind_access(&identity, "docs", "acme", Action::GraphRead)
             .unwrap();
@@ -422,6 +455,14 @@ fn graph_filters_respect_field_authority_and_hidden_bridges_across_seal_and_reop
         for field in ["secret", "unknown"] {
             let mut forbidden = request.clone();
             forbidden.node_filter = Some(Filter(serde_json::json!({field:"classified"})));
+            assert!(matches!(
+                db.traverse_authorized(&read, forbidden, &AtomicBool::new(false)),
+                Err(GaussError::Security(SecurityError::Forbidden))
+            ));
+        }
+        for field in ["secret", "unknown"] {
+            let mut forbidden = request.clone();
+            forbidden.edge_filter = Some(Filter(serde_json::json!({field:"edge-classified"})));
             assert!(matches!(
                 db.traverse_authorized(&read, forbidden, &AtomicBool::new(false)),
                 Err(GaussError::Security(SecurityError::Forbidden))
@@ -589,4 +630,126 @@ fn graph_filters_respect_field_authority_and_hidden_bridges_across_seal_and_reop
             .publish(|r| r.nodes.is_empty())
             .unwrap()
     );
+}
+
+#[test]
+fn independent_edge_policy_filters_traversal_and_atomically_rejects_writes() {
+    use crate::{MultiModelInsertRequest, NewRecord, NewRelation, RecordEndpoint, SqlExecutionRequest, SqlStatementRequest};
+    use crate::graph::{GraphTraverseRequest, GraphDirection, TraversalBudget, GraphTraversalQueryRequest, GraphTraversalReturn, GraphTraversalRows};
+    let (directory, db, key, _) = fixture(true);
+    let identity = db.identity_authority().unwrap().authenticate(&key).unwrap();
+    let sql = |text: &str| SqlExecutionRequest { statements: vec![SqlStatementRequest { sql:text.into(),parameters:vec![] }], idempotency_key:None,retry_id:None };
+    db.execute_sql_authorized(&identity, sql("CREATE TABLE docs (id TEXT PRIMARY KEY)"), "test").unwrap();
+    let inserted = db.insert_multimodel_authorized(&identity, MultiModelInsertRequest {
+        sql:sql("INSERT INTO docs VALUES ('created')"), collection:"docs".into(),template:"standard".into(),
+        records: ["source", "target"].into_iter().map(|id| NewRecord { binding:id.into(),point:point(id) }).collect(),
+        relations:vec![NewRelation { source:RecordEndpoint::New("source".into()),target:RecordEndpoint::New("target".into()),edge_type:"cites".into(),properties:serde_json::json!({"kind":"allow"}) }],
+    }, "test").unwrap();
+    let token = inserted.edge_ids[0].clone();
+    let source = inserted.records["source"].id.clone();
+    let target = inserted.records["target"].id.clone();
+    let request = GraphTraverseRequest { anchors:vec![source],edge_types:vec!["cites".into()],direction:GraphDirection::Outgoing,node_filter:None,edge_filter:None,budget:TraversalBudget::default() };
+    let bind = |action| db.bind_access(&identity,"docs","acme",action).unwrap();
+    let labels = bind(Action::LabelsManage);
+    let edge_id = db.edge_security_id_authorized(&labels,&token).unwrap();
+    let original = labels.authorize(&edge_id).unwrap();
+    assert!(!original.content.is_point());
+    assert!(bind(Action::Read).authorize(&edge_id).is_err());
+    let read = bind(Action::GraphRead);
+    let queued = db.traverse_authorized(&read,request.clone(),&AtomicBool::new(false)).unwrap();
+    // Both nodes remain readable; only the edge's object grant is denied.
+    replace_permissions(&db,&identity,&edge_id,vec![ObjectGrant { subject:Subject::Owner, actions:BTreeSet::from([Action::GraphRead,Action::GraphWrite]),effect:Effect::Deny,inherit:false }],None).unwrap();
+    assert!(queued.publish(|_| ()).is_err());
+    assert!(bind(Action::GraphRead).authorize(&target).is_ok());
+    let read = bind(Action::GraphRead);
+    for returns in [GraphTraversalReturn::Nodes,GraphTraversalReturn::Edges,GraphTraversalReturn::Paths] {
+        let result = db.traverse_query_authorized(&read, GraphTraversalQueryRequest { traversal:request.clone(),returns,limit:Some(10),with_payload:true },&AtomicBool::new(false)).unwrap().publish(|r|r).unwrap();
+        match result.result { GraphTraversalRows::Nodes(v) => assert!(v.is_empty()), GraphTraversalRows::Edges(v) => assert!(v.is_empty()), GraphTraversalRows::Paths(v) => assert!(v.is_empty()) }
+    }
+    let vector = bind(Action::Update);
+    let graph = bind(Action::GraphWrite);
+    let change = |updates, deletes| MultiModelTransactionRequest { sql:sql("UPDATE docs SET id = 'forbidden' WHERE id = 'created'"),collection:"docs".into(),points:vec![],point_deletes:vec![],relations:vec![],edge_deletes:deletes,edge_updates:updates };
+    assert!(db.execute_multimodel_transaction_authorized(&identity,&vector,&graph,change(vec![],vec![token.clone()]),"test").is_err());
+    replace_permissions(&db,&identity,&edge_id,vec![],None).unwrap();
+    // Own field rules are enforced independently of the fully permitted endpoints.
+    for (actions, query_allowed, projected) in [
+        (BTreeSet::from([PropertyAction::Read]),false,true),
+        (BTreeSet::from([PropertyAction::Query]),true,false),
+    ] {
+        let labels = bind(Action::LabelsManage);
+        let mut changed = original.clone();
+        changed.properties.get_mut("/kind").unwrap().actions = actions;
+        db.replace_object_labels_authorized(&labels,&edge_id,RevisionUpdate { expected_revision:labels.policy_revision(),value:ObjectLabels { labels:changed.labels,properties:changed.properties } }).unwrap();
+        let read = bind(Action::GraphRead);
+        let mut filtered = request.clone(); filtered.edge_filter=Some(Filter(serde_json::json!({"kind":"allow"})));
+        let result = db.traverse_authorized(&read,filtered,&AtomicBool::new(false));
+        if query_allowed { assert_eq!(result.unwrap().publish(|r|r.nodes.len()).unwrap(),1); } else { assert!(matches!(result,Err(GaussError::Security(SecurityError::Forbidden)))); }
+        let edges = db.traverse_query_authorized(&read,GraphTraversalQueryRequest { traversal:request.clone(),returns:GraphTraversalReturn::Edges,limit:Some(10),with_payload:true },&AtomicBool::new(false)).unwrap().publish(|r|r).unwrap();
+        let GraphTraversalRows::Edges(edges)=edges.result else {panic!("edges")};
+        assert_eq!(edges[0].properties.as_ref().unwrap().get("kind").is_some(),projected);
+        for guess in ["allow","wrong"] {
+            let vector=bind(Action::Update); let graph=bind(Action::GraphWrite);
+            assert!(matches!(db.execute_multimodel_transaction_authorized(&identity,&vector,&graph,change(vec![(token.clone(),crate::graph::UpdateEdgeRequest { mode:crate::graph::EdgePropertyMode::Merge,properties:serde_json::json!({"kind":guess}) })],vec![]),"test"),Err(GaussError::Security(SecurityError::Forbidden))));
+        }
+    }
+    assert!(!serde_json::to_string(&db.execute_sql_authorized(&identity,sql("SELECT id FROM docs"),"test").unwrap()).unwrap().contains("forbidden"));
+    let labels=bind(Action::LabelsManage);
+    db.replace_object_labels_authorized(&labels,&edge_id,RevisionUpdate { expected_revision:labels.policy_revision(),value:ObjectLabels { labels:original.labels,properties:original.properties } }).unwrap();
+    let read=bind(Action::GraphRead);
+    let queued=db.traverse_authorized(&read,request.clone(),&AtomicBool::new(false)).unwrap();
+    let vector=bind(Action::Update); let graph=bind(Action::GraphWrite);
+    db.execute_multimodel_transaction_authorized(&identity,&vector,&graph,MultiModelTransactionRequest { sql:sql("UPDATE docs SET id = 'deleted' WHERE id = 'created'"),..change(vec![],vec![token]) },"test").unwrap();
+    assert!(queued.publish(|_|()).is_err(),"edge retirement must revoke queued topology");
+    drop(db);
+    let db=Db::open(directory.path()).unwrap();
+    let identity=db.identity_authority().unwrap().authenticate(&key).unwrap();
+    let read=db.bind_access(&identity,"docs","acme",Action::GraphRead).unwrap();
+    assert!(db.traverse_authorized(&read,request,&AtomicBool::new(false)).unwrap().publish(|r|r.nodes.is_empty()).unwrap());
+}
+
+#[test]
+fn legacy_edges_stay_hidden_until_explicit_admin_registration_and_reopen() {
+    use crate::{MultiModelInsertRequest, NewRecord, NewRelation, RecordEndpoint, SqlExecutionRequest, SqlStatementRequest};
+    use crate::graph::{GraphTraverseRequest,GraphDirection,TraversalBudget};
+    let (directory,db,key,limited)=fixture(true);
+    let identity=db.identity_authority().unwrap().authenticate(&key).unwrap();
+    let manage=db.bind_access(&identity,"docs","acme",Action::PolicyManage).unwrap();
+    let mut policy=db.inner.read().collections["docs"].read().security.as_ref().unwrap().checkpoint().policy;
+    policy.templates.insert("edge".into(),IngestTemplate { department:"Finance".into(),classification:Classification::Internal,properties:BTreeMap::from([("/kind".into(),PropertyRule { classification:Classification::Internal,actions:BTreeSet::from([PropertyAction::Read,PropertyAction::Query,PropertyAction::Write]) })]),representations:BTreeMap::new() });
+    db.replace_collection_policy_authorized(&manage,RevisionUpdate { expected_revision:manage.policy_revision(),value:policy }).unwrap();
+    let sql=|text:&str| SqlExecutionRequest { statements:vec![SqlStatementRequest { sql:text.into(),parameters:vec![] }],idempotency_key:None,retry_id:None };
+    db.execute_sql_authorized(&identity,sql("CREATE TABLE docs (id TEXT PRIMARY KEY)"),"test").unwrap();
+    let inserted=db.insert_multimodel_authorized(&identity,MultiModelInsertRequest {
+        sql:sql("INSERT INTO docs VALUES ('old')"),collection:"docs".into(),template:"standard".into(),records:["source","target"].into_iter().map(|id| NewRecord { binding:id.into(),point:point(id) }).collect(),
+        relations:vec![NewRelation { source:RecordEndpoint::New("source".into()),target:RecordEndpoint::New("target".into()),edge_type:"cites".into(),properties:serde_json::json!({"kind":"allow"}) }],
+    },"test").unwrap();
+    let token=inserted.edge_ids[0].clone();
+    let request=GraphTraverseRequest { anchors:vec![inserted.records["source"].id.clone()],edge_types:vec!["cites".into()],direction:GraphDirection::Outgoing,node_filter:None,edge_filter:Some(Filter(serde_json::json!({"kind":"allow"}))),budget:TraversalBudget::default() };
+    // Model a verified pre-edge-authority checkpoint: graph content already
+    // exists, while its security catalog contains only endpoint bindings.
+    db.flush_wals().unwrap();
+    let root=db.inner.read().root.clone();
+    let mut stored={ let collection=db.inner.read().collections["docs"].clone(); let collection=collection.read();
+        crate::security::storage::StoredSecurity { wal_watermark:collection.wal.len().unwrap(),authority:collection.security.as_ref().unwrap().checkpoint() } };
+    stored.authority.resources.retain(|r| !matches!(r.content,ResourceContent::GraphEdge {..}));
+    drop(db);
+    crate::security::storage::write(&root.join("collections/docs"),&stored).unwrap();
+    let db=Db::open(directory.path()).unwrap();
+    let identity=db.identity_authority().unwrap().authenticate(&key).unwrap();
+    let read=db.bind_access(&identity,"docs","acme",Action::GraphRead).unwrap();
+    assert!(db.traverse_authorized(&read,request.clone(),&AtomicBool::new(false)).unwrap().publish(|r|r.nodes.is_empty()).unwrap());
+    let other=db.identity_authority().unwrap().authenticate(&limited).unwrap();
+    let other=db.bind_access(&other,"docs","acme",Action::GraphWrite).unwrap();
+    assert!(matches!(db.register_edge_authorized(&other,&token,"edge",other.policy_revision()),Err(GaussError::Security(SecurityError::Forbidden))));
+    let graph=db.bind_access(&identity,"docs","acme",Action::GraphWrite).unwrap();
+    let revision=db.register_edge_authorized(&graph,&token,"edge",graph.policy_revision()).unwrap().publish(|r|r).unwrap();
+    let graph=db.bind_access(&identity,"docs","acme",Action::GraphWrite).unwrap();
+    assert!(db.register_edge_authorized(&graph,&token,"edge",revision).is_err());
+    let read=db.bind_access(&identity,"docs","acme",Action::GraphRead).unwrap();
+    assert_eq!(db.traverse_authorized(&read,request.clone(),&AtomicBool::new(false)).unwrap().publish(|r|r.nodes.len()).unwrap(),1);
+    drop(db);
+    let db=Db::open(directory.path()).unwrap();
+    let identity=db.identity_authority().unwrap().authenticate(&key).unwrap();
+    let read=db.bind_access(&identity,"docs","acme",Action::GraphRead).unwrap();
+    assert_eq!(db.traverse_authorized(&read,request,&AtomicBool::new(false)).unwrap().publish(|r|r.nodes.len()).unwrap(),1);
 }

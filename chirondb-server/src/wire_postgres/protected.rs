@@ -52,7 +52,10 @@ where
     let username = params
         .get("user")
         .filter(|value| !value.is_empty() && value.len() <= 128)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing startup user"))?;
+        .ok_or_else(|| {
+            let _ = denial::record(&db, denial::Transport::PostgresScram);
+            io::Error::new(io::ErrorKind::InvalidData, "missing startup user")
+        })?;
     let authority = db
         .identity_authority()
         .ok_or_else(|| io::Error::other("identity authority unavailable"))?;
@@ -61,8 +64,13 @@ where
         .clone()
         .unwrap_or_else(|| authority.sql_decoy_verifier(username));
     let result = scram::authenticate(&mut reader, &mut writer, &verifier).await;
+    if result.is_err() {
+        let _ = denial::record(&db, denial::Transport::PostgresScram);
+    }
     let result = output::prepare(&mut writer, result).await?;
     if matches!(result, scram::ScramOutcome::UnsupportedMechanism) {
+        denial::record(&db, denial::Transport::PostgresScram)
+            .map_err(|_| io::Error::other("audit unavailable"))?;
         write_error_response(
             &mut writer,
             "FATAL",
@@ -83,17 +91,11 @@ where
         None
     };
     let Some(identity) = identity else {
-        let _ = db.audit_access_event(
-            "authentication",
-            "pgwire_scram",
-            "failure",
-            None,
-            "unknown",
-            None,
-            "pgwire",
-            None,
-            Some("invalid_credential"),
-        );
+        if denial::record(&db, denial::Transport::PostgresScram).is_err() {
+            write_error_response(&mut writer, "FATAL", "58030", "audit unavailable", None).await?;
+            writer.flush().await?;
+            return Ok(());
+        }
         write_error_response(
             &mut writer,
             "FATAL",
@@ -526,6 +528,17 @@ where
                                             .await?;
                                             extended_failed = true;
                                             continue;
+                                        };
+                                        let _row_policies = match response
+                                            .publication_context()
+                                            .publication_permits()
+                                        {
+                                            Ok(permits) => permits,
+                                            Err(error) => {
+                                                write_protected_error(&mut writer, &error).await?;
+                                                extended_failed = true;
+                                                continue;
+                                            }
                                         };
                                         if let Some(columns) = output::prepare(
                                             &mut writer,
@@ -1096,6 +1109,16 @@ async fn protected_query<W: AsyncWrite + Unpin>(
                 write_error_response(writer, "ERROR", "28000", "authorization was revoked", None)
                     .await?;
                 return Ok(());
+            };
+            let _row_policies = match response.publication_context().publication_permits() {
+                Ok(permits) => permits,
+                Err(error) => {
+                    if let Some(active) = transaction.as_mut() {
+                        active.failed = true;
+                    }
+                    write_protected_error(writer, &error).await?;
+                    return Ok(());
+                }
             };
             write_native_relational_results_formatted(
                 writer,

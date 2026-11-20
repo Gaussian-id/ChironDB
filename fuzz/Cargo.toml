@@ -11,6 +11,7 @@ cargo-fuzz = true
 [dependencies]
 chirondb-core = { version = "=0.1.0-beta.3", path = "../chirondb-core", features = ["fuzzing"] }
 chirondb = { version = "=0.1.0-beta.3", path = "../chirondb-server" }
+chirondb-temporal = { version = "=0.1.0", path = "../chirondb-temporal" }
 crc32fast = "1.5.0"
 libfuzzer-sys = "0.4"
 prost = "0.14.3"
@@ -76,6 +77,13 @@ bench = false
 [[bin]]
 name = "graph_gdx_loaders"
 path = "fuzz_targets/graph_gdx_loaders.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "temporal_decoders"
+path = "fuzz_targets/temporal_decoders.rs"
 test = false
 doc = false
 bench = false

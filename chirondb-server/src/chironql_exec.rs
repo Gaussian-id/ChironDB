@@ -232,6 +232,21 @@ fn execute_with_parser(
             trace: Some(Box::new(trace)),
         });
     }
+    if statement
+        .domains()
+        .contains(&chirondb_types::chironql::ExecutionDomain::Relational)
+        && (ctx.db.tenant_enforcement().blocks() || ctx.allowed_collections.is_some())
+    {
+        return Err(ChironQlError {
+            error: "scoped SQL requires protected authorization".into(),
+            code: "chironql.permission_denied".into(),
+            hint: None,
+            position: None,
+            affected_estimate: None,
+            query_id,
+            trace: Some(Box::new(trace)),
+        });
+    }
     // Collection DDL carries no tenant scope. `create_collection` and
     // `delete_collection` have no `_scoped` twin, so under `Enforced` there is
     // no rule for who owns a new collection or who may destroy one. That is a

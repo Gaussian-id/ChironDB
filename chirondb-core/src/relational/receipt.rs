@@ -54,7 +54,7 @@ fn standalone_json(
     table_authority: bool,
 ) -> Result<wal_decode::Owned<serde_json::Value>> {
     let response = ResponseRef::committed(sequence, results);
-    if table_authority {
+    if table_authority || authorization.is_some() {
         wal_decode::json(&StandaloneRef {
             version: 2,
             authorization,
@@ -108,9 +108,11 @@ impl SqlCommitReceipt<'_> {
                 prepared.authorization.as_ref(),
                 *table_authority,
             )?,
-            Self::Interactive { authorization, .. } => {
-                interactive_json(sequence, &prepared.results, *authorization)?
-            }
+            Self::Interactive { authorization, .. } => interactive_json(
+                sequence,
+                &prepared.results,
+                prepared.authorization.as_ref().or(*authorization),
+            )?,
         };
         response.consume(|response| match self {
             Self::Standalone { claim, .. } => claim.commit(target, mutation, audit, response),
@@ -181,6 +183,7 @@ mod tests {
 
     fn authorization() -> SqlAuthorization {
         SqlAuthorization {
+            row_policies: BTreeMap::new(),
             tenant: "tenant".into(),
             schema: true,
             grants: BTreeSet::from([("legacy".into(), SecurityAction::Read)]),
@@ -210,8 +213,8 @@ mod tests {
         for authorization in [None, Some(&authorization)] {
             for kind in 0..3 {
                 let expected = match kind {
-                    0 => serde_json::to_value(&response).unwrap(),
-                    1 => serde_json::to_value(StandaloneCommitReceipt {
+                    0 if authorization.is_none() => serde_json::to_value(&response).unwrap(),
+                    0 | 1 => serde_json::to_value(StandaloneCommitReceipt {
                         version: 2,
                         authorization: authorization.cloned(),
                         references: BTreeSet::new(),
@@ -238,7 +241,7 @@ mod tests {
                         serde_json::to_vec(&*actual).unwrap(),
                         serde_json::to_vec(&expected).unwrap()
                     );
-                    let result = if kind == 0 {
+                    let result = if kind == 0 && authorization.is_none() {
                         &actual["results"]
                     } else {
                         &actual["response"]["results"]
@@ -258,8 +261,10 @@ mod tests {
                         .consume(|value| {
                             assert!(used() > 0);
                             let received = match kind {
-                                0 => serde_json::from_value::<SqlExecutionResponse>(value).unwrap(),
-                                1 => {
+                                0 if authorization.is_none() => {
+                                    serde_json::from_value::<SqlExecutionResponse>(value).unwrap()
+                                }
+                                0 | 1 => {
                                     serde_json::from_value::<StandaloneCommitReceipt>(value)
                                         .unwrap()
                                         .response

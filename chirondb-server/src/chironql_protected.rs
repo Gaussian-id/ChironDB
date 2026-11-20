@@ -33,6 +33,7 @@ pub(crate) enum Output {
 
 #[derive(Clone)]
 pub(crate) enum PublicationGuard {
+    Sql(crate::SqlPublication, Box<PublicationGuard>),
     Data(AccessContext),
     Multi(Vec<AccessContext>),
     TemporalPipeline(Vec<AccessContext>, crate::db::MultiModelReadSnapshot),
@@ -42,6 +43,7 @@ pub(crate) enum PublicationGuard {
 impl PublicationGuard {
     pub(crate) fn publish<T>(&self, publish: impl FnOnce() -> T) -> Result<T> {
         match self {
+            Self::Sql(sql, other) => sql.publish(|| other.publish(publish))?,
             Self::Data(context) => {
                 let _permit = context.publication_permit()?;
                 Ok(publish())
@@ -69,7 +71,10 @@ impl PublicationGuard {
 impl Output {
     pub(crate) fn guard(&self) -> PublicationGuard {
         match self {
-            Self::Transaction(output) => PublicationGuard::Data(output.publication_context()),
+            Self::Transaction(output) => PublicationGuard::Sql(
+                output.sql_publication_context(),
+                Box::new(PublicationGuard::Data(output.publication_context())),
+            ),
             Self::Query(guard, _) => guard.clone(),
             Self::Data(output) => PublicationGuard::Data(output.publication_context()),
             Self::Identity(identity, _) => PublicationGuard::Identity(identity.clone()),
@@ -173,14 +178,20 @@ fn action(statement: &Statement) -> std::result::Result<Option<Action>, ()> {
         DeletePoints { .. } | DeleteWhere { .. } => Some(Action::Delete),
         Traverse(_) => Some(Action::GraphRead),
         Security(statement) => match statement.command {
+            Command::RegisterEdge { .. } => Some(Action::GraphWrite),
+            Command::CreateTemporalAsset { .. } => Some(Action::Create),
+            Command::GetTemporalAsset { .. } => Some(Action::Read),
+            Command::UpdateTemporalAsset { .. } => Some(Action::Update),
+            Command::DeleteTemporalAsset { .. } => Some(Action::Delete),
             Command::ShowCurrentUser { .. } => None,
             Command::ShowCatalogRevision | Command::CreateProtectedCollection { .. } => {
                 Some(Action::IdentityManage)
             }
             Command::SetGraphLifecycle { .. } | Command::SetEdgeType { .. } => Some(Action::Schema),
-            Command::SetCollectionPolicy { .. } | Command::ShowCollectionPolicy { .. } => {
-                Some(Action::PolicyManage)
-            }
+            Command::ShowRowSecurity { .. }
+            | Command::ChangeRowSecurity { .. }
+            | Command::SetCollectionPolicy { .. }
+            | Command::ShowCollectionPolicy { .. } => Some(Action::PolicyManage),
             Command::ObjectPrivileges { .. } => Some(Action::GrantsManage),
             Command::AlterPoint { .. } => Some(Action::LabelsManage),
             Command::CreatePoints { .. } => Some(Action::Create),
@@ -276,6 +287,7 @@ pub(crate) fn execute(
         let reference = db
             .sql_reference_publication_context(&identity, &result.results)
             .map_err(|failure| map_error(&query_id, failure))?;
+        let sql_publication = result.publication_context();
         let mut response =
             crate::chironql_exec::sql_execution_admitted(result, &query_id, &mut memory)?;
         response.domains = vec![ExecutionDomain::Relational];
@@ -287,7 +299,10 @@ pub(crate) fn execute(
             Some(context) => PublicationGuard::Multi(vec![context]),
             None => PublicationGuard::Identity(identity),
         };
-        return Ok(Output::Query(guard, QueryResult::new(response, memory)));
+        return Ok(Output::Query(
+            PublicationGuard::Sql(sql_publication, Box::new(guard)),
+            QueryResult::new(response, memory),
+        ));
     }
     let required = action(&statement).map_err(|()| {
         let mut e = error(&query_id, "chironql.protected_unsupported");
@@ -776,6 +791,7 @@ fn execute_pipeline(
         .sql_reference_publication_context(identity, &relational_response.results)
         .map_err(|failure| map_error(query_id, failure))?;
     let relational_snapshot = relational_response.snapshot;
+    let sql_publication = relational_response.publication_context();
     let rel =
         crate::chironql_exec::sql_execution_admitted(relational_response, query_id, &mut memory)?;
     let relational_rows =
@@ -850,11 +866,14 @@ fn execute_pipeline(
         .metadata(&result)
         .map_err(|e| receiving::error(query_id, e))?;
     Ok(Output::Query(
-        if pipeline.temporal.is_some() {
-            PublicationGuard::TemporalPipeline(contexts, snapshot)
-        } else {
-            PublicationGuard::Multi(contexts)
-        },
+        PublicationGuard::Sql(
+            sql_publication,
+            Box::new(if pipeline.temporal.is_some() {
+                PublicationGuard::TemporalPipeline(contexts, snapshot)
+            } else {
+                PublicationGuard::Multi(contexts)
+            }),
+        ),
         QueryResult::new(result, memory),
     ))
 }
@@ -1032,6 +1051,32 @@ fn execute_security(
     let bind = |collection: &str, action| {
         db.bind_access(&identity, collection, &identity.principal().tenant, action)
     };
+    if let Command::ShowRowSecurity { .. } | Command::ChangeRowSecurity { .. } = &statement.command
+    {
+        let result = match &statement.command {
+            Command::ShowRowSecurity {
+                table,
+                after,
+                limit,
+            } => db.relational_security_authorized(&identity, table, *after, *limit)?,
+            Command::ChangeRowSecurity { delta } => {
+                if delta.expected_revision != expected {
+                    return Err(SecurityError::Conflict.into());
+                }
+                db.change_relational_security_authorized(&identity, delta.clone())?
+            }
+            _ => unreachable!(),
+        };
+        let publication = result.publication_context();
+        let mut memory = QueryMemory::new()?;
+        let response = crate::chironql_exec::sql_execution_admitted(result, query_id, &mut memory)
+            .map_err(|_| SecurityError::Unavailable)?;
+        memory.metadata(&response)?;
+        return Ok(Output::Query(
+            PublicationGuard::Sql(publication, Box::new(PublicationGuard::Identity(identity))),
+            QueryResult::new(response, memory),
+        ));
+    }
     let rows = match &statement.command {
         Command::ShowCatalogRevision => Some(response(
             query_id,
@@ -1188,6 +1233,83 @@ fn execute_security(
         return Ok(Output::Identity(identity, rows));
     }
     match &statement.command {
+        Command::RegisterEdge {
+            collection,
+            id,
+            template,
+        } => {
+            return db
+                .register_edge_authorized(
+                    &bind(collection, Action::GraphWrite)?,
+                    &crate::graph::EdgeToken::from_encoded(id),
+                    template,
+                    expected,
+                )?
+                .map(|revision| {
+                    response(query_id, &["revision"], vec![json!({"revision":revision})])
+                })
+                .map(Output::Data);
+        }
+        Command::CreateTemporalAsset {
+            collection,
+            template,
+            metadata,
+            id,
+        } => {
+            let context = bind(collection, Action::Create)?;
+            let output = if let Some(id) = id {
+                db.register_temporal_asset_authorized(
+                    &context,
+                    id.clone(),
+                    template,
+                    metadata.clone(),
+                )?
+            } else {
+                db.create_temporal_asset_authorized(&context, template, metadata.clone())?
+            };
+            return output
+                .map(|id| response(query_id, &["id"], vec![json!({"id":id})]))
+                .map(Output::Data);
+        }
+        Command::GetTemporalAsset { collection, id } => {
+            return db
+                .get_temporal_asset_authorized(&bind(collection, Action::Read)?, id)?
+                .map(|metadata| {
+                    response(
+                        query_id,
+                        &["id", "metadata"],
+                        vec![json!({"id":id,"metadata":metadata})],
+                    )
+                })
+                .map(Output::Data);
+        }
+        Command::UpdateTemporalAsset {
+            collection,
+            id,
+            metadata,
+        } => {
+            return db
+                .replace_temporal_asset_authorized(
+                    &bind(collection, Action::Update)?,
+                    id,
+                    RevisionUpdate {
+                        expected_revision: expected,
+                        value: metadata.clone(),
+                    },
+                )?
+                .map(|revision| {
+                    response(query_id, &["revision"], vec![json!({"revision":revision})])
+                })
+                .map(Output::Data);
+        }
+        Command::DeleteTemporalAsset { collection, id } => {
+            return db
+                .delete_temporal_asset_authorized(&bind(collection, Action::Delete)?, id, expected)?
+                .map(|revision| {
+                    response(query_id, &["revision"], vec![json!({"revision":revision})])
+                })
+                .map(Output::Data);
+        }
         Command::CreateProtectedCollection { name, dim, metric } => {
             let config =
                 serde_json::from_value(json!({"name":name,"vector_dim":dim,"metric":metric}))?;
@@ -1241,6 +1363,7 @@ fn execute_security(
             ));
         }
         Command::ObjectPrivileges {
+            edge,
             collection,
             id,
             subject,
@@ -1252,10 +1375,19 @@ fn execute_security(
                 NamedSubject::User(name) => Subject::Principal(name.clone()),
                 NamedSubject::Group(name) => Subject::Group(name.clone()),
             };
+            let context = bind(collection, Action::GrantsManage)?;
+            let id = if *edge {
+                db.edge_security_id_authorized(
+                    &context,
+                    &crate::graph::EdgeToken::from_encoded(id),
+                )?
+            } else {
+                id.clone()
+            };
             return db
                 .change_object_privileges_authorized(
-                    &bind(collection, Action::GrantsManage)?,
-                    id,
+                    &context,
+                    &id,
                     expected,
                     PointPrivilegeChanges {
                         subject,
@@ -1270,16 +1402,26 @@ fn execute_security(
                 .map(Output::Data);
         }
         Command::AlterPoint {
+            edge,
             collection,
             id,
             owner,
             department,
             classification,
         } => {
+            let context = bind(collection, Action::LabelsManage)?;
+            let id = if *edge {
+                db.edge_security_id_authorized(
+                    &context,
+                    &crate::graph::EdgeToken::from_encoded(id),
+                )?
+            } else {
+                id.clone()
+            };
             return db
                 .alter_object_labels_authorized(
-                    &bind(collection, Action::LabelsManage)?,
-                    id,
+                    &context,
+                    &id,
                     expected,
                     PointLabelChanges {
                         owner: owner.clone(),
@@ -1506,10 +1648,18 @@ pub(crate) mod tests {
                             Action::Create,
                             Action::Update,
                             Action::Delete,
+                            Action::LabelsManage,
+                            Action::GrantsManage,
                         ]),
                     ),
                 ],
-                installation_actions: BTreeSet::from([Action::IdentityManage, Action::Schema]),
+                installation_actions: BTreeSet::from([
+                    Action::IdentityManage,
+                    Action::Schema,
+                    Action::PolicyManage,
+                    Action::LabelsManage,
+                    Action::GrantsManage,
+                ]),
             },
         )
         .unwrap();
@@ -1664,6 +1814,47 @@ pub(crate) mod tests {
         assert_eq!(selected.rows, vec![json!({"balance":125})]);
 
         let authority = db.identity_authority().unwrap();
+        // Table rights alone must not expose another owner's row. Grant the
+        // intended shared row explicitly before exercising role revocation.
+        let empty = run(&writer_key.secret, "SQL SELECT balance FROM accounts")
+            .unwrap()
+            .publish(|response| response)
+            .unwrap();
+        assert!(empty.rows.is_empty());
+        let root = authority.authenticate(&root_key.secret).unwrap();
+        let view = db
+            .relational_security_authorized(&root, "accounts", 0, 8)
+            .unwrap();
+        let crate::SqlResult::Rows { rows, .. } = &view.results[0] else {
+            panic!()
+        };
+        let crate::RelationalValue::Json(value) = &rows[0][0] else {
+            panic!()
+        };
+        let mut policy: chirondb_types::RelationalRowPolicy =
+            serde_json::from_value(value["policy"].clone()).unwrap();
+        let expected_revision = policy.revision;
+        policy.revision += 1;
+        let mut record: ResourceRecord =
+            serde_json::from_value(value["rows"][0]["authority"].clone()).unwrap();
+        record.revision = policy.revision;
+        record.grants.push(ObjectGrant {
+            subject: Subject::Principal("writer".into()),
+            actions: BTreeSet::from([Action::Read, Action::Update, Action::Delete]),
+            effect: Effect::Permit,
+            inherit: false,
+        });
+        db.change_relational_security_authorized(
+            &root,
+            chirondb_types::relational::RelationalSecurityDelta {
+                table: "accounts".into(),
+                incarnation: record.key.collection,
+                expected_revision,
+                policy,
+                records: vec![record],
+            },
+        )
+        .unwrap();
         let keyed_update = ChironQlRequest {
             query: "SQL UPDATE accounts SET balance = 125 WHERE id = 1 RETURNING balance".into(),
             idempotency_key: Some("writer-update-1".into()),
@@ -1775,14 +1966,19 @@ pub(crate) mod tests {
             .publish(|response| response)
             .unwrap();
         let root = authority.authenticate(&root_key.secret).unwrap();
-        assert_eq!(
+        assert!(
             db.commit_sql_transaction_authorized(
                 &root,
                 &root_commit_handle,
                 "reconcile-dropped-table"
             )
-            .unwrap(),
-            committed
+            .is_err()
+        );
+        assert_eq!(
+            db.transaction_status_authorized(&root, &root_commit_handle)
+                .unwrap()
+                .state,
+            chirondb_core::TransactionState::Committed
         );
     }
 

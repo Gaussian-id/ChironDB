@@ -129,6 +129,7 @@ mod tests {
 
     fn table() -> TableDefinition {
         TableDefinition {
+            row_policy: None,
             table_id: 1,
             security_incarnation: None,
             creator_principal_id: None,

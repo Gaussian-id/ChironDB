@@ -17,10 +17,173 @@ Authenticated ChironQL `SQL ...`, HTTP `/sql` and `/v1/sql`, gRPC SQL RPCs,
 and ChironWire SQL operations share the native protected relational executor.
 A table name is installation-global and persists the tenant that created it;
 another tenant receives `security.not_found` even if a misconfigured grant
-names that table. SELECT/EXPLAIN requires `read`, INSERT requires `create`,
-UPDATE requires `update`, DELETE requires `delete`, and DDL requires the
+names that table. SELECT/EXPLAIN requires `read`; blind INSERT VALUES requires
+`create`. INSERT with RETURNING or any ON CONFLICT clause also requires `read`.
+UPDATE requires `read` + `update`, DELETE requires `read` + `delete`, and DDL requires the
 installation action `schema`. Foreign-key validation and referential actions
-add the required parent/child grants before execution.
+add the required parent/child grants before execution, including Read for
+cascading updates/deletes. Predicates, affected-row counts and RETURNING are
+read primitives even when the caller changes no value. These rules also apply
+to PostgreSQL simple/extended queries, transactions and multi-model SQL stages.
+
+Table authority is the first gate. Each protected row also has a tenant/table
+incarnation binding, owner, department, classification and object grants. Each
+column has separate Read, Query and Write rules. These are security metadata,
+not ordinary SQL columns: a column named `owner` or `classification` cannot
+change authority. PostgreSQL `CREATE POLICY` and `ALTER TABLE ... ENABLE ROW
+LEVEL SECURITY` remain unsupported; use the native control plane below.
+
+New protected tables start with an owner-only template. The authenticated
+inserter owns each new row; the table creator's trusted department and clearance
+supply the template's department and classification. The initial columns allow
+Read/Query/Write at that classification. A lower-clearance writer needs an
+explicitly provisioned template. Table creator rights do not bypass row or
+column policy. Existing tables/rows without native authority remain closed
+until an administrator registers their metadata explicitly.
+
+Row visibility is applied before scans, index reads, joins and aggregation.
+Projection requires column Read; predicates, joins, ordering, grouping and
+aggregation require Query. Query can be granted without Read. A forbidden column
+rejects the request before value-dependent evaluation across the readable row
+domain; it is not replaced with NULL. INSERT checks Write on all physical columns,
+including defaults/NULL, and UPDATE checks every assigned column even if its
+value is unchanged. RETURNING requires Read. UPDATE/DELETE and cascades also
+require the affected row's Read plus mutation action.
+
+UNIQUE/FK validation examines a shared key domain. Every row in that domain must
+allow object Read **or Search**, plus Query on its key columns, before any probe;
+otherwise both present-key and absent-key operations fail. Blind writers sharing
+a constrained table therefore need an explicit Search/Query key-domain policy.
+This does not grant Read on the other columns. The same preflight requires
+Query on columns referenced by CHECK expressions, including cascaded updates:
+constraint success or failure must not disclose a hidden value. Only referenced
+CHECK columns need that permission. Protected mutations reject a concurrent
+snapshot change instead of rebasing onto unexamined rows.
+
+Deleting a vector point also probes SQL `RECORD_REF` integrity. Before testing
+whether any reference exists, standalone and atomic deletion require table Read
+for every participating table, object Read or Search across its reference
+domain, and Query on the reference columns. Without those permissions, both
+referenced and unreferenced points reject identically. Granting Query permits the
+integrity check without granting column Read; live references still block deletion.
+
+### Native row security administration
+
+The following ChironQL commands run through HTTP `POST /chironql` or
+`/v1/chironql`, gRPC `ExecuteQuery`, and ChironWire ChironQL. They are not
+PostgreSQL SQL statements:
+
+<!-- chironql-example: native-row-inspect -->
+```sql
+SHOW ROW SECURITY documents LIMIT 16;
+```
+
+<!-- chironql-example: native-row-page -->
+```sql
+SHOW ROW SECURITY documents AFTER '16' LIMIT 16;
+```
+
+`SHOW` requires installation PolicyManage and the table's tenant. It returns one
+`security` JSON value with `table`, `table_id`, `incarnation`, `policy` and
+`rows: [{row_id, authority}]`, without SQL row values. `row_id` is an internal,
+stable ID, not the SQL primary key. Pagination uses that ID; limit is 1–128.
+
+To change authority, submit `ALTER ROW SECURITY documents APPLY JSON '<delta>'
+IF REVISION n;`, where the quoted string is strict JSON for
+`RelationalSecurityDelta`:
+
+- `table` and `incarnation` must match the current table shown by SHOW.
+- `expected_revision` equals `n` and the current policy revision.
+- `policy` is the complete `RelationalRowPolicy` from SHOW, with `revision`
+  incremented once. It includes `default_template` and the collection-policy
+  owner/department actions and templates.
+- `records` contains zero to 1,024 complete row authority records. Preserve each
+  existing `key`, `storage_id` and content kind, set its `revision` to the new
+  policy revision, and edit only the intended labels, grants or property rules.
+  Empty records changes only the policy. JSON property actions are `read`,
+  `query`, and `write`; exact column paths use JSON-pointer escaping.
+
+Double any single quote inside the JSON string for ChironQL. Preserve u64 values
+as exact integers; do not round revisions through a floating-point JSON client.
+The command requires PolicyManage; changing records additionally requires
+LabelsManage and GrantsManage. Subject existence, tenant, classification and
+delegation ceilings are validated before one journal decision. Ordinary DML
+cannot supply authority. The audit event records table, incarnation, revisions
+and binding count, without SQL values.
+
+This complete syntax example changes the policy for a one-column `id` table.
+Use the incarnation/revision and complete policy returned by SHOW for your table;
+the UUID below is illustrative. It changes future-row defaults and the shared
+object policy; `records: []` preserves existing row labels and field rules.
+The documentation corpus checks syntax; the protocol regression suite exercises
+these changes against live authority.
+
+<!-- chironql-example: native-row-change -->
+```sql
+ALTER ROW SECURITY documents APPLY JSON '{
+  "table": "documents",
+  "incarnation": "11111111-1111-4111-8111-111111111111",
+  "expected_revision": 1,
+  "policy": {
+    "revision": 2,
+    "default_template": "owner",
+    "policy": {
+      "owner_actions": [
+        "read",
+        "create",
+        "update",
+        "delete",
+        "labels_manage",
+        "grants_manage"
+      ],
+      "department_actions": [],
+      "templates": {
+        "owner": {
+          "department": "Finance",
+          "classification": "internal",
+          "properties": {
+            "/id": {
+              "classification": "internal",
+              "actions": [
+                "read",
+                "query",
+                "write"
+              ]
+            }
+          },
+          "representations": {}
+        }
+      }
+    }
+  },
+  "records": []
+}' IF REVISION 1;
+```
+
+For a historical table with no policy, use expected revision 0 and policy
+revision 1. Preserve an existing incarnation from the table migration, or assign
+a fresh non-nil UUID if none exists. Register each historical row explicitly
+with its shown internal ID, trusted labels and a unique resource storage UUID.
+Unregistered rows remain invisible. Neither table-scope migration infers row
+owners from SQL values.
+
+Column rename moves existing rules; DROP removes them. A newly added column
+has no automatic permission, even when its name was previously dropped. Provision
+its rules in the template and existing rows before use. Schema changes, row
+deletion and authority changes advance a persistent policy revision and close
+old buffered results. Saved SQL receipts bind table ID, incarnation and policy
+revision; a stale or missing proof denies replay without repeating the mutation.
+This includes receipts in multi-model transactions.
+
+Interactive result sets keep all their guards across savepoint rollback. Private
+results expire when their transaction commits, rolls back, expires or closes,
+including rows in tables created before COMMIT. A failed authority decision may
+leave the old epoch closed; reopen and reconcile the journal before resuming.
+Already published data cannot be recalled. Trusted embedded callers should keep
+`SqlResponse` until guarded serialization/consumption; copying a raw DTO hands
+the data to the caller. These changes persist new row metadata: use the matching
+binary and verified backup; downgrading to a reader without these checks is not
+supported.
 
 After the offline `migrate-table-authority` command below, an installation
 administrator can grant SQL-only tables directly. The table and role must
@@ -89,16 +252,20 @@ rights do not grant vector/graph access or access to other existing tables.
 They survive rename and reopen and are independent of role grants; revoking a
 role does not remove creator rights. Disable/retire the principal to remove its
 access. Creator transfer is not supported. Savepoint rollback removes later
-private DDL; COMMIT rechecks accumulated permissions.
+private DDL; COMMIT rechecks accumulated permissions. The creator remains subject
+to the row/column rules above.
 
 Standalone idempotency receipts written under identity version 5 or later save
-table bindings. An identical retry after rename or reopen returns the original
-decision, subject to current permissions. Interactive commit reconciliation also
+table bindings. An identical retry after reopen returns the original decision only while its
+table policy bindings and current permissions still match. Rename/schema changes
+advance the row policy fence and can invalidate older receipts. Interactive commit reconciliation also
 rechecks these bindings. After strict migration, legacy successful standalone
 receipts without saved authorization and interactive proofs using only table
 names are denied. Their keys remain consumed: do not submit a new key to retry
 an uncertain mutation. Reconcile its durable transaction status and application
-state. Exact table-bound receipts continue to work.
+state. Replaying a mutation receipt requires Read on every written table,
+including a blind INSERT receipt: historical proofs do not distinguish all
+read-bearing mutation forms. A denied retry never re-executes the mutation.
 
 Installations that have not run `migrate-sql-scopes` retain the legacy SQL name
 fallback and do not have this table-isolation guarantee. The production candidate
@@ -126,7 +293,12 @@ shared journal decision; row, vector, graph, security metadata, and audit are
 projections of the same transaction ID. Request-level `idempotency_key` claims the shared
 ledger before allocation and returns the same transaction/snapshot and allocated `edge_id`
 rows on retry. Current SQL, object and graph-endpoint permissions apply to replay.
-Edge-token updates/deletes require GraphWrite on both endpoints. A DELETE receipt can
+Multi-model receipts also bind the collection policy revision. Older receipts
+without that dependency, or retries after any policy revision, reject without
+re-execution; reconcile the durable transaction status. This conservative rule
+prevents reuse of permissions on edge fields after revocation.
+Edge-token updates/deletes require GraphWrite on both endpoints and Write on
+submitted/removed edge fields. A DELETE receipt can
 acknowledge only its own retained tombstone; a prior UPDATE receipt cannot bypass a later
 deletion. Transport publication retains the exact identity/policy epoch checked by the
 core, including after DELETE rotates that epoch. Protected INSERT uses `VECTOR CREATE POINTS`,
@@ -136,7 +308,9 @@ receipt. The new record and any existing reference must remain readable on repla
 An UPDATE/DELETE planner rejection before attempting the durable journal decision
 leaves row, vector, graph and resource bindings unchanged and permits fresh reads.
 A rejected DELETE may invalidate already queued results while it drains the old
-authorization epoch. A failure after attempting the durable decision remains
+authorization epoch. If the journal proves refusal before PREPARE begins, fresh
+SQL readers receive a new epoch for the unchanged policy; drained results stay
+closed. A failure after attempting the durable decision remains
 fail closed until recovery and outcome reconciliation; it must not be treated as
 a safe retry without checking the transaction outcome.
 Protected PostgreSQL wire requires `SSLRequest`, TLS and a
@@ -147,6 +321,94 @@ key is not accepted as the SQL password. Issue or rotate through
 revision, and revoke its returned ID through the existing credential revocation
 route. The generated password is returned only once. Protected installations
 remain single-tenant in this beta.
+
+## Protected temporal access
+
+An asset is a current protected resource in the named collection. Both the
+collection grant and the asset's tenant, owner/department, classification and
+object grants must permit `TemporalRead` or `TemporalAppend`. These are distinct
+actions; add them explicitly to the collection policy's owner/department actions
+or to an object grant. `Read` alone does not grant temporal access.
+
+Property `temperature` uses the exact PropertyRule `/temperature`. A property
+name containing `/` or `~` is escaped as one JSON-pointer component. Read requires
+property Read; append requires property Write, including an identical retry.
+Every sample is checked before any batch is appended. Missing, retired,
+quarantined or inaccessible assets and unlabelled properties fail closed.
+Assets may be protected vector objects or independent metadata-only assets.
+A bare SQL/temporal name has no authority until an installation policy manager
+explicitly registers it. Registration does not infer owner or labels from the
+name or stored metadata.
+
+`HISTORY ... LIMIT n WHERE ...` and `LATEST ... WHERE ...` filter the registered
+asset's metadata. Each referenced field needs Query and sufficient clearance;
+Query does not grant Read on the returned temporal property. Nonmatching
+metadata produces no observations. Unknown/forbidden predicate fields reject.
+HTTP, gRPC and ChironWire use the same checks, including pipeline stages.
+Policy/identity revocation invalidates pending protected output. Historical
+observations retain the current asset/property authority after reopen.
+
+Temporal append remains a separate commit. Per-series UPDATE/DELETE/retention
+and atomic writes spanning temporal plus SQL/vector/graph are unsupported.
+
+### Metadata-only assets
+
+With an authorized `asset` template in collection `assets` (no vector
+representations), use ChironQL 1.2 through HTTP, gRPC or ChironWire:
+
+<!-- chironql-example: asset-create -->
+```sql
+CREATE ASSET assets TEMPLATE asset METADATA {location:'north'};
+```
+
+<!-- chironql-example: asset-get -->
+```sql
+GET ASSET assets ID 'ASSET_ID';
+```
+
+<!-- chironql-example: asset-update -->
+```sql
+UPDATE ASSET assets ID 'ASSET_ID' METADATA {location:'south'} IF REVISION 7;
+```
+
+<!-- chironql-example: asset-delete -->
+```sql
+DELETE ASSET assets ID 'ASSET_ID' IF REVISION 8;
+```
+
+Read the current revision with `SHOW SECURITY REVISION ON COLLECTION assets;`.
+
+Replace `ASSET_ID` with the allocated ID and each revision with the current
+collection security revision. Create uses Create and template field Write;
+metadata GET uses Read and projects readable fields. Replacement uses Update,
+checks submitted/removable properties and closes queued output by advancing the
+policy revision. Delete uses Delete, permanently retires the binding and denies
+further reads/appends to its retained observations. It does not purge history.
+These assets have no vector row and are excluded from vector and graph-node
+retrieval. Templates may declare both metadata fields (`/location`, with Query
+for WHERE) and observation properties (`/temperature`, with Read/Write).
+
+For explicit migration of an existing named series, the actor also needs the
+installation `policy_manage` capability:
+
+<!-- chironql-example: asset-register -->
+```sql
+REGISTER ASSET assets ID 'historic-truck' TEMPLATE asset METADATA {location:'north'};
+```
+
+Registration preserves the current tenant, cannot replace or revive an existing
+binding, and assigns owner/department/classification using the same trusted
+rules as vector creation. `ALTER ASSET 'ASSET_ID' IN assets SET CLASSIFICATION
+RESTRICTED IF REVISION 9` and `GRANT ... ON ASSET 'ASSET_ID' IN assets ...` use
+the existing label and object-grant authority. Property rules use the same
+protected object-label API as vector objects. Asset commands are unavailable
+in the unprotected profile and PostgreSQL SQL grammar.
+
+Asset bindings, metadata and retirement are persisted atomically in the
+collection WAL and survive encrypted backup/journal restore. Binaries predating
+this content kind reject its protected WAL/checkpoint; downgrade requires a
+verified backup from before asset registration.
+
 
 ## Guarded metadata replacement
 
@@ -224,8 +486,63 @@ hops, and both endpoints are checked before reading or evaluating edge propertie
 add `Query` permission and clearance checks for each referenced payload field. A disallowed field
 on a visible candidate rejects the query. Business edges do not grant access.
 
-All properties on a relation share the visibility of its two endpoints; this profile has no separate
-edge or edge-property ACL. Use protected records for content requiring stricter field permissions.
+Edge fields have a separate property namespace on both endpoint records. Field
+`kind` requires `/edges/kind`: Read for output, Query for predicates, and Write
+for create/update/removal. Both endpoints must allow the operation at the
+caller's clearance. Granting `/kind` on node payload does not grant edge access.
+Missing edge rules deny filtering/writes and omit fields from output. Merge
+checks submitted fields even when their values equal the old values; replacement
+and deletion also check fields removed from the old edge. Existing policies
+must explicitly add edge rules before writing/filtering those fields.
+
+Each protected edge also has its own durable owner, department, classification,
+object grants and field rules. New atomic relations create that binding in the
+same WAL/journal transaction as topology: owner is the authenticated creator,
+department is the creator's trusted department, classification is the stricter
+endpoint classification, and initial field rules intersect both endpoints.
+GraphRead/GraphWrite must permit the edge itself as well as both endpoints.
+An edge cannot expose an otherwise hidden endpoint or bridge. Its own `/kind`
+rule and both endpoint `/edges/kind` rules independently constrain metadata.
+Changing an edge's labels/grants or retiring it revokes queued topology results.
+
+Use opaque edge tokens returned by the transaction, never internal numeric IDs:
+
+<!-- chironql-example: edge-classification -->
+```sql
+ALTER EDGE '<edge-token>' IN docs SET CLASSIFICATION CONFIDENTIAL IF REVISION 7;
+```
+
+<!-- chironql-example: edge-deny -->
+```sql
+DENY GRAPH_READ, GRAPH_WRITE ON EDGE '<edge-token>' IN docs TO USER reader IF REVISION 8;
+```
+
+<!-- chironql-example: edge-revoke-deny -->
+```sql
+REVOKE DENY GRAPH_READ, GRAPH_WRITE ON EDGE '<edge-token>' IN docs FROM USER reader IF REVISION 9;
+```
+
+These statements require the corresponding LabelsManage/GrantsManage authority;
+ordinary GraphWrite cannot change security labels or grant itself access. Field
+rules can be replaced through the protected object-label API after resolving the
+edge with `Db::edge_security_id_authorized` under management authority.
+
+Edges predating this binding fail closed, including unfiltered traversal and
+mutations. An installation PolicyManage administrator with GraphWrite on both
+endpoints may bind an existing edge to an explicitly configured template:
+
+<!-- chironql-example: edge-register -->
+```sql
+REGISTER EDGE '<edge-token>' IN docs TEMPLATE edge_metadata IF REVISION 10;
+```
+
+The registration template has no representations; its field paths describe edge
+properties directly (for example `/kind`). Its classification must be at least
+as high as both endpoints. Registration preserves the opaque token and topology;
+its WAL record binds the current graph incarnation. Re-registration is rejected.
+These commands use ChironQL over both HTTP aliases, gRPC and ChironWire; they are
+not PostgreSQL SQL syntax. Old binaries reject the new resource/content kind;
+restore a pre-upgrade backup to downgrade safely.
 An unknown edge type yields no matching edges, like a type with no visible relations.
 
 The protected graph stage returns public node IDs and depth, ordered by depth then public ID,
@@ -236,7 +553,9 @@ Within a `PIPELINE`, `RETURN EDGES`, `RETURN PATHS`, and graph `WITH PAYLOAD` re
 Standalone protected `TRAVERSE` supports `RETURN NODES`, `RETURN EDGES`, and
 `RETURN PATHS` through ChironQL on HTTP, gRPC and ChironWire. Paths require an explicit
 `LIMIT`. `WITH PAYLOAD` projects node fields under their Read permissions; edge properties
-require GraphRead on both endpoints. IDs and path endpoints are public record identities.
+require GraphRead on the edge and endpoints, its own `/<field>` Read,
+and `/edges/<field>` Read on both endpoints. IDs and path
+endpoints are public record identities.
 For example, using the chunk ID returned by an atomic INSERT:
 
 ```sql
@@ -432,7 +751,7 @@ Every fenced SQL example below is paired with a coverage entry in [the example c
 
 `docs` is a collection created by the setup example. `ana`, `ben`, `writer`, and `ops` are users created in the reference. `POINT_ID`, `SECOND_ID`, `THIRD_ID`, `HR_ID` and `CURSOR_ID` represent actual returned values; ChironQL does not substitute these words itself. `KEY_ID` and `ROTATED_KEY_ID` are credential IDs from `SHOW API KEYS`. Replace them before manual execution. The validator captures and substitutes real values automatically. Security examples use single-quoted strings; escape a quote by doubling it (`'Ana''s report'`). JSON objects in SQL use unquoted or single-quoted keys. The **HTTP envelope** is ordinary double-quoted JSON, while its `query` string contains ChironQL.
 
-For ingestion the role needs Create plus Ingest, a trusted template, matching vector dimensions, sufficient clearance and write permission on the supplied fields. The template assigns the authoritative department/classification/property and representation labels. Ordinary payload fields named `owner` or `department` cannot substitute for security metadata. Update replaces existing authorized objects, and explicit batches are atomic. Deleted IDs cannot be reused by replay.
+For ingestion the role needs Create plus Ingest, a trusted template, matching vector dimensions, sufficient clearance and write permission on the supplied fields. The template assigns the authoritative department/classification/property and representation labels. Ordinary payload fields named `owner` or `department` cannot substitute for security metadata. Update replaces existing authorized objects, and explicit batches are atomic. Submitted unchanged hidden fields and representations still require write authority; a readable unchanged value may be carried through a permitted replacement. Representation source edits require Ingest, including SQL+graph atomic replacements. Deleted IDs cannot be reused by replay.
 
 A document permit does not override explicit deny, clearance, tenant boundaries or field rules. Reading a field and using it in filter/search are distinct. Inheritance/group membership must come from the trusted authority, not business graph edges. ChironQL 1.3 accepts point ACL subjects `USER` and `GROUP`, but has **no** group creation/membership or parent-inheritance editing syntax. Group examples are conditional on an already provisioned trusted group and are syntax-verified only.
 
@@ -1395,7 +1714,8 @@ GRANT DELETE ON COLLECTION docs TO ROLE operations;
 
 ### action-temporal_read
 
-Grant access to temporal observations in this collection.
+Grant the collection capability to read temporal observations. Asset policy and
+property Read must also permit the request; see [temporal access](#protected-temporal-access).
 
 <!-- chironql-example: action-temporal_read -->
 ```sql
@@ -1404,7 +1724,8 @@ GRANT TEMPORAL_READ ON COLLECTION docs TO ROLE operations;
 
 ### action-temporal_append
 
-Grant access to temporal observations in this collection.
+Grant the collection capability to append temporal observations. Asset policy and
+property Write must also permit every sample; see [temporal access](#protected-temporal-access).
 
 <!-- chironql-example: action-temporal_append -->
 ```sql

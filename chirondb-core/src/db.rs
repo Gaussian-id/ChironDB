@@ -1,4 +1,7 @@
+mod edge_authority;
+mod relational_security;
 pub mod temporal;
+mod temporal_assets;
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
@@ -1713,7 +1716,7 @@ impl Db {
         request: crate::SqlExecutionRequest,
     ) -> Result<crate::SqlExecutionResponse> {
         self.execute_sql_owned(request)
-            .map(crate::SqlResponse::into_dto)
+            .and_then(|output| output.consume(Ok))
     }
 
     /// Retain typed SQL output memory until consumption or transport encoding.
@@ -1730,7 +1733,7 @@ impl Db {
         audit_context: &crate::audit::AuditContext,
     ) -> Result<crate::SqlExecutionResponse> {
         self.execute_sql_with_audit_owned(request, audit_context)
-            .map(crate::SqlResponse::into_dto)
+            .and_then(|output| output.consume(Ok))
     }
 
     /// Retain typed SQL output memory until consumption or transport encoding.
@@ -1739,6 +1742,7 @@ impl Db {
         request: crate::SqlExecutionRequest,
         audit_context: &crate::audit::AuditContext,
     ) -> Result<crate::SqlResponse> {
+        self.require_legacy_sql_entry()?;
         self.ensure_request_admission()?;
         let _inflight = SearchInflightGuard::new(Arc::clone(&self.search_inflight));
         if !crate::RelationalEngine::request_is_read_only(&request)? {
@@ -1766,7 +1770,7 @@ impl Db {
         cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<crate::SqlExecutionResponse> {
         self.execute_sql_with_audit_cancellable_owned(request, audit_context, cancellation)
-            .map(crate::SqlResponse::into_dto)
+            .and_then(|output| output.consume(Ok))
     }
 
     /// Retain typed SQL output memory until consumption or transport encoding.
@@ -1776,6 +1780,7 @@ impl Db {
         audit_context: &crate::audit::AuditContext,
         cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<crate::SqlResponse> {
+        self.require_legacy_sql_entry()?;
         self.ensure_request_admission()?;
         let _inflight = SearchInflightGuard::new(Arc::clone(&self.search_inflight));
         if !crate::RelationalEngine::request_is_read_only(&request)? {
@@ -1807,7 +1812,7 @@ impl Db {
         transport: &str,
     ) -> Result<crate::SqlExecutionResponse> {
         self.execute_sql_authorized_owned(identity, request, transport)
-            .map(crate::SqlResponse::into_dto)
+            .and_then(|output| output.consume(Ok))
     }
 
     /// Retain typed SQL output memory until consumption or transport encoding.
@@ -1861,7 +1866,7 @@ impl Db {
         cancellation: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<crate::SqlExecutionResponse> {
         self.execute_sql_authorized_cancellable_owned(identity, request, transport, cancellation)
-            .map(crate::SqlResponse::into_dto)
+            .and_then(|output| output.consume(Ok))
     }
 
     /// Retain typed SQL output memory until consumption or transport encoding.
@@ -1915,7 +1920,7 @@ impl Db {
         audit_context: &crate::audit::AuditContext,
     ) -> Result<MultiModelTransactionResponse> {
         self.execute_multimodel_transaction_owned(request, scope, audit_context)
-            .map(MultiModelResponse::into_dto)
+            .and_then(|output| output.consume(Ok))
     }
     pub fn execute_multimodel_transaction_with_sql_rows(
         &self,
@@ -1930,7 +1935,7 @@ impl Db {
             audit_context,
             expected_sql_rows,
         )
-        .map(MultiModelResponse::into_dto)
+        .and_then(|output| output.consume(Ok))
     }
     pub fn execute_multimodel_transaction_authorized(
         &self,
@@ -1947,7 +1952,7 @@ impl Db {
             request,
             transport,
         )
-        .map(MultiModelResponse::into_dto)
+        .and_then(|output| output.consume(Ok))
     }
     pub fn execute_multimodel_transaction_authorized_with_sql_rows(
         &self,
@@ -1966,7 +1971,7 @@ impl Db {
             transport,
             expected_sql_rows,
         )
-        .map(MultiModelResponse::into_dto)
+        .and_then(|output| output.consume(Ok))
     }
 
     pub fn execute_multimodel_transaction_owned(
@@ -1988,6 +1993,7 @@ impl Db {
         audit_context: &crate::audit::AuditContext,
         expected_sql_rows: Option<u64>,
     ) -> Result<MultiModelResponse> {
+        self.require_legacy_sql_entry()?;
         let _lifecycle = self.lifecycle_gate.read();
         self.ensure_storage_mutations_available()?;
         let collection_ref = self.get_coll(&request.collection)?;
@@ -2016,6 +2022,7 @@ impl Db {
                 decision_started: None,
                 expected_sql_rows,
                 references: None,
+                changes: None,
             }),
         );
         drop(collection);
@@ -2134,27 +2141,7 @@ impl Db {
                 let old = collection
                     .try_resolve(&physical)?
                     .ok_or(crate::security::SecurityError::Unavailable)?;
-                vector_context.authorize_payload_change(
-                    &public_id,
-                    &old.payload,
-                    &point.payload,
-                )?;
-                if old.vector != point.vector {
-                    vector_context.authorize_representation_write(&public_id, "dense")?;
-                }
-                if old.sparse_vector != point.sparse_vector {
-                    vector_context.authorize_representation_write(&public_id, "sparse")?;
-                }
-                for name in old
-                    .vectors
-                    .keys()
-                    .chain(point.vectors.keys())
-                    .collect::<HashSet<_>>()
-                {
-                    if old.vectors.get(name) != point.vectors.get(name) {
-                        vector_context.authorize_representation_write(&public_id, name)?;
-                    }
-                }
+                security_runtime::authorize_point_replacement(vector_context, &old, point)?;
                 point.id = physical;
                 validate_point(&collection.config, point)?;
             }
@@ -2201,12 +2188,14 @@ impl Db {
                     decision_started: Some(&decision_started),
                     expected_sql_rows,
                     references: Some(references),
+                    changes: Some(references),
                 }),
             )
         };
         let result = authority.data_transaction(
             vector_context,
             &retired,
+            !request.edge_deletes.is_empty(),
             &decision_started,
             |bindings, previous, generation, revision, references| {
                 run(
@@ -2247,9 +2236,10 @@ impl Db {
         protected: Option<(crate::security::SecurityDelta, &str)>,
         idempotency: Option<multimodel::CommitOptions<'_>>,
     ) -> Result<MultiModelResponse> {
-        let (security, protected_tenant) = protected.map_or((None, None), |(security, tenant)| {
-            (Some(security), Some(tenant))
-        });
+        let (mut security, protected_tenant) = protected
+            .map_or((None, None), |(security, tenant)| {
+                (Some(security), Some(tenant))
+            });
         let (graph_batch, edge_ids) = self.build_multimodel_graph_batch_locked(
             collection,
             graph_runtime::MultiModelGraphMutations {
@@ -2261,6 +2251,32 @@ impl Db {
             },
             scope,
         )?;
+        if let Some(delta) = &mut security
+            && !graph_batch.edge_mutations.is_empty()
+        {
+            let changes = idempotency
+                .as_ref()
+                .and_then(|options| options.changes)
+                .ok_or(crate::security::SecurityError::Unavailable)?;
+            let bindings = changes.stage_edges(&graph_batch, |nid| {
+                let physical = graph_batch
+                    .handle_assignments
+                    .iter()
+                    .find(|a| a.nid == nid)
+                    .map(|a| a.point_id.as_str())
+                    .or_else(|| {
+                        collection
+                            .graph_resolver
+                            .as_ref()
+                            .and_then(|r| r.live_point_id(nid))
+                    })
+                    .ok_or(crate::security::SecurityError::NotFound)?;
+                physical
+                    .parse()
+                    .map_err(|_| crate::security::SecurityError::Unavailable.into())
+            })?;
+            delta.bindings.extend(bindings);
+        }
         let record_lsn = collection.wal.len()?;
         let prepared_graph = prepare_graph_batch(
             &collection.config,
@@ -2290,11 +2306,18 @@ impl Db {
                 .map(|insert| insert.bindings),
         )?;
         let mut operation_lsn = None;
+        let sql_identity = idempotency
+            .as_ref()
+            .and_then(|options| options.changes)
+            .map(|changes| changes.identity());
+        if protected_tenant != sql_identity.map(|identity| identity.principal().tenant.as_str()) {
+            return Err(crate::security::SecurityError::Forbidden.into());
+        }
         let execution = self.relational.read().execute_multimodel_with_projection(
             request.sql,
             vec![projection],
             audit_context,
-            protected_tenant,
+            sql_identity,
             idempotency.as_ref().map(|options| multimodel::CommitReceipt {
                 claim: options.claim, authorization: options.authorization, graph_epoch,
                 edge_ids: &edge_ids, insert: options.insert,
@@ -2445,6 +2468,7 @@ impl Db {
         &self,
         audit_context: &crate::audit::AuditContext,
     ) -> Result<crate::SqlTransactionHandleResponse> {
+        self.require_legacy_sql_entry()?;
         self.ensure_request_admission()?;
         let _lifecycle = self.lifecycle_gate.read();
         self.relational.read().begin_interactive(audit_context)
@@ -2476,7 +2500,7 @@ impl Db {
         audit_context: &crate::audit::AuditContext,
     ) -> Result<crate::SqlExecutionResponse> {
         self.execute_sql_transaction_owned(handle, request, audit_context)
-            .map(crate::SqlResponse::into_dto)
+            .and_then(|output| output.consume(Ok))
     }
 
     /// Retain typed SQL output memory until consumption or transport encoding.
@@ -2486,6 +2510,7 @@ impl Db {
         request: crate::SqlExecutionRequest,
         audit_context: &crate::audit::AuditContext,
     ) -> Result<crate::SqlResponse> {
+        self.require_legacy_sql_entry()?;
         self.ensure_request_admission()?;
         let _inflight = SearchInflightGuard::new(Arc::clone(&self.search_inflight));
         if !crate::RelationalEngine::request_is_read_only(&request)? {
@@ -2510,7 +2535,7 @@ impl Db {
         cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<crate::SqlExecutionResponse> {
         self.execute_sql_transaction_cancellable_owned(handle, request, audit_context, cancellation)
-            .map(crate::SqlResponse::into_dto)
+            .and_then(|output| output.consume(Ok))
     }
 
     /// Retain typed SQL output memory until consumption or transport encoding.
@@ -2521,6 +2546,7 @@ impl Db {
         audit_context: &crate::audit::AuditContext,
         cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<crate::SqlResponse> {
+        self.require_legacy_sql_entry()?;
         self.ensure_request_admission()?;
         let _inflight = SearchInflightGuard::new(Arc::clone(&self.search_inflight));
         if !crate::RelationalEngine::request_is_read_only(&request)? {
@@ -2540,7 +2566,7 @@ impl Db {
         transport: &str,
     ) -> Result<crate::SqlExecutionResponse> {
         self.execute_sql_transaction_authorized_owned(identity, handle, request, transport)
-            .map(crate::SqlResponse::into_dto)
+            .and_then(|output| output.consume(Ok))
     }
 
     /// Retain typed SQL output memory until consumption or transport encoding.
@@ -2595,7 +2621,7 @@ impl Db {
             transport,
             cancellation,
         )
-        .map(crate::SqlResponse::into_dto)
+        .and_then(|output| output.consume(Ok))
     }
 
     /// Retain typed SQL output memory until consumption or transport encoding.
@@ -2618,7 +2644,7 @@ impl Db {
         audit_context: &crate::audit::AuditContext,
     ) -> Result<crate::SqlExecutionResponse> {
         self.commit_sql_transaction_owned(handle, audit_context)
-            .map(crate::SqlResponse::into_dto)
+            .and_then(|output| output.consume(Ok))
     }
 
     /// Retain typed SQL output memory until consumption or transport encoding.
@@ -2627,6 +2653,7 @@ impl Db {
         handle: &str,
         audit_context: &crate::audit::AuditContext,
     ) -> Result<crate::SqlResponse> {
+        self.require_legacy_sql_entry()?;
         self.ensure_storage_mutations_available()?;
         let _inflight = SearchInflightGuard::new(Arc::clone(&self.search_inflight));
         let _lifecycle = self.lifecycle_gate.read();
@@ -2650,7 +2677,7 @@ impl Db {
         cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<crate::SqlExecutionResponse> {
         self.commit_sql_transaction_cancellable_owned(handle, audit_context, cancellation)
-            .map(crate::SqlResponse::into_dto)
+            .and_then(|output| output.consume(Ok))
     }
 
     /// Retain typed SQL output memory until consumption or transport encoding.
@@ -2660,6 +2687,7 @@ impl Db {
         audit_context: &crate::audit::AuditContext,
         cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<crate::SqlResponse> {
+        self.require_legacy_sql_entry()?;
         self.ensure_storage_mutations_available()?;
         let _inflight = SearchInflightGuard::new(Arc::clone(&self.search_inflight));
         let _lifecycle = self.lifecycle_gate.read();
@@ -2684,7 +2712,7 @@ impl Db {
         transport: &str,
     ) -> Result<crate::SqlExecutionResponse> {
         self.commit_sql_transaction_authorized_owned(identity, handle, transport)
-            .map(crate::SqlResponse::into_dto)
+            .and_then(|output| output.consume(Ok))
     }
 
     /// Retain typed SQL output memory until consumption or transport encoding.
@@ -2732,7 +2760,7 @@ impl Db {
             transport,
             cancellation,
         )
-        .map(crate::SqlResponse::into_dto)
+        .and_then(|output| output.consume(Ok))
     }
 
     /// Retain typed SQL output memory until consumption or transport encoding.
@@ -3229,6 +3257,15 @@ impl Db {
     /// is never replaced by snapshot restore or PITR.
     pub fn identity_authority(&self) -> Option<&Arc<crate::security::IdentityAuthority>> {
         self.identity_authority.as_ref()
+    }
+
+    /// Legacy SQL has no row authority. Reject it before transaction admission
+    /// when either tenant enforcement or protected installation authority is on.
+    fn require_legacy_sql_entry(&self) -> Result<()> {
+        if self.tenant_enforcement().blocks() || self.identity_authority.is_some() {
+            return Err(crate::security::SecurityError::Forbidden.into());
+        }
+        Ok(())
     }
 
     /// Refuses a call that arrived through an entry point carrying no tenant
@@ -4330,52 +4367,7 @@ impl Db {
                 let old = collection
                     .try_resolve(&physical)?
                     .ok_or(crate::security::SecurityError::Unavailable)?;
-                context.authorize_payload_change(&point.id, &old.payload, &point.payload)?;
-                if old.vector != point.vector {
-                    context.authorize_representation_write(&point.id, "dense")?;
-                }
-                if old.sparse_vector != point.sparse_vector {
-                    context.authorize_representation_write(&point.id, "sparse")?;
-                }
-                for name in old
-                    .vectors
-                    .keys()
-                    .chain(point.vectors.keys())
-                    .collect::<HashSet<_>>()
-                {
-                    if old.vectors.get(name) != point.vectors.get(name) {
-                        context.authorize_representation_write(&point.id, name)?;
-                    }
-                }
-                for name in point
-                    .vectors
-                    .keys()
-                    .map(String::as_str)
-                    .chain((!point.vector.is_empty()).then_some("dense"))
-                    .chain(point.sparse_vector.is_some().then_some("sparse"))
-                {
-                    let representation = record
-                        .representations
-                        .get(name)
-                        .ok_or(crate::security::SecurityError::Forbidden)?;
-                    if representation
-                        .source_fields
-                        .iter()
-                        .any(|field| old.payload.pointer(field) != point.payload.pointer(field))
-                    {
-                        context.authorize_representation_write(&point.id, name)?;
-                    }
-                    if representation
-                        .source_fields
-                        .iter()
-                        .any(|field| point.payload.pointer(field).is_none())
-                    {
-                        return Err(crate::security::SecurityError::Invalid(
-                            "representation source is absent from updated content".into(),
-                        )
-                        .into());
-                    }
-                }
+                security_runtime::authorize_point_replacement(context, &old, point)?;
                 point.id = physical;
                 validate_point(&collection.config, point)?;
             }
@@ -4777,11 +4769,12 @@ impl Db {
                 &create.template,
                 &create.points,
                 crate::security::CreateOptions {
+                    temporal_assets: false,
                     ids: create.public_ids.as_deref(),
                     request: create.request,
                     decision_started: Some(&decision_started),
                 },
-                |records, generation| {
+                |records, generation, _| {
                     let created_ids = crate::security::mutation::ids(
                         records.iter().map(|record| record.key.id.as_str()),
                     )?;
@@ -4814,6 +4807,7 @@ impl Db {
                 .data_transaction(
                     &context,
                     &[],
+                    false,
                     &decision_started,
                     |_, previous, generation, _, _| {
                         execute(
@@ -5097,17 +5091,20 @@ impl Db {
                 .data_transaction(
                     &context,
                     &retire,
+                    false,
                     &decision_started,
                     |records, previous, generation, revision, _| {
                         let public_ids = records
                             .iter()
                             .map(|record| record.key.id.clone())
                             .collect::<std::collections::BTreeSet<_>>();
-                        self.relational.read().ensure_no_live_references(
-                            context.tenant(),
-                            collection_name,
-                            &public_ids,
-                        )?;
+                        self.relational
+                            .read()
+                            .ensure_no_live_references_authorized(
+                                context.identity(),
+                                collection_name,
+                                &public_ids,
+                            )?;
                         execute(Some(crate::security::SecurityDelta {
                             incarnation: context.incarnation(),
                             expected_revision: context.policy_revision(),
@@ -13234,7 +13231,7 @@ fn load_collection_state_with_journal(
                 .authority
                 .resources
                 .iter()
-                .filter(|record| !record.retired)
+                .filter(|record| !record.retired && record.content.is_point())
                 .map(|record| record.storage_id.to_string())
                 .collect();
             if bindings.len() != id_index.len() || id_index.keys().any(|id| !bindings.contains(id))

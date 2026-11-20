@@ -156,6 +156,7 @@ mod tests {
                 id: "doc".into(),
             },
             storage_id: uuid::Uuid::new_v4(),
+            content: ResourceContent::Point,
             labels: ResourceLabels {
                 owner: "writer".into(),
                 department: "Finance".into(),

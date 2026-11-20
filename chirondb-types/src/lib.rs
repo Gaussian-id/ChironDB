@@ -31,7 +31,8 @@ pub use graph::{
 };
 pub use relational::{
     CheckConstraintDefinition, ForeignKeyAction, ForeignKeyDefinition, ForeignKeyMatch, RecordRef,
-    ReferencedKeyKind, RelationalColumn, RelationalType, RelationalValue, ScalarIndexDefinition,
-    SqlExecutionRequest, SqlExecutionResponse, SqlOutcome, SqlResult, SqlStatementRequest,
-    SqlTransactionHandleResponse, SqlTransactionState, TableDefinition, UniqueConstraint,
+    ReferencedKeyKind, RelationalColumn, RelationalRowPolicy, RelationalType, RelationalValue,
+    ScalarIndexDefinition, SqlExecutionRequest, SqlExecutionResponse, SqlOutcome, SqlResult,
+    SqlStatementRequest, SqlTransactionHandleResponse, SqlTransactionState, TableDefinition,
+    UniqueConstraint,
 };

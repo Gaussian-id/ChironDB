@@ -7,6 +7,7 @@ use std::mem::size_of;
 /// Transport/DTO fields are unchanged. This owner deliberately is not Clone.
 #[derive(Debug)]
 pub struct SqlResponse {
+    publication: SqlPublication,
     value: SqlExecutionResponse,
     _memory: wal_decode::Reservation,
 }
@@ -22,16 +23,26 @@ impl Serialize for SqlResponse {
         &self,
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
-        self.value.serialize(serializer)
+        self.publication
+            .publish(|| self.value.serialize(serializer))
+            .map_err(serde::ser::Error::custom)?
     }
 }
 impl SqlResponse {
+    pub fn publication_context(&self) -> SqlPublication {
+        self.publication.clone()
+    }
+    pub(super) fn with_publication(mut self, publication: SqlPublication) -> Self {
+        self.publication = publication;
+        self
+    }
     /// Allocation-free transfer into another admitted core result owner.
     pub(crate) fn into_parts(self) -> (SqlExecutionResponse, wal_decode::Reservation) {
         (self.value, self._memory)
     }
     pub(super) fn new(value: SqlExecutionResponse, memory: wal_decode::Reservation) -> Self {
         Self {
+            publication: SqlPublication::default(),
             value,
             _memory: memory,
         }
@@ -44,8 +55,12 @@ impl SqlResponse {
     /// Finish/drop the DTO in the callback, or transfer its allocations into a
     /// separately admitted receiving owner before returning.
     pub fn consume<R>(self, consumer: impl FnOnce(SqlExecutionResponse) -> Result<R>) -> Result<R> {
-        let Self { value, _memory } = self;
-        consumer(value)
+        let Self {
+            value,
+            _memory,
+            publication,
+        } = self;
+        publication.publish(|| consumer(value))?
     }
 }
 
@@ -115,7 +130,7 @@ pub(super) fn reserve_results(results: &Vec<SqlResult>) -> Result<wal_decode::Re
 
 impl RelationalExecution {
     pub(crate) fn into_output(self) -> SqlResponse {
-        SqlResponse::new(self.response, self.response_memory)
+        SqlResponse::new(self.response, self.response_memory).with_publication(self.publication)
     }
 }
 
@@ -376,7 +391,7 @@ mod tests {
                 let receipt = replay(&journal, &owner);
                 wal_decode::with_test_storage_pool(capacity, |used| {
                     let result = if matches!(shape, 2 | 3) {
-                        replay_interactive_sql_receipt(receipt, None, None)
+                        replay_interactive_sql_receipt(&engine, receipt, None, None)
                     } else {
                         replay_standalone_sql_receipt(
                             &engine,
@@ -399,7 +414,7 @@ mod tests {
             let receipt = replay(&journal, &owner);
             wal_decode::with_test_storage_pool(4 * 1024 * 1024, |used| {
                 let result = if matches!(shape, 2 | 3) {
-                    replay_interactive_sql_receipt(receipt, None, None)
+                    replay_interactive_sql_receipt(&engine, receipt, None, None)
                 } else {
                     replay_standalone_sql_receipt(
                         &engine,
@@ -424,7 +439,7 @@ mod tests {
             let mut receipt = replay(&journal, &owner);
             receipt.expired = true;
             let result = if matches!(shape, 2 | 3) {
-                replay_interactive_sql_receipt(receipt, None, None)
+                replay_interactive_sql_receipt(&engine, receipt, None, None)
             } else {
                 replay_standalone_sql_receipt(
                     &engine,

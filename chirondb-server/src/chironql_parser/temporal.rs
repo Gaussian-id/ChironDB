@@ -12,6 +12,7 @@ pub struct TemporalRead {
     pub asset: AssetSelector,
     pub property: String,
     pub range: Option<(i64, i64, usize)>,
+    pub filter: Option<Filter>,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct TemporalStage {
@@ -126,11 +127,17 @@ impl Parser {
         } else {
             None
         };
+        let filter = if self.eat_keyword("WHERE") {
+            Some(self.parse_filter()?)
+        } else {
+            None
+        };
         Ok(Statement::TemporalRead(TemporalRead {
             collection,
             asset,
             property,
             range,
+            filter,
         }))
     }
 }

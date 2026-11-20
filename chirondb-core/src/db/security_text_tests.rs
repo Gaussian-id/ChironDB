@@ -313,6 +313,7 @@ fn protected_multimodel_update_delete_before_prepare_preserves_retry_and_epoch_r
             let graph = db.bind_access(&identity, "docs", "acme", Action::GraphWrite).unwrap();
             let read = db.bind_access(&identity, "docs", "acme", Action::Read).unwrap();
             let queued = db.get_points_authorized(&read, &ids).unwrap();
+            let queued_sql = db.execute_sql_authorized_owned(&identity, preparation_retry_sql("SELECT title FROM docs", None), "queued").unwrap();
             let generation = vector.data_generation();
             let revision = vector.policy_revision();
             let frontier = db.transaction_journal.completed_commit_frontier().unwrap();
@@ -339,6 +340,8 @@ fn protected_multimodel_update_delete_before_prepare_preserves_retry_and_epoch_r
             assert_eq!(db.transaction_journal.completed_commit_frontier().unwrap(), frontier);
             if deleted { assert!(queued.publish(|_| panic!("drained epoch must stay closed")).is_err()); }
             else { assert_eq!(queued.publish(|points| points[0].payload.clone()).unwrap(), point("before").payload); }
+            assert_eq!(serde_json::to_vec(&queued_sql).is_err(), deleted,
+                "fresh SQL recovery must never revive a previously drained result");
             let vector = db.bind_access(&identity, "docs", "acme", action).unwrap();
             let graph = db.bind_access(&identity, "docs", "acme", Action::GraphWrite).unwrap();
             assert_eq!(vector.data_generation(), generation);
@@ -368,6 +371,51 @@ fn protected_multimodel_update_delete_before_prepare_preserves_retry_and_epoch_r
                 assert_eq!(replay.sql.transaction_id, committed.sql.transaction_id);
                 assert!(replay.graph.replayed);
             }
+        }
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn protected_multimodel_delete_ambiguous_prepare_never_renews_sql_epochs() {
+    for key in [None, Some("ambiguous-delete-epoch")] {
+        let (directory, db, secret, _) = fixture(true);
+        let identity = db.identity_authority().unwrap().authenticate(&secret).unwrap();
+        db.execute_sql_authorized(&identity, preparation_retry_sql("CREATE TABLE docs (id TEXT PRIMARY KEY, title TEXT NOT NULL, chunk RECORD_REF('docs') NOT NULL, source RECORD_REF('docs') NOT NULL)", None), "setup").unwrap();
+        let created = db.insert_multimodel_authorized(&identity, preparation_retry_insert(None), "setup").unwrap();
+        let ids = vec![created.records["chunk"].id.clone(), created.records["source"].id.clone()];
+        let delete = db.bind_access(&identity, "docs", "acme", Action::Delete).unwrap();
+        let graph = db.bind_access(&identity, "docs", "acme", Action::GraphWrite).unwrap();
+        let queued = db.execute_sql_authorized_owned(&identity, preparation_retry_sql("SELECT title FROM docs", None), "queued").unwrap();
+        let request = MultiModelTransactionRequest {
+            sql: preparation_retry_sql("DELETE FROM docs WHERE id='row-1'", key),
+            collection: "docs".into(),
+            points: vec![], point_deletes: vec![ids[0].clone()],
+            relations: vec![], edge_deletes: vec![], edge_updates: vec![],
+        };
+        let result = {
+            let _fault = crate::failpoint::test_env("error:transaction.before_commit_fsync", directory.path(), directory.path());
+            db.execute_multimodel_transaction_authorized(&identity, &delete, &graph, request.clone(), "fault")
+        };
+        let transaction_id = match result {
+            Err(GaussError::CommitOutcomeUnknown { transaction_id }) => transaction_id,
+            other => panic!("expected ambiguous decision: {other:?}"),
+        };
+        assert!(serde_json::to_vec(&queued).is_err());
+        assert!(db.execute_sql_authorized(&identity, preparation_retry_sql("SELECT title FROM docs", None), "closed").is_err());
+        drop(db);
+        let reopened = Db::open(directory.path()).unwrap();
+        let identity = reopened.identity_authority().unwrap().authenticate(&secret).unwrap();
+        assert_preparation_retry_state(&reopened, &identity, &ids, "deleted");
+        assert!(serde_json::to_vec(&queued).is_err(), "recovery must not revive an old result");
+        assert_eq!(reopened.transaction_status_authorized(&identity, &transaction_id).unwrap().state,
+            crate::transaction_journal::TransactionState::Committed);
+        if key.is_some() {
+            let delete = reopened.bind_access(&identity, "docs", "acme", Action::Delete).unwrap();
+            let graph = reopened.bind_access(&identity, "docs", "acme", Action::GraphWrite).unwrap();
+            let replay = reopened.execute_multimodel_transaction_authorized(&identity, &delete, &graph, request, "replay").unwrap();
+            assert!(replay.graph.replayed);
+            assert_eq!(replay.sql.transaction_id.as_deref(), Some(transaction_id.as_str()));
         }
     }
 }
