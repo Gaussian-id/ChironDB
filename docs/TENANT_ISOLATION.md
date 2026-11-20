@@ -137,7 +137,7 @@ actually uses, you can rehearse on a loopback-only staging copy with
 with the key, tenant, operation and fix. Production listeners refuse to start
 in `dry-run`, because it also stops enforcing tenant isolation for data. The
 full procedure is in the
-[unreleased release notes](releases/unreleased.md#installation-wide-admin-operations-need-installation-authority-rt-11).
+[0.4.0 release notes](releases/0.4.0.md#installation-wide-admin-operations-need-installation-authority-rt-11).
 A refused admin key gets a 403 body naming `installation:admin` and this page.
 
 With enforcement `disabled` (the single-tenant default) or `dry-run`, the
