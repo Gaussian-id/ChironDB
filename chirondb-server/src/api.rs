@@ -224,10 +224,12 @@ fn protected_routes() -> Router<AppState> {
 pub fn router_with_options(db: Db, auth: AuthConfig, options: ServerOptions) -> Router {
     let shutdown_db = db.clone();
     if db.identity_authority().is_some() {
-        return crate::security_http::router(db, options).layer(middleware::from_fn_with_state(
-            shutdown_db,
-            shutdown_admission,
-        ));
+        return crate::security_http::router(db, options)
+            .layer(middleware::from_fn_with_state(
+                shutdown_db,
+                shutdown_admission,
+            ))
+            .layer(middleware::map_response(security_headers));
     }
     let _ = observability::init_metrics();
     let auth_db = db.clone();
@@ -260,10 +262,42 @@ pub fn router_with_options(db: Db, auth: AuthConfig, options: ServerOptions) -> 
     if let Some(cors) = cors {
         router = router.layer(cors);
     }
-    router.layer(middleware::from_fn_with_state(
-        shutdown_db,
-        shutdown_admission,
-    ))
+    router
+        .layer(middleware::from_fn_with_state(
+            shutdown_db,
+            shutdown_admission,
+        ))
+        .layer(middleware::map_response(security_headers))
+}
+
+/// Baseline response hardening for every HTTP response, including errors
+/// produced by the auth and shutdown layers.
+async fn security_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        axum::http::HeaderName::from_static("cross-origin-resource-policy"),
+        HeaderValue::from_static("same-origin"),
+    );
+    response
+}
+
+/// HSTS is only meaningful (and only safe to send) on a TLS listener.
+async fn strict_transport_security(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        axum::http::header::STRICT_TRANSPORT_SECURITY,
+        HeaderValue::from_static("max-age=31536000"),
+    );
+    response
+}
+
+/// The HTTP router as served over TLS: [`router_with_options`] plus HSTS.
+pub fn tls_router_with_options(db: Db, auth: AuthConfig, options: ServerOptions) -> Router {
+    router_with_options(db, auth, options)
+        .layer(middleware::map_response(strict_transport_security))
 }
 
 async fn shutdown_admission(
@@ -371,7 +405,7 @@ pub async fn serve_tls_with_options(
         crate::tls::server_config(cert, key, client_ca).await?,
     ));
     axum_server::bind_rustls(addr, config)
-        .serve(router_with_options(db, auth, options).into_make_service())
+        .serve(tls_router_with_options(db, auth, options).into_make_service())
         .await
 }
 
@@ -384,7 +418,7 @@ pub async fn serve_tls_config_with_options(
 ) -> std::io::Result<()> {
     let config = RustlsConfig::from_config(tls.server_config());
     axum_server::bind_rustls(addr, config)
-        .serve(router_with_options(db, auth, options).into_make_service())
+        .serve(tls_router_with_options(db, auth, options).into_make_service())
         .await
 }
 
@@ -406,7 +440,7 @@ pub async fn serve_tls_config_with_options_until(
     });
     axum_server::bind_rustls(addr, config)
         .handle(handle)
-        .serve(router_with_options(db, auth, options).into_make_service())
+        .serve(tls_router_with_options(db, auth, options).into_make_service())
         .await
 }
 
@@ -1356,9 +1390,20 @@ async fn count(
 
 async fn index_status(
     State(state): State<AppState>,
+    Extension(perm): Extension<Permission>,
     Path(collection): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    Ok(Json(json!(state.db.index_status(&collection)?)))
+    let mut status = state.db.index_status(&collection)?;
+    if !perm.sees_installation_aggregates(state.db.tenant_enforcement()) {
+        // The collection's totals span every tenant. A tenant-scoped reader
+        // gets its own row count, the same number `count` would give it, and
+        // an indexed count clamped to it, so no other tenant's volume leaks.
+        let scope = perm.tenant_scope(perm.id.clone());
+        let own = state.db.count_scoped(&collection, None, &scope)?.count;
+        status.indexed_points = status.indexed_points.min(own);
+        status.total_points = own;
+    }
+    Ok(Json(json!(status)))
 }
 
 async fn scroll(
@@ -2002,8 +2047,8 @@ fn chironql_error_response(error: ChironQlError) -> Response {
     tracing::warn!(
         status = status.as_u16(),
         code = %error.code,
-        query_id = %error.query_id,
-        error = %error.error,
+        query_id = %crate::log_sanitize::untrusted(&error.query_id),
+        error = %crate::log_sanitize::untrusted(&error.error),
         "chironql statement failed"
     );
     (status, Json(error)).into_response()
@@ -2042,7 +2087,7 @@ impl IntoResponse for ApiError {
                 tracing::warn!(
                     status = StatusCode::FORBIDDEN.as_u16(),
                     code = "graph.permission_denied",
-                    error = %message,
+                    error = %crate::log_sanitize::untrusted(&message),
                     "graph request denied"
                 );
                 return (
@@ -2090,7 +2135,11 @@ impl IntoResponse for ApiError {
             | GaussError::Io(_)
             | GaussError::Json(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        tracing::warn!(status = status.as_u16(), error = %error, "request failed");
+        tracing::warn!(
+            status = status.as_u16(),
+            error = %crate::log_sanitize::untrusted(&error),
+            "request failed"
+        );
         let body = match &error {
             GaussError::Security(security) => {
                 Json(json!({ "code": security.code(), "error": security.to_string() }))
@@ -2170,6 +2219,40 @@ mod tests {
         assert_eq!(
             response.status(),
             axum::http::StatusCode::INSUFFICIENT_STORAGE
+        );
+    }
+
+    #[test]
+    fn logged_request_errors_escape_client_control_bytes() {
+        let hostile = "bad\x1b[31mred\nFORGED log line\0";
+        let logged = crate::log_sanitize::tests::capture_logs(|| {
+            let response =
+                ApiError::from(GaussError::InvalidRequest(hostile.into())).into_response();
+            assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+            super::chironql_error_response(super::ChironQlError {
+                code: "chironql.parse_error".into(),
+                error: hostile.into(),
+                query_id: "q\nforged".into(),
+                hint: None,
+                position: None,
+                affected_estimate: None,
+                trace: None,
+            });
+        });
+        assert!(logged.contains("request failed"), "{logged}");
+        assert!(logged.contains("chironql statement failed"), "{logged}");
+        assert!(
+            logged.contains("bad\\u{1b}[31mred\\nFORGED log line\\0"),
+            "{logged}"
+        );
+        assert!(logged.contains("q\\nforged"), "{logged}");
+        assert!(
+            !logged.contains('\x1b') && !logged.contains('\0'),
+            "{logged}"
+        );
+        assert!(
+            !logged.contains("\nFORGED") && !logged.contains("\nforged"),
+            "{logged}"
         );
     }
 

@@ -10047,6 +10047,26 @@ fn validate_config(config: &CollectionConfig) -> Result<()> {
             "recall_sla {sla} out of range; must be in 0.5..=1.0"
         )));
     }
+    // RT-20/RT-21 — opt-in write bounds must themselves be usable limits.
+    if let Some(norm) = config.max_vector_norm
+        && !(norm.is_finite() && norm > 0.0)
+    {
+        return Err(GaussError::InvalidRequest(format!(
+            "max_vector_norm {norm} is invalid; must be finite and > 0"
+        )));
+    }
+    if config.max_sparse_nnz == Some(0) {
+        return Err(GaussError::InvalidRequest(
+            "max_sparse_nnz 0 is invalid; must be > 0".to_string(),
+        ));
+    }
+    if let Some(weight) = config.max_sparse_weight
+        && !(weight.is_finite() && weight > 0.0)
+    {
+        return Err(GaussError::InvalidRequest(format!(
+            "max_sparse_weight {weight} is invalid; must be finite and > 0"
+        )));
+    }
     if config
         .index_kind
         .as_deref()
@@ -11801,8 +11821,15 @@ fn validate_point(config: &CollectionConfig, point: &Point) -> Result<()> {
             "point id must contain 1..={MAX_POINT_ID_BYTES} bytes"
         )));
     }
+    if let Some(limit) = config.max_vector_norm {
+        validate_vector_norm(&point.vector, limit, "dense vector")?;
+        for (name, vector) in &point.vectors {
+            validate_vector_norm(vector, limit, &format!("named vector '{name}'"))?;
+        }
+    }
     if let Some(sparse_vector) = &point.sparse_vector {
         validate_sparse_vector(sparse_vector)?;
+        validate_sparse_vector_bounds(config, sparse_vector)?;
     }
     validate_payload_schema(config, point)?;
     let payload_bytes = serde_json::to_vec(&point.payload)?.len();
@@ -11811,7 +11838,67 @@ fn validate_point(config: &CollectionConfig, point: &Point) -> Result<()> {
             "serialized point payload is {payload_bytes} bytes; maximum is {MAX_POINT_PAYLOAD_BYTES}"
         )));
     }
+    warn_extreme_vector_norm(config, point);
     Ok(())
+}
+
+/// RT-20: L2 norm above which an accepted vector on an unbounded `dot`
+/// collection is logged. Embedding models stay orders of magnitude below it;
+/// the red-team domination poison used 1e6.
+// ponytail: fixed threshold, not per-collection median tracking; add norm
+// statistics per collection if operators need relative alerts.
+const EXTREME_VECTOR_NORM: f64 = 1.0e4;
+/// At most one extreme-norm warning per this many seconds, process-wide, so a
+/// bulk poison write cannot flood the log.
+const EXTREME_VECTOR_NORM_WARN_INTERVAL_SECS: u64 = 10;
+static EXTREME_VECTOR_NORM_LAST_WARN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Largest dense or named vector norm in `point` when it is worth a warning:
+/// the collection uses `dot` (where norm decides ranking), has no
+/// `max_vector_norm`, and the norm exceeds `EXTREME_VECTOR_NORM`.
+fn extreme_vector_norm(config: &CollectionConfig, point: &Point) -> Option<f64> {
+    if !matches!(config.metric, crate::DistanceMetric::Dot) || config.max_vector_norm.is_some() {
+        return None;
+    }
+    std::iter::once(&point.vector)
+        .chain(point.vectors.values())
+        .map(|vector| l2_norm(vector))
+        .filter(|norm| *norm > EXTREME_VECTOR_NORM)
+        .reduce(f64::max)
+}
+
+fn warn_extreme_vector_norm(config: &CollectionConfig, point: &Point) {
+    use std::sync::atomic::Ordering;
+    let Some(norm) = extreme_vector_norm(config, point) else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let last = EXTREME_VECTOR_NORM_LAST_WARN.load(Ordering::Relaxed);
+    if now >= last.saturating_add(EXTREME_VECTOR_NORM_WARN_INTERVAL_SECS)
+        && EXTREME_VECTOR_NORM_LAST_WARN
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        tracing::warn!(
+            collection = %config.name,
+            norm,
+            threshold = EXTREME_VECTOR_NORM,
+            "accepted a dot-metric vector with an extreme L2 norm; it can dominate search results. \
+             Set max_vector_norm on the collection to bound it (further warnings suppressed for {EXTREME_VECTOR_NORM_WARN_INTERVAL_SECS}s)"
+        );
+    }
+}
+
+/// L2 norm accumulated in f64 so large finite components cannot overflow.
+fn l2_norm(vector: &[f32]) -> f64 {
+    vector
+        .iter()
+        .map(|value| f64::from(*value) * f64::from(*value))
+        .sum::<f64>()
+        .sqrt()
 }
 
 fn validate_k(k: usize, field: &str) -> Result<()> {
@@ -11864,6 +11951,48 @@ fn validate_sparse_vector(sparse_vector: &SparseVector) -> Result<()> {
                 "sparse vector indices must be unique".to_string(),
             ));
         }
+    }
+    Ok(())
+}
+
+/// RT-20 — reject a written dense vector whose L2 norm exceeds the
+/// collection's opt-in `max_vector_norm`. Accumulates in f64 so large finite
+/// components cannot overflow into a spurious accept or reject.
+fn validate_vector_norm(vector: &[f32], limit: f32, label: &str) -> Result<()> {
+    let norm = l2_norm(vector);
+    if norm > f64::from(limit) {
+        return Err(GaussError::InvalidRequest(format!(
+            "{label} L2 norm {norm} exceeds collection max_vector_norm {limit}"
+        )));
+    }
+    Ok(())
+}
+
+/// RT-21 — write-path-only bounds for sparse vectors. Query sparse vectors are
+/// validated by `validate_sparse_vector` alone and are never subject to these
+/// collection limits.
+fn validate_sparse_vector_bounds(
+    config: &CollectionConfig,
+    sparse_vector: &SparseVector,
+) -> Result<()> {
+    if let Some(limit) = config.max_sparse_nnz {
+        let nnz = sparse_vector.indices.len();
+        if nnz > limit as usize {
+            return Err(GaussError::InvalidRequest(format!(
+                "sparse vector has {nnz} non-zero entries; collection max_sparse_nnz is {limit}"
+            )));
+        }
+    }
+    if let Some(limit) = config.max_sparse_weight
+        && let Some(weight) = sparse_vector
+            .values
+            .iter()
+            .copied()
+            .find(|value| value.abs() > limit)
+    {
+        return Err(GaussError::InvalidRequest(format!(
+            "sparse vector weight {weight} exceeds collection max_sparse_weight {limit} (absolute value)"
+        )));
     }
     Ok(())
 }
@@ -14170,6 +14299,7 @@ mod tests {
     mod graph_snapshot;
     mod partitioned_delta;
     mod projection_binding;
+    mod vector_bounds;
     mod wal_pin_leases;
 
     #[cfg(unix)]
@@ -14769,6 +14899,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         }
@@ -23949,6 +24082,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -24005,6 +24141,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -24044,6 +24183,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -24092,6 +24234,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -24132,6 +24277,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -24170,6 +24318,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -24211,6 +24362,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -24265,6 +24419,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -24672,6 +24829,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -24787,6 +24947,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -24903,6 +25066,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -25028,6 +25194,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -25109,6 +25278,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -25501,6 +25673,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -25621,6 +25796,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -25676,6 +25854,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -25806,6 +25987,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -26084,6 +26268,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -26202,6 +26389,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -26281,6 +26471,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -26353,6 +26546,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -26441,6 +26637,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -26526,6 +26725,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -26601,6 +26803,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -26678,6 +26883,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -26746,6 +26954,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -26803,6 +27014,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -26848,6 +27062,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -26920,6 +27137,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -26990,6 +27210,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -27019,6 +27242,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -27107,6 +27333,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -27221,6 +27450,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -27298,6 +27530,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -27394,6 +27629,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -27461,6 +27699,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -27495,6 +27736,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -27603,6 +27847,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -27691,6 +27938,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -27732,6 +27982,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -27919,6 +28172,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -28002,6 +28258,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -28133,6 +28392,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -28213,6 +28475,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -28337,6 +28602,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -28469,6 +28737,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -28544,6 +28815,28 @@ mod tests {
                 .count,
             3
         );
+        // RT-41: empty/inverted ranges hit `BTreeMap::range` in the payload
+        // index; they must count zero instead of panicking.
+        for degenerate in [
+            json!({"score": {"gt": 5, "lt": 5}}),
+            json!({"score": {"gt": 10, "lt": 2}}),
+            json!({"score": {"gte": 5, "lt": 5}}),
+            json!({"score": {"gte": 10, "lte": -10}}),
+        ] {
+            assert_eq!(
+                reopened
+                    .count("docs", Some(Filter(degenerate.clone())))
+                    .unwrap()
+                    .count,
+                0,
+                "{degenerate}"
+            );
+        }
+        // RT-42: unknown operators are rejected instead of matching nothing.
+        assert!(matches!(
+            reopened.count("docs", Some(Filter(json!({"score": {"between": [1, 2]}})))),
+            Err(GaussError::InvalidRequest(_))
+        ));
     }
 
     #[test]
@@ -28563,6 +28856,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -28644,6 +28940,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -28700,6 +28999,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -28808,6 +29110,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -28905,6 +29210,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -28970,6 +29278,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -29056,6 +29367,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -29121,6 +29435,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -29185,6 +29502,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -29249,6 +29569,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -29314,6 +29637,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -29426,6 +29752,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -29573,6 +29902,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -29623,6 +29955,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -29687,6 +30022,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -29856,6 +30194,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -30091,6 +30432,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })
@@ -30367,6 +30711,9 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         })

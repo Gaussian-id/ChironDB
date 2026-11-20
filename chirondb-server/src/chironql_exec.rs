@@ -1790,6 +1790,9 @@ const COLLECTION_OPTION_KEYS: &[&str] = &[
     "hnsw_ef_construction",
     "hnsw_ef_search",
     "recall_sla",
+    "max_vector_norm",
+    "max_sparse_nnz",
+    "max_sparse_weight",
     "streamer_max_bytes",
 ];
 

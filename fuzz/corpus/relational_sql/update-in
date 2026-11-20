@@ -1,0 +1,1 @@
+UPDATE items SET score = score + 1 WHERE id IN (1, 3) RETURNING id, score

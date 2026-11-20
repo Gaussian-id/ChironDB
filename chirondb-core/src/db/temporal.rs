@@ -239,6 +239,11 @@ impl TemporalState {
         Ok(Some(self.runs.iter().map(|(id, _)| id.clone()).collect()))
     }
     fn read(&self, key: &Series, range: Option<(i64, i64, usize)>) -> Result<Vec<Observation>> {
+        // Match the on-disk segment scan, which rejects reversed intervals;
+        // the in-memory `BTreeMap::range` below would otherwise panic.
+        if range.is_some_and(|(lo, hi, _)| lo > hi) {
+            return Err(invalid("reversed temporal query interval"));
+        }
         let mut values = BTreeMap::new();
         let max = range.map_or(1, |r| r.2);
         let mut insert = |p: Observation| -> Result<()> {

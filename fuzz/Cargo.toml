@@ -88,6 +88,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "relational_sql"
+path = "fuzz_targets/relational_sql.rs"
+test = false
+doc = false
+bench = false
+
 # Keep fuzz-only dependencies and lock resolution out of the production
 # workspace's default build, tests, release artifacts, and Cargo.lock.
 [workspace]

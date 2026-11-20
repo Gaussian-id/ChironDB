@@ -500,8 +500,10 @@ fn numeric_range_ordinal_payload_candidates(
     term: IndexedNumericRangeTerm,
 ) -> RoaringBitmap {
     let mut term_ordinals = RoaringBitmap::new();
-    if let Some(values) = index.numeric.get(&term.field) {
-        for (_, ordinals) in values.range(numeric_payload_range_bounds(&term)) {
+    if let Some(values) = index.numeric.get(&term.field)
+        && let Some(range) = numeric_payload_range_bounds(&term)
+    {
+        for (_, ordinals) in values.range(range) {
             term_ordinals |= ordinals;
         }
     }
@@ -549,8 +551,9 @@ fn numeric_range_payload_candidates(
     term: IndexedNumericRangeTerm,
 ) -> HashSet<String> {
     let mut term_ids = HashSet::new();
-    if let Some(values) = index.numeric.get(&term.field) {
-        let range = numeric_payload_range_bounds(&term);
+    if let Some(values) = index.numeric.get(&term.field)
+        && let Some(range) = numeric_payload_range_bounds(&term)
+    {
         for (_, ids) in values.range(range) {
             term_ids.extend(ids.iter().cloned());
         }
@@ -575,7 +578,12 @@ fn text_payload_candidates(index: &PayloadIndex, term: IndexedTextTerm) -> HashS
     candidates.unwrap_or_default()
 }
 
-fn numeric_payload_range_bounds(term: &IndexedNumericRangeTerm) -> (Bound<u64>, Bound<u64>) {
+/// Translate a numeric range predicate into sort-key bounds. Returns `None`
+/// when the range is provably empty (inverted, or a single point with an
+/// exclusive side), because `BTreeMap::range` panics on such bounds.
+fn numeric_payload_range_bounds(
+    term: &IndexedNumericRangeTerm,
+) -> Option<(Bound<u64>, Bound<u64>)> {
     let lower = match (term.gt, term.gte) {
         (Some(gt), Some(gte)) if gt >= gte => numeric_payload_sort_key(gt).map(Bound::Excluded),
         (Some(_), Some(gte)) => numeric_payload_sort_key(gte).map(Bound::Included),
@@ -594,7 +602,13 @@ fn numeric_payload_range_bounds(term: &IndexedNumericRangeTerm) -> (Bound<u64>, 
     }
     .unwrap_or(Bound::Unbounded);
 
-    (lower, upper)
+    let empty = match (lower, upper) {
+        (Bound::Included(lo), Bound::Included(hi)) => lo > hi,
+        (Bound::Included(lo) | Bound::Excluded(lo), Bound::Excluded(hi))
+        | (Bound::Excluded(lo), Bound::Included(hi)) => lo >= hi,
+        _ => false,
+    };
+    (!empty).then_some((lower, upper))
 }
 
 // ── Key encoding helpers ─────────────────────────────────────────────────────
@@ -757,5 +771,72 @@ mod tests {
                 .collect::<HashSet<_>>();
             assert_eq!(ordinal_ids, string_candidates);
         }
+    }
+
+    #[test]
+    fn degenerate_numeric_ranges_are_empty_without_panicking() {
+        let points = [
+            make_point("a", json!({"range": 2})),
+            make_point("b", json!({"range": 5})),
+            make_point("c", json!({"range": 10})),
+            make_point("d", json!({"range": 7.5})),
+        ];
+        let string_points = points
+            .iter()
+            .cloned()
+            .map(|point| (point.id.clone(), point))
+            .collect::<HashMap<_, _>>();
+        let string_index = build_payload_index(&string_points);
+        let ordinal_index = build_ordinal_payload_index(
+            points
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(ordinal, point)| (ordinal as u32, point)),
+        );
+        let ids = |filter: &Filter| {
+            let string_candidates = payload_filter_candidates(&string_index, Some(filter)).unwrap();
+            let ordinal_ids = payload_filter_ordinal_candidates(&ordinal_index, Some(filter))
+                .unwrap()
+                .iter()
+                .map(|ordinal| points[ordinal as usize].id.clone())
+                .collect::<HashSet<_>>();
+            assert_eq!(ordinal_ids, string_candidates, "{:?}", filter.0);
+            // Indexed candidates must agree with the non-indexed matcher.
+            let scanned = points
+                .iter()
+                .filter(|point| filter.matches(&point.payload))
+                .map(|point| point.id.clone())
+                .collect::<HashSet<_>>();
+            assert_eq!(string_candidates, scanned, "{:?}", filter.0);
+            string_candidates
+        };
+
+        for degenerate in [
+            json!({"range": {"gt": 5, "lt": 5}}),
+            json!({"range": {"gt": 10, "lt": 2}}),
+            json!({"range": {"gte": 5, "lt": 5}}),
+            json!({"range": {"gt": 5, "lte": 5}}),
+            json!({"range": {"gte": 10, "lte": 2}}),
+            json!({"range": {"gt": 10, "lte": 2}}),
+            json!({"range": {"gte": 10, "lt": 2}}),
+        ] {
+            assert!(ids(&Filter(degenerate)).is_empty());
+        }
+
+        let set = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<HashSet<_>>();
+        assert_eq!(
+            ids(&Filter(json!({"range": {"gte": 5, "lte": 5}}))),
+            set(&["b"])
+        );
+        assert_eq!(
+            ids(&Filter(json!({"range": {"gt": 2, "lt": 10}}))),
+            set(&["b", "d"])
+        );
+        assert_eq!(
+            ids(&Filter(json!({"range": {"gte": 2, "lt": 7.5}}))),
+            set(&["a", "b"])
+        );
+        assert_eq!(ids(&Filter(json!({"range": {"gt": 5}}))), set(&["c", "d"]));
     }
 }

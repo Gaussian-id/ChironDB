@@ -259,11 +259,22 @@ fn run(
     identity: &AuthenticatedIdentity,
     sql: &str,
 ) -> Result<Vec<SqlResult>> {
+    run_batch(state, identity, "acme", &[sql])
+}
+fn run_batch(
+    state: &mut RelationalState,
+    identity: &AuthenticatedIdentity,
+    tenant: &str,
+    statements: &[&str],
+) -> Result<Vec<SqlResult>> {
     let request = SqlExecutionRequest {
-        statements: vec![crate::SqlStatementRequest {
-            sql: sql.into(),
-            parameters: vec![],
-        }],
+        statements: statements
+            .iter()
+            .map(|sql| crate::SqlStatementRequest {
+                sql: (*sql).into(),
+                parameters: vec![],
+            })
+            .collect(),
         idempotency_key: None,
         retry_id: None,
     };
@@ -272,7 +283,7 @@ fn run(
         request,
         false,
         true,
-        Some("acme"),
+        Some(tenant),
         Some(identity),
         false,
     )?;
@@ -1059,4 +1070,275 @@ fn native_queued_output_and_old_snapshot_fail_after_policy_epoch_closes() {
         Some(crate::security::Epoch::new(1));
     run(&mut state, &identity, "SELECT secret FROM docs").unwrap();
     assert!(response.consume(|_| Ok(())).is_err());
+}
+
+/// New rows inherit the default template, so INSERT ... RETURNING is judged
+/// against the authority of the row being created rather than existing rows.
+fn template_secret(state: &mut RelationalState, actions: &[PropertyAction]) {
+    let table = Arc::make_mut(state.tables.get_mut("docs").unwrap().unwrap());
+    let mut definition = (*table.definition).clone();
+    let config = definition.row_policy.as_mut().unwrap();
+    let template = config
+        .policy
+        .templates
+        .get_mut(&config.default_template)
+        .unwrap();
+    template.properties.get_mut("/secret").unwrap().actions = actions.iter().copied().collect();
+    table.definition = super::super::schema::Schema::adopt(definition).unwrap();
+}
+fn stored_secret(state: &RelationalState, row_id: u64) -> Option<RelationalValue> {
+    state
+        .tables
+        .get("docs")
+        .unwrap()
+        .rows
+        .visible(row_id, state.sequence)
+        .unwrap()
+        .map(|version| version.values[1].clone())
+}
+fn returned(result: Result<Vec<SqlResult>>) -> Vec<Vec<RelationalValue>> {
+    match result.unwrap().pop() {
+        Some(SqlResult::Rows { rows, .. }) => rows,
+        other => panic!("expected RETURNING rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn native_returning_requires_field_read_before_any_mutation() {
+    let (_root, _authority, identity, mut state) = fixture();
+    run(
+        &mut state,
+        &identity,
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, secret TEXT)",
+    )
+    .unwrap();
+    // Write without Read on /secret: SELECT refuses the column outright, so
+    // RETURNING must refuse the whole statement rather than redact it.
+    template_secret(&mut state, &[PropertyAction::Write]);
+    for sql in [
+        "INSERT INTO docs VALUES (1,'hidden') RETURNING secret",
+        "INSERT INTO docs VALUES (1,'hidden') RETURNING *",
+        "INSERT INTO docs VALUES (1,'hidden') RETURNING docs.*",
+        "INSERT INTO docs VALUES (1,'hidden') RETURNING id, secret AS s",
+        "INSERT INTO docs VALUES (1,'hidden') RETURNING record_ref('docs', secret)",
+        "INSERT INTO docs VALUES (1,'hidden') ON CONFLICT DO NOTHING RETURNING secret",
+    ] {
+        denied(&mut state, &identity, sql);
+        assert_eq!(stored_secret(&state, 1), None, "{sql} must not insert");
+    }
+    // A denied RETURNING aborts the whole request, including earlier writes.
+    let before = state.sequence;
+    let batch = run_batch(
+        &mut state,
+        &identity,
+        "acme",
+        &[
+            "INSERT INTO docs VALUES (2,'first')",
+            "INSERT INTO docs VALUES (3,'second') RETURNING secret",
+        ],
+    );
+    assert!(
+        matches!(batch, Err(GaussError::Security(SecurityError::Forbidden))),
+        "{batch:?}"
+    );
+    assert_eq!(state.sequence, before);
+    assert_eq!(stored_secret(&state, 2), None);
+    // Expressions over the column never become an unchecked output channel.
+    assert!(
+        run(
+            &mut state,
+            &identity,
+            "INSERT INTO docs VALUES (1,'hidden') RETURNING upper(secret)",
+        )
+        .is_err()
+    );
+    assert_eq!(state.sequence, before);
+    // Readable output columns and blind writes keep working.
+    assert_eq!(
+        returned(run(
+            &mut state,
+            &identity,
+            "INSERT INTO docs VALUES (1,'hidden') RETURNING id",
+        )),
+        vec![vec![RelationalValue::Integer(1)]]
+    );
+    // Existing row: Query+Write but no Read on /secret.
+    restrict(&mut state, &[PropertyAction::Query, PropertyAction::Write]);
+    for sql in [
+        "UPDATE docs SET secret='changed' WHERE id=1 RETURNING secret",
+        "UPDATE docs SET secret='changed' WHERE id=1 RETURNING *",
+        "UPDATE docs SET secret='changed' WHERE id=1 RETURNING id, record_ref('docs', secret)",
+        "DELETE FROM docs WHERE id=1 RETURNING secret",
+        "DELETE FROM docs WHERE id=1 RETURNING *",
+        "DELETE FROM docs WHERE id=1 RETURNING record_ref('docs', secret)",
+        "INSERT INTO docs VALUES (1,'x') ON CONFLICT(id) DO UPDATE SET id=EXCLUDED.id RETURNING secret",
+    ] {
+        denied(&mut state, &identity, sql);
+        assert_eq!(
+            stored_secret(&state, 1),
+            Some(RelationalValue::Text("hidden".into())),
+            "{sql} must not mutate"
+        );
+    }
+    assert_eq!(
+        returned(run(
+            &mut state,
+            &identity,
+            "UPDATE docs SET secret='changed' WHERE id=1 RETURNING id",
+        )),
+        vec![vec![RelationalValue::Integer(1)]]
+    );
+    // Read restores the ordinary RETURNING contract on the same principal.
+    restrict(
+        &mut state,
+        &[
+            PropertyAction::Read,
+            PropertyAction::Query,
+            PropertyAction::Write,
+        ],
+    );
+    assert_eq!(
+        returned(run(
+            &mut state,
+            &identity,
+            "UPDATE docs SET secret='again' WHERE id=1 RETURNING secret",
+        )),
+        vec![vec![RelationalValue::Text("again".into())]]
+    );
+    assert_eq!(
+        returned(run(
+            &mut state,
+            &identity,
+            "DELETE FROM docs WHERE id=1 RETURNING *",
+        )),
+        vec![vec![
+            RelationalValue::Integer(1),
+            RelationalValue::Text("again".into())
+        ]]
+    );
+    template_secret(
+        &mut state,
+        &[
+            PropertyAction::Read,
+            PropertyAction::Query,
+            PropertyAction::Write,
+        ],
+    );
+    assert_eq!(
+        returned(run(
+            &mut state,
+            &identity,
+            "INSERT INTO docs VALUES (4,'visible') RETURNING *",
+        )),
+        vec![vec![
+            RelationalValue::Integer(4),
+            RelationalValue::Text("visible".into())
+        ]]
+    );
+}
+
+#[test]
+fn native_sql_rows_and_schema_are_bound_to_the_caller_tenant() {
+    let (_root, _authority, alice, mut state) = fixture();
+    for sql in [
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, secret TEXT)",
+        "INSERT INTO docs VALUES (1,'acme-secret')",
+        "CREATE INDEX secret_idx ON docs(secret)",
+    ] {
+        run(&mut state, &alice, sql).unwrap();
+    }
+    // A fully privileged principal of another tenant, including Schema.
+    let other_root = tempfile::tempdir().unwrap();
+    let key = IdentityAuthority::bootstrap(
+        other_root.path(),
+        PrincipalRecord {
+            id: "bob".into(),
+            tenant: "globex".into(),
+            enabled: true,
+            attributes: SubjectAttributes {
+                department: "Security".into(),
+                clearance: Classification::Restricted,
+            },
+            grants: vec![ScopeGrant {
+                tenants: BTreeSet::from(["globex".into()]),
+                collections: BTreeSet::from(["docs".into(), "ledger".into()]),
+                actions: BTreeSet::from([
+                    Action::Read,
+                    Action::Create,
+                    Action::Update,
+                    Action::Delete,
+                ]),
+            }],
+            installation_actions: BTreeSet::from([Action::IdentityManage, Action::Schema]),
+            delegation: vec![],
+        },
+    )
+    .unwrap();
+    // Keep the authority open: dropping it cancels its identities.
+    let other_authority = IdentityAuthority::open(other_root.path()).unwrap().unwrap();
+    let bob = other_authority.authenticate(&key.secret).unwrap();
+    let hidden =
+        |state: &mut RelationalState, identity: &AuthenticatedIdentity, tenant: &str, sql: &str| {
+            let before = state.sequence;
+            let result = run_batch(state, identity, tenant, &[sql]);
+            assert!(
+                matches!(result, Err(GaussError::Security(SecurityError::NotFound))),
+                "{tenant}: {sql}: {result:?}"
+            );
+            assert_eq!(state.sequence, before, "{sql} must not publish");
+        };
+    for sql in [
+        "SELECT secret FROM docs",
+        "SELECT id FROM docs WHERE secret='acme-secret'",
+        "INSERT INTO docs VALUES (2,'globex')",
+        "INSERT INTO docs VALUES (2,'globex') RETURNING *",
+        "INSERT INTO docs VALUES (1,'globex') ON CONFLICT(id) DO UPDATE SET secret='globex' RETURNING secret",
+        "UPDATE docs SET secret='globex' RETURNING secret",
+        "DELETE FROM docs RETURNING *",
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY)",
+        "ALTER TABLE docs ADD COLUMN stolen TEXT",
+        "ALTER TABLE docs RENAME TO stolen",
+        "CREATE INDEX stolen_idx ON docs(secret)",
+        "DROP INDEX secret_idx",
+        "DROP TABLE docs",
+    ] {
+        hidden(&mut state, &bob, "globex", sql);
+    }
+    assert_eq!(
+        stored_secret(&state, 1),
+        Some(RelationalValue::Text("acme-secret".into()))
+    );
+    assert_eq!(stored_secret(&state, 2), None);
+    // A caller cannot claim another tenant's scope for its own identity.
+    assert!(matches!(
+        run_batch(&mut state, &bob, "acme", &["SELECT secret FROM docs"]),
+        Err(GaussError::Security(SecurityError::Forbidden))
+    ));
+    // Each tenant keeps full control of its own schema, invisible to the other.
+    for sql in [
+        "CREATE TABLE ledger (id BIGINT PRIMARY KEY)",
+        "INSERT INTO ledger VALUES (1)",
+    ] {
+        run_batch(&mut state, &bob, "globex", &[sql])
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+    for sql in [
+        "SELECT id FROM ledger",
+        "INSERT INTO ledger VALUES (2) RETURNING id",
+        "UPDATE ledger SET id=3 RETURNING id",
+        "DELETE FROM ledger RETURNING id",
+        "ALTER TABLE ledger ADD COLUMN stolen TEXT",
+        "DROP TABLE ledger",
+    ] {
+        hidden(&mut state, &alice, "acme", sql);
+    }
+    assert_eq!(
+        returned(run_batch(
+            &mut state,
+            &bob,
+            "globex",
+            &["SELECT id FROM ledger"]
+        )),
+        vec![vec![RelationalValue::Integer(1)]]
+    );
 }

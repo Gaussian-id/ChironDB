@@ -17,12 +17,15 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::{
     Db, DistanceMetric, Filter, GaussError,
-    auth::{AuthConfig, GrpcAuthInterceptor},
+    auth::{AuthConfig, GrpcAuthInterceptor, GrpcReflectionInterceptor},
     model::{
         CollectionConfig, HybridFusion, HybridSearchRequest, MultiSearchRequest, PayloadType,
         Point, RecommendRequest, SearchRequest, SearchResponse, SparseVector,
     },
-    rbac::{Action, Permission, authorize, authorize_graph},
+    rbac::{
+        Action, AuthorizationError, INSTALLATION_DENIED_MESSAGE, Permission, authorize,
+        authorize_graph, authorize_installation,
+    },
     security_paths::StoragePolicy,
     segment::ColdObjectStoreConfig,
 };
@@ -97,6 +100,42 @@ fn authorize_grpc(
             Err(Status::permission_denied("operation is not permitted"))
         }
     }
+}
+
+/// Installation-wide admin RPCs: see [`authorize_installation`].
+fn authorize_installation_grpc(
+    db: &Db,
+    principal: &Permission,
+    collection: Option<&str>,
+    rpc: &str,
+) -> Result<(), Status> {
+    let Err(error) = authorize_installation(
+        principal,
+        db.tenant_enforcement(),
+        collection,
+        &format!("grpc {rpc}"),
+    ) else {
+        return Ok(());
+    };
+    db.audit_access_event(
+        "authorization",
+        "grpc_request",
+        "denied",
+        collection,
+        &principal.id,
+        principal.tenant_id.as_deref(),
+        "grpc",
+        None,
+        Some("permission_denied"),
+    )
+    .map_err(status_from_error)?;
+    Err(Status::permission_denied(
+        if error == AuthorizationError::InstallationAuthorityRequired {
+            INSTALLATION_DENIED_MESSAGE
+        } else {
+            "operation is not permitted"
+        },
+    ))
 }
 
 fn authorize_graph_grpc(
@@ -217,7 +256,10 @@ async fn serve_with_storage_policy(
             .max_encoding_message_size(message_limit),
         interceptor.clone(),
     );
-    let reflection = InterceptedService::new(reflection_service(), interceptor);
+    let reflection = InterceptedService::new(
+        reflection_service(),
+        GrpcReflectionInterceptor::new(interceptor),
+    );
     protected_server_builder(message_limit == 8 * 1024 * 1024)
         .add_service(chiron_service)
         .add_service(service)
@@ -267,7 +309,10 @@ pub async fn serve_with_options(
         .max_encoding_message_size(message_limit),
         interceptor.clone(),
     );
-    let reflection = InterceptedService::new(reflection_service(), interceptor);
+    let reflection = InterceptedService::new(
+        reflection_service(),
+        GrpcReflectionInterceptor::new(interceptor),
+    );
     protected_server_builder(message_limit == 8 * 1024 * 1024)
         .accept_http1(true)
         .layer(cors)
@@ -319,7 +364,10 @@ pub async fn serve_with_options_until(
         .max_encoding_message_size(message_limit),
         interceptor.clone(),
     );
-    let reflection = InterceptedService::new(reflection_service(), interceptor);
+    let reflection = InterceptedService::new(
+        reflection_service(),
+        GrpcReflectionInterceptor::new(interceptor),
+    );
     if let Some(cors) = cors {
         protected_server_builder(message_limit == 8 * 1024 * 1024)
             .accept_http1(true)
@@ -448,7 +496,10 @@ pub async fn serve_tls_config_with_options(
         .max_encoding_message_size(message_limit),
         interceptor.clone(),
     );
-    let reflection = InterceptedService::new(reflection_service(), interceptor);
+    let reflection = InterceptedService::new(
+        reflection_service(),
+        GrpcReflectionInterceptor::new(interceptor),
+    );
     if options.grpc_web_enabled {
         let cors = grpc_web_cors(&options.cors_origins)?;
         protected_server_builder(message_limit == 8 * 1024 * 1024)
@@ -525,7 +576,10 @@ pub async fn serve_tls_config_with_options_until(
         .max_encoding_message_size(message_limit),
         interceptor.clone(),
     );
-    let reflection = InterceptedService::new(reflection_service(), interceptor);
+    let reflection = InterceptedService::new(
+        reflection_service(),
+        GrpcReflectionInterceptor::new(interceptor),
+    );
     if let Some(cors) = cors {
         protected_server_builder(message_limit == 8 * 1024 * 1024)
             .accept_http1(true)
@@ -674,11 +728,11 @@ impl pb::gauss_db_server::GaussDb for ChironDbService {
         request: Request<pb::DeleteCollectionRequest>,
     ) -> Result<Response<pb::DeleteCollectionResponse>, Status> {
         let principal = grpc_principal(&request)?;
-        authorize_grpc(
+        authorize_installation_grpc(
             &self.db,
             &principal,
-            Action::Admin,
             Some(&request.get_ref().collection),
+            "delete_collection",
         )?;
         self.db
             .delete_collection(&request.into_inner().collection)
@@ -691,11 +745,11 @@ impl pb::gauss_db_server::GaussDb for ChironDbService {
         request: Request<pb::UpdatePayloadSchemaRequest>,
     ) -> Result<Response<pb::CollectionConfig>, Status> {
         let principal = grpc_principal(&request)?;
-        authorize_grpc(
+        authorize_installation_grpc(
             &self.db,
             &principal,
-            Action::Admin,
             Some(&request.get_ref().collection),
+            "update_payload_schema",
         )?;
         let request = request.into_inner();
         let payload_schema = request
@@ -1253,11 +1307,11 @@ impl pb::gauss_db_server::GaussDb for ChironDbService {
         request: Request<pb::CompactRequest>,
     ) -> Result<Response<pb::CompactResponse>, Status> {
         let principal = grpc_principal(&request)?;
-        authorize_grpc(
+        authorize_installation_grpc(
             &self.db,
             &principal,
-            Action::Admin,
             Some(&request.get_ref().collection),
+            "compact",
         )?;
         let request = request.into_inner();
         self.db
@@ -1295,11 +1349,11 @@ impl pb::gauss_db_server::GaussDb for ChironDbService {
         request: Request<pb::ColdTierRequest>,
     ) -> Result<Response<pb::ColdTierResponse>, Status> {
         let principal = grpc_principal(&request)?;
-        authorize_grpc(
+        authorize_installation_grpc(
             &self.db,
             &principal,
-            Action::Admin,
             Some(&request.get_ref().collection),
+            "tier_cold",
         )?;
         let request = request.into_inner();
         self.db
@@ -1321,11 +1375,11 @@ impl pb::gauss_db_server::GaussDb for ChironDbService {
         request: Request<pb::PruneWalArchiveRequest>,
     ) -> Result<Response<pb::WalArchivePruneResponse>, Status> {
         let principal = grpc_principal(&request)?;
-        authorize_grpc(
+        authorize_installation_grpc(
             &self.db,
             &principal,
-            Action::Admin,
             Some(&request.get_ref().collection),
+            "prune_wal_archive",
         )?;
         let request = request.into_inner();
         self.db
@@ -1349,7 +1403,7 @@ impl pb::gauss_db_server::GaussDb for ChironDbService {
         request: Request<pb::SnapshotRequest>,
     ) -> Result<Response<pb::StatusResponse>, Status> {
         let principal = grpc_principal(&request)?;
-        authorize_grpc(&self.db, &principal, Action::Admin, None)?;
+        authorize_installation_grpc(&self.db, &principal, None, "snapshot")?;
         let path = self
             .storage_policy
             .resolve_path(request.into_inner().path)
@@ -1369,7 +1423,7 @@ impl pb::gauss_db_server::GaussDb for ChironDbService {
         request: Request<pb::RestoreRequest>,
     ) -> Result<Response<pb::StatusResponse>, Status> {
         let principal = grpc_principal(&request)?;
-        authorize_grpc(&self.db, &principal, Action::Admin, None)?;
+        authorize_installation_grpc(&self.db, &principal, None, "restore")?;
         let request = request.into_inner();
         let path = self
             .storage_policy
@@ -1408,7 +1462,7 @@ impl pb::gauss_db_server::GaussDb for ChironDbService {
         request: Request<pb::ShardMoveRequest>,
     ) -> Result<Response<pb::StatusResponse>, Status> {
         let principal = grpc_principal(&request)?;
-        authorize_grpc(&self.db, &principal, Action::Admin, None)?;
+        authorize_installation_grpc(&self.db, &principal, None, "shard_move")?;
         self.db
             .audit_admin_event(
                 "shard_move",
@@ -2584,6 +2638,9 @@ pub(crate) fn collection_config_from_proto(
         hnsw_ef_construction: config.hnsw_ef_construction,
         hnsw_ef_search: config.hnsw_ef_search,
         recall_sla: config.recall_sla,
+        max_vector_norm: config.max_vector_norm,
+        max_sparse_nnz: config.max_sparse_nnz,
+        max_sparse_weight: config.max_sparse_weight,
         index_kind: None,
         streamer_max_bytes: usize_from_u64(config.streamer_max_bytes, "streamer_max_bytes")?,
     })
@@ -2611,6 +2668,9 @@ pub(crate) fn collection_config_to_proto(config: CollectionConfig) -> pb::Collec
         hnsw_ef_construction: config.hnsw_ef_construction,
         hnsw_ef_search: config.hnsw_ef_search,
         recall_sla: config.recall_sla,
+        max_vector_norm: config.max_vector_norm,
+        max_sparse_nnz: config.max_sparse_nnz,
+        max_sparse_weight: config.max_sparse_weight,
         streamer_max_bytes: config.streamer_max_bytes as u64,
     }
 }

@@ -657,6 +657,9 @@ pub fn run(config: &RunConfig) -> Result<AnnBenchmarkReport> {
         hnsw_ef_construction: Some(hnsw_ef_construction),
         hnsw_ef_search: None,
         recall_sla: None,
+        max_vector_norm: None,
+        max_sparse_nnz: None,
+        max_sparse_weight: None,
         index_kind: config.index_kind.clone(),
         streamer_max_bytes,
     }

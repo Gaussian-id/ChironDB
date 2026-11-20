@@ -67,6 +67,9 @@ fn upsert_crossing_threshold_triggers_inline_hnsw_build() {
         hnsw_ef_construction: None,
         hnsw_ef_search: None,
         recall_sla: None,
+        max_vector_norm: None,
+        max_sparse_nnz: None,
+        max_sparse_weight: None,
         index_kind: None,
         streamer_max_bytes: 0,
     })
@@ -156,6 +159,9 @@ fn upsert_below_threshold_does_not_build_hnsw() {
         hnsw_ef_construction: None,
         hnsw_ef_search: None,
         recall_sla: None,
+        max_vector_norm: None,
+        max_sparse_nnz: None,
+        max_sparse_weight: None,
         index_kind: None,
         streamer_max_bytes: 0,
     })
@@ -221,6 +227,9 @@ fn incremental_inserts_past_threshold_are_searchable_without_compact() {
         hnsw_ef_construction: None,
         hnsw_ef_search: None,
         recall_sla: None,
+        max_vector_norm: None,
+        max_sparse_nnz: None,
+        max_sparse_weight: None,
         index_kind: None,
         streamer_max_bytes: 0,
     })

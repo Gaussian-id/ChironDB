@@ -98,6 +98,59 @@ Stable `id` values are required by secure mode and should survive key rotation.
 
 An unknown capability name is ignored and logged. It never grants anything.
 
+### Installation-wide administration needs installation authority
+
+Collections are one namespace shared by every tenant, so some admin operations
+act on every tenant's rows at once: `/admin/snapshot`, `/admin/restore` (and
+their `/stream` variants), `/admin/shard_move`, deleting a collection,
+changing its payload schema, compaction (`compact`, `compact/stream`),
+`calibrate`, `cold/tier`, `wal_archive/prune`, `/metrics` and the `/ws/*`
+event and metric streams. The same operations over gRPC and ChironWire follow
+the same rule.
+
+While enforcement is `enforced`, these require the `admin` role **and**
+installation authority, which a key has when either:
+
+- it has no `tenant_id` (the installation operator key), or
+- it is granted the explicit `installation:admin` capability.
+
+A tenant-bound `admin` key without `installation:admin` receives
+`403 Forbidden` (gRPC `PERMISSION_DENIED`) on them. An operation with no
+collection (snapshot, restore, shard move, metrics, event streams) is also
+refused to a key restricted by `allowed_collections`, because it reaches every
+collection. Creating a collection stays available to tenant admins: it
+touches no existing rows.
+
+```json
+{ "id": "ops", "key": "example-only-ops-key-replace-before-use", "tenant_id": "acme", "role": "admin",
+  "capabilities": ["installation:admin"] }
+```
+
+**Upgrading:** this is a breaking change for enforced multi-tenant
+installations whose operator keys carry a `tenant_id` or `allowed_collections`.
+Find them before upgrading with
+`chironctl security installation-check --rbac-config-file ./rbac.json`, which
+lists each affected `admin` key with its fix and exits `1` while any remain.
+Fix those keys, then upgrade with `enforced`. To see which keys your automation
+actually uses, you can rehearse on a loopback-only staging copy with
+`--tenant-enforcement dry-run`: every refusal `enforced` would make is logged
+with the key, tenant, operation and fix. Production listeners refuse to start
+in `dry-run`, because it also stops enforcing tenant isolation for data. The
+full procedure is in the
+[unreleased release notes](releases/unreleased.md#installation-wide-admin-operations-need-installation-authority-rt-11).
+A refused admin key gets a 403 body naming `installation:admin` and this page.
+
+With enforcement `disabled` (the single-tenant default) or `dry-run`, the
+`admin` role alone suffices exactly as before; `dry-run` logs the requests that
+enforcement would refuse. Snapshot contents are not filtered per tenant: a
+snapshot is always the whole installation, which is why it is gated rather than
+scoped.
+
+For tenant-scoped readers, `GET /collections/<c>/index_status` reports
+`total_points` as the caller's own row count (the value `count` returns) and
+clamps `indexed_points` to it; installation admins and `tenant:cross_read`
+keys see the collection-wide totals.
+
 ### Every cross-tenant access is audited
 
 Emitted as a structured event on the `chirondb::tenant_audit` target, carrying
@@ -208,7 +261,10 @@ collection, not per database.
 
 - **It does not encrypt anything.** Tenants share storage; this controls who
   can address which rows, not how they are stored.
-- **It does not scope collection administration.** Creating and deleting
-  collections is governed by the role and `allowed_collections`, as before.
+- **It does not give collections an owner.** Creating a collection is
+  governed by the role and `allowed_collections`; destroying or maintaining a
+  shared collection needs installation authority (see above). Listing
+  collections is filtered by `allowed_collections` only, so a tenant key
+  without an allowlist still sees every collection name (not its rows).
 - **It is not a substitute for separate deployments** where a customer's
   requirement is physical separation.

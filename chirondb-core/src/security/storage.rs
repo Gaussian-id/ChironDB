@@ -79,6 +79,10 @@ pub struct SecurityDelta {
 
 /// Nonrecursive content envelope. Nested batches and cross-collection writes
 /// cannot be expressed by this format.
+// `Schema` carries two inline `CollectionConfig`s (which grew with the RT-20/21
+// write bounds). Batches are short-lived envelopes; this mirrors the existing
+// `wal::WalEntry` allowance rather than boxing every construction site.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProtectedContent {

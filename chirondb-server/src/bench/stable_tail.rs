@@ -499,6 +499,9 @@ fn build_or_open_shards(
                 hnsw_ef_construction: None,
                 hnsw_ef_search: None,
                 recall_sla: Some(0.95),
+                max_vector_norm: None,
+                max_sparse_nnz: None,
+                max_sparse_weight: None,
                 index_kind: Some("lsvec".to_string()),
                 streamer_max_bytes: 1024 * 1024 * 1024,
             })?;
