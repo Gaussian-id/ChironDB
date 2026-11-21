@@ -41,6 +41,30 @@ pub struct CollectionConfig {
     /// Range: `0.5..=1.0`. `None` disables monitoring (default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recall_sla: Option<f32>,
+    /// RT-20 — optional upper bound on the L2 norm of every dense vector
+    /// (default and named) written to this collection. Under the DOT metric
+    /// an unbounded norm lets a single point (e.g. norm ~1e6) dominate the
+    /// top-k of every query. Unbounded norms are legal in other engines too,
+    /// so this is an opt-in policy knob: `None` = unbounded (previous
+    /// behavior). Whether a default bound should apply is a pending policy
+    /// decision. When set it must be finite and `> 0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_vector_norm: Option<f32>,
+    /// RT-21 — optional upper bound on the number of non-zero entries of a
+    /// written sparse vector. One document with hundreds of heavy terms can
+    /// otherwise dominate hybrid retrieval. Applies to the write/upsert path
+    /// only, never to query sparse vectors. `None` = unbounded (previous
+    /// behavior); defaults are a pending policy decision. When set it must be
+    /// `> 0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_sparse_nnz: Option<u32>,
+    /// RT-21 — optional upper bound on the absolute value of every weight of
+    /// a written sparse vector. Applies to the write/upsert path only, never
+    /// to query sparse vectors. `None` = unbounded (previous behavior);
+    /// defaults are a pending policy decision. When set it must be finite and
+    /// `> 0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_sparse_weight: Option<f32>,
     /// P4 — persisted dense index family. LS-VEC is the sole supported value
     /// and the default when omitted. Mini-HNSW remains an internal mutable-tier
     /// implementation detail, not a selectable sealed index.
@@ -602,6 +626,9 @@ mod sq8_default_tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             recall_sla: None,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
             index_kind: None,
             streamer_max_bytes: 0,
         }
@@ -659,6 +686,40 @@ mod sq8_default_tests {
         }))
         .unwrap();
         assert_eq!(config.streamer_max_bytes, DEFAULT_STREAMER_MAX_BYTES);
+        assert_eq!(config.max_vector_norm, None);
+        assert_eq!(config.max_sparse_nnz, None);
+        assert_eq!(config.max_sparse_weight, None);
+    }
+
+    #[test]
+    fn vector_bound_fields_serde_round_trip() {
+        // Unset limits are omitted from the wire/catalog form entirely.
+        let unset = cfg(4, None);
+        let json = serde_json::to_value(&unset).unwrap();
+        for key in ["max_vector_norm", "max_sparse_nnz", "max_sparse_weight"] {
+            assert!(json.get(key).is_none(), "{key} must be skipped when None");
+        }
+        let back: CollectionConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(back.max_vector_norm, None);
+        assert_eq!(back.max_sparse_nnz, None);
+        assert_eq!(back.max_sparse_weight, None);
+
+        let mut set = cfg(4, None);
+        set.max_vector_norm = Some(2.5);
+        set.max_sparse_nnz = Some(64);
+        set.max_sparse_weight = Some(10.0);
+        let json = serde_json::to_value(&set).unwrap();
+        assert_eq!(json["max_vector_norm"], serde_json::json!(2.5));
+        assert_eq!(json["max_sparse_nnz"], serde_json::json!(64));
+        assert_eq!(json["max_sparse_weight"], serde_json::json!(10.0));
+        let back: CollectionConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(back.max_vector_norm, Some(2.5));
+        assert_eq!(back.max_sparse_nnz, Some(64));
+        assert_eq!(back.max_sparse_weight, Some(10.0));
+        let normalized = back.normalize();
+        assert_eq!(normalized.max_vector_norm, Some(2.5));
+        assert_eq!(normalized.max_sparse_nnz, Some(64));
+        assert_eq!(normalized.max_sparse_weight, Some(10.0));
     }
 
     #[test]

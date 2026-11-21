@@ -306,7 +306,7 @@ jobs:
         run: cargo check --manifest-path fuzz/Cargo.toml --locked
       - name: Corpus regression and short smoke
         run: |
-          for target in protocol_decoders query_decoders storage_decoders index_decoders temporal_decoders catalog_wal; do
+          for target in protocol_decoders query_decoders relational_sql storage_decoders index_decoders temporal_decoders catalog_wal; do
             cargo fuzz run "$target" fuzz/corpus/"$target" -- -runs=256 -rss_limit_mb=2048
           done
 

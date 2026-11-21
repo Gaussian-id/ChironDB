@@ -889,8 +889,9 @@ DROP COLLECTION embeddings;
 Two things are fixed when a collection is made and cannot be changed afterwards: its vector
 dimension and its metric. They are grammar for that reason. Everything else `CollectionConfig`
 carries — shards, replicas, quantization, payload schema, named vector dimensions, the HNSW build
-parameters, `recall_sla`, `streamer_max_bytes` — arrives in one `WITH` object under its own field
-name:
+parameters, `recall_sla`, the opt-in write bounds `max_vector_norm` / `max_sparse_nnz` /
+`max_sparse_weight` (unset = unbounded), `streamer_max_bytes` — arrives in one `WITH` object under
+its own field name:
 
 ```sql
 CREATE COLLECTION documents DIM 1536 METRIC cosine

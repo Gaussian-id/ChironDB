@@ -452,3 +452,52 @@ async fn native_gausswire_clients_still_work_after_sniff() {
 fn force_arc_send_marker() -> Arc<()> {
     Arc::new(())
 }
+
+/// RT-40: deeply nested SQL used to abort the whole server with a stack
+/// overflow. The default `#[tokio::test]` runtime runs the server on this 2 MiB
+/// test thread, so any unbounded recursion aborts the test binary.
+#[tokio::test]
+async fn rt40_deeply_nested_sql_returns_error_and_connection_keeps_serving() {
+    let (db, _dir) = make_db();
+    let port = spawn_server(db, AuthConfig::disabled()).await;
+    let mut stream = connect_without_auth(port).await;
+    for sql in [
+        "CREATE TABLE rt40 (id INTEGER PRIMARY KEY)",
+        "INSERT INTO rt40 VALUES (1), (2)",
+    ] {
+        let response = simple_query(&mut stream, sql).await;
+        assert!(
+            response
+                .iter()
+                .all(|(message_type, _)| *message_type != b'E'),
+            "{sql}"
+        );
+    }
+    for sql in [
+        format!(
+            "SELECT * FROM rt40 WHERE {}",
+            vec!["id=1"; 6_000].join(" OR ")
+        ),
+        format!(
+            "SELECT * FROM rt40 WHERE {}id = 1{}",
+            "(".repeat(50_000),
+            ")".repeat(50_000)
+        ),
+        format!("SELECT * FROM rt40 WHERE {}id = 1", "NOT ".repeat(50_000)),
+    ] {
+        let response = simple_query(&mut stream, &sql).await;
+        assert!(
+            response
+                .iter()
+                .any(|(message_type, _)| *message_type == b'E'),
+            "deep SQL must return ErrorResponse"
+        );
+    }
+    let selected = simple_query(&mut stream, "SELECT id FROM rt40 WHERE id = 2").await;
+    let data_row = selected
+        .iter()
+        .find(|(message_type, _)| *message_type == b'D')
+        .map(|(_, body)| body)
+        .expect("server must still answer after rejecting deep SQL");
+    assert!(data_row.ends_with(b"2"));
+}

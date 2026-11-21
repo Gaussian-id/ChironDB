@@ -22,7 +22,10 @@ pub use work::WorkPermit;
 
 use crate::{
     Db,
-    rbac::{Action, Permission, RbacConfig, authorize},
+    rbac::{
+        Action, AuthorizationError, INSTALLATION_DENIED_MESSAGE, Permission, RbacConfig, authorize,
+        authorize_installation,
+    },
 };
 
 #[derive(Clone, Default)]
@@ -421,6 +424,14 @@ fn classify_http(method: &Method, path: &str) -> Option<Action> {
     }
 }
 
+/// Admin routes that act on the whole installation or on every tenant's rows
+/// in a shared collection. Creating a collection is the one admin route that
+/// touches no existing rows, so a tenant admin keeps it.
+fn is_installation_http_route(method: &Method, path: &str, operation: Action) -> bool {
+    operation == Action::Admin
+        && !(method == Method::POST && canonical_http_path(path) == "/collections")
+}
+
 fn sql_transaction_path(path: &str) -> Option<(&str, &str)> {
     let rest = path.strip_prefix("/sql/transactions/")?;
     let (handle, action) = rest.split_once('/').unwrap_or((rest, ""));
@@ -507,7 +518,24 @@ pub async fn require_http_auth(
     // capability and collection check in their handler. Doing the generic
     // collection/role check first would leak a different error envelope and,
     // more importantly, make a point role look like the graph authority.
-    if !graph_route && authorize(&principal, operation, collection.as_deref()).is_err() {
+    // Every admin route except collection creation acts on all tenants' rows
+    // (or the whole installation), so it needs installation authority on top
+    // of the admin role once tenant enforcement is on.
+    let installation_route = is_installation_http_route(method, path, operation);
+    let decision = if installation_route {
+        let route = format!("{method} {}", canonical_http_path(path));
+        authorize_installation(
+            &principal,
+            db.tenant_enforcement(),
+            collection.as_deref(),
+            &route,
+        )
+    } else if graph_route {
+        Ok(())
+    } else {
+        authorize(&principal, operation, collection.as_deref())
+    };
+    if let Err(error) = decision {
         audit_http(
             &db,
             "authorization",
@@ -519,7 +547,12 @@ pub async fn require_http_auth(
             request_id.as_deref(),
             Some("permission_denied"),
         )?;
-        return Err((StatusCode::FORBIDDEN, "forbidden").into_response());
+        let body = if error == AuthorizationError::InstallationAuthorityRequired {
+            INSTALLATION_DENIED_MESSAGE
+        } else {
+            "forbidden"
+        };
+        return Err((StatusCode::FORBIDDEN, body).into_response());
     }
     // Attach the resolved permission to request extensions so handlers can read it.
     let (mut parts, body) = request.into_parts();
@@ -755,6 +788,33 @@ impl Interceptor for GrpcAuthInterceptor {
         request.extensions_mut().insert(permission);
         request.extensions_mut().insert(Arc::new(work_permit));
         Ok(request)
+    }
+}
+
+/// gRPC server reflection describes the entire API surface, so it is limited
+/// to admin principals. Authentication, audit, rate and work limits are the
+/// ordinary [`GrpcAuthInterceptor`] ones; with auth disabled every caller is
+/// the unrestricted local admin and reflection keeps working for tooling.
+#[derive(Clone, Debug)]
+pub struct GrpcReflectionInterceptor {
+    inner: GrpcAuthInterceptor,
+}
+
+impl GrpcReflectionInterceptor {
+    pub fn new(inner: GrpcAuthInterceptor) -> Self {
+        Self { inner }
+    }
+}
+
+impl Interceptor for GrpcReflectionInterceptor {
+    fn call(&mut self, request: GrpcRequest<()>) -> Result<GrpcRequest<()>, Status> {
+        let request = self.inner.call(request)?;
+        match request.extensions().get::<Permission>() {
+            Some(principal) if principal.allows_admin() => Ok(request),
+            _ => Err(Status::permission_denied(
+                "gRPC server reflection requires an admin principal",
+            )),
+        }
     }
 }
 

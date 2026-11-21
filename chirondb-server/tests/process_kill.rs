@@ -722,6 +722,9 @@ fn test_collection() -> CollectionConfig {
         hnsw_ef_construction: None,
         hnsw_ef_search: None,
         recall_sla: None,
+        max_vector_norm: None,
+        max_sparse_nnz: None,
+        max_sparse_weight: None,
         index_kind: None,
         // Keep the crash fixture mutable until the explicit compaction below;
         // otherwise the background sealer can make compaction a no-op before

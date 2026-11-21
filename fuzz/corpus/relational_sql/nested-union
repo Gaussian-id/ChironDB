@@ -1,0 +1,1 @@
+SELECT * FROM items WHERE ((id = 1 OR id = 2) AND NOT (name = 'b')) UNION SELECT * FROM items WHERE id = 3

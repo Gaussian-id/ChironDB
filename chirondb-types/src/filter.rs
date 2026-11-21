@@ -86,6 +86,9 @@ impl Filter {
                 Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
             }
         }
+        if let Some(conditions) = self.0.as_object() {
+            validate_conditions(conditions)?;
+        }
         Ok(())
     }
 
@@ -123,6 +126,66 @@ impl Filter {
         }
         Some(predicates)
     }
+}
+
+/// Reject operator objects the matcher would otherwise silently evaluate as
+/// "no match" (unknown operator names or operands of the wrong type). Mirrors
+/// the operator grammar accepted by the secure filter compiler. Runs only after
+/// the depth/size bounds above have been checked, so the recursion is bounded.
+fn validate_conditions(conditions: &serde_json::Map<String, Value>) -> Result<(), String> {
+    for (field, expected) in conditions {
+        let Some(operators) = expected.as_object() else {
+            continue;
+        };
+        for (operator, bound) in operators {
+            match operator.as_str() {
+                "eq" | "ne" => {}
+                "gt" | "gte" | "lt" | "lte" if bound.is_number() => {}
+                "in" if bound.is_array() => {}
+                "text" if bound.is_string() => {}
+                "nested" => {
+                    let nested = match bound.as_object() {
+                        Some(wrapper) if wrapper.contains_key("filter") => {
+                            if wrapper.len() != 1 {
+                                return Err(format!(
+                                    "filter field '{field}': ambiguous nested filter wrapper"
+                                ));
+                            }
+                            &wrapper["filter"]
+                        }
+                        _ => bound,
+                    };
+                    let Some(nested) = nested.as_object() else {
+                        return Err(format!(
+                            "filter field '{field}': nested filter must be an object"
+                        ));
+                    };
+                    validate_conditions(nested)?;
+                }
+                "gt" | "gte" | "lt" | "lte" => {
+                    return Err(format!(
+                        "filter field '{field}': operator '{operator}' requires a number"
+                    ));
+                }
+                "in" => {
+                    return Err(format!(
+                        "filter field '{field}': operator 'in' requires an array"
+                    ));
+                }
+                "text" => {
+                    return Err(format!(
+                        "filter field '{field}': operator 'text' requires a string"
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "filter field '{field}': unsupported filter operator '{operator}'"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn matches_condition(actual: &Value, expected: &Value) -> bool {
@@ -527,6 +590,56 @@ mod tests {
         assert!(Filter(json!({"body": {"text": "Dense retrieval"}})).matches(&payload));
         assert!(!Filter(json!({"title": {"text": "python"}})).matches(&payload));
         assert!(!Filter(json!({"title": {"text": ""}})).matches(&payload));
+    }
+
+    #[test]
+    fn rejects_unknown_operators_and_mistyped_operands() {
+        for invalid in [
+            json!({"color": {"equals": "red"}}),
+            json!({"price": {"gte": 1, "between": [1, 2]}}),
+            json!({"price": {"gt": "5"}}),
+            json!({"tier": {"in": "gold"}}),
+            json!({"title": {"text": 3}}),
+            json!({"diet": {"nested": {"food": {"like": "meat"}}}}),
+            json!({"diet": {"nested": {"filter": {"food": "meat"}, "x": 1}}}),
+            json!({"diet": {"nested": true}}),
+        ] {
+            let err = Filter(invalid.clone())
+                .validate_complexity()
+                .expect_err(&format!("{invalid} must be rejected"));
+            assert!(err.starts_with("filter field '"), "{err}");
+        }
+        for valid in [
+            json!({"tenant": "acme", "price": {"gte": 100, "lt": 200}}),
+            json!({"tier": {"in": ["gold"]}, "status": {"ne": "deleted"}}),
+            json!({"metadata": {"eq": {"region": "us"}}}),
+            json!({"title": {"text": "rust"}}),
+            json!({"diet": {"nested": {"food": "meat", "calories": {"lte": 500}}}}),
+            json!({"diet[]": {"nested": {"filter": {"food": "meat"}}}}),
+            json!({"diet": {"nested": {}}}),
+            json!({"price": {}}),
+            json!({"range": {"gt": 5, "lt": 5}}),
+        ] {
+            assert!(
+                Filter(valid.clone()).validate_complexity().is_ok(),
+                "{valid} must stay valid"
+            );
+        }
+    }
+
+    #[test]
+    fn degenerate_numeric_ranges_match_nothing() {
+        let payload = json!({"range": 5});
+        for filter in [
+            json!({"range": {"gt": 5, "lt": 5}}),
+            json!({"range": {"gt": 10, "lt": 2}}),
+            json!({"range": {"gte": 5, "lt": 5}}),
+            json!({"range": {"gt": 5, "lte": 5}}),
+            json!({"range": {"gte": 10, "lte": 2}}),
+        ] {
+            assert!(!Filter(filter.clone()).matches(&payload), "{filter}");
+        }
+        assert!(Filter(json!({"range": {"gte": 5, "lte": 5}})).matches(&payload));
     }
 
     #[test]

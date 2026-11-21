@@ -46,6 +46,9 @@ impl Harness {
             recall_sla: None,
             index_kind: None,
             streamer_max_bytes: 0,
+            max_vector_norm: None,
+            max_sparse_nnz: None,
+            max_sparse_weight: None,
         })
         .expect("create collection");
         db.upsert(

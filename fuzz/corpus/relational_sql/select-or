@@ -1,0 +1,1 @@
+SELECT id, name FROM items WHERE score > 5 OR name IS NULL ORDER BY id

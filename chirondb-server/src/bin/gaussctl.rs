@@ -308,6 +308,15 @@ enum SecurityCommand {
         #[arg(long)]
         keyring: PathBuf,
     },
+    /// List admin keys that `--tenant-enforcement enforced` will refuse on
+    /// installation-wide operations (RT-11). Exits 1 when any exist.
+    InstallationCheck {
+        #[arg(long)]
+        rbac_config_file: PathBuf,
+        /// Print a JSON report instead of one line per key.
+        #[arg(long)]
+        json: bool,
+    },
     /// Install SQL table authority and bind existing tables to persistent incarnations.
     MigrateTableAuthority {
         #[arg(long)]
@@ -460,6 +469,9 @@ async fn main() -> anyhow::Result<()> {
                         hnsw_ef_construction: None,
                         hnsw_ef_search: None,
                         recall_sla: None,
+                        max_vector_norm: None,
+                        max_sparse_nnz: None,
+                        max_sparse_weight: None,
                         index_kind: None,
                         streamer_max_bytes: 0,
                     }),
@@ -867,6 +879,59 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Report the RT-11 upgrade gaps of an RBAC file. Returns `false` when any
+/// admin key would be refused installation-wide operations under `enforced`.
+/// Never prints key values.
+fn installation_check(rbac_config_file: &Path, json_output: bool) -> anyhow::Result<bool> {
+    use chirondb::rbac::{INSTALLATION_MIGRATION_DOC, Principal, RbacConfig};
+    let config = RbacConfig::load_from_file(rbac_config_file).map_err(anyhow::Error::msg)?;
+    let findings: Vec<_> = config
+        .keys
+        .iter()
+        .map(Principal::from_entry)
+        .filter_map(|principal| principal.installation_gap().map(|gap| (principal, gap)))
+        .collect();
+    if json_output {
+        let findings: Vec<_> = findings
+            .iter()
+            .map(|(principal, gap)| {
+                json!({
+                    "id": principal.id,
+                    "tenant_id": principal.tenant_id,
+                    "reason": gap.as_str(),
+                    "fix": gap.fix(),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "keys_checked": config.keys.len(),
+                "ready_for_enforced": findings.is_empty(),
+                "findings": findings,
+                "doc": INSTALLATION_MIGRATION_DOC,
+            }))?
+        );
+    } else {
+        for (principal, gap) in &findings {
+            println!(
+                "{} tenant={} reason={}: {}",
+                principal.id,
+                principal.tenant_id.as_deref().unwrap_or("-"),
+                gap.as_str(),
+                gap.fix()
+            );
+        }
+        println!(
+            "{} of {} keys need a change before --tenant-enforcement enforced; see {}",
+            findings.len(),
+            config.keys.len(),
+            INSTALLATION_MIGRATION_DOC
+        );
+    }
+    Ok(findings.is_empty())
+}
+
 fn run_security_command(command: &SecurityCommand) -> anyhow::Result<()> {
     match command {
         SecurityCommand::ConvertSnapshot {
@@ -1005,6 +1070,14 @@ fn run_security_command(command: &SecurityCommand) -> anyhow::Result<()> {
                 "{}",
                 json!({"common_frontier_format": 1, "installation_format": 7, "migrated": migrated})
             );
+        }
+        SecurityCommand::InstallationCheck {
+            rbac_config_file,
+            json,
+        } => {
+            if !installation_check(rbac_config_file, *json)? {
+                std::process::exit(1);
+            }
         }
         SecurityCommand::MigrateTableAuthority { data_dir, keyring } => {
             encryption::install_process_keyring(encryption::Keyring::load(keyring)?, false)?;
