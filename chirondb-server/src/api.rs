@@ -2387,27 +2387,30 @@ mod tests {
 
     #[test]
     fn ml_recovery_errors_are_unavailable_over_chironql() {
-        for code in [
-            "chironql.ml_recovery_required",
-            "chironql.ml_commit_unknown",
-            "chironql.ml_recovering",
-            "chironql.ml_storage_unavailable",
-            "chironql.ml_resource_exhausted",
-        ] {
-            let response = super::chironql_error_response(super::ChironQlError {
-                code: code.into(),
-                error: "ML recovery is required".into(),
-                query_id: "mapping-test".into(),
-                hint: None,
-                position: None,
-                affected_estimate: None,
-                trace: None,
-            });
-            assert_eq!(
-                response.status(),
-                axum::http::StatusCode::SERVICE_UNAVAILABLE
-            );
-        }
+        // Shares the logging callsite with the capture test; see capture_logs.
+        crate::log_sanitize::tests::capture_logs(|| {
+            for code in [
+                "chironql.ml_recovery_required",
+                "chironql.ml_commit_unknown",
+                "chironql.ml_recovering",
+                "chironql.ml_storage_unavailable",
+                "chironql.ml_resource_exhausted",
+            ] {
+                let response = super::chironql_error_response(super::ChironQlError {
+                    code: code.into(),
+                    error: "ML recovery is required".into(),
+                    query_id: "mapping-test".into(),
+                    hint: None,
+                    position: None,
+                    affected_estimate: None,
+                    trace: None,
+                });
+                assert_eq!(
+                    response.status(),
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                );
+            }
+        });
     }
 
     #[test]
