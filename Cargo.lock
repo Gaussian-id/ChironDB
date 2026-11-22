@@ -405,7 +405,7 @@ dependencies = [
 
 [[package]]
 name = "chirondb"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "chirondb-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -515,7 +515,7 @@ dependencies = [
 
 [[package]]
 name = "chirondb-types"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -527,7 +527,7 @@ dependencies = [
 
 [[package]]
 name = "chirondb-ui-server"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "axum",

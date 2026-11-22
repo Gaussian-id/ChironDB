@@ -254,7 +254,7 @@ jobs:
       - name: Build production image
         run: |
           docker build \
-            --build-arg CHIRONDB_VERSION=0.4.0 \
+            --build-arg CHIRONDB_VERSION=0.4.1 \
             --build-arg VCS_REF=${{ github.sha }} \
             -t chirondb:ci .
       - name: Three-protocol persistence smoke
