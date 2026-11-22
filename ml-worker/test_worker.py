@@ -1,8 +1,11 @@
 """Exercise the real scikit-learn estimators through the worker contract."""
 
+import io
+import json
 import unittest
+from unittest.mock import patch
 
-from chirondb_ml_worker import WorkerError, execute
+from chirondb_ml_worker import WorkerError, execute, main
 
 
 class WorkerTests(unittest.TestCase):
@@ -41,6 +44,27 @@ class WorkerTests(unittest.TestCase):
                     else:
                         self.assertTrue(all(isinstance(p, float) for p in result["predictions"]))
                         self.assertEqual(result["confidence"], [None, None, None])
+
+    def test_failure_codes_are_structured_and_do_not_expose_estimator_values(self):
+        for error, code in [
+            (WorkerError("feature price has no observed labeled values"), "chironql.ml_invalid_rows"),
+            (ImportError("private dependency path"), "chironql.ml_unavailable"),
+            (MemoryError("private training values"), "chironql.ml_worker_resource"),
+            (ValueError("private training values"), "chironql.ml_invalid_rows"),
+            (TypeError("private training values"), "chironql.ml_invalid_rows"),
+            (OSError("private storage path"), "chironql.ml_worker_io"),
+            (RuntimeError("private training values"), "chironql.ml_worker_failed"),
+        ]:
+            with self.subTest(code=code, error=type(error).__name__):
+                output = io.StringIO()
+                with patch("sys.stdin", io.StringIO("{}")), patch("sys.stdout", output), patch(
+                    "chirondb_ml_worker.execute", side_effect=error
+                ):
+                    self.assertEqual(main(), 1)
+                response = json.loads(output.getvalue())
+                self.assertFalse(response["ok"])
+                self.assertEqual(response["error_code"], code)
+                self.assertNotIn("private", response["error"])
 
     def test_rejects_target_leakage(self):
         with self.assertRaisesRegex(WorkerError, "target must be"):

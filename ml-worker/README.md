@@ -71,12 +71,39 @@ server credentials. It runs as the server user and is not a filesystem sandbox;
 configure only a trusted local worker. Results replace the previous view atomically after success;
 a failed refresh preserves the last published version.
 
+The server embeds a stdlib-only Python supervisor. It delivers the ordinary
+single JSON request to the configured worker and keeps a separate parent-liveness
+pipe open. Server shutdown, worker timeout, or parent death (including SIGKILL)
+closes that pipe; the supervisor stops and reaps its owned worker. On Linux and
+macOS the worker runs in its own session, so cleanup never signals the server
+process group or unrelated workers. A partial request is read completely before
+a worker is launched. Custom worker scripts retain the same stdin/stdout JSON
+contract and sibling imports.
+
+The existing hard limits remain: 10,000 source rows, 300 seconds, an 8 MiB JSON
+request, 8 MiB stdout and 64 KiB stderr. There are no per-customer limit flags.
+The worker remains a trusted local process; the supervisor is lifecycle
+management, not a sandbox or protected-tenant inference path.
+
+Failed responses may include a structured `error_code` alongside `ok:false` and
+`error`. The builtin worker identifies invalid rows/model, unavailable Python
+dependencies, temporary resource failure, I/O failure and execution failure.
+The supervisor identifies timeout and output overflow. The scheduler classifies
+these codes directly for retry or blocking; it does not infer retry safety from
+exception message text. Legacy custom-worker failure envelopes remain accepted.
+Third-party estimator exception details are not exposed as training data.
+
+Worker lifecycle tests exercise timeout, cancellation, stdout/stderr caps and
+a killed parent before, during and after request delivery. The Python tests
+include injected supervisor memory failures, so exhaustion is checked without
+forcing a real machine-wide OOM.
+
 With an unprotected local server on port 7401, the synthetic demo creates unique
 source/result tables and retains them for inspection:
 
 ```bash
 target/ml-worker-venv/bin/python ml-worker/try_ml.py
-PYTHONPATH=ml-worker target/ml-worker-venv/bin/python -m unittest -v test_worker
+target/ml-worker-venv/bin/python -m unittest discover -s ml-worker -v
 ```
 
 These are functional checks, not model quality or production certification.

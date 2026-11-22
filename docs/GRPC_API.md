@@ -21,13 +21,14 @@ The primary service definition is
 [`proto/chirondb/v1/chirondb.proto`](../proto/chirondb/v1/chirondb.proto).
 Its request and response messages intentionally reuse
 [`proto/chirondb/v1/compat.proto`](../proto/chirondb/v1/compat.proto) to keep
-GaussDB alpha clients and ChironWire envelopes compatible.
+GaussDB alpha clients and ChironWire envelopes compatible. Additive refresh
+messages are shared through [`ml.proto`](../proto/chirondb/v1/ml.proto).
 
 All source schemas live under `proto/chirondb/v1/`. `compat.proto` retains
 the `gaussdb.v1` protocol package, and `raft.proto` defines internal cluster
 messages in `raft.v1`. Folder names do not change the service names or
 encoded messages used by existing clients. Application clients need only
-`chirondb.proto` and `compat.proto`.
+`chirondb.proto`, `compat.proto`, and `ml.proto`.
 
 Server reflection is enabled. Install [grpcurl](https://github.com/fullstorydev/grpcurl#installation)
 (`brew install grpcurl` on macOS), then run:
@@ -41,6 +42,12 @@ grpcurl -plaintext -d '{}' \
 
 The health response includes the running `version`; compare it with
 `chirondb --version` before diagnosing client/server incompatibility.
+Health returns `UNAVAILABLE` when mandatory audit or durability is degraded,
+or during maintenance/shutdown. After a latched disk-full audit failure, free
+space and restart for verified recovery. The shared [HTTP readiness contract](HTTP_API.md)
+also describes recovery and metrics. Dense vector results use the same
+[approximate persistence contract](HTTP_API.md#create-a-collection); temporal
+float64 infinities use the [ChironQL JSON representation](CHIRONQL.md#time-series-chironql-15).
 
 ## Postman and other gRPC clients
 
@@ -49,8 +56,8 @@ To call ChironDB from a GUI gRPC client such as Postman:
 1. Create a gRPC request with server URL `127.0.0.1:7402`. Use plaintext for a
    local default server.
 2. Use server reflection to load `chirondb.v1.ChironDb`. If the client cannot
-   use reflection, import both `proto/chirondb/v1/chirondb.proto` and
-   `proto/chirondb/v1/compat.proto`, with the repository's `proto` directory as
+   use reflection, import `proto/chirondb/v1/chirondb.proto`,
+   `proto/chirondb/v1/compat.proto`, and `proto/chirondb/v1/ml.proto`, with the repository's `proto` directory as
    the protobuf import path.
 3. Select an RPC, open the message/body editor, and paste one of the JSON
    messages below.
@@ -671,6 +678,37 @@ truncation remains explicit and unchanged.
 }
 ```
 
+### ML refresh policy and status (local preview)
+
+The native `chirondb.v1.ChironDb` service adds `SetMlRefreshPolicy` and
+`GetMlRefreshStatus`, sharing messages from `chirondb/v1/ml.proto`:
+
+```json
+{"name":"sales_forecast","mode":"ML_REFRESH_MODE_AUTO"}
+```
+
+Send this to `SetMlRefreshPolicy`; `ML_REFRESH_MODE_MANUAL` disables future
+automatic refreshes. `GetMlRefreshStatus` accepts `{"name":"sales_forecast"}`.
+Policy changes require write authority and status reads require read authority.
+Both reject protected installation authority and tenant enforcement with
+`PERMISSION_DENIED`. An unspecified/unknown policy enum is `INVALID_ARGUMENT`;
+an unknown view is `NOT_FOUND`. Domain failures carry a JSON `code` and `error`
+in status details. No new credentials or ChironQL syntax are introduced.
+
+Both RPCs return `MlRefreshStatus`. Availability, activity and freshness are
+separate typed enums, so a blocked refresh can still have readable, stale
+results. Optional identity, revisions, job IDs and timestamps preserve absence;
+clients must not interpret an absent revision as zero. See the
+[HTTP status contract](HTTP_API.md#automatic-refresh-policy-and-status) for
+semantics, limits and the eventual-refresh lifecycle.
+
+ChironWire uses the same typed messages through additive `WireRequest` fields
+`set_ml_refresh_policy = 36` and `get_ml_refresh_status = 37`, with response
+`ml_refresh_status = 29`. Request IDs, authentication and framing are unchanged.
+The legacy `gaussdb.v1.GaussDb` RPC service remains unchanged. Regenerate native
+clients with all three public schemas (`compat.proto`, `chirondb.proto`, `ml.proto`);
+older servers do not support these new operations.
+
 ### ExecuteQuery (ChironQL)
 
 Send one top-level ChironQL 1.5 statement per call. A typed `TRANSACTION { ... }`
@@ -919,6 +957,7 @@ python -m grpc_tools.protoc \
   --python_out=generated \
   --grpc_python_out=generated \
   proto/chirondb/v1/compat.proto \
+  proto/chirondb/v1/ml.proto \
   proto/chirondb/v1/chirondb.proto
 ```
 

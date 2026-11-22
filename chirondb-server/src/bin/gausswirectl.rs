@@ -621,6 +621,31 @@ fn response_json(response: chirondb::grpc::pb::WireResponse) -> anyhow::Result<V
             serde_json::from_str(&response.response_json)
                 .context("server returned invalid graph batch response JSON")?
         }
+        wire_response::Payload::MlRefreshStatus(response) => {
+            use chirondb::grpc::chiron_pb::{
+                MlRefreshActivity, MlRefreshAvailability, MlRefreshFreshness, MlRefreshMode,
+            };
+            let name =
+                |value: &str, prefix: &str| value.trim_start_matches(prefix).to_ascii_lowercase();
+            let revision = |value: chirondb::grpc::chiron_pb::MlRefreshRevision| json!({"data":value.data, "schema":value.schema});
+            json!({
+                "view": response.view,
+                "mode": name(MlRefreshMode::try_from(response.mode)?.as_str_name(), "ML_REFRESH_MODE_"),
+                "availability": name(MlRefreshAvailability::try_from(response.availability)?.as_str_name(), "ML_REFRESH_AVAILABILITY_"),
+                "activity": name(MlRefreshActivity::try_from(response.activity)?.as_str_name(), "ML_REFRESH_ACTIVITY_"),
+                "freshness": name(MlRefreshFreshness::try_from(response.freshness)?.as_str_name(), "ML_REFRESH_FRESHNESS_"),
+                "source_table_id": response.source_table_id,
+                "current_revision": response.current_revision.map(revision),
+                "published_revision": response.published_revision.map(revision),
+                "active_job_id": response.active_job_id,
+                "last_success_at_ms": response.last_success_at_ms,
+                "queue_age_ms": response.queue_age_ms,
+                "retry_at_ms": response.retry_at_ms,
+                "error_code": response.error_code,
+                "blocked_reason": response.blocked_reason,
+                "refresh_version": response.refresh_version,
+            })
+        }
         wire_response::Payload::Sql(response) => serde_json::from_str(&response.response_json)
             .context("server returned invalid SQL response JSON")?,
     })
@@ -775,4 +800,37 @@ fn request_id() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64
+}
+
+#[cfg(test)]
+mod ml_refresh_tests {
+    use super::*;
+    use chirondb::grpc::{chiron_pb as ml, pb::WireResponse};
+
+    #[test]
+    fn status_json_preserves_names_nulls_and_large_integers() {
+        let result = response_json(WireResponse {
+            payload: Some(wire_response::Payload::MlRefreshStatus(
+                ml::MlRefreshStatus {
+                    view: "forecast".into(),
+                    mode: ml::MlRefreshMode::Auto as i32,
+                    availability: ml::MlRefreshAvailability::Available as i32,
+                    activity: ml::MlRefreshActivity::RetryWait as i32,
+                    freshness: ml::MlRefreshFreshness::Stale as i32,
+                    source_table_id: Some(u64::MAX),
+                    refresh_version: 2,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(result["mode"], "auto");
+        assert_eq!(result["activity"], "retry_wait");
+        assert_eq!(result["availability"], "available");
+        assert_eq!(result["freshness"], "stale");
+        assert_eq!(result["source_table_id"], u64::MAX);
+        assert!(result["published_revision"].is_null());
+        assert!(result["current_revision"].is_null());
+    }
 }

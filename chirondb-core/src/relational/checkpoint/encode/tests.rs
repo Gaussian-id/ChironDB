@@ -4,6 +4,7 @@ use crate::relational::memory::with_storage_pool;
 fn fixture(count: usize) -> RelationalCheckpoint {
     RelationalCheckpoint {
         version: RELATIONAL_CHECKPOINT_VERSION,
+        source_lineage: Some(uuid::Uuid::new_v4()),
         sequence: 1,
         next_catalog_id: 1,
         wal_watermark: 0,

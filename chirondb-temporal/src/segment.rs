@@ -87,6 +87,106 @@ pub struct Segment<R> {
     entries: BTreeMap<Vec<u8>, Entry>,
 }
 impl<R: Read + Seek> Segment<R> {
+    /// Upper bound for the merge output and block scratch, excluding indexes
+    /// already owned by the inputs. Callers can admit memory before merging.
+    pub fn merge_memory_bound(&self, other: &Self) -> u64 {
+        let blocks: u64 = self
+            .entries
+            .values()
+            .chain(other.entries.values())
+            .map(|entry| entry.blocks.len() as u64)
+            .sum();
+        blocks
+            .saturating_mul((2 * MAX_BLOCK + 256) as u64)
+            .saturating_add(262144)
+    }
+
+    /// Merge immutable runs without materializing their complete histories.
+    /// Only two input blocks and one output block are decoded at a time.
+    /// Duplicate timestamps must have identical types and value bits.
+    pub fn merge(mut self, mut other: Self) -> Result<Vec<u8>> {
+        let mut out = HEADER.to_vec();
+        let mut index = Vec::new();
+        while !self.entries.is_empty() || !other.entries.is_empty() {
+            let key = match (
+                self.entries.first_key_value(),
+                other.entries.first_key_value(),
+            ) {
+                (Some((a, _)), Some((b, _))) => a.min(b),
+                (Some((a, _)), None) | (None, Some((a, _))) => a,
+                (None, None) => unreachable!(),
+            }
+            .clone();
+            let left = self.entries.remove(&key);
+            let right = other.entries.remove(&key);
+            let tag = left.as_ref().or(right.as_ref()).unwrap().tag;
+            if right.as_ref().is_some_and(|entry| entry.tag != tag) {
+                return Err(bad("mixed types in series"));
+            }
+            index.extend((key.len() as u16).to_be_bytes());
+            index.extend(key);
+            index.push(tag);
+            let count_pos = index.len();
+            index.extend(0_u16.to_be_bytes());
+            let mut count = 0_u16;
+            let mut left = Points::new(&mut self.source, left);
+            let mut right = Points::new(&mut other.source, right);
+            let mut a = left.next()?;
+            let mut b = right.next()?;
+            let mut chunk = Vec::with_capacity(BLOCK_POINTS);
+            while a.is_some() || b.is_some() {
+                let point = match (a, b) {
+                    (Some(x), Some(y)) if x.time == y.time => {
+                        if x.value.bits() != y.value.bits() {
+                            return Err(bad("conflicting event"));
+                        }
+                        a = left.next()?;
+                        b = right.next()?;
+                        x
+                    }
+                    (Some(x), Some(y)) if x.time < y.time => {
+                        a = left.next()?;
+                        x
+                    }
+                    (Some(x), None) => {
+                        a = left.next()?;
+                        x
+                    }
+                    (_, Some(y)) => {
+                        b = right.next()?;
+                        y
+                    }
+                    _ => unreachable!(),
+                };
+                chunk.push(point);
+                if chunk.len() == BLOCK_POINTS || (a.is_none() && b.is_none()) {
+                    count = count
+                        .checked_add(1)
+                        .ok_or_else(|| bad("too many blocks in series"))?;
+                    let block = codec::encode(&chunk);
+                    index.extend(chunk[0].time.to_be_bytes());
+                    index.extend(chunk.last().unwrap().time.to_be_bytes());
+                    index.extend((out.len() as u64).to_be_bytes());
+                    index.extend(((block.len() + 4) as u32).to_be_bytes());
+                    out.extend(crc32fast::hash(&block).to_be_bytes());
+                    out.extend(block);
+                    chunk.clear();
+                    if index.len() > MAX_INDEX {
+                        return Err(bad("oversized index"));
+                    }
+                }
+            }
+            index[count_pos..count_pos + 2].copy_from_slice(&count.to_be_bytes());
+        }
+        let pos = out.len() as u64;
+        let crc = crc32fast::hash(&index);
+        out.extend(index);
+        out.extend(pos.to_be_bytes());
+        out.extend(crc.to_be_bytes());
+        out.extend(crc32fast::hash(&out[out.len() - 12..]).to_be_bytes());
+        Ok(out)
+    }
+
     pub fn open(mut source: R) -> Result<Self> {
         let size = source.seek(SeekFrom::End(0))?;
         if size < (HEADER.len() + FOOTER) as u64 {
@@ -230,5 +330,36 @@ impl<R: Read + Seek> Segment<R> {
             }
         }
         Ok(last)
+    }
+}
+
+struct Points<'a, R> {
+    source: &'a mut R,
+    tag: u8,
+    blocks: std::vec::IntoIter<Block>,
+    points: std::vec::IntoIter<Point>,
+}
+impl<'a, R: Read + Seek> Points<'a, R> {
+    fn new(source: &'a mut R, entry: Option<Entry>) -> Self {
+        let entry = entry.unwrap_or(Entry {
+            tag: 0,
+            blocks: Vec::new(),
+        });
+        Self {
+            source,
+            tag: entry.tag,
+            blocks: entry.blocks.into_iter(),
+            points: Vec::new().into_iter(),
+        }
+    }
+    fn next(&mut self) -> Result<Option<Point>> {
+        if let Some(point) = self.points.next() {
+            return Ok(Some(point));
+        }
+        let Some(block) = self.blocks.next() else {
+            return Ok(None);
+        };
+        self.points = Segment::read_block(self.source, self.tag, block)?.into_iter();
+        Ok(self.points.next())
     }
 }

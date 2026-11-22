@@ -1,4 +1,6 @@
 mod edge_authority;
+mod ml_runtime_owner;
+pub use ml_runtime_owner::MlRuntimeService;
 mod relational_security;
 pub mod temporal;
 mod temporal_assets;
@@ -216,6 +218,7 @@ pub struct Db {
     build_lifecycle: Arc<build_lifecycle::BuildLifecycle>,
     graph_shadow_runtime: Arc<graph_shadow::GraphShadowRuntime>,
     shutdown_lifecycle: Arc<ShutdownLifecycle>,
+    ml_runtime_owner: Arc<ml_runtime_owner::MlRuntimeOwner>,
 }
 
 /// One high-level atomic relational + vector/graph mutation request.
@@ -1367,6 +1370,7 @@ impl Db {
             build_lifecycle: build_lifecycle::BuildLifecycle::new(),
             graph_shadow_runtime: graph_shadow::GraphShadowRuntime::new(),
             shutdown_lifecycle: Arc::new(ShutdownLifecycle::default()),
+            ml_runtime_owner: Arc::new(ml_runtime_owner::MlRuntimeOwner::default()),
         };
         let checkpoint_lease: Arc<dyn Send + Sync + std::fmt::Debug> = db._data_dir_lock.clone();
         db.relational
@@ -1495,10 +1499,11 @@ impl Db {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// False after a post-commit durability/checkpoint failure. Liveness is
-    /// intentionally separate: existing durable data remains readable.
+    /// False when durability, mandatory audit, maintenance or shutdown prevents
+    /// serving requests. This is readiness, not process liveness.
     pub fn durability_ready(&self) -> bool {
         !self.durability_degraded.load(Ordering::Acquire)
+            && self.audit_writer.is_available()
             && !self.maintenance.load(Ordering::Acquire)
             && !self.is_shutting_down()
     }
@@ -1541,6 +1546,7 @@ impl Db {
     pub fn shutdown(&self, deadline: Instant) -> ShutdownReport {
         self.begin_shutdown();
         self.cancel_shutdown_work();
+        let ml_drained = self.ml_runtime_owner.shutdown(deadline);
         let _coordinator = self
             .shutdown_lifecycle
             .coordinator
@@ -1588,7 +1594,8 @@ impl Db {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_empty();
         let relational_drained = self.relational.read().cancel_and_drain_checkpoint(deadline);
-        let background_drained = builds_drained && compactions_drained && relational_drained;
+        let background_drained =
+            ml_drained && builds_drained && compactions_drained && relational_drained;
         self.wal_flusher.shutdown();
         let wal_flushed = Instant::now() < deadline && self.flush_wals().is_ok();
         let frontier_flushed = background_drained
@@ -2456,6 +2463,146 @@ impl Db {
 
     pub fn relational_tables(&self) -> Vec<crate::TableDefinition> {
         self.relational.read().table_definitions()
+    }
+
+    /// Persist the source-watermark format before enabling automatic ML work.
+    pub fn ensure_ml_source_format(&self) -> Result<()> {
+        self.require_legacy_sql_entry()?;
+        self.ensure_request_admission()?;
+        self.ensure_storage_mutations_available()?;
+        let _inflight = SearchInflightGuard::new(Arc::clone(&self.search_inflight));
+        let _lifecycle = self.lifecycle_gate.read();
+        crate::relational::with_sql_cancellation(
+            Arc::clone(&self.shutdown_lifecycle.cancelled),
+            || self.relational.read().ensure_ml_source_format(),
+        )
+    }
+
+    /// Stable identity of the currently installed relational content root.
+    /// Normal reopen preserves it; restore and snapshot forks change it.
+    pub fn ml_catalog_lineage(&self) -> Result<String> {
+        self.require_legacy_sql_entry()?;
+        self.ensure_request_admission()?;
+        let _lifecycle = self.lifecycle_gate.read();
+        Ok(format!(
+            "{}:{}",
+            self.graph_database_id(),
+            self.relational.read().ml_source_lineage()
+        ))
+    }
+
+    /// Execute an ML catalog transaction only against the content root that
+    /// produced its scheduler state. The lifecycle guard excludes restore from
+    /// the lineage check through the SQL commit and audit projection.
+    pub fn execute_ml_catalog(
+        &self,
+        request: crate::SqlExecutionRequest,
+        audit: &crate::audit::AuditContext,
+        expected_lineage: &str,
+    ) -> Result<crate::SqlResponse> {
+        self.require_legacy_sql_entry()?;
+        self.ensure_request_admission()?;
+        let _inflight = SearchInflightGuard::new(Arc::clone(&self.search_inflight));
+        if !crate::RelationalEngine::request_is_read_only(&request)? {
+            self.ensure_storage_mutations_available()?;
+        }
+        let _lifecycle = self.lifecycle_gate.read();
+        let relational = self.relational.read();
+        if expected_lineage
+            != format!(
+                "{}:{}",
+                self.graph_database_id(),
+                relational.ml_source_lineage()
+            )
+        {
+            return Err(GaussError::InvalidRequest(
+                "ML catalog lineage changed before execution".into(),
+            ));
+        }
+        let execution = relational.execute_with_audit_cancellable(
+            request,
+            audit,
+            Arc::clone(&self.shutdown_lifecycle.cancelled),
+        )?;
+        if let Some(error) = execution.projection_error.as_ref() {
+            self.mark_durability_degraded("relational_storage_projection", error);
+        }
+        if let Some(transaction) = execution.committed.as_ref() {
+            self.project_transaction_audit(transaction);
+        }
+        Ok(execution.into_output())
+    }
+
+    /// Read source identity and committed revisions without scanning rows.
+    pub fn ml_source_revision(&self, source: &str) -> Result<Option<crate::MlSourceMetadata>> {
+        self.require_legacy_sql_entry()?;
+        self.ensure_request_admission()?;
+        let _lifecycle = self.lifecycle_gate.read();
+        let mut metadata = self.relational.read().ml_source_revision(source)?;
+        if let Some(metadata) = &mut metadata {
+            metadata.lineage = format!("{}:{}", self.graph_database_id(), metadata.lineage);
+        }
+        Ok(metadata)
+    }
+
+    /// Read PK-ordered values, schema and source revisions from one MVCC state.
+    pub fn ml_source_snapshot(
+        &self,
+        source: &str,
+        columns: &[String],
+        max_rows: usize,
+    ) -> Result<crate::MlSourceSnapshot> {
+        self.require_legacy_sql_entry()?;
+        self.ensure_request_admission()?;
+        let _inflight = SearchInflightGuard::new(Arc::clone(&self.search_inflight));
+        let _lifecycle = self.lifecycle_gate.read();
+        let mut snapshot = crate::relational::with_sql_cancellation(
+            Arc::clone(&self.shutdown_lifecycle.cancelled),
+            || {
+                self.relational
+                    .read()
+                    .ml_source_snapshot(source, columns, max_rows)
+            },
+        )?;
+        snapshot.metadata.lineage =
+            format!("{}:{}", self.graph_database_id(), snapshot.metadata.lineage);
+        Ok(snapshot)
+    }
+
+    /// Atomically publish an ML result only while its source identity/schema
+    /// still matches the dispatched snapshot. Newer source data is permitted.
+    pub fn execute_ml_publication(
+        &self,
+        request: crate::SqlExecutionRequest,
+        audit: &crate::audit::AuditContext,
+        expected: &crate::MlSourceMetadata,
+        schedule: Option<&crate::MlPublicationFence>,
+    ) -> Result<crate::SqlResponse> {
+        self.require_legacy_sql_entry()?;
+        self.ensure_request_admission()?;
+        self.ensure_storage_mutations_available()?;
+        let _inflight = SearchInflightGuard::new(Arc::clone(&self.search_inflight));
+        let _lifecycle = self.lifecycle_gate.read();
+        let relational = self.relational.read();
+        let current = relational.ml_source_revision(&expected.table.name)?;
+        if current.as_ref().is_none_or(|current| {
+            expected.lineage != format!("{}:{}", self.graph_database_id(), current.lineage)
+        }) {
+            return Err(GaussError::InvalidRequest(
+                "ML source lineage changed before publication".into(),
+            ));
+        }
+        let execution = crate::relational::with_sql_cancellation(
+            Arc::clone(&self.shutdown_lifecycle.cancelled),
+            || relational.execute_ml_publication(request, audit, expected, schedule),
+        )?;
+        if let Some(error) = execution.projection_error.as_ref() {
+            self.mark_durability_degraded("relational_storage_projection", error);
+        }
+        if let Some(transaction) = execution.committed.as_ref() {
+            self.project_transaction_audit(transaction);
+        }
+        Ok(execution.into_output())
     }
 
     /// Run only in an offline process with exclusive ownership of the data
@@ -8783,6 +8930,7 @@ impl Db {
         let prepared = (|| -> Result<_> {
             fs::create_dir_all(&staging)?;
             copy_dir_contents(source, &staging)?;
+            snapshot_control::validate_transactions(&staging)?;
             GraphIdentityStore::discard_imported_from(&staging)?;
             sync_tree(&staging)?;
 
@@ -9201,6 +9349,7 @@ impl Db {
         let prepared = (|| -> Result<_> {
             durable_create_dir(&staging)?;
             copy_dir_contents(source, &staging)?;
+            snapshot_control::validate_transactions(&staging)?;
             GraphIdentityStore::discard_imported_from(&staging)?;
             sync_tree(&staging)?;
             crate::failpoint::check("restore.after_snapshot_copy")?;
@@ -9938,12 +10087,21 @@ impl Db {
     /// Refresh process samples at an explicit observation boundary. Mutation
     /// paths update storage gauges without walking OS page tables per commit.
     pub fn refresh_metrics(&self) {
+        metrics::gauge!("chirondb_audit_unavailable").set(if self.audit_writer.is_available() {
+            0.0
+        } else {
+            1.0
+        });
         crate::observability::refresh_runtime_gauges();
         self.refresh_storage_metrics();
     }
 
     fn refresh_storage_metrics(&self) {
         let inner = self.inner.read();
+        for (name, collection) in &inner.collections {
+            metrics::gauge!("chirondb_temporal_runs", "collection" => name.clone())
+                .set(collection.read().temporal.run_count() as f64);
+        }
         let collections = inner.collections.len();
         let points = inner
             .collections
@@ -9968,6 +10126,9 @@ impl Db {
 
 impl Drop for Db {
     fn drop(&mut self) {
+        if Arc::strong_count(&self.ml_runtime_owner) == 1 {
+            self.ml_runtime_owner.stop();
+        }
         // The worker keeps only a Weak reference to `inner`, so this is the
         // final externally-owned handle. Flush first, then stop and join the
         // coordinator while the collection files are still alive.
@@ -22573,8 +22734,27 @@ mod tests {
         db.set_payload("docs", "p000", json!({"version": "suffix"}), false)
             .unwrap();
         db.delete("docs", &["p001".to_string()]).unwrap();
-        db.upsert("docs", vec![ls_vec_point("p002", -1.0, "suffix")])
-            .unwrap();
+        // The payload update fills the one-byte successor streamer. Until
+        // the frozen leg finishes sealing, cgroup pressure legitimately rejects
+        // this next upsert before its WAL append. Exercise the client's bounded
+        // retry contract instead of assuming this fixture owns an idle machine.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            match db.upsert("docs", vec![ls_vec_point("p002", -1.0, "suffix")]) {
+                Ok(_) => break,
+                Err(GaussError::ResourceExhausted(message))
+                    if message
+                        == "both mutable streamers are full under cgroup memory pressure; retry after the background segment seal completes" =>
+                {
+                    assert!(Instant::now() < deadline, "streamer pressure did not clear");
+                    let unchanged = db.get_points("docs", &["p002".to_string()]).unwrap();
+                    assert_eq!(unchanged[0].payload, json!({"version": "sealed"}));
+                    eprintln!("retrying pre-WAL streamer pressure rejection");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                outcome => panic!("unexpected suffix upsert outcome: {outcome:?}"),
+            }
+        }
 
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {

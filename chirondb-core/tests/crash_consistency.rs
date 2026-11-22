@@ -1186,6 +1186,328 @@ fn snapshot_holds_sql_commits_until_its_tree_is_published() {
     ));
 }
 
+// Match the ML publisher's numeric width and 400-row statement batches, then
+// crash at the journal decision boundary. The previous generation must survive
+// an uncommitted replacement; a committed replacement must recover in full.
+#[cfg(unix)]
+#[test]
+fn ml_sized_sql_publication_recovers_old_or_complete_generation() {
+    const TEST: &str = "ml_sized_sql_publication_recovers_old_or_complete_generation";
+    const COUNT: i64 = 6023;
+    if child_mode(TEST) {
+        let db = Db::open(required_path("CHIRON_ML_CRASH_DATA")).unwrap();
+        let mut statements = vec![SqlStatementRequest {
+            sql: "DELETE FROM publication".into(),
+            parameters: vec![],
+        }];
+        for start in (0..COUNT).step_by(400) {
+            let tuples = (start..(start + 400).min(COUNT))
+                .map(|id| {
+                    let values = std::iter::once(id.to_string())
+                        .chain((1..17).map(|column| format!("{}.25", id + column)))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!("({values})")
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            statements.push(SqlStatementRequest {
+                sql: format!("INSERT INTO publication VALUES {tuples}"),
+                parameters: vec![],
+            });
+        }
+        db.execute_sql(SqlExecutionRequest {
+            statements,
+            idempotency_key: Some("ml-publication-replacement".into()),
+            retry_id: None,
+        })
+        .unwrap();
+        panic!("publication must stop at its injected boundary");
+    }
+    for (boundary, committed) in [
+        ("transaction.before_prepare", false),
+        ("transaction.after_prepare", false),
+        ("transaction.before_commit", false),
+        ("transaction.after_commit", true),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        {
+            let db = Db::open(temp.path()).unwrap();
+            let columns = (1..17)
+                .map(|column| format!("value_{column} DOUBLE PRECISION"))
+                .collect::<Vec<_>>()
+                .join(",");
+            restore_sql(
+                &db,
+                &format!("CREATE TABLE publication (id BIGINT PRIMARY KEY, {columns})"),
+            );
+            restore_sql(
+                &db,
+                &format!(
+                    "INSERT INTO publication VALUES (-1,{})",
+                    ["0"; 16].join(",")
+                ),
+            );
+        }
+        assert_crashed(run_child(
+            TEST,
+            TEST,
+            boundary,
+            &[("CHIRON_ML_CRASH_DATA", temp.path())],
+        ));
+        for restart in 0..2 {
+            eprintln!("publication recovery {boundary}, restart {restart}");
+            let db = Db::open(temp.path()).unwrap();
+            let mut actual = Vec::new();
+            for offset in (0..COUNT).step_by(512) {
+                let response = restore_sql(
+                    &db,
+                    &format!(
+                        "SELECT id, value_16 FROM publication ORDER BY id LIMIT 512 OFFSET {offset}"
+                    ),
+                );
+                let SqlResult::Rows { rows, .. } = &response.results[0] else {
+                    panic!("expected publication rows");
+                };
+                actual.extend(rows.iter().cloned());
+                if rows.len() < 512 {
+                    break;
+                }
+            }
+            let expected = if committed {
+                (0..COUNT)
+                    .map(|id| {
+                        vec![
+                            RelationalValue::Integer(id),
+                            RelationalValue::Float((id + 16) as f64 + 0.25),
+                        ]
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                vec![vec![
+                    RelationalValue::Integer(-1),
+                    RelationalValue::Float(0.0),
+                ]]
+            };
+            assert_eq!(actual, expected, "{boundary}");
+        }
+    }
+}
+
+// Qualify the actual source/claim-fenced publication path separately from the
+// existing large numeric publication budget fixture above.
+#[cfg(unix)]
+#[test]
+fn ml_fenced_publication_recovers_result_revision_receipt_and_claim_atomically() {
+    const TEST: &str =
+        "ml_fenced_publication_recovers_result_revision_receipt_and_claim_atomically";
+    fn context() -> audit::AuditContext {
+        let mut audit = audit::AuditContext::embedded();
+        audit.transport = "chironql-ml".into();
+        audit.request_id = Some("forecast-job".into());
+        audit
+    }
+    fn statement(sql: &str, parameters: Vec<RelationalValue>) -> SqlStatementRequest {
+        SqlStatementRequest {
+            sql: sql.into(),
+            parameters,
+        }
+    }
+    fn request(statements: Vec<SqlStatementRequest>) -> SqlExecutionRequest {
+        SqlExecutionRequest {
+            statements,
+            idempotency_key: None,
+            retry_id: Some("forecast-job".into()),
+        }
+    }
+    fn schedule(current: chirondb_core::MlSourceRevision, published: bool) -> String {
+        let revision = if published {
+            current
+        } else {
+            chirondb_core::MlSourceRevision {
+                data_revision: 2,
+                schema_revision: 1,
+                ..current
+            }
+        };
+        json!({"epoch":"forecast-epoch", "claim": if published { None } else { Some("forecast-claim") },
+            "job": if published { None } else { Some("forecast-job") }, "desired": current,
+            "published": revision, "version": if published {2} else {1}}).to_string()
+    }
+    fn publication(source: &chirondb_core::MlSourceMetadata) -> SqlExecutionRequest {
+        request(vec![
+            statement("DELETE FROM forecast", vec![]),
+            statement("INSERT INTO forecast VALUES (1, 11, 2), (2, 22, 2)", vec![]),
+            statement(
+                "UPDATE __chiron_ml_views SET version = 2, published_data = $1, published_schema = $2 WHERE name = 'forecast'",
+                vec![
+                    RelationalValue::Integer(source.revision.data_revision as i64),
+                    RelationalValue::Integer(source.revision.schema_revision as i64),
+                ],
+            ),
+            statement(
+                "UPDATE __chiron_ml_jobs SET status = 'succeeded' WHERE id = 'forecast-job'",
+                vec![],
+            ),
+            statement(
+                "UPDATE __chiron_ml_schedule SET state = $1 WHERE name = 'forecast'",
+                vec![RelationalValue::Text(schedule(source.revision, true))],
+            ),
+        ])
+    }
+    if child_mode(TEST) {
+        let db = Db::open(required_path("CHIRON_ML_FENCED_DATA")).unwrap();
+        let source = db.ml_source_revision("source").unwrap().unwrap();
+        let fence = chirondb_core::MlPublicationFence {
+            schedule_name: "forecast".into(),
+            schedule_state: schedule(source.revision, false),
+        };
+        db.execute_ml_publication(publication(&source), &context(), &source, Some(&fence))
+            .unwrap();
+        // The caller has not delivered an acknowledgement yet. A crash here
+        // must be reconciled by the durable receipt, never a second generation.
+        chirondb_core::failpoint::check("ml_publication.before_client_ack").unwrap();
+        panic!("fenced publication must stop at its injected boundary");
+    }
+    for (boundary, committed) in [
+        ("transaction.before_prepare", false),
+        ("transaction.after_prepare", false),
+        ("transaction.before_commit", false),
+        ("transaction.after_commit", true),
+        ("ml_publication.before_client_ack", true),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let expected_source;
+        {
+            let db = Db::open(directory.path()).unwrap();
+            restore_sql(
+                &db,
+                "CREATE TABLE source (id INTEGER PRIMARY KEY, value INTEGER)",
+            );
+            restore_sql(&db, "INSERT INTO source VALUES (1, 10), (2, 20)");
+            db.execute_sql_with_audit(request(vec![
+                statement("CREATE TABLE forecast (id INTEGER PRIMARY KEY, prediction INTEGER, refresh_version BIGINT)", vec![]),
+                statement("INSERT INTO forecast VALUES (0, 0, 1)", vec![]),
+                statement("CREATE TABLE __chiron_ml_views (name TEXT PRIMARY KEY, version BIGINT, published_data BIGINT, published_schema BIGINT)", vec![]),
+                statement("INSERT INTO __chiron_ml_views VALUES ('forecast', 1, 2, 1)", vec![]),
+                statement("CREATE TABLE __chiron_ml_jobs (id TEXT PRIMARY KEY, status TEXT)", vec![]),
+                statement("INSERT INTO __chiron_ml_jobs VALUES ('forecast-job', 'running')", vec![]),
+                statement("CREATE TABLE __chiron_ml_schedule (name TEXT PRIMARY KEY, state TEXT NOT NULL)", vec![]),
+            ]), &context()).unwrap();
+            restore_sql(&db, "UPDATE source SET value = 11 WHERE id = 1");
+            expected_source = db.ml_source_revision("source").unwrap().unwrap();
+            db.execute_sql_with_audit(
+                request(vec![statement(
+                    "INSERT INTO __chiron_ml_schedule VALUES ('forecast', $1)",
+                    vec![RelationalValue::Text(schedule(
+                        expected_source.revision,
+                        false,
+                    ))],
+                )]),
+                &context(),
+            )
+            .unwrap();
+            db.ensure_ml_source_format().unwrap();
+        }
+        assert_crashed(run_child(
+            TEST,
+            TEST,
+            boundary,
+            &[("CHIRON_ML_FENCED_DATA", directory.path())],
+        ));
+        for restart in 0..2 {
+            eprintln!("fenced ML recovery {boundary}, restart {restart}");
+            let db = Db::open(directory.path()).unwrap();
+            assert_eq!(
+                db.ml_source_revision("source").unwrap().unwrap(),
+                expected_source
+            );
+            let result = db.execute_sql(request(vec![
+                statement("SELECT id, prediction, refresh_version FROM forecast ORDER BY id", vec![]),
+                statement("SELECT version, published_data, published_schema FROM __chiron_ml_views WHERE name = 'forecast'", vec![]),
+                statement("SELECT status FROM __chiron_ml_jobs WHERE id = 'forecast-job'", vec![]),
+                statement("SELECT state FROM __chiron_ml_schedule WHERE name = 'forecast'", vec![]),
+            ])).unwrap();
+            let rows = |index: usize| match &result.results[index] {
+                SqlResult::Rows { rows, .. } => rows.clone(),
+                _ => panic!("expected rows"),
+            };
+            let generation = if committed { 2 } else { 1 };
+            assert_eq!(
+                rows(0),
+                if committed {
+                    vec![
+                        vec![
+                            RelationalValue::Integer(1),
+                            RelationalValue::Integer(11),
+                            RelationalValue::Integer(2),
+                        ],
+                        vec![
+                            RelationalValue::Integer(2),
+                            RelationalValue::Integer(22),
+                            RelationalValue::Integer(2),
+                        ],
+                    ]
+                } else {
+                    vec![vec![
+                        RelationalValue::Integer(0),
+                        RelationalValue::Integer(0),
+                        RelationalValue::Integer(1),
+                    ]]
+                },
+                "{boundary}"
+            );
+            assert_eq!(
+                rows(1),
+                vec![vec![
+                    RelationalValue::Integer(generation),
+                    RelationalValue::Integer(if committed {
+                        expected_source.revision.data_revision as i64
+                    } else {
+                        2
+                    }),
+                    RelationalValue::Integer(1)
+                ]]
+            );
+            assert_eq!(
+                rows(2),
+                vec![vec![RelationalValue::Text(
+                    if committed { "succeeded" } else { "running" }.into()
+                )]]
+            );
+            assert_eq!(
+                rows(3),
+                vec![vec![RelationalValue::Text(schedule(
+                    expected_source.revision,
+                    committed
+                ))]]
+            );
+            if committed {
+                let stale = chirondb_core::MlPublicationFence {
+                    schedule_name: "forecast".into(),
+                    schedule_state: schedule(expected_source.revision, false),
+                };
+                assert!(
+                    db.execute_ml_publication(
+                        publication(&expected_source),
+                        &context(),
+                        &expected_source,
+                        Some(&stale)
+                    )
+                    .is_err()
+                );
+                let version = restore_sql(
+                    &db,
+                    "SELECT version FROM __chiron_ml_views WHERE name = 'forecast'",
+                );
+                assert!(
+                    matches!(&version.results[0], SqlResult::Rows {rows, ..} if rows == &vec![vec![RelationalValue::Integer(2)]])
+                );
+            }
+        }
+    }
+}
+
 fn child_mode(expected: &str) -> bool {
     std::env::var(CHILD_MODE).is_ok_and(|mode| mode == expected)
 }

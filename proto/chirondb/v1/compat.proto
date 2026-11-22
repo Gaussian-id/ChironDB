@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package gaussdb.v1;
 
+import "chirondb/v1/ml.proto";
+
 service GaussDb {
   rpc Health(HealthRequest) returns (HealthResponse);
   rpc CreateCollection(CreateCollectionRequest) returns (CollectionConfig);
@@ -368,6 +370,8 @@ message WireRequest {
     // of begin, execute, commit, or rollback; execute carries request_json.
     WireSqlTransactionRequest sql_transaction = 34;
     WireGraphRelateBatchRequest relate_batch = 35;
+    chirondb.v1.SetMlRefreshPolicyRequest set_ml_refresh_policy = 36;
+    chirondb.v1.GetMlRefreshStatusRequest get_ml_refresh_status = 37;
   }
 }
 
@@ -445,6 +449,7 @@ message WireResponse {
     WireChironQlResponse chironql = 26;
     WireSqlResponse sql = 27;
     WireGraphRelateBatchResponse relate_batch = 28;
+    chirondb.v1.MlRefreshStatus ml_refresh_status = 29;
     SearchResponse search = 15;
     MultiSearchResponse multi_search = 16;
     CountResponse count = 17;

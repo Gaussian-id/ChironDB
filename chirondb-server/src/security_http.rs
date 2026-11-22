@@ -62,7 +62,7 @@ impl IntoResponse for Failure {
             GaussError::InvalidRequest(_) | GaussError::DimensionMismatch { .. } => {
                 (StatusCode::BAD_REQUEST, "security.invalid")
             }
-            GaussError::ResourceExhausted(_) => {
+            GaussError::ResourceExhausted(_) | GaussError::SqlLimitExceeded(_) => {
                 (StatusCode::TOO_MANY_REQUESTS, "security.budget_exceeded")
             }
             _ => (StatusCode::SERVICE_UNAVAILABLE, "security.unavailable"),
@@ -856,6 +856,24 @@ async fn revoke(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn hard_and_transient_limits_keep_redacted_budget_response() {
+        for error in [
+            GaussError::ResourceExhausted("private rows".into()),
+            GaussError::SqlLimitExceeded("private rows".into()),
+        ] {
+            let response = Failure(error).into_response();
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                json!({"error":{"code":"security.budget_exceeded"}})
+            );
+        }
+    }
 
     #[test]
     fn protected_json_output_stops_at_limit_before_following_values() {

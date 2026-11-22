@@ -32,6 +32,42 @@ fn config() -> CollectionConfig {
     )
     .unwrap()
 }
+
+#[test]
+fn temporal_infinity_wire_contract_survives_merging_and_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let tenant = TenantScope::tenant("writer", "fleet");
+    let db = Db::open(dir.path()).unwrap();
+    db.create_collection(config()).unwrap();
+    for (time, value) in [(0, "1e999"), (1, "-1e999"), (2, "12.5")] {
+        query(&db, &tenant, &format!("APPEND INTO armada [{{asset:'truck',property:'value',time_ns:'{time}',value:{value}}}];")).unwrap();
+        db.compact_collection("armada").unwrap();
+    }
+    drop(db);
+    let db = Db::open(dir.path()).unwrap();
+    let response = query(
+        &db,
+        &tenant,
+        "HISTORY armada ASSET 'truck' PROPERTY 'value' FROM '0' TO '3' LIMIT 3;",
+    )
+    .unwrap();
+    assert_eq!(
+        response
+            .rows
+            .iter()
+            .map(|row| row["value"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!("+Infinity"), json!("-Infinity"), json!(12.5)]
+    );
+    assert!(
+        query(
+            &db,
+            &tenant,
+            "APPEND INTO armada [{asset:'truck',property:'value',time_ns:'3',value:'text'}];"
+        )
+        .is_err()
+    );
+}
 const APPEND: &str = "APPEND INTO armada [{asset:'truk-7', property:'suhu', time_ns:'1700000000000000000', value:24.5},{asset:'truk-7', property:'suhu',time_ns:'1700000000000000001',value:25.0}];";
 const HISTORY: &str = "HISTORY armada ASSET 'truk-7' PROPERTY 'suhu' FROM '1700000000000000000' TO '1700000000000000002' LIMIT 100;";
 const LATEST: &str = "LATEST armada ASSET 'truk-7' PROPERTY 'suhu';";

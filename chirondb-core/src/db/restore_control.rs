@@ -22,7 +22,9 @@ pub(super) fn prepare(db: &Db, content: &Path) -> Result<Arc<crate::RelationalEn
 }
 
 pub(super) fn validate_staging(db: &Db, staging: &Path) -> Result<()> {
-    drop(prepare(db, staging)?);
+    let engine = prepare(db, staging)?;
+    engine.rotate_ml_source_lineage_for_restore()?;
+    drop(engine);
     crate::failpoint::check("restore.after_relational_validation")
 }
 

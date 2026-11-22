@@ -24,6 +24,7 @@ def main():
     proto_root = repo / "proto"
     legacy_proto = proto_root / "chirondb" / "v1" / "compat.proto"
     primary_proto = proto_root / "chirondb" / "v1" / "chirondb.proto"
+    ml_proto = proto_root / "chirondb" / "v1" / "ml.proto"
     raft_proto = proto_root / "chirondb" / "v1" / "raft.proto"
     protoc = shutil.which("protoc")
     if protoc is None:
@@ -43,6 +44,7 @@ def main():
                 "--include_imports",
                 str(legacy_proto.relative_to(proto_root)),
                 str(primary_proto.relative_to(proto_root)),
+                str(ml_proto.relative_to(proto_root)),
                 str(raft_proto.relative_to(proto_root)),
             ],
             cwd=repo,
@@ -56,6 +58,7 @@ def main():
         try:
             generated = importlib.import_module("chirondb.v1.compat_pb2")
             primary = importlib.import_module("chirondb.v1.chirondb_pb2")
+            ml = importlib.import_module("chirondb.v1.ml_pb2")
             importlib.import_module("chirondb.v1.raft_pb2")
         except Exception as error:  # noqa: BLE001 - see the check below
             # A local `protoc` newer than the installed protobuf runtime is an
@@ -102,6 +105,20 @@ def main():
             raise AssertionError("batch wire response tag changed")
         if generated.WireRequest.FromString(batch_wire.SerializeToString()).WhichOneof("operation") != "relate_batch":
             raise AssertionError("additive batch wire operation round-trip failed")
+
+        policy = generated.WireRequest(request_id=503)
+        policy.set_ml_refresh_policy.name = "forecast"
+        policy.set_ml_refresh_policy.mode = ml.ML_REFRESH_MODE_AUTO
+        if generated.WireRequest.FromString(policy.SerializeToString()) != policy:
+            raise AssertionError("ML policy frame round-trip failed")
+        for name, tag in (("set_ml_refresh_policy", 36), ("get_ml_refresh_status", 37)):
+            if generated.WireRequest.DESCRIPTOR.fields_by_name[name].number != tag:
+                raise AssertionError("ML request tag changed")
+        if generated.WireResponse.DESCRIPTOR.fields_by_name["ml_refresh_status"].number != 29:
+            raise AssertionError("ML status response tag changed")
+        refresh = ml.MlRefreshStatus(view="forecast", refresh_version=3)
+        if refresh.HasField("source_table_id") or refresh.HasField("published_revision"):
+            raise AssertionError("unknown ML source provenance must remain absent")
 
         create = generated.CreateCollectionRequest()
         create.config.name = "compat"
@@ -164,6 +181,7 @@ def validate_descriptor(descriptor_path):
     expected_packages = {
         "chirondb/v1/chirondb.proto": "chirondb.v1",
         "chirondb/v1/compat.proto": "gaussdb.v1",
+        "chirondb/v1/ml.proto": "chirondb.v1",
         "chirondb/v1/raft.proto": "raft.v1",
     }
     if set(files) != set(expected_packages):
@@ -233,7 +251,7 @@ def validate_descriptor(descriptor_path):
         "ExecuteSql", "BeginSqlTransaction", "ExecuteSqlTransaction",
         "CommitSqlTransaction", "RollbackSqlTransaction",
     }
-    expected_primary_only = graph_methods | sql_methods | {"ExecuteQuery"}
+    expected_primary_only = graph_methods | sql_methods | {"ExecuteQuery", "SetMlRefreshPolicy", "GetMlRefreshStatus"}
     if primary_methods != methods | expected_primary_only:
         raise AssertionError(
             "ChironDb primary-only RPC mismatch: "

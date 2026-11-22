@@ -132,6 +132,11 @@ fn protected_routes() -> Router<AppState> {
         )
         .route("/ml/jobs/{id}", get(ml_job))
         .route("/ml/views/{name}", get(ml_view).delete(ml_drop_view))
+        .route(
+            "/ml/views/{name}/refresh-policy",
+            put(ml_set_refresh_policy),
+        )
+        .route("/ml/views/{name}/refresh-status", get(ml_refresh_status))
         .route("/chironql", post(chironql_execute))
         .route("/chironql/parse", post(chironql_parse))
         .route(
@@ -230,6 +235,9 @@ pub fn router_with_options(db: Db, auth: AuthConfig, options: ServerOptions) -> 
                 shutdown_admission,
             ))
             .layer(middleware::map_response(security_headers));
+    }
+    if let Err(error) = crate::ml_runtime::initialize(&db) {
+        tracing::error!(error = %error, "ML scheduler recovery unavailable");
     }
     let _ = observability::init_metrics();
     let auth_db = db.clone();
@@ -1821,13 +1829,26 @@ fn now_ms() -> u128 {
 
 fn ml_error_response(error: crate::ml_runtime::MlError) -> Response {
     let status = match error.code {
+        "chironql.ml_tenant_unsupported"
+        | "chironql.ml_protected_denied"
+        | "chironql.permission_denied" => StatusCode::FORBIDDEN,
         "chironql.ml_not_found" => StatusCode::NOT_FOUND,
-        "chironql.ml_not_ready" | "chironql.ml_stale_cursor" | "chironql.ml_refresh_running" => {
-            StatusCode::CONFLICT
-        }
-        "chironql.ml_invalid_job" | "chironql.ml_invalid_name" | "chironql.ml_invalid_page" => {
-            StatusCode::BAD_REQUEST
-        }
+        "chironql.ml_not_ready"
+        | "chironql.ml_stale_cursor"
+        | "chironql.ml_refresh_running"
+        | "chironql.ml_invalid_source"
+        | "chironql.ml_definition_conflict"
+        | "chironql.ml_publication_rejected"
+        | "chironql.ml_name_conflict" => StatusCode::CONFLICT,
+        "chironql.ml_invalid_job"
+        | "chironql.ml_invalid_name"
+        | "chironql.ml_invalid_page"
+        | "chironql.ml_invalid_policy"
+        | "chironql.ml_invalid_schema"
+        | "chironql.ml_invalid_rows"
+        | "chironql.ml_limit_exceeded" => StatusCode::BAD_REQUEST,
+        "chironql.ml_worker_resource" => StatusCode::INSUFFICIENT_STORAGE,
+        "chironql.ml_worker_timeout" => StatusCode::GATEWAY_TIMEOUT,
         _ => StatusCode::SERVICE_UNAVAILABLE,
     };
     (
@@ -1835,6 +1856,68 @@ fn ml_error_response(error: crate::ml_runtime::MlError) -> Response {
         Json(json!({"error": error.message, "code": error.code})),
     )
         .into_response()
+}
+
+async fn ml_set_refresh_policy(
+    State(state): State<AppState>,
+    Extension(permission): Extension<Permission>,
+    Path(name): Path<String>,
+    body: Result<
+        Json<chirondb_types::MlRefreshPolicyRequest>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> Response {
+    if state.db.identity_authority().is_some()
+        || state.db.tenant_enforcement().blocks()
+        || !permission.role.allows_write()
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Ok(Json(policy)) = body else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "code": "chironql.ml_invalid_policy",
+                "error": "refresh policy requires only mode: manual or auto"
+            })),
+        )
+            .into_response();
+    };
+    let actor = actor_name(&permission);
+    match tokio::task::spawn_blocking(move || {
+        crate::ml_runtime::set_refresh_policy(
+            &state.db,
+            &name,
+            policy.mode,
+            &actor,
+            permission.tenant_id.as_deref(),
+        )
+    })
+    .await
+    {
+        Ok(Ok(status)) => Json(status).into_response(),
+        Ok(Err(error)) => ml_error_response(error),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn ml_refresh_status(
+    State(state): State<AppState>,
+    Extension(_permission): Extension<Permission>,
+    Path(name): Path<String>,
+) -> Response {
+    if state.db.identity_authority().is_some() || state.db.tenant_enforcement().blocks() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    match tokio::task::spawn_blocking(move || {
+        crate::ml_runtime::get_refresh_status(&state.db, &name)
+    })
+    .await
+    {
+        Ok(Ok(status)) => Json(status).into_response(),
+        Ok(Err(error)) => ml_error_response(error),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
 }
 
 async fn ml_job(
@@ -2035,6 +2118,11 @@ fn chironql_error_response(error: ChironQlError) -> Response {
         "graph.overloaded" => StatusCode::TOO_MANY_REQUESTS,
         "chironql.storage_unavailable"
         | "chironql.snapshot_busy"
+        | "chironql.ml_recovery_required"
+        | "chironql.ml_commit_unknown"
+        | "chironql.ml_recovering"
+        | "chironql.ml_storage_unavailable"
+        | "chironql.ml_resource_exhausted"
         | "graph.slo_unavailable"
         | "chironql.outcome_unknown" => StatusCode::SERVICE_UNAVAILABLE,
         "chironql.transaction_rejected" | "chironql.sql_row_precondition_failed" => {
@@ -2125,7 +2213,9 @@ impl IntoResponse for ApiError {
             | GaussError::InvalidCollectionName(_)
             | GaussError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             GaussError::Graph(error) => graph_http_status(error.code),
-            GaussError::ResourceExhausted(_) => StatusCode::INSUFFICIENT_STORAGE,
+            GaussError::ResourceExhausted(_) | GaussError::SqlLimitExceeded(_) => {
+                StatusCode::INSUFFICIENT_STORAGE
+            }
             GaussError::WalUnavailable(_)
             | GaussError::AuditUnavailable(_)
             | GaussError::CommitOutcomeUnknown { .. }
@@ -2212,14 +2302,112 @@ mod tests {
     use super::{ApiError, AppState};
     use crate::{GaussError, GraphError, GraphErrorCode};
 
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn health_reports_audit_unavailable_on_both_http_paths() {
+        const TEST: &str = "api::tests::health_reports_audit_unavailable_on_both_http_paths";
+        const CHILD: &str = "CHIRON_QUAL_HTTP_HEALTH_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            for boundary in [
+                "audit.before_append",
+                "audit.before_registry_prepare",
+                "audit.before_rotate",
+            ] {
+                assert!(
+                    std::process::Command::new(std::env::current_exe().unwrap())
+                        .args(["--exact", TEST, "--nocapture"])
+                        .env(CHILD, "1")
+                        .env("CHIRONDB_FAILPOINT", format!("error:{boundary}"))
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let db = crate::Db::open(root.path()).unwrap();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, super::router(db)).await.unwrap();
+            });
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap();
+            for path in ["/health", "/v1/health"] {
+                assert_eq!(
+                    client
+                        .get(format!("{base}{path}"))
+                        .send()
+                        .await
+                        .unwrap()
+                        .status(),
+                    200
+                );
+            }
+            // Authentication's mandatory audit fails before any data is served.
+            assert_eq!(
+                client
+                    .get(format!("{base}/v1/collections"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                503
+            );
+            for path in ["/health", "/v1/health"] {
+                let response = client.get(format!("{base}{path}")).send().await.unwrap();
+                assert_eq!(response.status(), 503);
+                assert_eq!(
+                    response.json::<serde_json::Value>().await.unwrap()["status"],
+                    "degraded"
+                );
+            }
+            server.abort();
+            let _ = server.await;
+        });
+    }
+
     #[test]
     fn resource_exhaustion_maps_to_http_507() {
-        let response =
-            ApiError::from(GaussError::ResourceExhausted("retry".into())).into_response();
-        assert_eq!(
-            response.status(),
-            axum::http::StatusCode::INSUFFICIENT_STORAGE
-        );
+        for error in [
+            GaussError::ResourceExhausted("limit".into()),
+            GaussError::SqlLimitExceeded("limit".into()),
+        ] {
+            let response = ApiError::from(error).into_response();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::INSUFFICIENT_STORAGE
+            );
+        }
+    }
+
+    #[test]
+    fn ml_recovery_errors_are_unavailable_over_chironql() {
+        for code in [
+            "chironql.ml_recovery_required",
+            "chironql.ml_commit_unknown",
+            "chironql.ml_recovering",
+            "chironql.ml_storage_unavailable",
+            "chironql.ml_resource_exhausted",
+        ] {
+            let response = super::chironql_error_response(super::ChironQlError {
+                code: code.into(),
+                error: "ML recovery is required".into(),
+                query_id: "mapping-test".into(),
+                hint: None,
+                position: None,
+                affected_estimate: None,
+                trace: None,
+            });
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
     }
 
     #[test]

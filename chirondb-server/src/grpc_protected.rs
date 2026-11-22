@@ -392,6 +392,10 @@ mod tests {
                 tonic::Code::ResourceExhausted,
             ),
             (
+                GaussError::SqlLimitExceeded(sensitive.into()),
+                tonic::Code::ResourceExhausted,
+            ),
+            (
                 GaussError::InvalidRequest(sensitive.into()),
                 tonic::Code::InvalidArgument,
             ),

@@ -2,6 +2,22 @@
 //! generation while the caller holds the exclusive lifecycle gate.
 use super::*;
 
+/// Restore keeps the live installation's control journal in generation mode,
+/// but the supplied backup must still be usable for a cold restore. Validate
+/// every retained frame strictly before recovery can repair a torn final tail.
+/// Recovery may rebuild derived caches only in the private staging copy.
+pub(super) fn validate_transactions(staging: &Path) -> Result<()> {
+    TransactionJournal::validate_existing_format(staging)?;
+    if !staging.join("transactions").exists() {
+        return Ok(()); // A pre-transaction-format backup.
+    }
+    let dir = staging.join(crate::transaction_journal::TRANSACTION_JOURNAL_DIR);
+    Wal::validate_existing(&dir)?;
+    Wal::scan_from(&dir, 0, |_| Ok(()))?;
+    drop(TransactionJournal::open(staging)?);
+    Ok(())
+}
+
 pub(super) fn stage_transactions(
     data_dir: &Path,
     content_root: &Path,

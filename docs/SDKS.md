@@ -76,12 +76,17 @@ float64 value type. APPEND accepts 1–1,024 observations atomically; exact repe
 insert zero new observations and conflicting values reject the batch. HISTORY
 uses an inclusive lower and exclusive upper bound with a required 1–4,096 row
 limit. Protected use requires `temporal_append` / `temporal_read` collection grants.
+Finite observations are JSON numbers; float64 infinities are the strings
+`"+Infinity"` and `"-Infinity"`. Handle those sentinels before aggregation.
+NaN and text observations are unsupported. See the [temporal value contract](CHIRONQL.md#time-series-chironql-15).
 
 Temporal batches are separate from SQL/vector/graph atomic transactions;
 APPEND inside a multi-model TRANSACTION is rejected. Temporal PIPELINE is a
 bounded read composition. Targeted temporal WAL restore and the legacy point-only
-replication path are unsupported. Each collection is limited to 4,096 temporal
-runs, and current compaction retains existing runs. Capacity, sustained-workload
+replication path are unsupported. Checkpoints merge similarly sized temporal
+runs and retain old files until their replacement is durable. The 4,096-run
+metadata guard remains; capped legacy collections can merge before the next
+append or through collection compaction. Capacity, sustained-workload
 and release gates remain open; local functional tests do not establish production readiness.
 
 ## Atomic graph batches — unreleased SDK source
@@ -1255,6 +1260,36 @@ in Python, with the corresponding `MlModel` variants in Rust. Foundation-model
 integration is removed; `tabfm`, `causilo`, `tabpfn` and `prior_labs` are rejected.
 The ML worker remains a local evaluation preview, **not production ready**.
 See [ChironQL](CHIRONQL.md#tabular-ml-materialization-preview).
+
+The unreleased SDK source additions expose refresh policy/status helpers:
+
+```python
+# Sync client; use await for the same AsyncChironDbClient methods.
+refresh = client.set_ml_refresh_policy("sales_forecast", "auto")
+refresh = client.get_ml_refresh_status("sales_forecast")
+```
+
+```rust
+use chirondb_client::MlRefreshMode;
+let refresh = client.set_ml_refresh_policy("sales_forecast", MlRefreshMode::Auto).await?;
+let refresh = client.get_ml_refresh_status("sales_forecast").await?;
+```
+
+```javascript
+await client.setMlRefreshPolicy("sales_forecast", "auto");
+const refresh = await client.getMlRefreshStatus("sales_forecast");
+```
+
+These methods require a server with the additive refresh API and a matching
+SDK source revision; they are not a promise about existing published packages.
+Policy changes require write access, status reads require read access, and both
+remain unavailable on protected installations. Read `availability`, `activity`
+and `freshness` separately: `available` + `blocked` + `stale` preserves the last
+published generation. Nullable revisions/timestamps remain unknown, not zero;
+a queued job's `source_version` remains null until dispatch captures a snapshot.
+Rust returns typed `MlRefreshStatus`; Python retains dictionary results and Node
+retains `number | bigint` precision for integer metadata. No SDK retries a
+mutation automatically. See the [refresh lifecycle](HTTP_API.md#automatic-refresh-policy-and-status).
 
 The Rust client exposes `execute_chironql(&ChironQlRequest)`. The Python client
 exposes `chironql(query, parameters=None, retry_id=None, ...)`. Both call the

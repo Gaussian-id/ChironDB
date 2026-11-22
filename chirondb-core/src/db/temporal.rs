@@ -12,6 +12,8 @@ use std::{
     io::{Read, Seek, SeekFrom},
 };
 
+mod compaction;
+
 pub const MAX_BATCH: usize = 1024;
 pub const MAX_HISTORY: usize = 4096;
 const HOT_BYTES: usize = 4 << 20;
@@ -159,6 +161,10 @@ pub(super) struct TemporalState {
     hot_reservations: Vec<MetadataCharge>,
 }
 impl TemporalState {
+    pub(super) fn run_count(&self) -> usize {
+        self.runs.len()
+    }
+
     pub(super) fn empty(dir: &Path) -> Self {
         Self {
             dir: dir.join("temporal"),
@@ -235,7 +241,9 @@ impl TemporalState {
         if !self.enabled {
             return Ok(None);
         }
+        self.reclaim_obsolete_runs()?;
         self.flush()?;
+        self.compact_runs(false)?;
         Ok(Some(self.runs.iter().map(|(id, _)| id.clone()).collect()))
     }
     fn read(&self, key: &Series, range: Option<(i64, i64, usize)>) -> Result<Vec<Observation>> {
@@ -363,7 +371,10 @@ impl TemporalState {
             self.hot.entry(key).or_default().extend(ps);
         }
     }
-    fn admit_new_run(&self) -> Result<()> {
+    fn admit_new_run(&mut self) -> Result<()> {
+        if self.runs.len() >= MAX_RUNS {
+            self.compact_runs(true)?;
+        }
         if self.runs.len() >= MAX_RUNS {
             return Err(GaussError::ResourceExhausted(
                 "temporal checkpoint run limit exceeded".into(),
@@ -387,6 +398,9 @@ impl TemporalState {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod compaction_tests;
 
 impl Db {
     fn bind_temporal<'a>(

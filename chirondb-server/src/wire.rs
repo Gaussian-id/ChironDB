@@ -182,6 +182,7 @@ pub async fn serve_listener_with_policy_until(
     storage_policy: StoragePolicy,
     shutdown: CancellationToken,
 ) -> std::io::Result<()> {
+    crate::ml_runtime::initialize(&db).map_err(std::io::Error::other)?;
     let mut connections = JoinSet::new();
     loop {
         let accepted = tokio::select! {
@@ -448,6 +449,7 @@ async fn serve_tls_listener_with_acceptor_until(
     storage_policy: StoragePolicy,
     shutdown: CancellationToken,
 ) -> std::io::Result<()> {
+    crate::ml_runtime::initialize(&db).map_err(std::io::Error::other)?;
     let mut connections = JoinSet::new();
     loop {
         let accepted = tokio::select! {
@@ -805,6 +807,7 @@ fn is_read_only_operation(operation: &Option<wire_request::Operation>) -> bool {
         }
         Some(
             wire_request::Operation::Health(_)
+            | wire_request::Operation::GetMlRefreshStatus(_)
             | wire_request::Operation::ListCollections(_)
             | wire_request::Operation::Search(_)
             | wire_request::Operation::HybridSearch(_)
@@ -1395,6 +1398,8 @@ fn wire_policy(operation: &wire_request::Operation) -> (Action, Option<&str>) {
         wire_request::Operation::DeleteByFilter(request) => {
             (Action::Write, Some(&request.collection))
         }
+        wire_request::Operation::GetMlRefreshStatus(_) => (Action::Read, None),
+        wire_request::Operation::SetMlRefreshPolicy(_) => (Action::Write, None),
         wire_request::Operation::Chironql(request) => (Action::Read, request.collection.as_deref()),
         wire_request::Operation::Sql(request) => (wire_sql_action(request), None),
         wire_request::Operation::SqlTransaction(request) => {
@@ -1452,7 +1457,7 @@ fn dispatch_operation(
         wire_request::Operation::Health(_) => {
             if !db.durability_ready() {
                 return Err(Status::unavailable(
-                    "WAL durability is degraded or restore maintenance is active",
+                    "durability or audit is unavailable, or maintenance/shutdown is active",
                 ));
             }
             Ok(wire_response::Payload::Health(pb::HealthResponse {
@@ -1844,6 +1849,29 @@ fn dispatch_operation(
             Ok(wire_response::Payload::Status(pb::StatusResponse {
                 status: "accepted_single_node_noop".to_string(),
             }))
+        }
+        wire_request::Operation::SetMlRefreshPolicy(request) => {
+            grpc::ml_preview_allowed(db)?;
+            let mode = grpc::ml_refresh_mode_from_proto(request.mode)?;
+            let status = crate::ml_runtime::set_refresh_policy(
+                db,
+                &request.name,
+                mode,
+                &principal.id,
+                principal.tenant_id.as_deref(),
+            )
+            .map_err(grpc::ml_error_status)?;
+            Ok(wire_response::Payload::MlRefreshStatus(
+                grpc::ml_refresh_status_to_proto(status),
+            ))
+        }
+        wire_request::Operation::GetMlRefreshStatus(request) => {
+            grpc::ml_preview_allowed(db)?;
+            let status = crate::ml_runtime::get_refresh_status(db, &request.name)
+                .map_err(grpc::ml_error_status)?;
+            Ok(wire_response::Payload::MlRefreshStatus(
+                grpc::ml_refresh_status_to_proto(status),
+            ))
         }
         wire_request::Operation::Chironql(request) => {
             let parameters = request

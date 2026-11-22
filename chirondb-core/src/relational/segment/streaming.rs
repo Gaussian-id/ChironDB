@@ -228,6 +228,10 @@ impl<'a, I: Iterator<Item = Result<Cow<'a, SegmentRecord>>>> Read for RecordRead
         if output.is_empty() {
             return Ok(0);
         }
+        // io::copy writes every successful read to the file. Fill its existing
+        // buffer across fragments/records instead of issuing a disk write for
+        // each small header, key and value. No additional buffer is retained.
+        let mut written = 0;
         loop {
             if self.current.is_none() {
                 let Some(record) = self.records.next() else {
@@ -238,7 +242,7 @@ impl<'a, I: Iterator<Item = Result<Cow<'a, SegmentRecord>>>> Read for RecordRead
                             "relational segment source changed between passes",
                         ));
                     }
-                    return Ok(0);
+                    return Ok(written);
                 };
                 let record = record.map_err(io::Error::other)?;
                 self.header = record_header(&record).map_err(io::Error::other)?;
@@ -252,13 +256,18 @@ impl<'a, I: Iterator<Item = Result<Cow<'a, SegmentRecord>>>> Read for RecordRead
             let record = self.current.as_ref().expect("installed record");
             let mut offset = self.offset;
             for part in [self.header.as_slice(), &record.key, &record.value] {
-                if offset < part.len() {
-                    let count = output.len().min(part.len() - offset);
-                    output[..count].copy_from_slice(&part[offset..offset + count]);
-                    self.offset += count;
-                    return Ok(count);
+                if offset >= part.len() {
+                    offset -= part.len();
+                    continue;
                 }
-                offset -= part.len();
+                let count = (output.len() - written).min(part.len() - offset);
+                output[written..written + count].copy_from_slice(&part[offset..offset + count]);
+                self.offset += count;
+                written += count;
+                if written == output.len() {
+                    return Ok(written);
+                }
+                offset = 0;
             }
             self.current = None;
         }
@@ -417,6 +426,38 @@ mod tests {
         output.extend_from_slice(&meta);
         output.extend_from_slice(&body);
         output
+    }
+
+    #[test]
+    fn record_reader_fills_copy_buffer_across_record_fragments() {
+        let records = records(257);
+        let mut expected = Vec::new();
+        for record in &records {
+            expected.extend_from_slice(&record_header(record).unwrap());
+            expected.extend_from_slice(&record.key);
+            expected.extend_from_slice(&record.value);
+        }
+        for capacity in [1, 7, 8192] {
+            let mut reader = RecordReader {
+                records: records.iter().map(|record| Ok(Cow::Borrowed(record))),
+                current: None,
+                header: [0; RECORD_HEADER_LEN],
+                offset: 0,
+                crc: Hasher::new(),
+                count: 0,
+                expected_count: records.len(),
+                expected_crc: crc32(&expected),
+            };
+            let mut buffer = vec![0; capacity];
+            let mut actual = Vec::new();
+            while actual.len() < expected.len() {
+                let read = reader.read(&mut buffer).unwrap();
+                assert_eq!(read, capacity.min(expected.len() - actual.len()));
+                actual.extend_from_slice(&buffer[..read]);
+            }
+            assert_eq!(reader.read(&mut buffer).unwrap(), 0);
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]

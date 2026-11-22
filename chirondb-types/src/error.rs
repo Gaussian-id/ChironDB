@@ -28,6 +28,10 @@ pub enum GaussError {
     SqlRowPreconditionFailed { expected: u64, actual: u64 },
     #[error("resource exhausted: {0}")]
     ResourceExhausted(String),
+    /// Deterministic SQL request, result or operator limit. Retrying unchanged
+    /// input cannot succeed; transports retain their existing resource code.
+    #[error("resource exhausted: {0}")]
+    SqlLimitExceeded(String),
     #[error("audit unavailable: {0}")]
     AuditUnavailable(String),
     #[error("data directory is already locked: {path}; owner metadata: {owner:?}")]

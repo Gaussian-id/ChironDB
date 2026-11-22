@@ -60,7 +60,7 @@ class ChironLab(Lab):
         generated.mkdir(exist_ok=True)
         subprocess.run([sys.executable, '-m', 'grpc_tools.protoc', '-I'+str(ROOT/'proto'),
                         '--python_out='+str(generated), '--grpc_python_out='+str(generated),
-                        str(ROOT/'proto/chirondb/v1/compat.proto'), str(ROOT/'proto/chirondb/v1/chirondb.proto')], check=True)
+                        str(ROOT/'proto/chirondb/v1/compat.proto'), str(ROOT/'proto/chirondb/v1/chirondb.proto'), str(ROOT/'proto/chirondb/v1/ml.proto')], check=True)
         sys.path.insert(0, str(generated))
         from chirondb.v1 import chirondb_pb2, chirondb_pb2_grpc, compat_pb2, compat_pb2_grpc
         self.pb, self.pbgrpc, self.wpb, self.legacygrpc = chirondb_pb2, chirondb_pb2_grpc, compat_pb2, compat_pb2_grpc

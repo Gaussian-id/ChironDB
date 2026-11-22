@@ -45,10 +45,12 @@ fn fixture() -> RelationalCheckpoint {
     };
     RelationalCheckpoint {
         version: RELATIONAL_CHECKPOINT_VERSION,
+        source_lineage: Some(uuid::Uuid::new_v4()),
         sequence: 1,
         next_catalog_id: 7,
         wal_watermark: 0,
         tables: vec![RelationalCheckpointTable {
+            source_revision: None,
             definition,
             rows: BTreeMap::from([(
                 1,

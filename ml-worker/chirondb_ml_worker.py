@@ -18,7 +18,9 @@ TASKS = {"classification", "regression"}
 
 
 class WorkerError(ValueError):
-    pass
+    def __init__(self, message: str, code: str = "chironql.ml_invalid_rows"):
+        super().__init__(message)
+        self.code = code
 
 
 def _frame(request: dict[str, Any]):
@@ -91,7 +93,7 @@ def execute(request: dict[str, Any]) -> dict[str, Any]:
     model = request.get("model")
     task = request.get("task")
     if model not in MODELS or task not in TASKS:
-        raise WorkerError("model or task is unsupported")
+        raise WorkerError("model or task is unsupported", "chironql.ml_model")
     x_train, y_train, x_predict = _frame(request)
     if task == "regression" and (not y_train.map(lambda value: isinstance(value, (int, float)) and not isinstance(value, bool)).all()):
         raise WorkerError("regression targets must be numeric")
@@ -120,9 +122,22 @@ def main() -> int:
         response = execute(request)
         print(json.dumps({"ok": True, "result": response}, allow_nan=False))
         return 0
-    except (WorkerError, ImportError, ValueError, TypeError, OSError, RuntimeError) as error:
-        print(json.dumps({"ok": False, "error": str(error)}))
-        return 1
+    except WorkerError as error:
+        code, message = error.code, str(error)
+    except ImportError:
+        code, message = "chironql.ml_unavailable", "ML worker dependency is unavailable"
+    except MemoryError:
+        code, message = "chironql.ml_worker_resource", "ML worker memory is exhausted"
+    except (ValueError, TypeError):
+        # Estimator exceptions may embed training values; expose a stable reason
+        # and taxonomy, not raw rows, targets or third-party exception text.
+        code, message = "chironql.ml_invalid_rows", "ML worker input or training data is invalid"
+    except OSError:
+        code, message = "chironql.ml_worker_io", "ML worker I/O failed"
+    except RuntimeError:
+        code, message = "chironql.ml_worker_failed", "ML worker execution failed"
+    print(json.dumps({"ok": False, "error_code": code, "error": message}))
+    return 1
 
 
 if __name__ == "__main__":

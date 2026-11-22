@@ -8,6 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     unsafe { std::env::set_var("PROTOC", protoc) };
     println!("cargo:rerun-if-changed=../proto/chirondb/v1/compat.proto");
     println!("cargo:rerun-if-changed=../proto/chirondb/v1/chirondb.proto");
+    println!("cargo:rerun-if-changed=../proto/chirondb/v1/ml.proto");
     println!("cargo:rerun-if-changed=../proto/chirondb/v1/raft.proto");
     let descriptor_path = PathBuf::from(std::env::var("OUT_DIR")?).join("gaussdb_descriptor.bin");
     tonic_prost_build::configure()

@@ -878,6 +878,10 @@ async fn async_main() -> anyhow::Result<()> {
         }
     }
 
+    chirondb::ml_runtime::initialize(&db)
+        .map_err(anyhow::Error::msg)
+        .context("failed to recover ML refresh scheduler")?;
+
     let http_db = db.clone();
     let grpc_db = db.clone();
     let wire_db = db.clone();

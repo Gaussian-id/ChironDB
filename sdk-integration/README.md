@@ -38,3 +38,19 @@ package consumer checks. SDK and server version numbers are independent.
 Unreleased SDK batch helpers and early-stage temporal decoder changes must be
 qualified and committed in their SDK repositories before advancing these pins.
 The public fixture does not certify ChironQL 1.5 time series.
+
+## Automatic-refresh companion SDK candidates
+
+The existing pins remain the backward-compatibility baseline and do not expose
+the new refresh policy/status helpers. Those helpers require the companion SDK
+source additions described in [the SDK guide](../docs/SDKS.md#tabular-ml-materialized-views-local-preview).
+No unpublished commit is substituted into this lock file.
+
+Each companion SDK has an explicit candidate qualification group requiring
+`CHIRONDB_ML_AUTO_REFRESH=1` and `CHIRONDB_BIN_DIR` pointing to the qualified
+new server binaries, with its actual worker script and Python environment.
+Rust additionally selects its ignored candidate with `--include-ignored`;
+Python and Node run their candidate cases when that environment flag is set.
+Those cases must run without skips before the new helpers are considered
+qualified. The SDKs' default pinned public server fixture continues to verify
+legacy behavior; its CI result does not establish refresh API support.

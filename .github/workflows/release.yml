@@ -383,6 +383,7 @@ jobs:
           mkdir -p "$out/proto/chirondb/v1"
           cp proto/chirondb/v1/chirondb.proto "$out/proto/chirondb/v1/"
           cp proto/chirondb/v1/compat.proto "$out/proto/chirondb/v1/"
+          cp proto/chirondb/v1/ml.proto "$out/proto/chirondb/v1/"
           mkdir -p "$out/sbom"
           find . -name '*.cdx.json' -not -path './target/*' -not -path './fuzz/target/*' -exec cp {} "$out/sbom/" \;
           cp LICENSE NOTICE TRADEMARKS.md "$out/"

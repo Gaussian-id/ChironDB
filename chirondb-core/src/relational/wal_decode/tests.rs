@@ -3,6 +3,77 @@ use crate::transaction_journal::TransactionPrepare;
 use std::io::Write;
 
 #[test]
+fn ml_sized_numeric_publication_fits_default_storage_admission() {
+    // The exact POC width, then the preview row limit with the same width.
+    // ML publishes batches of 400 rows in one atomic journal decision.
+    for count in [6023, 10000] {
+        let rows = (0..count)
+            .map(|row_id| StoredRow {
+                security: None,
+                row_id,
+                values: (0..17)
+                    .map(|column| RelationalValue::Float((row_id + column) as f64 / 100.0))
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        let entry = WalEntry::RelationalBatch {
+            batch: RelationalBatch {
+                sequence: 2,
+                mutations: rows
+                    .chunks(400)
+                    .map(|rows| RelationalMutation::Insert {
+                        table: "ml_results".into(),
+                        rows: rows.to_vec(),
+                    })
+                    .collect(),
+            },
+        };
+        let bytes = serde_json::to_vec(&entry).unwrap();
+        memory::with_storage_pool(128 * 1024 * 1024, |pool| {
+            let decoded = decode::<WalEntry>(&bytes).unwrap();
+            eprintln!(
+                "publication rows={count} encoded_bytes={} admitted_bytes={}",
+                bytes.len(),
+                pool.used()
+            );
+            assert_eq!(serde_json::to_vec(&*decoded).unwrap(), bytes);
+            drop(decoded);
+            assert_eq!(pool.used(), 0);
+            let prepare = TransactionPrepare {
+                version: crate::transaction_journal::TRANSACTION_JOURNAL_VERSION,
+                transaction_id: Default::default(),
+                commit_sequence: 2,
+                target: TransactionTarget::Relational,
+                mutation: Box::new(entry),
+                audit: TransactionAudit::mutation(
+                    "sql_transaction",
+                    None,
+                    &AuditContext::embedded(),
+                    serde_json::json!({}),
+                ),
+                idempotency: None,
+            };
+            // Include encoded input, frame scratch and the exact recovery DTO.
+            let prepared = crate::wal::Wal::prepare_transaction_record(0, &prepare).unwrap();
+            drop(prepared);
+            assert_eq!(pool.used(), 0);
+            let directory = tempfile::tempdir().unwrap();
+            let mut wal = Wal::open(directory.path()).unwrap();
+            wal.append(&WalEntry::TransactionPrepare { prepare })
+                .unwrap();
+            wal.sync().unwrap();
+            Wal::inspect_at(directory.path(), 0, |record| {
+                assert!(matches!(record.entry, WalEntry::TransactionPrepare { .. }));
+                Ok(())
+            })
+            .unwrap();
+            drop(wal);
+            assert_eq!(pool.used(), 0);
+        });
+    }
+}
+
+#[test]
 fn encoded_json_copy_preserves_finite_numeric_bits_and_integer_boundaries() {
     let values = [
         1.2345678901234567e300_f64,

@@ -1,0 +1,70 @@
+# ChironDB — unreleased changes
+
+Changes on top of 0.4.0 that are not yet in a tagged release: automatic
+refresh for ML materialized views, temporal run capacity recovery, restore
+validation and bounded SQL publication.
+
+## Breaking changes
+
+### Relational checkpoints use SQL v5
+
+Normal relational checkpoints written by this server use SQL v5, including for
+tables that have no ML view. The first `ML MATERIALIZE` submission persists v5
+and source lineage before binding a durable ML dependency. A previous server
+binary rejects a v5 datastore, and in-place binary downgrade is unsupported.
+Opening or reading a legacy datastore does not by itself force a checkpoint.
+
+Upgrade: take a backup before starting this version. To roll back, restore
+that backup with the matching previous server. See
+[HTTP API](../HTTP_API.md#automatic-refresh-policy-and-status) for the full
+compatibility notes.
+
+## Features
+
+### Automatic refresh for ML materialized views
+
+ML materialized views can retrain and publish a new generation after committed
+source-table changes. The policy is opt-in per view; `manual` stays the
+default.
+
+- Set the policy with `PUT /v1/ml/views/{name}/refresh-policy` and
+  `{"mode":"auto"}` or `{"mode":"manual"}`. Read state with
+  `GET /v1/ml/views/{name}/refresh-status`, which reports `availability`,
+  `activity` and `freshness` separately. The same policy and status are
+  available over gRPC, ChironWire and the CLI.
+- Manual and automatic work share one bounded worker queue with debounce,
+  coalescing, fairness and retry cooldown. Publication is fenced by source
+  identity, schema and epoch; the previous results stay readable while a view
+  is stale, running, retrying or blocked.
+- An uncertain commit outcome fails closed with a recovery-required status
+  until restart. Restore or fork creates a new lineage: existing results stay
+  readable, but views must be recreated.
+- Not available under protected installation authority or tenant enforcement.
+
+## Fixes
+
+### Temporal run capacity and restore validation
+
+- Checkpoints merge similarly sized immutable temporal runs, so repeated small
+  appends no longer consume one permanent slot each of the 4,096-run limit. A
+  collection already at the limit merges runs before admitting a new append.
+  Optional merges are deferred under memory pressure; old files are reclaimed
+  only after durable publication.
+- Restore validates the backup's retained transaction journal (WAL base
+  metadata, frame checksums, complete frames and transaction recovery) before
+  installing its content. A corrupt or incomplete journal rejects the restore
+  and preserves live content.
+- A latched audit append or sync failure now makes health return `503` with
+  `status: "degraded"` over HTTP, gRPC and ChironWire. Metrics add
+  `chirondb_audit_unavailable`, `chirondb_temporal_runs{collection}` and
+  `chirondb_temporal_run_merges_total`.
+- Documented: dense vectors are persisted as scaled-f16 and are not bit-exact
+  f32; temporal `HISTORY`/`LATEST` encode infinities as `"+Infinity"` and
+  `"-Infinity"`.
+
+### Bounded SQL publication
+
+SQL publication of ML results no longer duplicates generic mutation and journal
+ownership, keeps only projected rows for late primary-key pages, and fills
+segment copy buffers across record fragments. Persisted formats, checksums and
+atomic generation replacement are unchanged.

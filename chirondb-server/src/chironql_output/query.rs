@@ -216,7 +216,10 @@ impl QueryMemory {
 pub(crate) fn error(id: &str, failure: GaussError) -> ChironQlError {
     ChironQlError {
         error: failure.to_string(),
-        code: if matches!(failure, GaussError::ResourceExhausted(_)) {
+        code: if matches!(
+            failure,
+            GaussError::ResourceExhausted(_) | GaussError::SqlLimitExceeded(_)
+        ) {
             "chironql.resource_exhausted"
         } else {
             "chironql.invalid_request"
@@ -339,3 +342,20 @@ impl PartialEq for JsonKey {
     }
 }
 impl Eq for JsonKey {}
+
+#[cfg(test)]
+mod limit_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn hard_and_transient_limits_keep_the_query_resource_code() {
+        for failure in [
+            GaussError::ResourceExhausted("limit".into()),
+            GaussError::SqlLimitExceeded("limit".into()),
+        ] {
+            let result = error("query", failure);
+            assert_eq!(result.code, "chironql.resource_exhausted");
+            assert_eq!(result.error, "resource exhausted: limit");
+        }
+    }
+}

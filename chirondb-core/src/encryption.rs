@@ -605,10 +605,23 @@ impl PersistentChunkCache {
 
     #[cfg(test)]
     fn insert(&mut self, key: (u64, usize), chunk: Arc<CachedChunk>) {
-        self.try_insert(key, chunk).unwrap();
+        // Queue-policy fixtures exercise the normal capacity independently of
+        // the host cgroup. Pressure shrink has a separate deterministic test.
+        self.try_insert_with_pressure(key, chunk, || false).unwrap();
     }
 
     fn try_insert(&mut self, key: (u64, usize), chunk: Arc<CachedChunk>) -> Result<()> {
+        self.try_insert_with_pressure(key, chunk, crate::streamer::memory_pressure)
+    }
+
+    // Keep the live pressure sample at the publication boundary; tests can
+    // exercise both policies without changing process-global cgroup state.
+    fn try_insert_with_pressure(
+        &mut self,
+        key: (u64, usize),
+        chunk: Arc<CachedChunk>,
+        memory_pressure: impl FnOnce() -> bool,
+    ) -> Result<()> {
         // A concurrent reader may have filled the miss while this caller was
         // decrypting. Keep the already-published entry and avoid duplicate
         // queue nodes; this caller can still use its authenticated local Arc.
@@ -643,7 +656,7 @@ impl PersistentChunkCache {
         self.probation.push_back(key);
         PERSISTENT_CACHE_HIGH_WATER_BYTES.fetch_max(self.bytes, Ordering::Relaxed);
         self.rebalance();
-        if crate::streamer::memory_pressure() {
+        if memory_pressure() {
             self.shrink_to(PERSISTENT_CACHE_BYTES / 2);
             metrics::counter!("chirondb_persistent_cache_pressure_shrinks_total").increment(1);
         }
@@ -2819,6 +2832,55 @@ mod tests {
         assert!(hot_cache.main_bytes <= PERSISTENT_MAIN_BYTES);
         assert!(hot_cache.bytes <= PERSISTENT_CACHE_BYTES);
         assert!(hot_cache.get((hot_file_id, resident_chunks)).is_some());
+    }
+
+    #[test]
+    fn persistent_chunk_cache_pressure_shrinks_without_invalidating_reader_pins() {
+        let mut cache = PersistentChunkCache::default();
+        let resident_chunks = PERSISTENT_CACHE_BYTES / DEFAULT_CHUNK_SIZE;
+        let probation_chunks = PERSISTENT_PROBATION_BYTES / DEFAULT_CHUNK_SIZE;
+        let pressure_target = PERSISTENT_CACHE_BYTES / 2;
+        let mut pinned = None;
+        for index in 0..resident_chunks + probation_chunks {
+            cache
+                .try_insert_with_pressure(
+                    (7, index),
+                    Arc::new(CachedChunk::new(vec![0x5a; DEFAULT_CHUNK_SIZE])),
+                    || true,
+                )
+                .unwrap();
+            let chunk = cache.get((7, index)).unwrap();
+            if index == resident_chunks {
+                pinned = Some(chunk);
+            }
+            assert!(cache.bytes <= pressure_target);
+            assert_eq!(cache.bytes, cache.probation_bytes + cache.main_bytes);
+        }
+        assert_eq!(cache.bytes, pressure_target);
+        assert_eq!(
+            cache.bytes,
+            cache
+                .chunks
+                .values()
+                .map(|entry| entry.chunk.bytes.len())
+                .sum::<usize>()
+        );
+        // Normal-capacity 2Q retains this key. Pressure eviction is allowed to
+        // remove it, but a reader's Arc must keep its authenticated bytes alive.
+        assert!(cache.get((7, resident_chunks)).is_none());
+        let pinned = pinned.unwrap();
+        assert!(pinned.bytes.iter().all(|byte| *byte == 0x5a));
+
+        // A later unpressured insertion can grow past the reduced target while
+        // continuing to obey the ordinary cache ceiling and queue policy.
+        let next = resident_chunks + probation_chunks;
+        cache.insert(
+            (7, next),
+            Arc::new(CachedChunk::new(vec![0; DEFAULT_CHUNK_SIZE])),
+        );
+        assert!(cache.get((7, next)).is_some());
+        assert!(cache.bytes > pressure_target);
+        assert!(cache.bytes <= PERSISTENT_CACHE_BYTES);
     }
 
     #[test]
