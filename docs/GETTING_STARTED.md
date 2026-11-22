@@ -1,7 +1,7 @@
 # Getting started with ChironDB
 
 Run ChironDB locally, write your first points, and try dense and hybrid search.
-This guide follows the `0.4.0` source tree and uses a small collection of
+This guide follows the `0.5.0` source tree and uses a small collection of
 demonstration vectors. Generate real embeddings in your application before
 sending them to ChironDB.
 
@@ -64,7 +64,7 @@ curl --fail --retry 15 --retry-connrefused --retry-delay 1 --retry-max-time 30 \
 Expected response:
 
 ```json
-{"status":"ok","version":"0.4.0"}
+{"status":"ok","version":"0.5.0"}
 ```
 
 By default, HTTP uses port `7401`, gRPC uses `7402`, and ChironWire plus the
@@ -134,7 +134,7 @@ profile for an externally reachable service. Wait for the health request above
 to succeed; inspect startup with `docker logs chirondb` if needed.
 
 The repository's [Compose file](../docker-compose.yml) instead pulls
-`ghcr.io/gaussian-id/chirondb:0.4.0`. Use it only when that image is
+`ghcr.io/gaussian-id/chirondb:0.5.0`. Use it only when that image is
 published and accessible to you. Available signed binaries will be listed on
 the [Releases page](https://github.com/Gaussian-id/ChironDB/releases); a source
 version number alone does not mean release artifacts have been published.
