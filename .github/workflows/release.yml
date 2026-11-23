@@ -150,6 +150,81 @@ jobs:
             --max-rss-delta-mib 256 \
             | tee "$RUNNER_TEMP/sift-recovery-report.json"
 
+      - name: Upload WAL release evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wal-sift-plaintext
+          path: |
+            ${{ runner.temp }}/sift-report.json
+            ${{ runner.temp }}/sift-recovery-report.json
+            ${{ runner.temp }}/sift-plaintext-time.txt
+            ${{ runner.temp }}/sift-plaintext-bytes.txt
+          if-no-files-found: error
+
+  wal-encrypted-release-gate:
+    name: WAL official encrypted SIFT-128 release gate
+    needs: source
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      SOURCE_SHA: ${{ needs.source.outputs.source_sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.source.outputs.source_sha }}
+
+      - name: Install Python for the pinned SIFT converter
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@87eb139fed4b08a67bd1fa429a21d1f5d523e03e # 1.92.0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+
+      - name: Install benchmark dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler python3-venv
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --only-binary=:all: --upgrade pip==26.3
+          .venv/bin/pip install --only-binary=:all: h5py==3.14.0
+
+      - name: Cache pinned official SIFT corpus
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .cache/ann-benchmarks
+          key: sift-128-euclidean-dd6f0a6ed6b7ebb8934680f861a33ed01ff33991eaee4fd60914d854a0ca5984
+
+      - name: Fetch and verify official SIFT-128
+        run: |
+          set -euo pipefail
+          mkdir -p .cache/ann-benchmarks
+          h5=.cache/ann-benchmarks/sift-128-euclidean.hdf5
+          if [[ ! -f "$h5" ]]; then
+            curl --fail --location --retry 3 \
+              --output "$h5" \
+              https://ann-benchmarks.com/sift-128-euclidean.hdf5
+          fi
+          echo "dd6f0a6ed6b7ebb8934680f861a33ed01ff33991eaee4fd60914d854a0ca5984  $h5" | sha256sum --check --strict
+
+      - name: Convert and verify GBENCHv1 corpus
+        run: |
+          set -euo pipefail
+          h5=.cache/ann-benchmarks/sift-128-euclidean.hdf5
+          gbench=.cache/ann-benchmarks/sift-128-euclidean.gbench
+          if [[ ! -f "$gbench" ]]; then
+            .venv/bin/python .github/tools/ann-benchmarks/h5_to_gbench.py "$h5" "$gbench"
+          fi
+          echo "d9eb5c85b274efd3cd221a49d82ed8a577737fae9bec9074bc17a341c442ca04  $gbench" | sha256sum --check --strict
+
+      - name: Build benchmark and recovery tools
+        run: cargo build --release --locked -p chirondb --bin gaussbench --bin chirondrill
+
       - name: Run official encrypted SIFT and recovery gates
         run: |
           set -euo pipefail
@@ -188,6 +263,38 @@ jobs:
             --max-recovery-seconds 120 \
             --max-rss-delta-mib 256 \
             | tee "$RUNNER_TEMP/sift-encrypted-recovery-report.json"
+
+      - name: Upload WAL release evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wal-sift-encrypted
+          path: |
+            ${{ runner.temp }}/sift-encrypted-report.json
+            ${{ runner.temp }}/sift-encrypted-recovery-report.json
+            ${{ runner.temp }}/sift-encrypted-time.txt
+            ${{ runner.temp }}/sift-encrypted-bytes.txt
+          if-no-files-found: error
+
+  wal-encryption-overhead:
+    name: WAL encryption overhead gate
+    needs: [source, wal-release-gate, wal-encrypted-release-gate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SOURCE_SHA: ${{ needs.source.outputs.source_sha }}
+    steps:
+      - name: Download wal-sift-plaintext
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: wal-sift-plaintext
+          path: ${{ runner.temp }}
+
+      - name: Download wal-sift-encrypted
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: wal-sift-encrypted
+          path: ${{ runner.temp }}
 
       - name: Verify and report encryption overhead
         run: |
@@ -256,17 +363,19 @@ jobs:
           path: |
             ${{ runner.temp }}/sift-report.json
             ${{ runner.temp }}/sift-recovery-report.json
+            ${{ runner.temp }}/sift-plaintext-time.txt
+            ${{ runner.temp }}/sift-plaintext-bytes.txt
             ${{ runner.temp }}/sift-encrypted-report.json
             ${{ runner.temp }}/sift-encrypted-recovery-report.json
-            ${{ runner.temp }}/sift-encryption-overhead.json
-            ${{ runner.temp }}/sift-plaintext-time.txt
             ${{ runner.temp }}/sift-encrypted-time.txt
+            ${{ runner.temp }}/sift-encrypted-bytes.txt
+            ${{ runner.temp }}/sift-encryption-overhead.json
           if-no-files-found: error
 
   build:
     name: build (${{ matrix.label }})
     if: needs.source.outputs.publish == 'true'
-    needs: [source, wal-release-gate]
+    needs: [source, wal-release-gate, wal-encrypted-release-gate, wal-encryption-overhead]
     runs-on: ${{ matrix.os }}
     env:
       RELEASE_TAG: ${{ needs.source.outputs.release_tag }}
