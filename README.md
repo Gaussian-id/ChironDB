@@ -76,7 +76,7 @@ authentication plus RBAC.
 
 ## Status
 
-**Source version status (2026-11-22):** the server workspace, Docker build default, and pinned Compose image use **`0.5.0`**. No `v0.5.0` tag or image is published yet; see the [0.5.0 release notes](docs/releases/0.5.0.md). Standalone SDKs have their own package versions and compatibility pins.
+**Source version status (2026-11-23):** the server workspace, Docker build default, and pinned Compose image use **`0.5.0`**. No `v0.5.0` tag or image is published yet; see the [0.5.0 release notes](docs/releases/0.5.0.md). The most recent tag is `v0.4.1`; `v0.4.0` was tagged but never published. Standalone SDKs have their own package versions and compatibility pins.
 
 This source includes standalone SDK compatibility updates, row and field authority across supported models, and bounded SQL parsing. The existing `v0.1.0-beta.3` tag is an earlier snapshot; source builds from `main` include later changes. Consult the commit and workflow results when evaluating a source build.
 
