@@ -256,7 +256,7 @@ async def exercise(args, directory, process, ports, provider):
         generated = directory / "generated"
         generated.mkdir()
         repo = Path(__file__).resolve().parents[2]
-        subprocess.run([sys.executable, "-m", "grpc_tools.protoc", f"-I{repo / 'proto'}", f"--python_out={generated}", f"--grpc_python_out={generated}", "chirondb/v1/compat.proto", "chirondb/v1/chirondb.proto"], check=True)
+        subprocess.run([sys.executable, "-m", "grpc_tools.protoc", f"-I{repo / 'proto'}", f"--python_out={generated}", f"--grpc_python_out={generated}", "chirondb/v1/compat.proto", "chirondb/v1/chirondb.proto", "chirondb/v1/ml.proto"], check=True)
         sys.path.insert(0, str(generated))
         pb = importlib.import_module("chirondb.v1.compat_pb2")
         primary = importlib.import_module("chirondb.v1.chirondb_pb2_grpc")

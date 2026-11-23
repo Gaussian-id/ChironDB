@@ -231,6 +231,9 @@ async fn serve_with_storage_policy(
     addr: SocketAddr,
     storage_policy: StoragePolicy,
 ) -> Result<(), tonic::transport::Error> {
+    if let Err(error) = crate::ml_runtime::initialize(&db) {
+        tracing::error!(error = %error, "ML scheduler recovery unavailable");
+    }
     let message_limit = if db.identity_authority().is_some() {
         8 * 1024 * 1024
     } else {
@@ -281,6 +284,7 @@ pub async fn serve_with_options(
     }
 
     let cors = grpc_web_cors(&options.cors_origins)?;
+    crate::ml_runtime::initialize(&db).map_err(io::Error::other)?;
     let message_limit = if db.identity_authority().is_some() {
         8 * 1024 * 1024
     } else {
@@ -336,6 +340,7 @@ pub async fn serve_with_options_until(
         .grpc_web_enabled
         .then(|| grpc_web_cors(&options.cors_origins))
         .transpose()?;
+    crate::ml_runtime::initialize(&db).map_err(io::Error::other)?;
     let message_limit = if db.identity_authority().is_some() {
         8 * 1024 * 1024
     } else {
@@ -456,6 +461,7 @@ pub async fn serve_tls_config_with_options(
     options: GrpcServerOptions,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(addr).await?;
+    crate::ml_runtime::initialize(&db).map_err(io::Error::other)?;
     let acceptor = TlsAcceptor::from(tls.server_config());
     let incoming = TcpListenerStream::new(listener).then(move |socket| {
         let acceptor = acceptor.clone();
@@ -532,6 +538,7 @@ pub async fn serve_tls_config_with_options_until(
     shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(addr).await?;
+    crate::ml_runtime::initialize(&db).map_err(io::Error::other)?;
     let acceptor = TlsAcceptor::from(tls.server_config());
     let incoming = TcpListenerStream::new(listener).then(move |socket| {
         let acceptor = acceptor.clone();
@@ -666,7 +673,7 @@ impl pb::gauss_db_server::GaussDb for ChironDbService {
         authorize_grpc(&self.db, &principal, Action::Read, None)?;
         if !self.db.durability_ready() {
             return Err(Status::unavailable(
-                "WAL durability is degraded or restore maintenance is active",
+                "durability or audit is unavailable, or maintenance/shutdown is active",
             ));
         }
         Ok(Response::new(pb::HealthResponse {
@@ -2406,6 +2413,42 @@ macro_rules! impl_chiron_service {
                 Ok(Response::new(sql_transaction_handle_to_proto(response)))
             }
 
+            /// Assign an existing ML view's refresh policy without changing its definition.
+            async fn set_ml_refresh_policy(
+                &self,
+                request: Request<chiron_pb::SetMlRefreshPolicyRequest>,
+            ) -> Result<Response<chiron_pb::MlRefreshStatus>, Status> {
+                ml_preview_allowed(&self.db)?;
+                let principal = grpc_principal(&request)?;
+                authorize_grpc(&self.db, &principal, Action::Write, None)?;
+                let request = request.into_inner();
+                let mode = ml_refresh_mode_from_proto(request.mode)?;
+                let db = self.db.clone();
+                let status = tokio::task::spawn_blocking(move || {
+                    crate::ml_runtime::set_refresh_policy(
+                        &db, &request.name, mode, &principal.id, principal.tenant_id.as_deref(),
+                    )
+                }).await.map_err(|_| Status::unavailable("ML policy worker failed"))?
+                    .map_err(ml_error_status)?;
+                Ok(Response::new(ml_refresh_status_to_proto(status)))
+            }
+
+            async fn get_ml_refresh_status(
+                &self,
+                request: Request<chiron_pb::GetMlRefreshStatusRequest>,
+            ) -> Result<Response<chiron_pb::MlRefreshStatus>, Status> {
+                ml_preview_allowed(&self.db)?;
+                let principal = grpc_principal(&request)?;
+                authorize_grpc(&self.db, &principal, Action::Read, None)?;
+                let name = request.into_inner().name;
+                let db = self.db.clone();
+                let status = tokio::task::spawn_blocking(move || {
+                    crate::ml_runtime::get_refresh_status(&db, &name)
+                }).await.map_err(|_| Status::unavailable("ML status worker failed"))?
+                    .map_err(ml_error_status)?;
+                Ok(Response::new(ml_refresh_status_to_proto(status)))
+            }
+
             /// ChironQL over gRPC.
             ///
             /// Hand-written rather than forwarded, because this rpc exists only
@@ -2484,6 +2527,107 @@ macro_rules! impl_chiron_service {
     };
 }
 
+pub(crate) fn ml_preview_allowed(db: &Db) -> Result<(), Status> {
+    if db.identity_authority().is_some() || db.tenant_enforcement().blocks() {
+        return Err(Status::permission_denied(
+            "ML refresh is unavailable on protected authority",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn ml_refresh_mode_from_proto(
+    mode: i32,
+) -> Result<chirondb_types::MlRefreshMode, Status> {
+    match chiron_pb::MlRefreshMode::try_from(mode) {
+        Ok(chiron_pb::MlRefreshMode::Manual) => Ok(chirondb_types::MlRefreshMode::Manual),
+        Ok(chiron_pb::MlRefreshMode::Auto) => Ok(chirondb_types::MlRefreshMode::Auto),
+        _ => Err(Status::with_details(
+            tonic::Code::InvalidArgument,
+            "refresh mode must be explicitly manual or auto",
+            serde_json::to_vec(&json!({"code":"chironql.ml_invalid_policy", "error":"refresh mode must be explicitly manual or auto"})).unwrap_or_default().into(),
+        )),
+    }
+}
+
+pub(crate) fn ml_error_status(error: crate::ml_runtime::MlError) -> Status {
+    use tonic::Code;
+    let code = match error.code {
+        "chironql.ml_not_found" => Code::NotFound,
+        "chironql.ml_tenant_unsupported"
+        | "chironql.ml_protected_denied"
+        | "chironql.permission_denied" => Code::PermissionDenied,
+        "chironql.ml_not_ready"
+        | "chironql.ml_stale_cursor"
+        | "chironql.ml_refresh_running"
+        | "chironql.ml_invalid_source"
+        | "chironql.ml_definition_conflict"
+        | "chironql.ml_publication_rejected"
+        | "chironql.ml_limit_exceeded"
+        | "chironql.ml_name_conflict" => Code::FailedPrecondition,
+        "chironql.ml_invalid_job"
+        | "chironql.ml_invalid_name"
+        | "chironql.ml_invalid_page"
+        | "chironql.ml_invalid_policy"
+        | "chironql.ml_invalid_schema"
+        | "chironql.ml_invalid_rows" => Code::InvalidArgument,
+        "chironql.ml_worker_resource" | "chironql.ml_resource_exhausted" => Code::ResourceExhausted,
+        "chironql.ml_worker_timeout" => Code::DeadlineExceeded,
+        "chironql.ml_interrupted" | "chironql.ml_worker_interrupted" => Code::Aborted,
+        _ => Code::Unavailable,
+    };
+    let details = serde_json::to_vec(&json!({"error": error.message, "code": error.code}))
+        .unwrap_or_default();
+    Status::with_details(code, error.message, details.into())
+}
+
+pub(crate) fn ml_refresh_status_to_proto(
+    status: chirondb_types::MlRefreshStatus,
+) -> chiron_pb::MlRefreshStatus {
+    use chirondb_types::{
+        MlRefreshActivity as A, MlRefreshAvailability as V, MlRefreshFreshness as F,
+        MlRefreshMode as M,
+    };
+    let revision = |r: chirondb_types::MlRefreshRevision| chiron_pb::MlRefreshRevision {
+        data: r.data,
+        schema: r.schema,
+    };
+    chiron_pb::MlRefreshStatus {
+        view: status.view,
+        mode: match status.mode {
+            M::Manual => chiron_pb::MlRefreshMode::Manual,
+            M::Auto => chiron_pb::MlRefreshMode::Auto,
+        } as i32,
+        availability: match status.availability {
+            V::NotReady => chiron_pb::MlRefreshAvailability::NotReady,
+            V::Available => chiron_pb::MlRefreshAvailability::Available,
+        } as i32,
+        activity: match status.activity {
+            A::Idle => chiron_pb::MlRefreshActivity::Idle,
+            A::Debouncing => chiron_pb::MlRefreshActivity::Debouncing,
+            A::Queued => chiron_pb::MlRefreshActivity::Queued,
+            A::Running => chiron_pb::MlRefreshActivity::Running,
+            A::RetryWait => chiron_pb::MlRefreshActivity::RetryWait,
+            A::Blocked => chiron_pb::MlRefreshActivity::Blocked,
+        } as i32,
+        freshness: match status.freshness {
+            F::Fresh => chiron_pb::MlRefreshFreshness::Fresh,
+            F::Stale => chiron_pb::MlRefreshFreshness::Stale,
+            F::InvalidSource => chiron_pb::MlRefreshFreshness::InvalidSource,
+        } as i32,
+        source_table_id: status.source_table_id,
+        current_revision: status.current_revision.map(revision),
+        published_revision: status.published_revision.map(revision),
+        active_job_id: status.active_job_id,
+        last_success_at_ms: status.last_success_at_ms,
+        queue_age_ms: status.queue_age_ms,
+        retry_at_ms: status.retry_at_ms,
+        error_code: status.error_code,
+        blocked_reason: status.blocked_reason,
+        refresh_version: status.refresh_version,
+    }
+}
+
 /// Maps a ChironQL failure onto a gRPC status, carrying the full error - code,
 /// hint, caret position and the trace up to the failing stage - in the status
 /// details so a client loses nothing by using gRPC instead of HTTP.
@@ -2503,11 +2647,17 @@ pub(crate) fn chironql_status(error: chirondb_types::chironql::ChironQlError) ->
         "chironql.confirmation_required" => Code::FailedPrecondition,
         "chironql.snapshot_changed" => Code::Aborted,
         "chironql.not_implemented" => Code::Unimplemented,
-        "chironql.resource_exhausted" | "graph.overloaded" => Code::ResourceExhausted,
+        "chironql.resource_exhausted" | "chironql.ml_resource_exhausted" | "graph.overloaded" => {
+            Code::ResourceExhausted
+        }
         "graph.cancelled" => Code::Cancelled,
         "graph.slo_unavailable"
         | "chironql.storage_unavailable"
         | "chironql.snapshot_busy"
+        | "chironql.ml_recovery_required"
+        | "chironql.ml_commit_unknown"
+        | "chironql.ml_recovering"
+        | "chironql.ml_storage_unavailable"
         | "chironql.outcome_unknown" => Code::Unavailable,
         "chironql.transaction_rejected" => Code::Aborted,
         "chironql.storage_corruption" | "chironql.io_error" | "chironql.engine_error" => {
@@ -2906,7 +3056,9 @@ pub(crate) fn status_from_error(error: GaussError) -> Status {
         | GaussError::DimensionMismatch { .. }
         | GaussError::InvalidCollectionName(_)
         | GaussError::InvalidRequest(_) => Status::invalid_argument(error.to_string()),
-        GaussError::ResourceExhausted(_) => Status::resource_exhausted(error.to_string()),
+        GaussError::ResourceExhausted(_) | GaussError::SqlLimitExceeded(_) => {
+            Status::resource_exhausted(error.to_string())
+        }
         GaussError::WalUnavailable(_)
         | GaussError::AuditUnavailable(_)
         | GaussError::CommitOutcomeUnknown { .. }
@@ -2972,9 +3124,104 @@ mod tests {
     use crate::{GaussError, GraphError, GraphErrorCode};
 
     #[test]
+    fn ml_recovery_errors_are_unavailable_over_chironql() {
+        for code in [
+            "chironql.ml_recovery_required",
+            "chironql.ml_commit_unknown",
+            "chironql.ml_recovering",
+            "chironql.ml_storage_unavailable",
+            "chironql.ml_resource_exhausted",
+        ] {
+            let status = super::chironql_status(chirondb_types::chironql::ChironQlError {
+                code: code.into(),
+                error: "ML recovery is required".into(),
+                query_id: "mapping-test".into(),
+                hint: None,
+                position: None,
+                affected_estimate: None,
+                trace: None,
+            });
+            assert_eq!(
+                status.code(),
+                if code == "chironql.ml_resource_exhausted" {
+                    Code::ResourceExhausted
+                } else {
+                    Code::Unavailable
+                }
+            );
+            assert_eq!(
+                serde_json::from_slice::<Value>(status.details()).unwrap()["code"],
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_status_preserves_unknown_revisions_and_additive_wire_tags() {
+        use chirondb_types::{
+            MlRefreshActivity, MlRefreshAvailability, MlRefreshFreshness, MlRefreshMode,
+            MlRefreshRevision, MlRefreshStatus,
+        };
+        let status = super::ml_refresh_status_to_proto(MlRefreshStatus {
+            view: "forecast".into(),
+            mode: MlRefreshMode::Auto,
+            availability: MlRefreshAvailability::Available,
+            activity: MlRefreshActivity::Blocked,
+            freshness: MlRefreshFreshness::Stale,
+            source_table_id: Some(u64::MAX),
+            current_revision: Some(MlRefreshRevision { data: 9, schema: 2 }),
+            published_revision: None,
+            active_job_id: None,
+            last_success_at_ms: None,
+            queue_age_ms: Some(0),
+            retry_at_ms: None,
+            error_code: Some("chironql.ml_invalid_source".into()),
+            blocked_reason: Some("source dropped".into()),
+            refresh_version: 3,
+        });
+        let decoded =
+            super::chiron_pb::MlRefreshStatus::decode(status.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, status);
+        assert_eq!(decoded.source_table_id, Some(u64::MAX));
+        assert!(decoded.published_revision.is_none());
+        assert_eq!(decoded.queue_age_ms, Some(0));
+        assert_eq!(
+            decoded.availability,
+            super::chiron_pb::MlRefreshAvailability::Available as i32
+        );
+        let policy = pb::WireRequest {
+            operation: Some(pb::wire_request::Operation::SetMlRefreshPolicy(
+                super::chiron_pb::SetMlRefreshPolicyRequest::default(),
+            )),
+            ..Default::default()
+        };
+        assert_eq!(policy.encode_to_vec(), [0xa2, 0x02, 0x00]); // field 36
+        let read = pb::WireRequest {
+            operation: Some(pb::wire_request::Operation::GetMlRefreshStatus(
+                super::chiron_pb::GetMlRefreshStatusRequest::default(),
+            )),
+            ..Default::default()
+        };
+        assert_eq!(read.encode_to_vec(), [0xaa, 0x02, 0x00]); // field 37
+        let response = pb::WireResponse {
+            payload: Some(pb::wire_response::Payload::MlRefreshStatus(
+                super::chiron_pb::MlRefreshStatus::default(),
+            )),
+            ..Default::default()
+        };
+        assert_eq!(response.encode_to_vec(), [0xea, 0x01, 0x00]); // field 29
+    }
+
+    #[test]
     fn resource_exhaustion_maps_to_grpc_status() {
-        let status = status_from_error(GaussError::ResourceExhausted("retry".into()));
-        assert_eq!(status.code(), Code::ResourceExhausted);
+        for error in [
+            GaussError::ResourceExhausted("limit".into()),
+            GaussError::SqlLimitExceeded("limit".into()),
+        ] {
+            let status = status_from_error(error);
+            assert_eq!(status.code(), Code::ResourceExhausted);
+            assert_eq!(status.message(), "resource exhausted: limit");
+        }
     }
 
     #[test]

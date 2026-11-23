@@ -3,6 +3,7 @@ pub mod distance;
 pub mod error;
 pub mod filter;
 pub mod graph;
+pub mod ml;
 pub mod model;
 pub mod relational;
 pub mod security;
@@ -28,6 +29,10 @@ pub use graph::{
     GraphTraversalRows, GraphWarning, Nid, RelateBatchRequest, RelateBatchResult, RelateMutation,
     RelateRequest, RelateResult, TraversalBudget, TraversalResult, TraversalStats,
     TraversalTruncationReason, TraversalVisit, TypeId, UnrelateMutation, UpdateEdgeRequest,
+};
+pub use ml::{
+    MlRefreshActivity, MlRefreshAvailability, MlRefreshFreshness, MlRefreshMode,
+    MlRefreshPolicyRequest, MlRefreshRevision, MlRefreshStatus,
 };
 pub use relational::{
     CheckConstraintDefinition, ForeignKeyAction, ForeignKeyDefinition, ForeignKeyMatch, RecordRef,

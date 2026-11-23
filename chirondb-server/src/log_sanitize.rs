@@ -77,8 +77,14 @@ pub(crate) mod tests {
         }
     }
 
+    /// Serializes log capture against tests that hit the same callsites
+    /// without a subscriber: a parallel unsubscribed hit can leave a callsite
+    /// disabled for the capturing thread, dropping the line under test.
+    static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+
     /// Runs `f` under a plain-text fmt subscriber and returns what it logged.
     pub(crate) fn capture_logs(f: impl FnOnce()) -> String {
+        let _serial = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let capture = Capture::default();
         let writer = capture.clone();
         let subscriber = tracing_subscriber::fmt()

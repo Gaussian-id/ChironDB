@@ -3193,7 +3193,9 @@ fn describe_engine_error(role: Role, error: &GaussError) -> (&'static str, Strin
             ("chironql.sql_row_precondition_failed", error.to_string())
         }
         GaussError::InvalidRequest(message) => ("chironql.invalid_request", message.clone()),
-        GaussError::ResourceExhausted(message) => ("chironql.resource_exhausted", message.clone()),
+        GaussError::ResourceExhausted(message) | GaussError::SqlLimitExceeded(message) => {
+            ("chironql.resource_exhausted", message.clone())
+        }
         GaussError::WalUnavailable(message) => ("chironql.wal_unavailable", message.clone()),
         GaussError::AuditUnavailable(message) => ("chironql.audit_unavailable", message.clone()),
         GaussError::DataDirLocked { .. } => (
@@ -3337,6 +3339,19 @@ mod tests {
 
         let (_, admin_message) = describe_engine_error(Role::Admin, &error);
         assert!(admin_message.contains("/var/lib"));
+    }
+
+    #[test]
+    fn hard_and_transient_limits_keep_the_chironql_resource_code() {
+        for error in [
+            GaussError::ResourceExhausted("limit".into()),
+            GaussError::SqlLimitExceeded("limit".into()),
+        ] {
+            assert_eq!(
+                describe_engine_error(Role::ReadOnly, &error),
+                ("chironql.resource_exhausted", "limit".into())
+            );
+        }
     }
 
     #[test]

@@ -4,50 +4,39 @@
 //! The relational engine supplies snapshot reads, WAL ordering, and atomic
 //! visibility; this module owns only job orchestration and the worker process.
 
-use std::{
-    collections::{HashMap, HashSet},
-    env,
-    io::{Read, Write},
-    path::PathBuf,
-    process::{Command, Stdio},
-    sync::{Arc, LazyLock, Mutex, Weak},
-    thread,
-    time::{Duration, Instant},
-};
+mod scheduler;
+mod worker;
+
+use chirondb_types::{MlRefreshMode, MlRefreshStatus};
+use scheduler::read_ready;
+pub(crate) use scheduler::{get_refresh_status, set_refresh_policy};
+use std::{env, path::PathBuf};
+use worker::WorkerConfig;
+
+/// Recover persisted ML schedules before accepting protocol traffic.
+pub fn initialize(db: &Db) -> Result<(), String> {
+    scheduler::initialize(db).map_err(|error| format!("{}: {}", error.code, error.message))
+}
 
 use chirondb_core::{
-    Db, RelationalType, RelationalValue, SqlExecutionRequest, SqlResult, SqlStatementRequest,
-    TableDefinition, audit::AuditContext,
+    Db, MlSourceSnapshot, RelationalType, RelationalValue, SqlExecutionRequest, SqlResult,
+    SqlStatementRequest, audit::AuditContext,
 };
 use serde_json::{Value, json};
 
 use crate::chironql_parser::{MlMaterialize, MlModel, MlTask};
 
 const MAX_SOURCE_ROWS: usize = 10_000;
-const WORKER_TIMEOUT: Duration = Duration::from_secs(300);
 const INSERT_BATCH_ROWS: usize = 400;
 
 const VIEWS_TABLE: &str = "__chiron_ml_views";
 const JOBS_TABLE: &str = "__chiron_ml_jobs";
 
-static STATES: LazyLock<Mutex<HashMap<PathBuf, Weak<MlState>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-#[derive(Default)]
-struct MlState {
-    inner: Mutex<MlStateInner>,
-}
-
-#[derive(Default)]
-struct MlStateInner {
-    initialized: bool,
-    active_views: HashSet<String>,
-}
-
 #[derive(Debug)]
 pub(crate) struct MlError {
     pub code: &'static str,
     pub message: String,
+    transient: bool,
 }
 
 impl MlError {
@@ -55,6 +44,7 @@ impl MlError {
         Self {
             code,
             message: message.into(),
+            transient: false,
         }
     }
 }
@@ -68,29 +58,31 @@ pub(crate) struct MlSubmitted {
     pub status: &'static str,
 }
 
-#[derive(Clone)]
-struct WorkerConfig {
-    python: PathBuf,
-    script: PathBuf,
-}
-
 struct SourceSnapshot {
-    table: TableDefinition,
-    selected_columns: Vec<String>,
-    rows: Vec<Vec<RelationalValue>>,
-    source_version: u64,
+    source: MlSourceSnapshot,
     labeled_rows: usize,
 }
 
-fn state_for(db: &Db) -> Arc<MlState> {
-    let mut states = STATES.lock().expect("ML state registry mutex");
-    let key = db.data_dir();
-    if let Some(state) = states.get(&key).and_then(Weak::upgrade) {
-        return state;
+impl SourceSnapshot {
+    fn source_version(&self) -> u64 {
+        self.source.sequence
     }
-    let state = Arc::new(MlState::default());
-    states.insert(key, Arc::downgrade(&state));
-    state
+}
+
+fn local_preview(db: &Db) -> MlResult<()> {
+    if db.identity_authority().is_some() || db.tenant_enforcement().blocks() {
+        return Err(MlError::new(
+            "chironql.ml_protected_denied",
+            "tabular ML is available only in the local evaluation profile",
+        ));
+    }
+    if db.is_shutting_down() {
+        return Err(MlError::new(
+            "chironql.ml_unavailable",
+            "server is shutting down",
+        ));
+    }
+    Ok(())
 }
 
 fn statement(sql: impl Into<String>, parameters: Vec<RelationalValue>) -> SqlStatementRequest {
@@ -113,7 +105,25 @@ fn execute_sql(
         },
         audit,
     )
-    .map_err(|error| MlError::new("chironql.ml_storage_failed", error.to_string()))
+    .map_err(engine_error)
+}
+
+fn engine_error(error: chirondb_core::GaussError) -> MlError {
+    use chirondb_core::GaussError;
+    let (code, transient) = match &error {
+        GaussError::SqlLimitExceeded(_) => ("chironql.ml_limit_exceeded", false),
+        GaussError::ResourceExhausted(_) => ("chironql.ml_resource_exhausted", true),
+        GaussError::CommitOutcomeUnknown { .. } => ("chironql.ml_commit_unknown", true),
+        GaussError::Io(_) | GaussError::WalUnavailable(_) | GaussError::AuditUnavailable(_) => {
+            ("chironql.ml_storage_unavailable", true)
+        }
+        _ => ("chironql.ml_storage_failed", false),
+    };
+    MlError {
+        code,
+        message: error.to_string(),
+        transient,
+    }
 }
 
 fn rows(result: &SqlResult) -> MlResult<(&[String], &[Vec<RelationalValue>])> {
@@ -211,90 +221,32 @@ fn worker_config() -> MlResult<WorkerConfig> {
     Ok(WorkerConfig { python, script })
 }
 
-fn ensure_catalog(db: &Db, state: &mut MlStateInner, audit: &AuditContext) -> MlResult<()> {
-    if state.initialized {
-        return Ok(());
-    }
-    execute_sql(
-        db,
-        vec![
-            statement(
-                format!(
-                    "CREATE TABLE IF NOT EXISTS {VIEWS_TABLE} (name TEXT PRIMARY KEY, definition TEXT NOT NULL, source TEXT NOT NULL, version BIGINT NOT NULL, source_version BIGINT, row_count BIGINT)"
-                ),
-                vec![],
-            ),
-            statement(
-                format!(
-                    "CREATE TABLE IF NOT EXISTS {JOBS_TABLE} (id TEXT PRIMARY KEY, view_name TEXT NOT NULL, status TEXT NOT NULL, source_version BIGINT, row_count BIGINT, context_rows BIGINT, error TEXT, duration_ms BIGINT)"
-                ),
-                vec![],
-            ),
-            statement(
-                format!(
-                    "UPDATE {JOBS_TABLE} SET status = 'failed', error = 'server_restarted' WHERE status = 'queued' OR status = 'running'"
-                ),
-                vec![],
-            ),
-        ],
-        audit,
-    )?;
-    state.initialized = true;
-    Ok(())
-}
-
 fn read_snapshot(db: &Db, definition: &MlMaterialize) -> MlResult<SourceSnapshot> {
-    let tables = db.relational_tables();
-    crate::chironql_ml::validate_source(definition, &tables)
+    local_preview(db)?;
+    let selected = definition
+        .features
+        .iter()
+        .cloned()
+        .chain([definition.target.clone()])
+        .collect::<Vec<_>>();
+    let source = db
+        .ml_source_snapshot(&definition.source, &selected, MAX_SOURCE_ROWS)
+        .map_err(engine_error)?;
+    crate::chironql_ml::validate_source(definition, std::slice::from_ref(&source.metadata.table))
         .map_err(|message| MlError::new("chironql.ml_invalid_schema", message))?;
-    let table = tables
-        .into_iter()
-        .find(|table| table.name.eq_ignore_ascii_case(&definition.source))
-        .expect("validated source table");
-    let mut selected_columns = table.primary_key.clone();
-    selected_columns.extend(definition.features.iter().cloned());
-    selected_columns.push(definition.target.clone());
-    for name in &selected_columns {
-        identifier(name)?;
-    }
-    let order = table.primary_key.join(", ");
-    let response = db
-        .execute_sql(SqlExecutionRequest {
-            statements: vec![statement(
-                format!(
-                    "SELECT {} FROM {} ORDER BY {order} LIMIT {}",
-                    selected_columns.join(", "),
-                    definition.source,
-                    MAX_SOURCE_ROWS + 1,
-                ),
-                vec![],
-            )],
-            idempotency_key: None,
-            retry_id: None,
-        })
-        .map_err(|error| MlError::new("chironql.ml_source_failed", error.to_string()))?;
-    let (_, result_rows) = rows(&response.results[0])?;
-    if result_rows.is_empty() || result_rows.len() > MAX_SOURCE_ROWS {
-        return Err(MlError::new(
-            "chironql.ml_invalid_rows",
-            format!("source must contain 1 to {MAX_SOURCE_ROWS} rows"),
-        ));
-    }
-    let labeled_rows = result_rows
+    let labeled_rows = source
+        .rows
         .iter()
         .filter(|row| !matches!(row.last(), Some(RelationalValue::Null)))
         .count();
-    if labeled_rows == 0 || labeled_rows == result_rows.len() {
+    if source.rows.is_empty() || labeled_rows == 0 || labeled_rows == source.rows.len() {
         return Err(MlError::new(
             "chironql.ml_invalid_rows",
-            "source must contain both labeled rows and NULL targets",
+            "source must contain labeled rows and NULL targets",
         ));
     }
     Ok(SourceSnapshot {
-        table,
-        selected_columns,
-        rows: result_rows.to_vec(),
-        source_version: response.snapshot,
+        source,
         labeled_rows,
     })
 }
@@ -305,93 +257,7 @@ pub(crate) fn submit(
     actor: &str,
     tenant_id: Option<&str>,
 ) -> MlResult<MlSubmitted> {
-    for name in [&definition.view, &definition.source, &definition.target] {
-        identifier(name)?;
-    }
-    if definition.view.eq_ignore_ascii_case(&definition.source) {
-        return Err(MlError::new(
-            "chironql.ml_invalid_name",
-            "view and source table must have different names",
-        ));
-    }
-    let worker = worker_config()?;
-    let state = state_for(db);
-    let mut guard = state.inner.lock().expect("ML view state mutex");
-    let audit = AuditContext {
-        principal_id: actor.into(),
-        tenant_id: tenant_id.map(str::to_string),
-        transport: "chironql-ml".into(),
-        request_id: None,
-    };
-    ensure_catalog(db, &mut guard, &audit)?;
-    if guard.active_views.contains(&definition.view) {
-        return Err(MlError::new(
-            "chironql.ml_refresh_running",
-            "a refresh for this view is already running",
-        ));
-    }
-    let existing = execute_sql(
-        db,
-        vec![statement(
-            format!("SELECT definition FROM {VIEWS_TABLE} WHERE name = $1"),
-            vec![RelationalValue::Text(definition.view.clone())],
-        )],
-        &audit,
-    )?;
-    let (_, existing_rows) = rows(&existing.results[0])?;
-    let canonical = canonical_definition(definition);
-    if let Some(row) = existing_rows.first() {
-        if one_text(&row[0])? != canonical {
-            return Err(MlError::new(
-                "chironql.ml_definition_conflict",
-                "view already has a different ML definition; drop it before changing parameters",
-            ));
-        }
-    } else if db
-        .relational_tables()
-        .iter()
-        .any(|table| table.name.eq_ignore_ascii_case(&definition.view))
-    {
-        return Err(MlError::new(
-            "chironql.ml_name_conflict",
-            "view name already belongs to a relational table",
-        ));
-    }
-    let snapshot = read_snapshot(db, definition)?;
-    let job_id = uuid::Uuid::new_v4().to_string();
-    let mut statements = Vec::new();
-    if existing_rows.is_empty() {
-        statements.push(statement(
-            format!("INSERT INTO {VIEWS_TABLE} (name, definition, source, version) VALUES ($1, $2, $3, 0)"),
-            vec![
-                RelationalValue::Text(definition.view.clone()),
-                RelationalValue::Text(canonical),
-                RelationalValue::Text(definition.source.clone()),
-            ],
-        ));
-    }
-    statements.push(statement(
-        format!("INSERT INTO {JOBS_TABLE} (id, view_name, status, source_version) VALUES ($1, $2, 'queued', $3)"),
-        vec![
-            RelationalValue::Text(job_id.clone()),
-            RelationalValue::Text(definition.view.clone()),
-            RelationalValue::Integer(snapshot.source_version as i64),
-        ],
-    ));
-    execute_sql(db, statements, &audit)?;
-    guard.active_views.insert(definition.view.clone());
-    drop(guard);
-
-    let view = definition.view.clone();
-    let db = db.clone();
-    let definition = definition.clone();
-    let job = job_id.clone();
-    thread::spawn(move || run_job(db, state, worker, definition, snapshot, job, audit));
-    Ok(MlSubmitted {
-        job_id,
-        view,
-        status: "queued",
-    })
+    scheduler::submit(db, definition, actor, tenant_id)
 }
 
 fn value_json(value: &RelationalValue) -> MlResult<Value> {
@@ -419,11 +285,12 @@ fn value_json(value: &RelationalValue) -> MlResult<Value> {
 
 fn worker_request(definition: &MlMaterialize, snapshot: &SourceSnapshot) -> MlResult<Value> {
     let rows = snapshot
+        .source
         .rows
         .iter()
         .map(|row| {
             let mut object = serde_json::Map::new();
-            for (name, value) in snapshot.selected_columns.iter().zip(row) {
+            for (name, value) in snapshot.source.selected_columns.iter().zip(row) {
                 object.insert(name.clone(), value_json(value)?);
             }
             Ok(Value::Object(object))
@@ -442,102 +309,6 @@ fn worker_request(definition: &MlMaterialize, snapshot: &SourceSnapshot) -> MlRe
         "training_rows": training_rows,
         "prediction_rows": rows,
     }))
-}
-
-fn run_worker(config: &WorkerConfig, request: &Value) -> MlResult<Value> {
-    let input = serde_json::to_vec(request)
-        .map_err(|error| MlError::new("chironql.ml_worker_failed", error.to_string()))?;
-    if input.len() > 8 * 1024 * 1024 {
-        return Err(MlError::new(
-            "chironql.ml_invalid_rows",
-            "worker request exceeds 8 MiB",
-        ));
-    }
-    let mut command = Command::new(&config.python);
-    command
-        .arg(&config.script)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env_clear()
-        .env("PYTHONNOUSERSITE", "1");
-    if let Some(system_root) = env::var_os("SystemRoot") {
-        command.env("SystemRoot", system_root);
-    }
-    let mut child = command
-        .spawn()
-        .map_err(|error| MlError::new("chironql.ml_worker_failed", error.to_string()))?;
-    let mut stdin = child.stdin.take().expect("piped worker stdin");
-    let stdout = child.stdout.take().expect("piped worker stdout");
-    let stderr = child.stderr.take().expect("piped worker stderr");
-    let output_reader = thread::spawn(move || {
-        let mut output = Vec::new();
-        stdout
-            .take(8 * 1024 * 1024 + 1)
-            .read_to_end(&mut output)
-            .map(|_| output)
-    });
-    let error_reader = thread::spawn(move || {
-        let mut output = Vec::new();
-        stderr
-            .take(64 * 1024 + 1)
-            .read_to_end(&mut output)
-            .map(|_| output)
-    });
-    let input_writer = thread::spawn(move || stdin.write_all(&input));
-    let started = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() < WORKER_TIMEOUT => {
-                thread::sleep(Duration::from_millis(50));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(MlError::new(
-                    "chironql.ml_worker_timeout",
-                    "ML worker exceeded five minutes",
-                ));
-            }
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(MlError::new("chironql.ml_worker_failed", error.to_string()));
-            }
-        }
-    };
-    let output = output_reader
-        .join()
-        .map_err(|_| MlError::new("chironql.ml_worker_failed", "worker output reader panicked"))?
-        .map_err(|error| MlError::new("chironql.ml_worker_failed", error.to_string()))?;
-    input_writer
-        .join()
-        .map_err(|_| MlError::new("chironql.ml_worker_failed", "worker input writer panicked"))?
-        .map_err(|error| MlError::new("chironql.ml_worker_failed", error.to_string()))?;
-    let stderr = error_reader
-        .join()
-        .map_err(|_| MlError::new("chironql.ml_worker_failed", "worker error reader panicked"))?
-        .map_err(|error| MlError::new("chironql.ml_worker_failed", error.to_string()))?;
-    if output.len() > 8 * 1024 * 1024 || stderr.len() > 64 * 1024 {
-        return Err(MlError::new(
-            "chironql.ml_worker_failed",
-            "worker output exceeded its size limit",
-        ));
-    }
-    let message: Value = serde_json::from_slice(&output).map_err(|_| {
-        MlError::new(
-            "chironql.ml_worker_failed",
-            "worker did not return a valid JSON response",
-        )
-    })?;
-    if !status.success() || message["ok"] != true {
-        let error = message["error"]
-            .as_str()
-            .unwrap_or("worker exited without a result");
-        return Err(MlError::new("chironql.ml_worker_failed", error));
-    }
-    Ok(message["result"].clone())
 }
 
 fn sql_type(data_type: &RelationalType) -> MlResult<String> {
@@ -601,11 +372,14 @@ fn prediction_value(
 fn result_schema(definition: &MlMaterialize, snapshot: &SourceSnapshot) -> MlResult<String> {
     let mut columns = Vec::new();
     for name in snapshot
+        .source
         .selected_columns
         .iter()
-        .take(snapshot.selected_columns.len() - 1)
+        .take(snapshot.source.selected_columns.len() - 1)
     {
         let column = snapshot
+            .source
+            .metadata
             .table
             .columns
             .iter()
@@ -614,6 +388,8 @@ fn result_schema(definition: &MlMaterialize, snapshot: &SourceSnapshot) -> MlRes
         columns.push(format!("{name} {}", sql_type(&column.data_type)?));
     }
     let target_type = &snapshot
+        .source
+        .metadata
         .table
         .columns
         .iter()
@@ -631,7 +407,7 @@ fn result_schema(definition: &MlMaterialize, snapshot: &SourceSnapshot) -> MlRes
     columns.push("refresh_version BIGINT NOT NULL".into());
     columns.push(format!(
         "PRIMARY KEY ({})",
-        snapshot.table.primary_key.join(", ")
+        snapshot.source.metadata.table.primary_key.join(", ")
     ));
     Ok(format!(
         "CREATE TABLE IF NOT EXISTS {} ({})",
@@ -640,15 +416,77 @@ fn result_schema(definition: &MlMaterialize, snapshot: &SourceSnapshot) -> MlRes
     ))
 }
 
-fn publish(
-    db: &Db,
-    definition: &MlMaterialize,
-    snapshot: &SourceSnapshot,
-    job_id: &str,
-    result: &Value,
-    audit: &AuditContext,
+fn output_schema_changed(db: &Db, definition: &MlMaterialize, snapshot: &SourceSnapshot) -> bool {
+    let Some(existing) = db
+        .relational_tables()
+        .into_iter()
+        .find(|table| table.name.eq_ignore_ascii_case(&definition.view))
+    else {
+        return false;
+    };
+    let source = &snapshot.source.metadata.table;
+    let mut expected = snapshot
+        .source
+        .selected_columns
+        .iter()
+        .take(snapshot.source.selected_columns.len() - 1)
+        .map(|name| {
+            let column = source
+                .columns
+                .iter()
+                .find(|column| column.name.eq_ignore_ascii_case(name))
+                .expect("validated source column");
+            (name.clone(), column.data_type.clone())
+        })
+        .collect::<Vec<_>>();
+    let target = &source
+        .columns
+        .iter()
+        .find(|column| column.name.eq_ignore_ascii_case(&definition.target))
+        .expect("validated target")
+        .data_type;
+    expected.extend([
+        ("actual".into(), target.clone()),
+        (
+            "prediction".into(),
+            if definition.task == MlTask::Regression {
+                RelationalType::Float
+            } else {
+                target.clone()
+            },
+        ),
+        ("confidence".into(), RelationalType::Float),
+        ("refresh_version".into(), RelationalType::BigInt),
+    ]);
+    existing.primary_key != source.primary_key
+        || existing.columns.len() != expected.len()
+        || existing
+            .columns
+            .iter()
+            .zip(expected)
+            .any(|(actual, (name, kind))| {
+                !actual.name.eq_ignore_ascii_case(&name) || actual.data_type != kind
+            })
+}
+
+struct Publication<'a> {
+    definition: &'a MlMaterialize,
+    snapshot: &'a SourceSnapshot,
+    job_id: &'a str,
+    audit: &'a AuditContext,
     duration_ms: i64,
-) -> MlResult<(i64, usize)> {
+    schedule: &'a scheduler::Schedule,
+}
+
+fn publish(db: &Db, result: &Value, publication: Publication<'_>) -> MlResult<(i64, usize)> {
+    let Publication {
+        definition,
+        snapshot,
+        job_id,
+        audit,
+        duration_ms,
+        schedule,
+    } = publication;
     let predictions = result["predictions"].as_array().ok_or_else(|| {
         MlError::new(
             "chironql.ml_worker_failed",
@@ -661,7 +499,9 @@ fn publish(
             "worker returned no confidence array",
         )
     })?;
-    if predictions.len() != snapshot.rows.len() || confidences.len() != snapshot.rows.len() {
+    if predictions.len() != snapshot.source.rows.len()
+        || confidences.len() != snapshot.source.rows.len()
+    {
         return Err(MlError::new(
             "chironql.ml_worker_failed",
             "worker returned a different number of rows",
@@ -680,6 +520,8 @@ fn publish(
         ));
     }
     let target_type = &snapshot
+        .source
+        .metadata
         .table
         .columns
         .iter()
@@ -699,24 +541,35 @@ fn publish(
         .first()
         .ok_or_else(|| MlError::new("chironql.ml_storage_failed", "ML view definition vanished"))?;
     let version = one_integer(&previous[0])? + 1;
-    let mut statements = vec![
-        statement(result_schema(definition, snapshot)?, vec![]),
-        statement(format!("DELETE FROM {}", definition.view), vec![]),
-    ];
+    let mut statements = Vec::new();
+    // Compatible source type changes may require a new output schema. Drop +
+    // create is in the same publication transaction, preserving the old view
+    // in every reader snapshot until the complete replacement commits.
+    if output_schema_changed(db, definition, snapshot) {
+        statements.push(statement(format!("DROP TABLE {}", definition.view), vec![]));
+    }
+    statements.push(statement(result_schema(definition, snapshot)?, vec![]));
+    statements.push(statement(
+        format!("DELETE FROM {}", definition.view),
+        vec![],
+    ));
     let column_names = snapshot
+        .source
         .selected_columns
         .iter()
-        .take(snapshot.selected_columns.len() - 1)
+        .take(snapshot.source.selected_columns.len() - 1)
         .cloned()
         .chain(["actual", "prediction", "confidence", "refresh_version"].map(str::to_string))
         .collect::<Vec<_>>();
-    for (start, batch) in snapshot.rows.chunks(INSERT_BATCH_ROWS).enumerate() {
+    for (start, batch) in snapshot.source.rows.chunks(INSERT_BATCH_ROWS).enumerate() {
         let mut parameters = Vec::new();
         let mut tuples = Vec::new();
         for (offset, row) in batch.iter().enumerate() {
             let index = start * INSERT_BATCH_ROWS + offset;
             let prediction = prediction_value(&predictions[index], definition.task, target_type)?;
-            let confidence = if confidences[index].is_null() {
+            let confidence = if definition.task == MlTask::Regression
+                || confidences[index].is_null()
+            {
                 RelationalValue::Null
             } else {
                 let value = confidences[index]
@@ -752,149 +605,69 @@ fn publish(
         format!("UPDATE {VIEWS_TABLE} SET version = $1, source_version = $2, row_count = $3 WHERE name = $4"),
         vec![
             RelationalValue::Integer(version),
-            RelationalValue::Integer(snapshot.source_version as i64),
-            RelationalValue::Integer(snapshot.rows.len() as i64),
+            RelationalValue::Integer(snapshot.source_version() as i64),
+            RelationalValue::Integer(snapshot.source.rows.len() as i64),
             RelationalValue::Text(definition.view.clone()),
         ],
     ));
     statements.push(statement(
         format!("UPDATE {JOBS_TABLE} SET status = 'succeeded', row_count = $1, context_rows = $2, duration_ms = $3 WHERE id = $4"),
         vec![
-            RelationalValue::Integer(snapshot.rows.len() as i64),
+            RelationalValue::Integer(snapshot.source.rows.len() as i64),
             RelationalValue::Integer(context_rows as i64),
             RelationalValue::Integer(duration_ms),
             RelationalValue::Text(job_id.to_string()),
         ],
     ));
-    execute_sql(db, statements, audit)?;
-    Ok((version, context_rows))
-}
-
-fn mark_failed(db: &Db, job_id: &str, error: &MlError, audit: &AuditContext, duration_ms: i64) {
-    let _ = execute_sql(
+    local_preview(db)?;
+    statements.push(scheduler::save_statement(schedule)?);
+    statements.push(scheduler::finish_provenance_statement(
         db,
-        vec![statement(
-            format!(
-                "UPDATE {JOBS_TABLE} SET status = 'failed', error = $1, duration_ms = $2 WHERE id = $3"
-            ),
-            vec![
-                RelationalValue::Text(format!("{}: {}", error.code, error.message)),
-                RelationalValue::Integer(duration_ms),
-                RelationalValue::Text(job_id.into()),
-            ],
-        )],
-        audit,
-    );
-}
-
-fn run_job(
-    db: Db,
-    state: Arc<MlState>,
-    worker: WorkerConfig,
-    definition: MlMaterialize,
-    snapshot: SourceSnapshot,
-    job_id: String,
-    audit: AuditContext,
-) {
-    let started = Instant::now();
-    let operation = db.audit_network_operation(
-        "ml_materialize",
-        None,
-        &audit.principal_id,
-        audit.tenant_id.as_deref(),
-        &audit.transport,
-        Some(&job_id),
-    );
-    let outcome = (|| {
-        execute_sql(
-            &db,
-            vec![statement(
-                format!("UPDATE {JOBS_TABLE} SET status = 'running' WHERE id = $1"),
-                vec![RelationalValue::Text(job_id.clone())],
-            )],
-            &audit,
-        )?;
-        let request = worker_request(&definition, &snapshot)?;
-        let result = run_worker(&worker, &request)?;
-        publish(
-            &db,
-            &definition,
-            &snapshot,
-            &job_id,
-            &result,
-            &audit,
-            started.elapsed().as_millis() as i64,
-        )
-    })();
-    match outcome {
-        Ok((version, context_rows)) => {
-            if let Ok(operation) = operation {
-                let _ = operation.success(json!({
-                    "view": definition.view,
-                    "model": model_name(definition.model),
-                    "source_version": snapshot.source_version,
-                    "version": version,
-                    "rows": snapshot.rows.len(),
-                    "context_rows": context_rows,
-                    "duration_ms": started.elapsed().as_millis(),
-                }));
-            }
-        }
-        Err(error) => {
-            mark_failed(
-                &db,
-                &job_id,
-                &error,
-                &audit,
-                started.elapsed().as_millis() as i64,
-            );
-            if let Ok(operation) = operation {
-                let _ = operation.failure_with_details(
-                    error.code,
-                    json!({
-                        "view": definition.view,
-                        "model": model_name(definition.model),
-                        "source_version": snapshot.source_version,
-                        "duration_ms": started.elapsed().as_millis(),
-                    }),
-                );
-            }
-        }
-    }
-    state
-        .inner
-        .lock()
-        .expect("ML view state mutex")
-        .active_views
-        .remove(&definition.view);
-}
-
-fn read_ready(db: &Db) -> MlResult<()> {
-    let state = state_for(db);
-    let mut guard = state.inner.lock().expect("ML view state mutex");
-    ensure_catalog(
-        db,
-        &mut guard,
-        &AuditContext {
-            principal_id: "ml-recovery".into(),
-            tenant_id: None,
-            transport: "chironql-ml".into(),
-            request_id: None,
+        job_id,
+        schedule.finished_at(),
+        &snapshot.source.metadata.lineage,
+    )?);
+    let fence = chirondb_core::MlPublicationFence {
+        schedule_name: definition.view.clone(),
+        schedule_state: scheduler::stored_state(
+            db,
+            &definition.view,
+            &snapshot.source.metadata.lineage,
+        )?,
+    };
+    db.execute_ml_publication(
+        SqlExecutionRequest {
+            statements,
+            idempotency_key: None,
+            retry_id: audit.request_id.clone(),
         },
+        audit,
+        &snapshot.source.metadata,
+        Some(&fence),
     )
+    .and_then(|response| response.consume(Ok))
+    .map_err(|error| {
+        if matches!(error, chirondb_core::GaussError::InvalidRequest(_)) {
+            MlError::new("chironql.ml_publication_rejected", error.to_string())
+        } else {
+            engine_error(error)
+        }
+    })?;
+    Ok((version, context_rows))
 }
 
 pub(crate) fn get_job(db: &Db, job_id: &str) -> MlResult<Value> {
     if job_id.is_empty() || !job_id.chars().all(|ch| ch.is_ascii_hexdigit() || ch == '-') {
         return Err(MlError::new("chironql.ml_invalid_job", "invalid ML job ID"));
     }
+    local_preview(db)?;
     read_ready(db)?;
     let response = db
         .execute_sql(SqlExecutionRequest {
             statements: vec![statement(
                 format!("SELECT id, view_name, status, source_version, row_count, context_rows, error, duration_ms FROM {JOBS_TABLE} WHERE id = $1"),
                 vec![RelationalValue::Text(job_id.into())],
-            )],
+            ), statement(format!("SELECT details FROM {} WHERE id = $1", scheduler::PROVENANCE_TABLE), vec![RelationalValue::Text(job_id.into())])],
             idempotency_key: None,
             retry_id: None,
         })
@@ -907,6 +680,14 @@ pub(crate) fn get_job(db: &Db, job_id: &str) -> MlResult<Value> {
     for (name, value) in columns.iter().zip(row) {
         object.insert(name.clone(), value_json(value)?);
     }
+    if let Some(row) = rows(&response.results[1])?.1.first() {
+        let details: serde_json::Map<String, Value> = serde_json::from_str(one_text(&row[0])?)
+            .map_err(|error| MlError::new("chironql.ml_storage_failed", error.to_string()))?;
+        object.extend(details);
+    } else {
+        object.insert("requested_revision".into(), Value::Null);
+        object.insert("source_revision".into(), Value::Null);
+    }
     Ok(Value::Object(object))
 }
 
@@ -916,48 +697,7 @@ pub(crate) fn drop_view(
     actor: &str,
     tenant_id: Option<&str>,
 ) -> MlResult<Value> {
-    identifier(name)?;
-    let state = state_for(db);
-    let mut guard = state.inner.lock().expect("ML view state mutex");
-    let audit = AuditContext {
-        principal_id: actor.into(),
-        tenant_id: tenant_id.map(str::to_string),
-        transport: "chironql-ml".into(),
-        request_id: None,
-    };
-    ensure_catalog(db, &mut guard, &audit)?;
-    if guard.active_views.contains(name) {
-        return Err(MlError::new(
-            "chironql.ml_refresh_running",
-            "cannot drop a view while its refresh is running",
-        ));
-    }
-    let catalog = execute_sql(
-        db,
-        vec![statement(
-            format!("SELECT name FROM {VIEWS_TABLE} WHERE name = $1"),
-            vec![RelationalValue::Text(name.into())],
-        )],
-        &audit,
-    )?;
-    if rows(&catalog.results[0])?.1.is_empty() {
-        return Err(MlError::new(
-            "chironql.ml_not_found",
-            "ML view was not found",
-        ));
-    }
-    execute_sql(
-        db,
-        vec![
-            statement(format!("DROP TABLE IF EXISTS {name}"), vec![]),
-            statement(
-                format!("DELETE FROM {VIEWS_TABLE} WHERE name = $1"),
-                vec![RelationalValue::Text(name.into())],
-            ),
-        ],
-        &audit,
-    )?;
-    Ok(json!({"name": name, "dropped": true}))
+    scheduler::drop_view(db, name, actor, tenant_id)
 }
 
 pub(crate) fn get_view(db: &Db, name: &str, limit: usize, cursor: Option<&str>) -> MlResult<Value> {
@@ -968,6 +708,7 @@ pub(crate) fn get_view(db: &Db, name: &str, limit: usize, cursor: Option<&str>) 
             "limit must be between 1 and 1000",
         ));
     }
+    local_preview(db)?;
     read_ready(db)?;
     let catalog = db
         .execute_sql(SqlExecutionRequest {
@@ -1070,12 +811,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fixed_limits_and_temporary_pressure_have_typed_retry_decisions() {
+        let hard = engine_error(chirondb_core::GaussError::SqlLimitExceeded(
+            "operator limit".into(),
+        ));
+        assert_eq!(hard.code, "chironql.ml_limit_exceeded");
+        assert!(!hard.transient);
+        // Equal text cannot turn transient admission into a permanent limit.
+        let temporary = engine_error(chirondb_core::GaussError::ResourceExhausted(
+            "operator limit".into(),
+        ));
+        assert!(temporary.transient);
+    }
+
+    #[test]
     fn marks_interrupted_job_failed_after_reopen() {
         let directory = tempfile::tempdir().unwrap();
         let id = "5d18a62b-e737-4103-849f-7640804f9a1f";
         {
             let db = Db::open(directory.path()).unwrap();
-            read_ready(&db).unwrap();
+            let runtime = scheduler::state_for(&db);
+            scheduler::ensure_catalog_for_test(&db, &runtime).unwrap();
             execute_sql(
                 &db,
                 vec![statement(
@@ -1092,6 +848,7 @@ mod tests {
             .unwrap();
         }
         let reopened = Db::open(directory.path()).unwrap();
+        initialize(&reopened).unwrap();
         let job = get_job(&reopened, id).unwrap();
         assert_eq!(job["status"], "failed");
         assert_eq!(job["error"], "server_restarted");

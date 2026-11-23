@@ -197,10 +197,22 @@ struct WriterState {
     group_pending: usize,
     group_started: Option<Instant>,
     writer_error: Option<String>,
+    preappend_unavailable: bool,
     registry: registry::Registry,
 }
 
 impl AuditWriter {
+    /// Append/fsync/rotation failures latch until verified recovery; a failed
+    /// pre-append preparation clears only after another append succeeds.
+    /// Probes inspect this state without attempting an audited operation.
+    pub(crate) fn is_available(&self) -> bool {
+        !self.closed.load(Ordering::Acquire)
+            && self
+                .state
+                .lock()
+                .is_ok_and(|state| state.writer_error.is_none() && !state.preappend_unavailable)
+    }
+
     pub fn open(root: impl AsRef<Path>) -> Result<Arc<Self>> {
         Self::open_inner(root.as_ref(), None)
     }
@@ -255,6 +267,7 @@ impl AuditWriter {
             group_pending: 0,
             group_started: None,
             writer_error: None,
+            preappend_unavailable: false,
             registry,
         }));
         let commit = Arc::new(Condvar::new());
@@ -460,6 +473,7 @@ impl AuditWriter {
             group_pending: 0,
             group_started: None,
             writer_error: None,
+            preappend_unavailable: false,
             registry,
         };
         self.commit.notify_all();
@@ -758,14 +772,24 @@ impl AuditWriter {
             }
             return Ok(());
         }
-        if state.file.metadata()?.len() >= AUDIT_SEGMENT_BYTES && state.group_pending > 0 {
-            state.file.sync_all()?;
-            state.durable_sequence = state.sequence;
-            state.group_pending = 0;
-            state.group_started = None;
+        let rotate = (|| -> Result<()> {
+            crate::failpoint::check("audit.before_rotate")?;
+            if state.file.metadata()?.len() >= AUDIT_SEGMENT_BYTES && state.group_pending > 0 {
+                state.file.sync_all()?;
+                state.durable_sequence = state.sequence;
+                state.group_pending = 0;
+                state.group_started = None;
+                self.commit.notify_all();
+            }
+            rotate_if_needed(&mut state)
+        })();
+        if let Err(error) = rotate {
+            // Rotation may have renamed the active file already. Recovery is
+            // required before this writer can safely append again.
+            state.writer_error = Some("audit rotation failed".into());
             self.commit.notify_all();
+            return Err(audit_unavailable(error));
         }
-        rotate_if_needed(&mut state)?;
         let next = state
             .sequence
             .checked_add(1)
@@ -801,7 +825,17 @@ impl AuditWriter {
                 );
             Ok(value)
         })?;
-        let entry = state.registry.prepare(&value, next)?;
+        let entry = match crate::failpoint::check("audit.before_registry_prepare")
+            .and_then(|()| state.registry.prepare(&value, next))
+        {
+            Ok(entry) => entry,
+            Err(error) => {
+                // No audit bytes were appended. This preparation can retry,
+                // but readiness must not hide a disk-full registry flush.
+                state.preappend_unavailable = true;
+                return Err(audit_unavailable(error));
+            }
+        };
         let frame = encode_audit_value(&value)?;
         if let Err(error) = crate::failpoint::check("audit.before_append")
             .and_then(|_| state.file.write_all(&frame.bytes).map_err(Into::into))
@@ -819,6 +853,9 @@ impl AuditWriter {
             self.commit.notify_all();
             return Err(audit_unavailable(error));
         }
+        // Clear while this append still owns the writer lock. A group-commit
+        // waiter must not later erase a newer preparation failure.
+        state.preappend_unavailable = false;
         if durable {
             if let Err(error) = crate::failpoint::check("audit.before_sync")
                 .and_then(|_| state.file.sync_all().map_err(Into::into))

@@ -87,6 +87,7 @@ pub(in crate::relational) fn capture(
         check_sql_cancelled()?;
         tables.push(RelationalCheckpointTable {
             definition: table.definition.as_ref().clone(),
+            source_revision: Some(table.source_revision),
             rows: BTreeMap::new(),
             next_row_id: table.next_row_id,
             row_segment: None,
@@ -99,6 +100,7 @@ pub(in crate::relational) fn capture(
     Ok(CapturedRelationalCheckpoint {
         manifest: RelationalCheckpoint {
             version: RELATIONAL_CHECKPOINT_VERSION,
+            source_lineage: Some(state.source_lineage),
             sequence: state.sequence,
             next_catalog_id: state.next_catalog_id,
             wal_watermark,
@@ -133,6 +135,7 @@ pub(super) fn copy(
         check_sql_cancelled()?;
         tables.push(RelationalCheckpointTable {
             definition: table.definition.clone(),
+            source_revision: table.source_revision,
             rows: if projection {
                 BTreeMap::new()
             } else {
@@ -147,6 +150,7 @@ pub(super) fn copy(
     }
     Ok(RelationalCheckpoint {
         version: checkpoint.version,
+        source_lineage: checkpoint.source_lineage,
         sequence: checkpoint.sequence,
         next_catalog_id: checkpoint.next_catalog_id,
         wal_watermark: checkpoint.wal_watermark,

@@ -456,7 +456,9 @@ pub(super) fn audit_error_code(error: &GaussError) -> &'static str {
         GaussError::InvalidCollectionName(_) => "chirondb.invalid_collection_name",
         GaussError::InvalidRequest(_) => "chirondb.invalid_request",
         GaussError::SqlRowPreconditionFailed { .. } => "chironql.sql_row_precondition_failed",
-        GaussError::ResourceExhausted(_) => "chirondb.resource_exhausted",
+        GaussError::ResourceExhausted(_) | GaussError::SqlLimitExceeded(_) => {
+            "chirondb.resource_exhausted"
+        }
         GaussError::AuditUnavailable(_) => "chirondb.audit_unavailable",
         GaussError::DataDirLocked { .. } => "chirondb.data_dir_locked",
         GaussError::WalCorruption { .. } => "chirondb.wal_corruption",

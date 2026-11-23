@@ -108,6 +108,7 @@ pub use chirondb_types::relational::{
     SqlExecutionResponse, SqlOutcome, SqlResult, SqlStatementRequest, SqlTransactionHandleResponse,
     SqlTransactionState, TableDefinition, UniqueConstraint,
 };
+pub use db::MlRuntimeService;
 pub use db::{
     Db, MultiModelInsertRequest, MultiModelReadSnapshot, MultiModelResponse,
     MultiModelTransactionRequest, MultiModelTransactionResponse, NewRecord, NewRelation,
@@ -124,8 +125,9 @@ pub use model::{
 };
 pub use ordinal::SegmentOrdinalSet;
 pub use relational::{
-    RelationalBatch, RelationalEngine, SqlPublication, SqlResponse, SqlStatementAnalysis,
-    SqlStatementClass, SqlStatementKind,
+    MlPublicationFence, MlSourceMetadata, MlSourceRevision, MlSourceSnapshot, RelationalBatch,
+    RelationalEngine, SqlPublication, SqlResponse, SqlStatementAnalysis, SqlStatementClass,
+    SqlStatementKind,
 };
 pub use segment::{SoASegmentCache, SoAVectorStorage};
 pub use structural_embedding::StructuralUpsertReceipt;

@@ -3,6 +3,7 @@ syntax = "proto3";
 package chirondb.v1;
 
 import "chirondb/v1/compat.proto";
+import "chirondb/v1/ml.proto";
 
 // Primary ChironDB beta service. Messages intentionally reuse gaussdb.v1 so
 // existing alpha clients and persisted GaussWire envelopes remain compatible.
@@ -52,6 +53,8 @@ service ChironDb {
   // than deepening the legacy gaussdb.v1 package; the legacy GaussDb service
   // is frozen at the surface it shipped with and does not get this rpc.
   rpc ExecuteQuery(ChironQlRequest) returns (ChironQlResponse);
+  rpc SetMlRefreshPolicy(SetMlRefreshPolicyRequest) returns (MlRefreshStatus);
+  rpc GetMlRefreshStatus(GetMlRefreshStatusRequest) returns (MlRefreshStatus);
 
   // Native relational SQL. The legacy gaussdb.v1 service remains frozen.
   rpc ExecuteSql(SqlExecutionRequest) returns (SqlExecutionResponse);

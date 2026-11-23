@@ -1,6 +1,7 @@
 //! Admission for the existing checkpoint serde model. This adapter is scoped to
-//! its derived DTOs (including serde's tagged-enum Content buffering), not an
-//! allocator contract for arbitrary custom Deserialize implementations.
+//! its internal DTO visitors (including the audited mutation decoder and serde's
+//! tagged-enum Content buffering), not an allocator contract for arbitrary
+//! custom Deserialize implementations.
 use super::*;
 use serde::de::{
     DeserializeSeed, EnumAccess, Error as _, MapAccess, SeqAccess, VariantAccess, Visitor,

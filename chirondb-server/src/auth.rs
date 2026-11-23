@@ -323,6 +323,12 @@ fn classify_http(method: &Method, path: &str) -> Option<Action> {
             Some(Action::Read)
         }
         (&Method::POST, "/chironql" | "/chironql/parse" | "/sql") => Some(Action::Read),
+        (&Method::GET, path) if ml_refresh_path(path) == Some("refresh-status") => {
+            Some(Action::Read)
+        }
+        (&Method::PUT, path) if ml_refresh_path(path) == Some("refresh-policy") => {
+            Some(Action::Write)
+        }
         (&Method::GET, path)
             if ["/ml/jobs/", "/ml/views/"].iter().any(|prefix| {
                 path.strip_prefix(prefix)
@@ -439,6 +445,11 @@ fn sql_transaction_path(path: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((handle, action))
+}
+
+fn ml_refresh_path(path: &str) -> Option<&str> {
+    let (name, suffix) = path.strip_prefix("/ml/views/")?.split_once('/')?;
+    (!name.is_empty() && matches!(suffix, "refresh-policy" | "refresh-status")).then_some(suffix)
 }
 
 fn is_graph_http_path(path: &str) -> bool {
@@ -1168,6 +1179,16 @@ mod tests {
             (Method::POST, "/sql", OperationType::Read),
             (Method::GET, "/ml/jobs/job-123", OperationType::Read),
             (Method::GET, "/ml/views/forecast", OperationType::Read),
+            (
+                Method::GET,
+                "/ml/views/forecast/refresh-status",
+                OperationType::Read,
+            ),
+            (
+                Method::PUT,
+                "/ml/views/forecast/refresh-policy",
+                OperationType::Write,
+            ),
             (Method::DELETE, "/ml/views/forecast", OperationType::Write),
             (Method::POST, "/collections", OperationType::Admin),
             (Method::PUT, "/collections/col/points", OperationType::Write),

@@ -1890,7 +1890,7 @@ where
     let sqlstate = match error {
         crate::GaussError::DuplicateKey => "23505",
         crate::GaussError::InvalidRequest(_) if message.contains("query canceled") => "57014",
-        crate::GaussError::ResourceExhausted(_) => "53200",
+        crate::GaussError::ResourceExhausted(_) | crate::GaussError::SqlLimitExceeded(_) => "53200",
         crate::GaussError::CommitOutcomeUnknown { .. } => "40003",
         crate::GaussError::CommitRejected { .. } => "40000",
         crate::GaussError::WalUnavailable(_) if message.contains("server is shutting down") => {
@@ -2429,7 +2429,11 @@ fn parse_native_parse_message_admitted(
     } else {
         crate::RelationalEngine::analyze_statement(&sql).map_err(|error| {
             (
-                if matches!(error, crate::GaussError::ResourceExhausted(_)) {
+                if matches!(
+                    error,
+                    crate::GaussError::ResourceExhausted(_)
+                        | crate::GaussError::SqlLimitExceeded(_)
+                ) {
                     "53200"
                 } else {
                     "42601"
@@ -3348,6 +3352,21 @@ mod tests {
         assert!(body.windows(7).any(|w| w == b"C0A000\0"));
         assert!(body.windows(20).any(|w| w == b"MJOIN not supported\0"));
         assert!(body.windows(21).any(|w| w == b"Hhttps://docs/x#joins"));
+    }
+
+    #[tokio::test]
+    async fn hard_and_transient_limits_keep_postgresql_resource_sqlstate() {
+        for error in [
+            crate::GaussError::ResourceExhausted("limit".into()),
+            crate::GaussError::SqlLimitExceeded("limit".into()),
+        ] {
+            let mut bytes = Vec::new();
+            write_native_relational_error(&mut bytes, &error)
+                .await
+                .unwrap();
+            assert_eq!(bytes[0], b'E');
+            assert!(bytes[5..].windows(7).any(|field| field == b"C53200\0"));
+        }
     }
 
     #[tokio::test]

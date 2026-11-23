@@ -158,7 +158,9 @@ pub(crate) fn map_error(query_id: &str, failure: GaussError) -> ChironQlError {
     }
     let code = match failure {
         GaussError::Security(ref security) => security.code(),
-        GaussError::ResourceExhausted(_) => "security.budget_exceeded",
+        GaussError::ResourceExhausted(_) | GaussError::SqlLimitExceeded(_) => {
+            "security.budget_exceeded"
+        }
         GaussError::PointNotFound(_) | GaussError::CollectionNotFound(_) => "security.not_found",
         GaussError::InvalidRequest(_) | GaussError::DimensionMismatch { .. } => "security.invalid",
         _ => "security.unavailable",

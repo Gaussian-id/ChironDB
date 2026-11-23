@@ -90,6 +90,26 @@ A temporal batch has its own commit. It cannot be included in a SQL interactive 
 
 `APPEND` accepts 1–1,024 observations in one durable batch. Each series has a single type, boolean or float64. NaN is rejected. A retry of an identical observation returns zero newly affected rows. A different value at an existing timestamp rejects the whole batch. Late observations appear in their event-time position. `HISTORY` includes its lower bound and excludes its upper bound. Its required limit is 1–4,096 rows.
 
+Positive and negative infinity are accepted float64 observations, including
+overflowing numeric literals such as `1e999` and `-1e999`. Since JSON has no
+infinity number, `HISTORY` and `LATEST` encode these as `"+Infinity"` and
+`"-Infinity"` in the `value` column (`jsonb`). Finite values remain JSON numbers
+and booleans remain booleans. Text observations are unsupported, so these two
+strings denote nonfinite numeric values, not user text. Clients must handle
+them explicitly before numeric aggregation. Compaction preserves temporal
+float64 bits, including signed zero and infinities.
+
+Checkpoints merge similarly sized immutable temporal runs. The 4,096-run
+checkpoint guard remains, but repeated small appends/checkpoints no longer
+consume one permanent slot each. An existing collection at that limit merges
+runs before admitting a new append; the normal collection compact endpoint
+also performs temporal merging. Keep enough disk and admitted memory for the
+replacement runs. Old files remain until a subsequent checkpoint maintenance
+pass can prove they are no longer referenced by the durable checkpoint or live
+state. If an optional merge exceeds the available memory budget, the checkpoint
+keeps its existing valid runs and merging can retry later. Merging runs synchronously during maintenance can take time on a large
+history; it does not remove resource limits or promise constant latency.
+
 <!-- temporal-pipeline -->
 ```sql
 SQL CREATE TABLE trucks (id TEXT PRIMARY KEY);

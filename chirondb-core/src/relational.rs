@@ -8,6 +8,7 @@ mod catalog;
 mod catalog_view;
 pub use catalog_view::RelationalCatalogSnapshot;
 mod checkpoint;
+mod delete;
 pub(crate) mod disk_map;
 mod history;
 mod indexes;
@@ -22,6 +23,9 @@ mod intents;
 mod key_encoding;
 mod maintenance;
 mod memory;
+mod ml_source;
+pub use ml_source::{MlPublicationFence, MlSourceMetadata, MlSourceRevision, MlSourceSnapshot};
+mod mutation_decode;
 mod output;
 mod parsing;
 mod query_spill;
@@ -111,7 +115,8 @@ const RELATIONAL_SEGMENT_DIR: &str = "relational/segments";
 const RELATIONAL_QUERY_SPILL_DIR: &str = "relational/query-spill";
 const RELATIONAL_CHECKPOINT_MAGIC: &[u8; 8] = b"CHRNREL1";
 const RELATIONAL_CHECKPOINT_HEADER_LEN: usize = 20;
-const RELATIONAL_CHECKPOINT_VERSION: u32 = 4;
+const RELATIONAL_CHECKPOINT_VERSION: u32 = 5;
+const RELATIONAL_CHECKPOINT_REPLAY_FRONTIER_VERSION: u32 = 4;
 const RELATIONAL_CHECKPOINT_RUNS_VERSION: u32 = 3;
 const RELATIONAL_CHECKPOINT_LEGACY_VERSION: u32 = 2;
 const RELATIONAL_CHECKPOINT_INTERVAL: u64 = 1_024;
@@ -220,7 +225,7 @@ impl Write for BoundedCounter {
 fn enforce_serialized_limit<T: Serialize>(value: &T, limit: usize, label: &str) -> Result<()> {
     let mut counter = BoundedCounter { written: 0, limit };
     serde_json::to_writer(&mut counter, value).map_err(|error| {
-        GaussError::ResourceExhausted(format!("{label} exceeds {limit} bytes: {error}"))
+        GaussError::SqlLimitExceeded(format!("{label} exceeds {limit} bytes: {error}"))
     })
 }
 
@@ -291,7 +296,7 @@ pub(crate) fn check_sql_cancelled() -> Result<()> {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum RelationalMutation {
     RowSecurity {
@@ -357,6 +362,8 @@ struct RowVersion {
 #[serde(deny_unknown_fields)]
 struct RelationalCheckpointTable {
     definition: TableDefinition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_revision: Option<MlSourceRevision>,
     #[serde(default)]
     rows: BTreeMap<u64, Vec<RowVersion>>,
     next_row_id: u64,
@@ -374,6 +381,8 @@ struct RelationalCheckpointTable {
 #[serde(deny_unknown_fields)]
 struct RelationalCheckpoint {
     version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_lineage: Option<uuid::Uuid>,
     sequence: u64,
     next_catalog_id: u64,
     wal_watermark: u64,
@@ -450,6 +459,7 @@ struct CheckpointTableBackings {
 
 #[derive(Clone, Debug)]
 struct TableState {
+    source_revision: MlSourceRevision,
     policy_epoch: Option<Arc<crate::security::Epoch>>,
     directory: Arc<PathBuf>,
     definition: Schema,
@@ -470,6 +480,11 @@ impl TableState {
     fn with_schema(definition: Schema, directory: Arc<PathBuf>) -> Result<Self> {
         let indexes = IndexCatalog::new(&definition)?;
         Ok(Self {
+            source_revision: MlSourceRevision {
+                table_id: definition.table_id,
+                data_revision: 0,
+                schema_revision: 0,
+            },
             policy_epoch: definition.tenant_id.as_ref().map(|_| {
                 crate::security::Epoch::new(
                     definition
@@ -549,6 +564,7 @@ impl TableState {
             }
         }
         let mut replacement = Self::empty(definition, Arc::clone(&self.directory))?;
+        replacement.source_revision = self.source_revision;
         if same_policy {
             replacement.policy_epoch = self.policy_epoch.clone();
         }
@@ -575,6 +591,7 @@ impl TableState {
 
 #[derive(Clone, Debug)]
 struct RelationalState {
+    source_lineage: uuid::Uuid,
     // Execution-only identity; never serialized or installed in a live snapshot.
     request_identity: Option<Arc<AuthenticatedIdentity>>,
     request_identity_memory: Option<Arc<memory::Charge>>,
@@ -591,6 +608,7 @@ struct RelationalState {
 impl RelationalState {
     fn empty(directory: PathBuf) -> Result<Self> {
         Ok(Self {
+            source_lineage: uuid::Uuid::new_v4(),
             request_identity: None,
             request_identity_memory: None,
             directory: Arc::new(directory),
@@ -791,6 +809,7 @@ pub struct RelationalEngine {
     self_weak: Weak<Self>,
     checkpoint_worker: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     checkpoint_cancel: Arc<AtomicBool>,
+    ml_source_format_ready: AtomicBool,
     checkpoint_lease: std::sync::Mutex<Option<Arc<dyn Send + Sync + std::fmt::Debug>>>,
     interactive: InteractiveSessions,
     snapshots: SnapshotRegistry,
@@ -807,6 +826,8 @@ pub struct RelationalExecution {
 }
 
 struct PreparedRelationalExecution {
+    ml_source_fence: Option<MlSourceMetadata>,
+    ml_schedule_fence: Option<MlPublicationFence>,
     publication: SqlPublication,
     snapshot: u64,
     results: Vec<SqlResult>,
@@ -1149,6 +1170,9 @@ impl RelationalEngine {
         query_spill::cleanup_interrupted(&root.join(RELATIONAL_QUERY_SPILL_DIR))?;
         checkpoint::cleanup_interrupted(&segment_dir, &checkpoint_path)?;
         let checkpoint = read_relational_checkpoint(&checkpoint_path)?;
+        let ml_source_format_ready = checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.version >= RELATIONAL_CHECKPOINT_VERSION);
         let mut recovery_generation = checkpoint
             .as_ref()
             .map(checkpoint::projection_manifest)
@@ -1241,6 +1265,7 @@ impl RelationalEngine {
             self_weak: weak.clone(),
             checkpoint_worker: std::sync::Mutex::new(None),
             checkpoint_cancel: Arc::new(AtomicBool::new(false)),
+            ml_source_format_ready: AtomicBool::new(ml_source_format_ready),
             checkpoint_lease: std::sync::Mutex::new(None),
             interactive: InteractiveSessions::default(),
             snapshots: SnapshotRegistry::default(),
@@ -1326,6 +1351,25 @@ impl RelationalEngine {
         protected_tenant: Option<&str>,
         reference_scope: Option<(&crate::Db, &AuthenticatedIdentity)>,
     ) -> Result<RelationalExecution> {
+        self.execute_scoped_with_audit_fenced(
+            request,
+            audit_context,
+            protected_tenant,
+            reference_scope,
+            None,
+            None,
+        )
+    }
+
+    fn execute_scoped_with_audit_fenced(
+        &self,
+        request: SqlExecutionRequest,
+        audit_context: &AuditContext,
+        protected_tenant: Option<&str>,
+        reference_scope: Option<(&crate::Db, &AuthenticatedIdentity)>,
+        ml_source_fence: Option<&MlSourceMetadata>,
+        ml_schedule_fence: Option<&MlPublicationFence>,
+    ) -> Result<RelationalExecution> {
         let _admission = SQL_ADMISSION.acquire()?;
         check_sql_cancelled()?;
         let read_only = Self::request_is_read_only(&request)?;
@@ -1365,6 +1409,8 @@ impl RelationalEngine {
             reference_scope.map(|(_, identity)| identity),
             audit_context.transport == "chironql-ml",
         )?;
+        prepared.ml_source_fence = ml_source_fence.cloned();
+        prepared.ml_schedule_fence = ml_schedule_fence.cloned();
         prepared
             .reference_writes
             .extend(record_references::result_references(&prepared.results));
@@ -1699,6 +1745,12 @@ impl RelationalEngine {
             .acquire(prepared.intents.clone(), INTENT_WAIT_TIMEOUT)?;
         check_sql_cancelled()?;
         let mut guard = self.state.write();
+        if let Some(expected) = &prepared.ml_source_fence {
+            ml_source::validate_publication(&guard, expected)?;
+        }
+        if let Some(expected) = &prepared.ml_schedule_fence {
+            ml_source::validate_schedule(&guard, expected)?;
+        }
         let commit_sequence = guard
             .sequence
             .checked_add(1)
@@ -1844,6 +1896,7 @@ impl RelationalEngine {
             assign_missing_catalog_ids(&mut candidate, &mut definition)?;
             validate_definition(&definition)?;
             let mut replacement = TableState::empty(definition, Arc::clone(&previous.directory))?;
+            replacement.source_revision = previous.source_revision;
             replacement.rows = previous.rows.clone();
             replacement.next_row_id = previous.next_row_id;
             candidate.tables.insert(&name, Arc::new(replacement))?;
@@ -2033,10 +2086,12 @@ impl RelationalEngine {
             .expect("relational checkpoint has a parent")
             .join("segments");
         let existing = read_relational_checkpoint(&self.checkpoint_path)?;
-        if let Some(current) = existing
-            .as_ref()
-            .filter(|current| current.sequence >= checkpoint.manifest.sequence)
-        {
+        if let Some(current) = existing.as_ref().filter(|current| {
+            current.sequence > checkpoint.manifest.sequence
+                || (current.sequence == checkpoint.manifest.sequence
+                    && current.version >= checkpoint.manifest.version
+                    && current.source_lineage == checkpoint.manifest.source_lineage)
+        }) {
             let backings = prepare_checkpoint_backings(current, &segment_dir)?;
             let permit = self.state.read().tables.prepare_install()?;
             if !install_checkpoint_backings(&mut self.state.write(), current, backings, permit) {
@@ -2250,7 +2305,7 @@ impl RelationalEngine {
             return Err(invalid("SQL request must contain at least one statement"));
         }
         if request.statements.len() > MAX_STATEMENTS_PER_REQUEST {
-            return Err(GaussError::ResourceExhausted(format!(
+            return Err(GaussError::SqlLimitExceeded(format!(
                 "SQL request has {} statements; maximum is {MAX_STATEMENTS_PER_REQUEST}",
                 request.statements.len()
             )));
@@ -2328,7 +2383,7 @@ impl RelationalEngine {
                 None => {
                     if session.history.statements().len() >= MAX_STATEMENTS_PER_REQUEST {
                         session.aborted = true;
-                        return Err(GaussError::ResourceExhausted(format!(
+                        return Err(GaussError::SqlLimitExceeded(format!(
                             "interactive transaction exceeds {MAX_STATEMENTS_PER_REQUEST} statements"
                         )));
                     }
@@ -2484,6 +2539,8 @@ impl RelationalEngine {
             let statement_count = session.history.statements().len();
             let prepared = if statement_count == 0 {
                 PreparedRelationalExecution {
+                    ml_source_fence: None,
+                    ml_schedule_fence: None,
                     publication: SqlPublication::default(),
                     snapshot: session.base.sequence,
                     results: Vec::new(),
@@ -3059,7 +3116,7 @@ fn prepare_execution(
         return Err(invalid("SQL request must contain at least one statement"));
     }
     if request.statements.len() > MAX_STATEMENTS_PER_REQUEST {
-        return Err(GaussError::ResourceExhausted(format!(
+        return Err(GaussError::SqlLimitExceeded(format!(
             "SQL request has {} statements; maximum is {MAX_STATEMENTS_PER_REQUEST}",
             request.statements.len()
         )));
@@ -3271,6 +3328,8 @@ fn prepare_execution(
     let publication =
         SqlPublication::capture(authorized_identity, &snapshot_state, authorization.as_ref())?;
     Ok(PreparedRelationalExecution {
+        ml_source_fence: None,
+        ml_schedule_fence: None,
         publication,
         snapshot,
         results,
@@ -5973,6 +6032,12 @@ fn execute_delete(
         .ok_or_else(|| invalid(format!("table {table_name} does not exist")))?
         .definition
         .clone();
+    if returning.is_none()
+        && delete.selection.is_none()
+        && let Some(result) = delete::all_if_unreferenced(state, &table_name, sequence, mutations)?
+    {
+        return Ok(result);
+    }
     let candidates = mutation_candidates(
         state,
         &from[0].relation,
@@ -6123,7 +6188,7 @@ fn apply_referential_actions(
                             )));
                         }
                         if matching_rows.len() == MAX_ROWS_PER_RESULT {
-                            return Err(GaussError::ResourceExhausted(format!(
+                            return Err(GaussError::SqlLimitExceeded(format!(
                                 "disk index lookup exceeded {MAX_ROWS_PER_RESULT} candidate rows"
                             )));
                         }
@@ -6161,7 +6226,7 @@ fn apply_referential_actions(
                 visited.insert(visit_key);
                 action_rows = action_rows.saturating_add(1);
                 if action_rows > MAX_REFERENTIAL_ACTION_ROWS {
-                    return Err(GaussError::ResourceExhausted(format!(
+                    return Err(GaussError::SqlLimitExceeded(format!(
                         "foreign-key action exceeds {MAX_REFERENTIAL_ACTION_ROWS} affected rows"
                     )));
                 }
@@ -6680,12 +6745,12 @@ fn execute_query(
                 .as_ref()
                 .map(|limit| {
                     usize::try_from(integer_literal(limit)?).map_err(|_| {
-                        GaussError::ResourceExhausted("LIMIT exceeds platform size".into())
+                        GaussError::SqlLimitExceeded("LIMIT exceeds platform size".into())
                     })
                 })
                 .transpose()?;
             if requested.is_some_and(|requested| requested > MAX_ROWS_PER_RESULT) {
-                return Err(GaussError::ResourceExhausted(format!(
+                return Err(GaussError::SqlLimitExceeded(format!(
                     "LIMIT exceeds maximum result rows {MAX_ROWS_PER_RESULT}"
                 )));
             }
@@ -6693,7 +6758,7 @@ fn execute_query(
                 .as_ref()
                 .map(|offset| {
                     usize::try_from(integer_literal(&offset.value)?).map_err(|_| {
-                        GaussError::ResourceExhausted("OFFSET exceeds platform size".into())
+                        GaussError::SqlLimitExceeded("OFFSET exceeds platform size".into())
                     })
                 })
                 .transpose()?
@@ -6719,7 +6784,7 @@ fn execute_query(
         });
     }
     if !distinct && selected.len().saturating_sub(offset) > MAX_ROWS_PER_RESULT && limit.is_none() {
-        return Err(GaussError::ResourceExhausted(format!(
+        return Err(GaussError::SqlLimitExceeded(format!(
             "query produced more than {MAX_ROWS_PER_RESULT} rows; add a smaller LIMIT"
         )));
     }
@@ -6759,7 +6824,7 @@ fn execute_query(
         deduplicate_rows(&mut rows);
     }
     if rows.len().saturating_sub(offset) > MAX_ROWS_PER_RESULT && unbounded {
-        return Err(GaussError::ResourceExhausted(format!(
+        return Err(GaussError::SqlLimitExceeded(format!(
             "query produced more than {MAX_ROWS_PER_RESULT} rows; add a smaller LIMIT"
         )));
     }
@@ -6853,7 +6918,8 @@ fn compare_query_order(
     left_position.cmp(&right_position)
 }
 
-/// A keyset page on a single integer primary key can stop after LIMIT rows.
+/// A page on a single integer primary key can stop after OFFSET + LIMIT matches.
+/// OFFSET rows are discarded before projection, not retained in a top-k heap.
 /// The scalar index supplies logical key order even when physical row IDs or
 /// mutation overlays are out of order; other ORDER BY shapes use the bounded
 /// general top-k operator.
@@ -6867,7 +6933,7 @@ fn execute_ordered_primary_range(
     let Some(order_by) = query.order_by.as_ref() else {
         return Ok(None);
     };
-    let (Some(limit), 0) = aggregate_limit_offset(&query.limit_clause)? else {
+    let (Some(limit), offset) = aggregate_limit_offset(&query.limit_clause)? else {
         return Ok(None);
     };
     if limit == 0 || limit > MAX_ROWS_PER_RESULT || order_by.interpolate.is_some() {
@@ -6952,6 +7018,7 @@ fn execute_ordered_primary_range(
     let mut rows = Vec::new();
     let mut serialized_bytes = 0;
     let mut ordered_rows = table.rows.ordered_reader();
+    let mut skipped = 0;
     let entries = match &lower {
         Some((key, _)) => index.entries_from(&table.index_segments, snapshot, key)?,
         None => index.entries(&table.index_segments, snapshot, None)?,
@@ -6989,6 +7056,10 @@ fn execute_ordered_primary_range(
             parameters,
             &mut cursor,
         )? {
+            continue;
+        }
+        if skipped < offset {
+            skipped += 1;
             continue;
         }
         let projected = project_query_row(&version.values, &projection);
@@ -7121,7 +7192,7 @@ fn execute_topk_query(
         let budget = query_operator_budget();
         if charged.saturating_sub(replacing).saturating_add(charge) > budget {
             if !crate::encryption::encryption_enabled() || charge > budget {
-                return Err(GaussError::ResourceExhausted(format!(
+                return Err(GaussError::SqlLimitExceeded(format!(
                     "SQL operator memory budget exceeds {budget} bytes"
                 )));
             }
@@ -7206,13 +7277,13 @@ fn charge_result_row(charged: &mut usize, row: &[RelationalValue]) -> Result<()>
         limit: MAX_RESULT_BYTES.saturating_sub(*charged),
     };
     serde_json::to_writer(&mut counter, row).map_err(|error| {
-        GaussError::ResourceExhausted(format!(
+        GaussError::SqlLimitExceeded(format!(
             "SQL result exceeds {MAX_RESULT_BYTES} bytes: {error}"
         ))
     })?;
     *charged = charged.saturating_add(counter.written).saturating_add(1);
     if *charged > MAX_RESULT_BYTES {
-        return Err(GaussError::ResourceExhausted(format!(
+        return Err(GaussError::SqlLimitExceeded(format!(
             "SQL result exceeds {MAX_RESULT_BYTES} bytes"
         )));
     }
@@ -7336,7 +7407,7 @@ fn execute_streaming_query(
             continue;
         }
         if rows.len() == MAX_ROWS_PER_RESULT {
-            return Err(GaussError::ResourceExhausted(format!(
+            return Err(GaussError::SqlLimitExceeded(format!(
                 "query produced more than {MAX_ROWS_PER_RESULT} rows; add a smaller LIMIT"
             )));
         }
@@ -7736,7 +7807,7 @@ fn execute_aggregate_query(
 
     let (limit, offset) = aggregate_limit_offset(&query.limit_clause)?;
     if rows.len().saturating_sub(offset) > MAX_ROWS_PER_RESULT && limit.is_none() {
-        return Err(GaussError::ResourceExhausted(format!(
+        return Err(GaussError::SqlLimitExceeded(format!(
             "query produced more than {MAX_ROWS_PER_RESULT} groups; add a smaller LIMIT"
         )));
     }
@@ -7927,7 +7998,7 @@ fn aggregate_value(
             .take(MAX_ROWS_PER_RESULT + 1)
             .collect::<Vec<_>>();
         if distinct_rows.len() > MAX_ROWS_PER_RESULT {
-            return Err(GaussError::ResourceExhausted(format!(
+            return Err(GaussError::SqlLimitExceeded(format!(
                 "aggregate DISTINCT exceeded {MAX_ROWS_PER_RESULT} values"
             )));
         }
@@ -8157,12 +8228,12 @@ fn aggregate_limit_offset(limit_clause: &Option<LimitClause>) -> Result<(Option<
                 .as_ref()
                 .map(|limit| {
                     usize::try_from(integer_literal(limit)?).map_err(|_| {
-                        GaussError::ResourceExhausted("LIMIT exceeds platform size".into())
+                        GaussError::SqlLimitExceeded("LIMIT exceeds platform size".into())
                     })
                 })
                 .transpose()?;
             if limit.is_some_and(|limit| limit > MAX_ROWS_PER_RESULT) {
-                return Err(GaussError::ResourceExhausted(format!(
+                return Err(GaussError::SqlLimitExceeded(format!(
                     "LIMIT exceeds maximum result rows {MAX_ROWS_PER_RESULT}"
                 )));
             }
@@ -8170,7 +8241,7 @@ fn aggregate_limit_offset(limit_clause: &Option<LimitClause>) -> Result<(Option<
                 .as_ref()
                 .map(|offset| {
                     usize::try_from(integer_literal(&offset.value)?).map_err(|_| {
-                        GaussError::ResourceExhausted("OFFSET exceeds platform size".into())
+                        GaussError::SqlLimitExceeded("OFFSET exceeds platform size".into())
                     })
                 })
                 .transpose()?
@@ -8217,7 +8288,7 @@ fn charge_query_operator_bytes(charged: &mut usize, bytes: usize) -> Result<()> 
     let budget = query_operator_budget();
     *charged = charged.saturating_add(bytes);
     if *charged > budget {
-        return Err(GaussError::ResourceExhausted(format!(
+        return Err(GaussError::SqlLimitExceeded(format!(
             "SQL operator memory budget exceeds {budget} bytes"
         )));
     }
@@ -8237,7 +8308,7 @@ fn query_operator_row_charge(row: &[RelationalValue]) -> Result<usize> {
         limit: budget,
     };
     serde_json::to_writer(&mut counter, row).map_err(|error| {
-        GaussError::ResourceExhausted(format!(
+        GaussError::SqlLimitExceeded(format!(
             "SQL operator memory budget exceeds {budget} bytes: {error}"
         ))
     })?;
@@ -8468,7 +8539,7 @@ fn apply_join(
             charge_query_operator_row(&mut charged, &combined)?;
             rows.push(combined);
             if rows.len() > MAX_ROWS_PER_RESULT {
-                return Err(GaussError::ResourceExhausted(format!(
+                return Err(GaussError::SqlLimitExceeded(format!(
                     "join produced more than {MAX_ROWS_PER_RESULT} rows; add selective predicates"
                 )));
             }
@@ -8478,7 +8549,7 @@ fn apply_join(
             charge_query_operator_row(&mut charged, &combined)?;
             rows.push(combined);
             if rows.len() > MAX_ROWS_PER_RESULT {
-                return Err(GaussError::ResourceExhausted(format!(
+                return Err(GaussError::SqlLimitExceeded(format!(
                     "join produced more than {MAX_ROWS_PER_RESULT} rows; add selective predicates"
                 )));
             }
@@ -11965,20 +12036,33 @@ fn read_relational_checkpoint(path: &Path) -> Result<Option<RelationalCheckpoint
     )?;
     if checkpoint.version != RELATIONAL_CHECKPOINT_LEGACY_VERSION
         && checkpoint.version != RELATIONAL_CHECKPOINT_RUNS_VERSION
+        && checkpoint.version != RELATIONAL_CHECKPOINT_REPLAY_FRONTIER_VERSION
         && checkpoint.version != RELATIONAL_CHECKPOINT_VERSION
     {
         return Err(relational_checkpoint_corruption(
             path,
             format!(
-                "unsupported relational checkpoint version {}; expected {}, {} or {}",
+                "unsupported relational checkpoint version {}; expected {}, {}, {} or {}",
                 checkpoint.version,
                 RELATIONAL_CHECKPOINT_LEGACY_VERSION,
                 RELATIONAL_CHECKPOINT_RUNS_VERSION,
+                RELATIONAL_CHECKPOINT_REPLAY_FRONTIER_VERSION,
                 RELATIONAL_CHECKPOINT_VERSION
             ),
         ));
     }
+    if (checkpoint.version >= RELATIONAL_CHECKPOINT_VERSION && checkpoint.source_lineage.is_none())
+        || checkpoint
+            .source_lineage
+            .is_some_and(|lineage| lineage.is_nil())
+    {
+        return Err(relational_checkpoint_corruption(
+            path,
+            "invalid ML source lineage",
+        ));
+    }
     for table in &checkpoint.tables {
+        ml_source::validate_checkpoint_revision(table, checkpoint.version, checkpoint.sequence)?;
         let legacy_fields_present = table.row_segment.is_some() || table.index_segment.is_some();
         let run_fields_present = !table.row_segments.is_empty() || !table.index_segments.is_empty();
         if legacy_fields_present && run_fields_present {
@@ -12036,6 +12120,7 @@ fn restore_relational_checkpoint(
 ) -> Result<(RelationalState, u64)> {
     let checkpoint_sequence = checkpoint.sequence;
     let mut state = RelationalState {
+        source_lineage: checkpoint.source_lineage.unwrap_or_else(uuid::Uuid::new_v4),
         request_identity: None,
         request_identity_memory: None,
         directory: Arc::new(segment_dir.to_path_buf()),
@@ -12085,7 +12170,13 @@ fn restore_relational_checkpoint(
         } else {
             &persisted.index_segments
         };
+        let source_revision = persisted.source_revision.unwrap_or(MlSourceRevision {
+            table_id: persisted.definition.table_id,
+            data_revision: checkpoint_sequence,
+            schema_revision: checkpoint_sequence,
+        });
         let mut table = TableState::empty(persisted.definition, Arc::clone(&state.directory))?;
+        table.source_revision = source_revision;
         table.rows = restored_rows;
         table.next_row_id = persisted.next_row_id;
         if !index_references.is_empty() {
@@ -12174,6 +12265,7 @@ fn rewrite_table_state_with_flush(
     if definition.row_policy == previous.definition.row_policy {
         rewritten.policy_epoch = previous.policy_epoch.clone();
     }
+    rewritten.source_revision = previous.source_revision;
     rewritten.rows.mark_modified(sequence);
     rewritten.next_row_id = previous.next_row_id;
     state.tables.insert(&definition.name, Arc::new(rewritten))?;
@@ -12247,6 +12339,7 @@ fn apply_batch_with_flush(
     let before = state.clone();
     let mut mutations = batch.mutations.iter().peekable();
     while let Some(mutation) = mutations.next() {
+        let source_change = ml_source::mutation_change(state, mutation, batch.sequence)?;
         match mutation {
             RelationalMutation::RowSecurity { delta } => {
                 row_security::apply_delta(state, batch.sequence, delta)?;
@@ -12301,6 +12394,7 @@ fn apply_batch_with_flush(
                     state.next_catalog_id =
                         state.next_catalog_id.max(catalog_id_frontier(definition));
                     mutations.next();
+                    ml_source::stamp(state, &definition.name, batch.sequence, true, true)?;
                     flush(state)?;
                     continue;
                 }
@@ -12412,6 +12506,9 @@ fn apply_batch_with_flush(
                     flush(state)?;
                 }
             }
+        }
+        if let Some((name, data, schema)) = source_change {
+            ml_source::stamp(state, name, batch.sequence, data, schema)?;
         }
         flush(state)?;
     }
@@ -13410,11 +13507,11 @@ mod tests {
         );
         assert!(matches!(
             engine.execute(request("SELECT id FROM stream ORDER BY id DESC LIMIT 270")),
-            Err(GaussError::ResourceExhausted(_))
+            Err(GaussError::SqlLimitExceeded(_))
         ));
         assert!(matches!(
             engine.execute(request("SELECT note FROM stream")),
-            Err(GaussError::ResourceExhausted(_))
+            Err(GaussError::SqlLimitExceeded(_))
         ));
         let repeated_read = SqlExecutionRequest {
             statements: (0..2)
@@ -13428,7 +13525,7 @@ mod tests {
         };
         assert!(matches!(
             engine.execute(repeated_read),
-            Err(GaussError::ResourceExhausted(_))
+            Err(GaussError::SqlLimitExceeded(_))
         ));
         drop(engine);
         drop(journal);
@@ -13552,6 +13649,18 @@ mod tests {
                 "SELECT id, payload FROM pages WHERE id > 90 ORDER BY id LIMIT 3",
                 vec![],
             ),
+            (
+                "SELECT id, payload FROM pages ORDER BY id LIMIT 2 OFFSET 3",
+                vec![(60, "sixty"), (70, "seventy")],
+            ),
+            (
+                "SELECT id, payload FROM pages WHERE id > 10 ORDER BY id LIMIT 2 OFFSET 2",
+                vec![(60, "sixty"), (70, "seventy")],
+            ),
+            (
+                "SELECT id, payload FROM pages ORDER BY id LIMIT 2 OFFSET 100",
+                vec![],
+            ),
         ] {
             rows::VISIBLE_ROW_SCANS.with(|scans| scans.set(0));
             let response = engine.execute(request(sql)).unwrap().response;
@@ -13643,6 +13752,52 @@ mod tests {
     }
 
     #[test]
+    fn late_primary_key_page_does_not_retain_skipped_wide_rows() {
+        // This wide fixture must not consume the shared storage pool of other
+        // concurrently running SQL tests. Keep the normal production capacity.
+        memory::with_storage_pool(128 * 1024 * 1024, |_| {
+            let directory = tempdir().unwrap();
+            let open = || {
+                let journal = TransactionJournal::open(directory.path()).unwrap();
+                RelationalEngine::open(directory.path(), journal).unwrap()
+            };
+            let engine = open();
+            engine
+                .execute(request(
+                    "CREATE TABLE wide_pages (id BIGINT PRIMARY KEY, body TEXT)",
+                ))
+                .unwrap();
+            // The skipped payload alone exceeds the 8 MiB operator limit. Reverse
+            // insertion order also prevents relying on physical row-id ordering.
+            for start in (0..2048).step_by(32) {
+                let tuples = (start..start + 32)
+                    .map(|id| format!("({}, $1)", 2048 - id))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let mut insert = request(&format!("INSERT INTO wide_pages VALUES {tuples}"));
+                insert.statements[0].parameters = vec![RelationalValue::Text("x".repeat(8192))];
+                engine.execute(insert).unwrap();
+            }
+            engine.checkpoint().unwrap();
+            drop(engine);
+            let reopened = open();
+            let result = reopened
+                .execute(request(
+                    "SELECT * FROM wide_pages ORDER BY id LIMIT 5 OFFSET 2000",
+                ))
+                .unwrap();
+            let SqlResult::Rows { rows, .. } = &result.response.results[0] else {
+                panic!("expected rows")
+            };
+            assert_eq!(rows.len(), 5);
+            for (row, id) in rows.iter().zip(2001..=2005) {
+                assert_eq!(row[0], RelationalValue::Integer(id));
+                assert_eq!(row[1], RelationalValue::Text("x".repeat(8192)));
+            }
+        });
+    }
+
+    #[test]
     fn ordered_primary_page_reuses_locator_cursor_for_adjacent_rows() {
         let directory = tempdir().unwrap();
         let journal = TransactionJournal::open(directory.path()).unwrap();
@@ -13694,7 +13849,7 @@ mod tests {
         };
         assert!(matches!(
             engine.execute_interactive(&transaction.handle, excess, &context),
-            Err(GaussError::ResourceExhausted(_))
+            Err(GaussError::SqlLimitExceeded(_))
         ));
         engine
             .execute_interactive(
@@ -16911,6 +17066,7 @@ mod tests {
                 definition.reference_index_ids.clear();
                 let mut replacement =
                     TableState::empty(definition, Arc::clone(&previous.directory))?;
+                replacement.source_revision = previous.source_revision;
                 replacement.rows = previous.rows.clone();
                 replacement.next_row_id = previous.next_row_id;
                 Ok(Some(Arc::new(replacement)))
@@ -20256,7 +20412,7 @@ mod tests {
                 Ok(_) => panic!("oversized DML unexpectedly committed: {sql}"),
                 Err(error) => error,
             };
-            assert!(matches!(&error, GaussError::ResourceExhausted(_)));
+            assert!(matches!(&error, GaussError::SqlLimitExceeded(_)));
             assert!(error.to_string().contains("SQL operator memory budget"));
         }
         drop(engine);
@@ -20320,7 +20476,7 @@ mod tests {
             Ok(_) => panic!("combined cascade buffers unexpectedly committed"),
             Err(error) => error,
         };
-        assert!(matches!(&error, GaussError::ResourceExhausted(_)));
+        assert!(matches!(&error, GaussError::SqlLimitExceeded(_)));
         assert!(error.to_string().contains("SQL operator memory budget"));
         drop(engine);
         drop(journal);

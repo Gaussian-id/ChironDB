@@ -1526,24 +1526,16 @@ impl Wal {
                 })?;
             // Keep the visitor's errors outside the decoder's JSON mapping.
             // A cancelled hash/serialization must not become WAL corruption.
-            crate::relational::wal_decode::inspect::<PersistedWalRecord, _>(
-                &plaintext,
-                |persisted| {
-                    Ok(match persisted {
-                        PersistedWalRecord::Record(record) => {
-                            if record.lsn != lsn {
-                                Err(wal_corruption(path, "lsn mismatch"))
-                            } else {
-                                visitor(record)
-                            }
-                        }
-                        // Journal PREPAREs always carry their absolute LSN.
-                        PersistedWalRecord::Legacy(_) => {
-                            Err(wal_corruption(path, "journal record lacks LSN envelope"))
-                        }
-                    })
-                },
-            )
+            // Journal records require the LSN envelope. Decode that DTO
+            // directly: an untagged Record/Legacy fallback first buffers the
+            // entire PREPARE into serde Content, defeating typed row decoding.
+            crate::relational::wal_decode::inspect::<WalRecord, _>(&plaintext, |record| {
+                Ok(if record.lsn != lsn {
+                    Err(wal_corruption(path, "lsn mismatch"))
+                } else {
+                    visitor(record)
+                })
+            })
             .map_err(|error| match error {
                 GaussError::Json(_) => {
                     wal_corruption(path, &format!("invalid WAL record JSON: {error}"))

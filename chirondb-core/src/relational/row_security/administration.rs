@@ -175,6 +175,8 @@ impl RelationalEngine {
         let mutations = vec![RelationalMutation::RowSecurity { delta }];
         let intents = collect_transaction_intents(&base, &candidate, base.sequence, &mutations)?;
         let prepared = PreparedRelationalExecution {
+            ml_source_fence: None,
+            ml_schedule_fence: None,
             publication,
             snapshot: base.sequence,
             results: vec![SqlResult::Definition {

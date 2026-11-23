@@ -114,6 +114,7 @@ jobs:
             done
             cp "$source/proto/chirondb/v1/chirondb.proto" "$stage/proto/chirondb/v1/"
             cp "$source/proto/chirondb/v1/compat.proto" "$stage/proto/chirondb/v1/"
+            cp "$source/proto/chirondb/v1/ml.proto" "$stage/proto/chirondb/v1/"
             cp "$source/LICENSE" "$source/NOTICE" "$source/TRADEMARKS.md" "$stage/"
             if [[ -d "$source/chirondb-temporal" ]]; then
               mkdir -p "$stage/chirondb-temporal/verification"

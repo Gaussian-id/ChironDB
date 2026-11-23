@@ -177,7 +177,7 @@ class InstallationLab:
                 proto = Path(__file__).resolve().parents[2] / 'proto'
                 self.run([sys.executable, '-m', 'grpc_tools.protoc', '-I' + str(proto),
                           '--python_out=' + str(generated), '--grpc_python_out=' + str(generated),
-                          proto / 'chirondb/v1/compat.proto', proto / 'chirondb/v1/chirondb.proto'])
+                          proto / 'chirondb/v1/compat.proto', proto / 'chirondb/v1/chirondb.proto', proto / 'chirondb/v1/ml.proto'])
                 sys.path.insert(0, str(generated))
                 from chirondb.v1 import chirondb_pb2, chirondb_pb2_grpc, compat_pb2
                 self.pb, self.pbgrpc, self.wpb = chirondb_pb2, chirondb_pb2_grpc, compat_pb2

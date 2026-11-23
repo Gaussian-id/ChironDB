@@ -235,7 +235,8 @@ jobs:
           "$RUNNER_TEMP/chirondb-ml-python/bin/python" -m pip install --only-binary=:all: --upgrade pip==26.3
           ml_python="$RUNNER_TEMP/chirondb-ml-python/bin/python"
           "$ml_python" -m pip install -r ml-worker/requirements-traditional.txt requests==2.34.2 protobuf==7.36.2
-          PYTHONPATH=ml-worker "$ml_python" -m unittest -v test_worker
+          PYTHONPATH=ml-worker "$ml_python" -m unittest discover -s ml-worker -v
+          "$ml_python" chirondb-server/tests/ml_auto_refresh_e2e.py --server "$CHIRONDB_BIN_DIR/chirondb" --output "$RUNNER_TEMP/ml-auto-refresh-evidence"
           "$ml_python" -m pip install "$(ls "$CHIRONDB_SDK_PYTHON_ROOT"/dist/*.whl)[async,dev]"
           "$ml_python" -m pytest "$CHIRONDB_SDK_PYTHON_ROOT/tests/test_ml_sdk.py" -q
           export CHIRONDB_ML_WORKER_PYTHON="$ml_python"
@@ -243,7 +244,7 @@ jobs:
           export CHIRONDB_ML_WORKER_SCRIPT="$GITHUB_WORKSPACE/ml-worker/chirondb_ml_worker.py"
           cargo test --offline --manifest-path sdk-integration/Cargo.toml --test ml_materialize --locked -j 2 traditional_models_materialize_and_refresh_through_http_and_sdks -- --ignored --exact
           cargo test --offline --manifest-path sdk-integration/Cargo.toml --test ml_materialize --locked -j 2 grpc_and_chironwire_share_ml_materialization -- --ignored --exact
-          CHIRONDB_ML_WORKER_SCRIPT="$GITHUB_WORKSPACE/ml-worker/delayed_worker.py" cargo test --offline --manifest-path sdk-integration/Cargo.toml --test ml_materialize --locked -j 2 job_uses_submission_snapshot_and_serializes_refreshes -- --ignored --exact
+          CHIRONDB_ML_WORKER_SCRIPT="$GITHUB_WORKSPACE/ml-worker/delayed_worker.py" cargo test --offline --manifest-path sdk-integration/Cargo.toml --test ml_materialize --locked -j 2 job_uses_dispatch_snapshot_and_serializes_refreshes -- --ignored --exact
 
   docker:
     name: Docker deployment smoke
@@ -254,7 +255,7 @@ jobs:
       - name: Build production image
         run: |
           docker build \
-            --build-arg CHIRONDB_VERSION=0.4.1 \
+            --build-arg CHIRONDB_VERSION=0.5.0 \
             --build-arg VCS_REF=${{ github.sha }} \
             -t chirondb:ci .
       - name: Three-protocol persistence smoke

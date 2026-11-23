@@ -1916,7 +1916,7 @@ Generate clients from the matching source schemas (run from the checkout):
 ```sh
 python3 -m grpc_tools.protoc -I proto \
   --python_out=. --grpc_python_out=. \
-  proto/chirondb/v1/compat.proto proto/chirondb/v1/chirondb.proto
+  proto/chirondb/v1/compat.proto proto/chirondb/v1/ml.proto proto/chirondb/v1/chirondb.proto
 ```
 
 Install the pinned protocol dependencies in an isolated environment from [security_chironql_requirements.txt](../chirondb-server/tests/security_chironql_requirements.txt), or generate in a separate directory and add it to `PYTHONPATH`. The example uses `chirondb.v1.ChironDb/ExecuteQuery`. Legacy `gaussdb.v1.GaussDb` remains denied for protected execution. Reusing a channel does not retain revoked permission.

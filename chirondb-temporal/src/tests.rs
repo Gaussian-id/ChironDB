@@ -324,3 +324,90 @@ fn malformed_checked_metadata_and_payload_return_errors() {
     let mut s = Segment::open(Cursor::new(bad_block)).unwrap();
     assert!(s.latest(&input[0].0).is_err());
 }
+#[test]
+fn compaction_merges_late_events_extremes_and_preserves_value_bits() {
+    use std::io::Cursor;
+    let float = Series::new("tenant", "asset", "float");
+    let boolean = Series::new("other", "asset", "bool");
+    let mut rows: Vec<_> = (0..4001)
+        .map(|time| {
+            (
+                float.clone(),
+                Point {
+                    time,
+                    value: Value::Float(f64::from_bits(0x3ff0000000000000 + time as u64)),
+                },
+            )
+        })
+        .collect();
+    rows.extend([
+        (
+            float.clone(),
+            Point {
+                time: i64::MIN,
+                value: Value::Float(-0.0),
+            },
+        ),
+        (
+            float.clone(),
+            Point {
+                time: i64::MAX,
+                value: Value::Float(f64::INFINITY),
+            },
+        ),
+        (
+            boolean.clone(),
+            Point {
+                time: i64::MAX,
+                value: Value::Boolean(true),
+            },
+        ),
+    ]);
+    let a = encode_segment(rows.iter().step_by(2).cloned()).unwrap();
+    let b = encode_segment(
+        rows.iter()
+            .skip(1)
+            .step_by(2)
+            .cloned()
+            .chain(rows.iter().take(2).cloned()),
+    )
+    .unwrap();
+    let merged = Segment::open(Cursor::new(a))
+        .unwrap()
+        .merge(Segment::open(Cursor::new(b)).unwrap())
+        .unwrap();
+    // Same canonical bytes as a single encoding, including deduplication and
+    // block boundaries. This also covers timestamps that HISTORY cannot include.
+    assert_eq!(merged, encode_segment(rows).unwrap());
+}
+
+#[test]
+fn compaction_rejects_conflicts_mixed_types_and_corrupt_blocks() {
+    use std::io::Cursor;
+    let key = Series::new("", "a", "p");
+    let original = encode_segment([(
+        key.clone(),
+        Point {
+            time: 0,
+            value: Value::Float(0.0),
+        },
+    )])
+    .unwrap();
+    for value in [Value::Float(-0.0), Value::Float(1.0), Value::Boolean(false)] {
+        let conflict = encode_segment([(key.clone(), Point { time: 0, value })]).unwrap();
+        assert!(
+            Segment::open(Cursor::new(original.clone()))
+                .unwrap()
+                .merge(Segment::open(Cursor::new(conflict)).unwrap())
+                .is_err()
+        );
+    }
+    let mut corrupt = original.clone();
+    corrupt[9] ^= 1;
+    assert!(
+        Segment::open(Cursor::new(original))
+            .unwrap()
+            .merge(Segment::open(Cursor::new(corrupt)).unwrap())
+            .is_err()
+    );
+}

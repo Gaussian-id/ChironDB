@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package chirondb.v1;
+
+// Shared by the native ChironDB RPC service and additive ChironWire frames.
+// The legacy GaussDb RPC service does not expose these operations.
+enum MlRefreshMode {
+  ML_REFRESH_MODE_UNSPECIFIED = 0;
+  ML_REFRESH_MODE_MANUAL = 1;
+  ML_REFRESH_MODE_AUTO = 2;
+}
+
+enum MlRefreshAvailability {
+  ML_REFRESH_AVAILABILITY_UNSPECIFIED = 0;
+  ML_REFRESH_AVAILABILITY_NOT_READY = 1;
+  ML_REFRESH_AVAILABILITY_AVAILABLE = 2;
+}
+
+enum MlRefreshActivity {
+  ML_REFRESH_ACTIVITY_UNSPECIFIED = 0;
+  ML_REFRESH_ACTIVITY_IDLE = 1;
+  ML_REFRESH_ACTIVITY_DEBOUNCING = 2;
+  ML_REFRESH_ACTIVITY_QUEUED = 3;
+  ML_REFRESH_ACTIVITY_RUNNING = 4;
+  ML_REFRESH_ACTIVITY_RETRY_WAIT = 5;
+  ML_REFRESH_ACTIVITY_BLOCKED = 6;
+}
+
+enum MlRefreshFreshness {
+  ML_REFRESH_FRESHNESS_UNSPECIFIED = 0;
+  ML_REFRESH_FRESHNESS_FRESH = 1;
+  ML_REFRESH_FRESHNESS_STALE = 2;
+  ML_REFRESH_FRESHNESS_INVALID_SOURCE = 3;
+}
+
+message MlRefreshRevision {
+  uint64 data = 1;
+  uint64 schema = 2;
+}
+
+message SetMlRefreshPolicyRequest {
+  string name = 1;
+  MlRefreshMode mode = 2;
+}
+
+message GetMlRefreshStatusRequest {
+  string name = 1;
+}
+
+message MlRefreshStatus {
+  string view = 1;
+  MlRefreshMode mode = 2;
+  MlRefreshAvailability availability = 3;
+  MlRefreshActivity activity = 4;
+  MlRefreshFreshness freshness = 5;
+  optional uint64 source_table_id = 6;
+  MlRefreshRevision current_revision = 7;
+  MlRefreshRevision published_revision = 8;
+  optional string active_job_id = 9;
+  optional uint64 last_success_at_ms = 10;
+  optional uint64 queue_age_ms = 11;
+  optional uint64 retry_at_ms = 12;
+  optional string error_code = 13;
+  optional string blocked_reason = 14;
+  uint64 refresh_version = 15;
+}

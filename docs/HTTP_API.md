@@ -31,6 +31,21 @@ authenticated SQL or retrieval query before routing production traffic:
 `/health` can succeed while query indexes are still warming and a client
 query can exceed its timeout.
 
+Health is a readiness signal: a latched audit append or synchronization failure
+also returns `503` with `status: "degraded"`. The same audit state is checked by
+gRPC and ChironWire health. Mandatory audit remains enforced for reads and
+writes. After a disk-full failure, free space on the data filesystem and restart
+to verify/recover the audit log before resuming traffic. Freeing space alone
+does not clear a latched writer failure; startup can fail while the disk is full.
+Authenticated metrics expose `chirondb_audit_unavailable` (0 or 1),
+`chirondb_temporal_runs{collection}` and `chirondb_temporal_run_merges_total`.
+These are current failure/run observations, not a proactive free-space check.
+Registry preparation failures before any audit append also degrade readiness;
+a later successful audited request can clear that transient condition. Failed
+append, sync or rotation remains latched and requires recovery.
+The authenticated metrics endpoint can itself return `503` during an audit
+outage; alert on failed scrapes and the public health response as well.
+
 All data and administration routes require a key when the server starts with
 `CHIRONDB_API_KEY` or `--api-key`:
 
@@ -750,6 +765,14 @@ curl --fail -X POST http://127.0.0.1:7401/v1/collections \
 Supported metrics are `cosine`, `l2`, and `dot`. LS-VEC is the sole/default
 index path; clients do not select HNSW as a separate persisted index.
 
+Dense vector persistence is approximate: current LS-VEC sealed segments use
+scaled-f16 components, decoded to f32 when returned. Sealing or compaction can
+therefore change vector component bits, including with `quantization: null`.
+That field does not promise lossless f32 persistence. Keep original embeddings
+outside ChironDB when exact reconstruction is required. Search-quality/recall
+validation is separate from bit-for-bit storage fidelity; payloads and temporal
+float64 observations do not use this vector encoding.
+
 Optional write bounds, all unset (unbounded) by default and fixed once the
 collection exists:
 
@@ -1289,6 +1312,14 @@ paths on the Postman workstation. They must resolve beneath the configured
 configured. Object-store restore URLs must match the configured origin and path
 prefix. Snapshot and restore require the `admin` role.
 
+Restore validates the backup's retained transaction journal, including WAL base
+metadata, frame checksums, complete final frames and transaction recovery,
+before installing its content. A missing retained WAL segment or corrupt journal
+rejects the restore and preserves live content. Backups without a transaction
+control directory retain legacy compatibility. Validation uses a private staging copy and does not
+repair the supplied backup in place, even when the running installation keeps
+its own transaction journal across a content restore.
+
 Optional `wal_restore_archive_dir` or `wal_restore_object_store_dir` supplies
 archived collection WAL from server-side storage. With archives, a collection's
 `target_wal_lsns` value may exceed the snapshot's WAL end only when verified,
@@ -1363,6 +1394,110 @@ The view is also readable by `SQL SELECT` through ChironQL or the native SQL
 API. Delete requires a write-capable API key. ML routes return 403 while
 tenant enforcement is active; this preview does not expose predictions through
 the protected tenant executor.
+
+#### Automatic refresh policy and status
+
+New views default to `manual`. Enable automatic full retraining on committed
+source changes with `PUT /v1/ml/views/{name}/refresh-policy` and exactly
+`{"mode":"auto"}`; use `{"mode":"manual"}` to disable future automatic work.
+The same routes are available without `/v1`. Assignment is idempotent, requires
+a write-capable key, and returns the current status. It does not wait for training.
+Manual `ML MATERIALIZE` and automatic requests share one bounded worker queue.
+Disabling automatic refresh lets an already running job finish. Dropping a running
+view returns 409; once idle, dropping removes the view and its policy atomically.
+
+`GET /v1/ml/views/{name}/refresh-status` requires read access. Neither endpoint
+is available under protected installation authority or tenant enforcement.
+An unknown view returns 404; invalid mode, omitted mode or extra policy fields
+return 400. No ChironQL grammar or client credential change is needed.
+
+```bash
+curl -X PUT http://127.0.0.1:7401/v1/ml/views/sales_forecast/refresh-policy \
+  -H 'content-type: application/json' -d '{"mode":"auto"}'
+curl http://127.0.0.1:7401/v1/ml/views/sales_forecast/refresh-status
+```
+
+The status separates three independent dimensions:
+
+| Field | Values |
+| --- | --- |
+| `availability` | `not_ready`, `available` (a published generation exists) |
+| `activity` | `idle`, `debouncing`, `queued`, `running`, `retry_wait`, `blocked` |
+| `freshness` | `fresh`, `stale`, `invalid_source` |
+
+It also includes `view`, `mode`, `source_table_id`, `current_revision` and
+`published_revision` (`{"data":N,"schema":N}`), `active_job_id`,
+`last_success_at_ms`, `queue_age_ms`, `retry_at_ms`, `error_code`,
+`blocked_reason`, and `refresh_version` (published generation). Missing source
+identity, revision, job or timing information is JSON `null`, never fabricated
+revision zero. Timestamps are Unix milliseconds; queue age is a duration.
+Old published results stay readable while stale, running, retrying or blocked.
+Inspect `availability` before reading results, then `freshness` and `activity`.
+
+Automatic refresh coalesces commits with a five-second quiet period and a
+thirty-second maximum wait. Each job captures its source only when dispatched;
+a queued job's `source_version` is therefore `null`. The requested revision is
+scheduling intent, while the captured revision describes the worker's actual
+snapshot. New job provenance records identify their trigger as `manual`,
+`automatic` or `recovery` (resuming interrupted automatic work). Worker identity
+hashes are null until dispatch captures a source snapshot; queued jobs and
+preflight failures never borrow the previous generation's worker identity.
+A commit during training schedules one follow-up. This is eventual
+refresh, not a transactionally current prediction. Source DDL/drop can block
+refresh without destroying the last successful generation. A successful refresh
+invalidates earlier pagination cursors with 409; clients must restart pagination.
+After correcting a blocked worker/configuration error, explicitly retry with
+`ML MATERIALIZE` using the existing definition. Reassigning the same policy does
+not clear a failure or reset its retry backoff.
+The 10,000-source-row and five-minute worker limits still apply.
+
+The dispatcher polls source metadata roughly once per second without scanning
+source rows to detect changes. Its metrics have no view-name or source-row labels:
+
+| Metric | Meaning |
+| --- | --- |
+| `chirondb_ml_observed_source_revision_changes_total` | Observed revision transitions saved durably in scheduling state. |
+| `chirondb_ml_coalesced_revision_observations_total` | Subset of those transitions merged into already pending work. |
+| `chirondb_ml_observed_freshness_lag_seconds` | Distribution of known lag sampled for valid AUTO views per dispatcher iteration: time since the first observed unpublished revision; known fresh views emit zero. |
+
+The counters are process-local, best-effort observations, not exact source commit
+counts: polling may miss intervening commits. Initial bindings, duplicate
+observations, failed or uncertain saves, and replay do not increment them. Lag
+survives dispatch, failure and publication of a still-stale generation; elapsed
+time is bounded across clock changes and recovery. Unknown lag, invalid sources
+or schemas, and failed metadata reads emit no sample. Recovery clamps the saved
+observation timestamp; a legacy view without one starts measuring when recovery
+first observes an outstanding revision.
+
+An unreconciled `chironql.ml_commit_unknown` stops ML scheduling and publication
+for the current database until it is reopened. Status reads still return 200,
+with `activity: "blocked"`, `error_code: "chironql.ml_recovery_required"` and
+`retry_at_ms: null` for every view; the existing availability, freshness and
+published version remain visible. Previously published results remain readable.
+New materialization, policy changes and view deletion return 503 with that
+recovery-required code. Repeating requests, waiting or committing source changes
+does not clear it. Restart the server, or close and reopen an embedded `Db`, to
+recover the durable WAL decision before scheduling resumes. A successful
+publication whose applied receipt can be reconciled does not enter this state.
+
+Opening or reading a legacy datastore does not itself force a checkpoint;
+normal relational checkpoints written by this server use SQL v5, including for
+non-ML tables. The first `ML MATERIALIZE` submission, including a manual
+submission, explicitly persists v5 and source lineage before binding a durable
+ML dependency. Enabling automatic refresh on a pre-existing view also requires
+this format. A previous server binary rejects a v5 datastore; in-place binary
+downgrade is unsupported. Keep a pre-upgrade backup if rollback is needed and
+restore that backup with the matching previous server. Legacy views remain
+manual, and unknown published revisions remain null until a new generation is
+published.
+
+Ordinary server restart preserves source identity and resumes automatic refresh.
+Database restore or fork creates a new lineage: existing published results remain
+readable, but restored automatic views become `invalid_source` / `blocked`.
+Explicitly drop and recreate each affected ML view to bind it to the restored
+source; there is no implicit rebinding. A worker from the previous lineage cannot
+publish into the restored database. This rule applies even when source names and
+numeric revisions happen to match.
 
 ChironQL 1.5 supports vector, graph, relational and time-series queries. Send one statement per request. The full language reference is
 [CHIRONQL.md](CHIRONQL.md).

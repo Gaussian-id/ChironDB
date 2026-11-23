@@ -470,7 +470,7 @@ async fn traditional_models_materialize_and_refresh_through_http_and_sdks() {
 
 #[tokio::test]
 #[ignore = "requires delayed_worker.py as the optional ML worker script"]
-async fn job_uses_submission_snapshot_and_serializes_refreshes() {
+async fn job_uses_dispatch_snapshot_and_serializes_refreshes() {
     let data = TempDir::new().unwrap();
     let db = Db::open(data.path()).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -492,6 +492,37 @@ async fn job_uses_submission_snapshot_and_serializes_refreshes() {
         "SQL INSERT INTO snapshot_source VALUES (1, 1.0, 2.0), (2, 2.0, 4.0), (3, 3.0, NULL)",
     )
     .await;
+    async fn wait_running(sdk: &ChironDbClient, job_id: &str) -> Value {
+        for _ in 0..3100 {
+            let job = sdk.get_ml_job(job_id).await.unwrap();
+            if job["status"] == "running" {
+                assert!(!job["source_version"].is_null());
+                assert!(!job["source_revision"].is_null());
+                return job;
+            }
+            assert_eq!(
+                job["status"], "queued",
+                "job did not expose its running snapshot: {job}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("job never reached dispatch");
+    }
+    // Occupy the shared worker before submitting the target view. The delayed
+    // real worker keeps these state barriers observable without engine hooks.
+    let blocker = sdk
+        .materialize_ml(
+            "snapshot_blocker",
+            "snapshot_source",
+            "target",
+            &["price"],
+            MlTask::Regression,
+            MlModel::DecisionTree,
+        )
+        .await
+        .unwrap();
+    let blocker_id = blocker.rows[0]["job_id"].as_str().unwrap();
+    wait_running(&sdk, blocker_id).await;
     let submitted = sdk
         .materialize_ml(
             "snapshot_view",
@@ -504,10 +535,24 @@ async fn job_uses_submission_snapshot_and_serializes_refreshes() {
         .await
         .unwrap();
     let job_id = submitted.rows[0]["job_id"].as_str().unwrap();
+    let queued = sdk.get_ml_job(job_id).await.unwrap();
+    assert_eq!(queued["status"], "queued");
+    assert!(queued["source_version"].is_null());
+    assert!(queued["source_revision"].is_null());
+    assert!(!queued["requested_revision"].is_null());
     query(
         &http,
         &base,
         "SQL UPDATE snapshot_source SET price = 30.0 WHERE id = 3",
+    )
+    .await;
+    let running = wait_running(&sdk, job_id).await;
+    assert_eq!(running["requested_revision"], queued["requested_revision"]);
+    assert_ne!(running["source_revision"], queued["requested_revision"]);
+    query(
+        &http,
+        &base,
+        "SQL UPDATE snapshot_source SET price = 60.0 WHERE id = 3",
     )
     .await;
     let conflicting = http
@@ -519,10 +564,13 @@ async fn job_uses_submission_snapshot_and_serializes_refreshes() {
     assert!(!conflicting.status().is_success());
     let body: Value = conflicting.json().await.unwrap();
     assert_eq!(body["code"], "chironql.ml_refresh_running");
-    wait_job(&http, &base, job_id).await;
+    let completed = wait_job(&http, &base, job_id).await;
+    assert_eq!(completed["source_version"], running["source_version"]);
+    assert_eq!(completed["source_revision"], running["source_revision"]);
+    wait_job(&http, &base, blocker_id).await;
     let first = sdk.get_ml_view("snapshot_view", 100, None).await.unwrap();
     assert_eq!(first["version"], 1);
-    assert_eq!(first["rows"][2]["price"], 3.0);
+    assert_eq!(first["rows"][2]["price"], 30.0);
     let refresh = sdk
         .materialize_ml(
             "snapshot_view",
@@ -537,8 +585,10 @@ async fn job_uses_submission_snapshot_and_serializes_refreshes() {
     wait_job(&http, &base, refresh.rows[0]["job_id"].as_str().unwrap()).await;
     let second = sdk.get_ml_view("snapshot_view", 100, None).await.unwrap();
     assert_eq!(second["version"], 2);
-    assert_eq!(second["rows"][2]["price"], 30.0);
-    println!("snapshot: version 1 price=3, version 2 price=30; concurrent refresh rejected");
+    assert_eq!(second["rows"][2]["price"], 60.0);
+    println!(
+        "dispatch snapshot: queued source_version=NULL; version 1 price=30, version 2 price=60; concurrent refresh rejected"
+    );
     server.abort();
 }
 
